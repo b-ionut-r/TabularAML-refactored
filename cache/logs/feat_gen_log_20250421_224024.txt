@@ -1,0 +1,4 @@
+[2025-04-21 22:40:24] [INFO] Starting feature generation: 20250421_224024
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-21 22:40:24] Starting feature generation - Task: regression, Device: cpu
+[2025-04-21 22:40:24] Dataset: 1460 samples, 80 features, Limit: 160 new features max

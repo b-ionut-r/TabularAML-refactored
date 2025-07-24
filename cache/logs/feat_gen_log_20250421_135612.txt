@@ -1,0 +1,12 @@
+[2025-04-21 13:56:12] [INFO] Starting new feature generation with timestamp: 20250421_135612
+[2025-04-21 13:56:12] [DEBUG] Parameters: n_generations=10, n_parents=30, n_children=150
+[2025-04-21 13:56:12] [DEBUG] Greeks parameters: min_pct_gain=0.01, early_stopping_child_eval=1.0, early_stopping_iter=inf
+[2025-04-21 13:56:12] [DEBUG] Max new features: -1
+[2025-04-21 13:56:12] Starting feature generation process - Task: regression, Device: cuda
+[2025-04-21 13:56:12] Initial dataset: 1460 samples, 80 features
+[2025-04-21 13:56:12] Feature limit: Unlimited (max_gen_new_feats_pct=-1)
+[2025-04-21 13:56:27] Gen 0:
+  Training with original features.
+  Mean Val rmse = 29591.69689.
+  No improvement yet, as this is the base generation.
+

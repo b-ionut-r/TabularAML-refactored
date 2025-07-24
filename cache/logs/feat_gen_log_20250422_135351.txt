@@ -1,0 +1,4 @@
+[2025-04-22 13:53:51] [INFO] Starting feature generation: 20250422_135351
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-22 13:53:51] Starting feature generation - Task: classification, Device: cuda
+[2025-04-22 13:53:51] Dataset: 83733 samples, 54 features, Limit: 108 new features max

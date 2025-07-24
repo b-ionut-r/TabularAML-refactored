@@ -1,0 +1,1214 @@
+############################################################################################################################################################################################################################################
+
+import inspect
+import os
+import random
+import time
+from pathlib import Path
+from collections import Counter
+from datetime import datetime
+from itertools import combinations
+from typing import Union, List, Optional, Callable, Literal, Dict
+
+import numpy as np
+import pandas as pd
+from copy import deepcopy
+from sklearn.utils.multiclass import type_of_target
+from sklearn.model_selection import BaseCrossValidator
+from tqdm.auto import tqdm
+from xgboost import XGBClassifier, XGBRegressor
+
+
+from tabularaml.eval.cv import cross_val_score
+from tabularaml.eval.scorers import (PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, 
+                                     PREDEFINED_SCORERS, Scorer)
+from tabularaml.generate.ops import OPS, CAT_OPS_LAMBDAS, NUM_OPS_LAMBDAS, ALL_OPS_LAMBDAS
+from tabularaml.inspect.importance import FeatureImportanceAnalyzer
+from tabularaml.preprocessing.encoders import CategoricalEncoder
+from tabularaml.preprocessing.imputers import SimpleImputer
+from tabularaml.preprocessing.pipeline import PipelineWrapper
+from tabularaml.configs.feature_gen import PRESET_PARAMS
+from tabularaml.utils import is_gpu_available
+
+############################################################################################################################################################################################################################################
+
+class Feature:
+    """
+    Feature class for representing data columns with their properties and metadata.
+    Attributes:
+        name (str): Feature name or identifier.
+        dtype (Literal["num", "cat"]): Data type of the feature - 'num' for numeric, 'cat' for categorical.
+        weight (float): Importance weight assigned to this feature.
+        depth (int): Feature complexity or transformation depth (number of operations applied).
+        require_pipeline (bool): Indicates if feature requires specific preprocessing pipeline.
+        generating_interaction: Reference to the interaction that generated this feature, if any.
+    Methods:
+        get_feature_depth(): Calculates feature complexity by counting operations in its name.
+        get_col_from_df(X): Extracts feature values from a dataframe.
+        update_weight(new_weight): Updates the feature's importance weight.
+        set_generating_interaction(interaction): Sets reference to generating interaction.
+    """
+
+    def __init__(self, 
+                 name: str, 
+                 dtype: Literal["num", "cat"], 
+                 weight: float, 
+                 depth: Optional[int] = None, 
+                 require_pipeline: Optional[bool] = False):
+        
+        self.name = name
+        self.dtype = dtype
+        self.weight = weight
+        self.depth = depth if depth is not None else self.get_feature_depth()
+        self.require_pipeline = require_pipeline
+        self.generating_interaction = None
+        
+    def get_feature_depth(self):
+        n = 0
+        for ending in OPS["num"]["unary"] + OPS["cat"]["unary"]:
+            n += self.name.count(f"_{ending}")
+        for middle in OPS["num"]["binary"] + OPS["cat"]["binary"]:
+            n += self.name.count(f"_{middle}_")
+        return n
+
+    def get_col_from_df(self, X: pd.DataFrame): 
+        return X[self.name].values
+    
+    def update_weight(self, new_weight: float): 
+        self.weight = new_weight
+
+    def set_generating_interaction(self, interaction: 'Interaction'): 
+        self.generating_interaction = interaction
+
+
+############################################################################################################################################################################################################################################
+
+class Interaction:
+
+    """
+    Represents feature interactions for engineering new features.
+    Creates features by applying unary operations to single features or binary operations between two features.
+
+    Parameters:
+        feature_1: First input feature.
+        op: Operation to apply (e.g.,  "+", "-", "*", "/", "concat", "count", "target" etc.)/
+        feature_2: Second feature for binary operations (default: None).
+
+    Attributes:
+        type: "unary" or "binary" interaction.
+        dtype: Data type of resulting feature.
+        depth: Complexity level in feature engineering tree.
+        weight: Importance score.
+        require_pipeline: Whether pipeline is needed to prevent data leakage (for "count", "target", "freq").
+        name: Generated feature name.
+    """
+
+    def __init__(self, 
+                 feature_1: Feature, 
+                 op: str, 
+                 feature_2: Optional[Feature] = None):
+        
+        self.feature_1 = feature_1
+        self.op = op
+        self.feature_2 = feature_2
+        self.type = "unary" if self.feature_2 is None else "binary"
+        self.dtype = (self.feature_1.dtype if self.feature_2 is None else 
+                    "num" if self.feature_1.dtype == self.feature_2.dtype == "num" else "cat")
+        self.depth = (feature_1.depth + 1 if self.feature_2 is None else 
+                    max(self.feature_1.depth, self.feature_2.depth) + 1)
+        self.weight = feature_1.weight if self.feature_2 is None else (feature_1.weight + feature_2.weight) / 2
+        self.require_pipeline = self.feature_2 is None and self.op in ["target", "count", "freq"]
+        self.name = f"{self.feature_1.name}_{op}" if self.type == "unary" else f"{self.feature_1.name}_{op}_{self.feature_2.name}"
+         
+    def generate(self, X, y = None):
+        if not self.require_pipeline:
+            if self.type == "unary":
+                return ALL_OPS_LAMBDAS[self.op](X, self.feature_1.name)
+            elif self.type == "binary":
+                return ALL_OPS_LAMBDAS[self.op](X, self.feature_1.name, self.feature_2.name)
+        raise Exception("Can't generate feature using lambdas. Requires pipeline to avoid data leakage.")
+    
+    def get_new_feature_instance(self):
+        return Feature(name=self.name, dtype=self.dtype, weight=self.weight, require_pipeline=self.require_pipeline)
+
+
+############################################################################################################################################################################################################################################
+
+class FeatureGenerator:
+    """
+    A genetic algorithm-based feature generator for tabular data.
+    This class implements an evolutionary approach to automatically create and select new features
+    that improve model performance. It iteratively constructs features through operations like
+    arithmetic combinations, aggregations, and categorical encoding, evaluating them by their
+    impact on model performance.
+    Parameters
+    ----------
+    baseline_model : model object, default = None
+        The model used to evaluate features. If None, XGBoost will be used based on task type.
+    model_fit_kwargs : dict, default = {}
+        Additional parameters passed to the model's fit method.
+    task : str, default = None
+        'classification' or 'regression'. If None, will be inferred from target data.
+    scorer : Scorer, default = None
+        Metric used to evaluate features. If None, will use appropriate default for task.
+    mode : str, default = None
+        Preset parameter configuration (e.g., 'lite', 'medium', 'best', 'extreme').
+        See API documentation for further details.
+    n_generations : int, default = 15
+        Maximum number of generations to evolve.
+    n_parents : int, default = 40
+        Number of parent features selected in each generation, of each
+        interaction type (n_parents features for unary and n_parents pairs for binary).
+    n_children : int, default = 200
+        Number of candidate features to evaluate in each generation.
+    rank_child_by_shap : bool, default = False
+        Whether to rank candidate features by SHAP importance.
+        WARNING: Experimental feature. Might degrade performance.
+    min_pct_gain : float, default = 0.005
+        Minimum percentage improvement required to keep a feature.
+    imp_weights : dict, default = None
+        Weights for feature importance metrics.
+    max_gen_new_feats_pct : float or int, default = 2.0
+        Maximum number of new features to create, as percentage or absolute value.
+    early_stopping_iter : float or int or None, default = 0.4
+        Number of generations without improvement before early stopping.
+    early_stopping_child_eval : float or int or None, default = 0.3
+        Controls early stopping during candidate evaluation.
+    ops : dict, default=None
+        Operations to use for feature generation.
+    cv : int, default = 5
+        Number of cross-validation folds / cross validator instance.    n_children : int, default = 300
+        Number of candidate features to evaluate in each generation.
+    use_gpu : bool, default = True
+        Whether to use GPU if available.
+    log_to_file : str, default = "cache/logs/feat_gen_log.txt"
+        File path for logging.
+    adaptive : bool, default = True
+        Whether to adapt parameters during feature generation.
+    time_budget : int, default = None
+        Maximum time (seconds) to run feature generation.
+    Methods
+    -------
+    generate(X, y)
+        Generate new features based on provided data.
+        Returns augmented dataframe, pipeline, and feature representation.
+    Notes
+    -----
+    The feature generation process combines operations on parent features to create
+    candidate features, then evaluates their impact using cross-validation.
+    """
+
+
+
+    def __init__(self,
+                 baseline_model = None,
+                 model_fit_kwargs: dict = {},
+                 task: Optional[Literal["regression", "classification"]] = None,
+                 scorer: Optional[Scorer] = None,
+                 mode: Optional[str] = None,
+                 n_generations: int = 15, 
+                 n_parents: int = 40,                 
+                 n_children: int = 200,
+                 rank_child_by_shap: bool = False,
+                 min_pct_gain: float = 0.005, # 0.5%
+                 imp_weights: Optional[Dict[Literal["tree", "correlation", "permutation", "shap"], float]] = None,
+                 max_new_feats = None,
+                 early_stopping_iter: Union[float, int, bool] = 0.4, 
+                 early_stopping_child_eval: Union[float, int, bool] = 0.3,
+                 ops: Optional[dict] = None,
+                 cv: Union[int, BaseCrossValidator] = 5,
+                 use_gpu: bool = True,
+                 log_file: Union[str, Path] = "cache/logs/feat_gen_log.txt",
+                 adaptive: bool = True, 
+                 time_budget: Optional[int] = None):        
+        self.mode = mode
+        if mode:
+            self._set_params_from_mode()
+        
+        self.baseline_model = baseline_model
+        self.model_fit_kwargs = model_fit_kwargs
+        self.task = task
+        self.scorer = scorer
+        self.infer_task = any(param is None for param in (baseline_model, task, scorer))
+        self.n_generations = n_generations
+        self.n_parents = n_parents
+        self.n_children = n_children
+        self.rank_child_by_shap = rank_child_by_shap
+        self.min_pct_gain = min_pct_gain
+        self.imp_weights = imp_weights
+        self.max_new_feats = max_new_feats
+        self.early_stopping_iter = (
+            int(early_stopping_iter * n_generations)
+            if isinstance(early_stopping_iter, float)
+            else early_stopping_iter
+            if isinstance(early_stopping_iter, int)
+            else float('inf')
+        )
+        self.early_stopping_child_eval = early_stopping_child_eval
+        self.adaptive = adaptive
+        self.time_budget = time_budget 
+          # Store original min_pct_gain for potential adaptive adjustment 
+        self.original_min_pct_gain = min_pct_gain
+        self.original_adaptive = self.adaptive
+        self.ops = ops if ops is not None else OPS
+        self.cv = cv
+        self.device = "cuda" if is_gpu_available() and use_gpu else "cpu"
+        self.pipeline = PipelineWrapper(
+            imputer = None,
+            scaler = None,
+            encoder = CategoricalEncoder()
+        )
+         
+        if log_file:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        self.log_file = log_file
+
+
+
+
+    def _set_params_from_mode(self):
+        """
+        Sets instance generation parameters to the ones assigned to the 
+        'mode' string key in the PRESET_PARAMS dictionary.
+        Used in __init__ constructor. If at instantiation user overwrites any
+        of the parameters, that takes precedence.
+        """
+        mode_dict = PRESET_PARAMS.get(self.mode, None)
+        if mode_dict:
+            for param, value in mode_dict.items():
+                setattr(self, param, value)
+        else:
+            raise Exception(f"{self.mode.upper()} mode is undefinded. Use one of the following: \
+                            'low', 'medium', 'best', 'extreme'")
+        
+
+    
+    def _log(self, message):
+        """Log message to both terminal and file if specified."""
+        print(message)
+        if self.log_file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(self.log_file, "a") as f:
+                f.write(f"[{timestamp}] {message}\n")
+    
+
+
+    def _get_num_cat_cols(self, X: pd.DataFrame) -> tuple[list, list]:
+        num_cols = X.select_dtypes(include=['number']).columns.to_list()
+        cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+        return num_cols, cat_cols
+    
+    def _get_top_k_features(self,
+                            X: pd.DataFrame, 
+                            y: pd.Series, 
+                            k: int = 50, 
+                            pipeline: Optional[PipelineWrapper] = None) -> pd.DataFrame:
+        """
+        Retrieves top k features according to FeatureImportanceAnalyzer.
+        Return type: pd.DataFrame, with index features names and a column
+        for their assigned weighted feature importance.
+        """
+        # FIA needs imputing
+        pipeline.imputer = SimpleImputer() 
+        
+        # Create and fit the analyzer
+        analyzer = FeatureImportanceAnalyzer(
+            task_type=self.task,
+            weights=self.imp_weights,
+            preferred_gbm="xgboost",
+            pipeline=pipeline,
+            cv=self.cv,
+            use_gpu=(self.device == "cuda")
+        )
+        analyzer.fit(X, y)
+        
+        # After analysis, drop imputing from pipeline
+        pipeline.imputer = None 
+        
+        # Get unnormalized feature importances for more accurate feature weighting in sampling
+        imp_df = analyzer.get_importance(normalize=False)[["weighted_importance"]]
+        imp_df.sort_values(by="weighted_importance", axis=0, ascending=False, inplace=True)
+        
+        # Return all features or top k
+        return imp_df if k == -1 else imp_df[:k]  # index: feats, col: weights of importance
+
+    
+
+    def _eval_baseline(self, 
+                       X: pd.DataFrame, 
+                       y: pd.Series,
+                       pipeline: Optional[PipelineWrapper] = None) -> tuple[float, float]:
+        """
+        Evaluates given (X, y) state with baseline model.
+        Returns mean_train_score, mean_val_score.
+        """
+        pipeline = pipeline.get_pipeline(X) if pipeline is not None else pipeline
+        cv_dict =  cross_val_score(self.baseline_model, X, y, self.scorer, cv = self.cv,
+                                   return_dict = True, pipeline = pipeline, 
+                                   model_fit_kwargs = self.model_fit_kwargs)
+        return cv_dict["mean_train_score"], cv_dict["mean_val_score"]
+            
+
+
+
+    def _softmax_temp_sampling(self, pool, weights, n=1, tau=0.5) -> list:
+        """
+        General sampling method.
+        Samples items from a pool using softmax temperature sampling.
+            
+        Args:
+            pool: Collection of items to sample from.
+            weights: Corresponding weights for each item in pool.
+            n: Number of items to sample. Returns entire pool if n > len(pool).
+            tau: Temperature parameter, controls randomness (lower = more deterministic).
+            
+        Returns:
+            List of n sampled items from pool.
+        """
+        if n > len(pool):
+            return pool
+        weights = np.array(weights)
+        w = weights / tau
+        w -= np.max(w)
+        probs = np.exp(w) / np.sum(np.exp(w))
+        return random.choices(pool, k = n, weights = probs)
+    
+    
+
+
+    def _sample_parents(self, 
+                        generation: List[Feature], 
+                        n = 20, 
+                        tau = 0.5) -> tuple[list[Feature], list[tuple[Feature, Feature]]]:
+        """
+        At the start of each generation, it samples 'n' features for mutation and 'n' feature pairs
+        for crossover operations.
+        Uses weighted probability sampling based on feature weights.
+
+        Args:
+            generation (List[Feature]): Pool of candidate features to sample from.
+            n (int, optional): Number of samples to select. Defaults to 20.
+            tau (float, optional): Temperature parameter for softmax sampling. Defaults to 0.5.
+
+        Returns:
+            tuple: A tuple containing:
+                - List of features selected for unary mutation.
+                - List of features tuple pairs selected for binary crossover.
+        """
+        generation = [feature for feature in generation if not feature.require_pipeline]
+        # Unary selection
+        unary_pool = generation
+        unary_weights = [f.weight for f in unary_pool]
+        features_for_unary_mutation = self._softmax_temp_sampling(unary_pool, unary_weights, n = n, tau = tau)
+        # Binary selection
+        binary_pool = list(combinations(generation, r=2))
+        binary_weights = [(f1.weight + f2.weight) / 2 for f1, f2 in binary_pool]
+        feature_pairs_for_crossover = self._softmax_temp_sampling(binary_pool, binary_weights, n = n, tau = tau)
+        return list(features_for_unary_mutation), list(feature_pairs_for_crossover)
+    
+
+
+    def _sample_children(self,
+                         candidates_pool: List[Interaction], n = 200, 
+                         beta = 0.2, gamma = 0.1, lambda_ = 0.2, tau = 0.7) -> list[Interaction]:
+        """
+        Sample candidate interactions based on multiple scoring factors.
+        
+        The sampling process uses the original, unnormalized feature weights directly
+        and applies influence factors (Greek parameters) multiplicatively. This ensures:
+        1. Original weight ratios are preserved (sampling is equivalent with sum-normalized weights)
+        2. Secondary factors like operator frequency, novelty, and depth only adjust the weights
+           without diluting the original importance signal
+        3. No min-max normalization is applied as it would distort relative sampling probabilities
+           unless the minimum weight is zero
+        
+        Parameters:
+        -----------
+        candidates_pool : List[Interaction]
+            Pool of all possible candidate interactions.
+        n : int, default = 200
+            Number of interactions to sample (n_children).
+        beta : float, default = 0.2
+            Weight for operator rarity from global operation frequency tracking.
+        gamma : float, default = 0.1
+            Weight for feature novelty.
+        lambda_ : float, default = 0.2
+            Weight for complexity penalty
+        tau : float, default = 0.7
+            Temperature for softmax sampling
+            
+        Returns:
+        --------
+        List[Interaction]
+            Sampled candidate interactions
+        """
+        if not candidates_pool:
+            return []
+            
+        # Update the global operation frequency counter with the current batch
+        current_op_freq = Counter(f.op for f in candidates_pool)
+        self.state['op_freq'].update(current_op_freq)
+        
+        # Extract the original weights without normalization
+        original_weights = [interaction.weight for interaction in candidates_pool]
+        
+        # Get the additional scoring factors and normalize them
+        op_freqs = [self.state['op_freq'][interaction.op] for interaction in candidates_pool]
+        novelty_scores = [sum(feat not in self.state['seen_feats'] 
+                             for feat in [interaction.feature_1, interaction.feature_2] 
+                             if feat is not None) for interaction in candidates_pool]
+        depth_penalties = [interaction.depth for interaction in candidates_pool]
+        
+        # Normalize the additional factors (not the original weights)
+        def normalize_factor(values):
+            min_val, max_val = min(values), max(values)
+            if max_val != min_val:
+                return [(val - min_val) / (max_val - min_val) for val in values]
+            else:
+                return [0.0] * len(values)  # FIXED: Neutral influence when all equal
+                
+        norm_op_freqs = normalize_factor(op_freqs)
+        norm_novelty = normalize_factor(novelty_scores)
+        norm_depth = normalize_factor(depth_penalties)
+        
+        # Calculate the influence factors without diluting the original weights
+        influence_factors = []
+        for i in range(len(candidates_pool)):
+            factor = (beta * (1 - norm_op_freqs[i]) +  # FIXED: Invert for rarity
+                     gamma * norm_novelty[i] - 
+                     lambda_ * norm_depth[i] * (0.5 if norm_depth[i] < 0.5 else 1.0))  # Softer penalty for moderate depth
+            # Scale the influence factor to be a small adjustment to the original weight
+            influence_factors.append(max(0.01, 1.0 + factor))  # Allow more significant downweighting
+        
+        # Final scores combine original weights with the influence factors
+        scores = [original_weights[i] * influence_factors[i] for i in range(len(candidates_pool))]
+        
+        return self._softmax_temp_sampling(candidates_pool, scores, n, tau)
+
+
+
+    def _prepare_pipeline(self, interactions: List[Interaction]) -> PipelineWrapper:
+        """
+        From a given list of interactions, prepare, if needed
+        the PipelineWrapper needed for encoding operations.
+        """
+        target_enc_cols, count_enc_cols, freq_enc_cols = [], [], []
+        for interaction in interactions:
+            op = interaction.op
+            feat = interaction.feature_1.name
+            if op == "target":
+                target_enc_cols.append(feat)
+            elif op == "count":
+                count_enc_cols.append(feat)
+            elif op == "freq":
+                freq_enc_cols.append(feat)
+        if target_enc_cols or count_enc_cols or freq_enc_cols:
+            return PipelineWrapper(imputer = None,
+                                   scaler = None,
+                                   encoder = CategoricalEncoder(target_enc_cols,
+                                                                count_enc_cols,
+                                                                freq_enc_cols))
+        return PipelineWrapper(imputer = None,
+                               scaler = None,
+                               encoder = CategoricalEncoder())
+    
+
+
+
+    def _extend_pipeline(self, pipeline: PipelineWrapper, new_pipeline: PipelineWrapper) -> PipelineWrapper:
+        """
+        Extends pipeline with new_pipeline. Used for categorical encoding features, where
+        PipelineWrapper's encoder is  as needed.
+        """
+        return PipelineWrapper(
+            imputer = None,
+            scaler = None,
+            encoder = CategoricalEncoder(
+                target_enc_cols = list(set(pipeline.encoder.target_enc_cols 
+                + new_pipeline.encoder.target_enc_cols)),
+                count_enc_cols = list(set(pipeline.encoder.count_enc_cols 
+                + new_pipeline.encoder.count_enc_cols)),
+                freq_enc_cols = list(set(pipeline.encoder.freq_enc_cols 
+                + new_pipeline.encoder.freq_enc_cols)),
+            )
+        )
+        
+    
+
+
+    def _apply_interactions(self, X: pd.DataFrame, 
+                            interactions: List[Interaction]) -> tuple[pd.DataFrame, PipelineWrapper]:
+        """
+        Applies non-pipeline feature interactions to X and returns the updated DataFrame 
+        along with a PipelineWrapper for deferred transformations.
+        """
+        # Generate all features first
+        new_features = {}
+        for interaction in interactions:
+            if not interaction.require_pipeline:
+                name, val = interaction.generate(X)
+                if name not in X.columns:
+                    new_features[name] = val
+        # Join all new features at once
+        if new_features:
+            X_copy = pd.concat([X.copy(), pd.DataFrame(new_features)], axis=1)
+        else:
+            X_copy = X.copy()
+        pipeline = self._prepare_pipeline(interactions)
+        return X_copy, pipeline
+    
+    
+
+
+    def _select_elites(self, batch: list[Interaction], n: int,
+                   X: pd.DataFrame, y: pd.Series,
+                   callback: Optional[Callable] = None
+                   ) -> tuple[list[Interaction], pd.DataFrame, PipelineWrapper]:
+        """ Greedy forward-selection of ≤ n interactions (SHAP-rank + early-stop). """
+
+        # ── early exit ──────────────────────────────────────────────────────────
+        if not batch:
+            if callback: callback(0, 0, force_complete=True)
+            return [], X, self.pipeline
+
+        # ── prepare batch features & pipeline ──────────────────────────────────
+        X_copy, pipe_batch = self._apply_interactions(X, batch)
+        pipe_ext = self._extend_pipeline(self.pipeline, pipe_batch)
+
+        # ── rank candidates (SHAP or original order) ───────────────────────────
+        if self.rank_child_by_shap:
+            fi = FeatureImportanceAnalyzer(weights={"shap": 1.0},
+                                        task_type=self.task, cv=self.cv,
+                                        pipeline=pipe_ext)
+            fi.fit(X_copy, y)
+            # Get unnormalized SHAP values for accurate feature importance ranking
+            shap = fi.get_importance(normalize=False)
+            shap = shap[shap.index.isin([i.name for i in batch])]             # filter
+            ranked = sorted(batch,
+                            key=lambda i: shap.loc[i.name, "weighted_importance"]
+                            if i.name in shap.index else -float("inf"),
+                            reverse=True)
+        else:
+            ranked = batch
+
+        # ── baseline ───────────────────────────────────────────────────────────
+        _base_train, best_val = self._eval_baseline(X, y, self.pipeline)
+        selected: list[Interaction] = []
+        X_base = X.copy()
+        evals = consec_no_gain = 0
+        min_evals = max(5, int(0.05 * len(ranked)))
+        early_thr = (int(len(ranked) * self.early_stopping_child_eval)
+                    if isinstance(self.early_stopping_child_eval, float)
+                    else self.early_stopping_child_eval
+                    if isinstance(self.early_stopping_child_eval, int)
+                    else len(ranked))
+
+        # ── main loop ──────────────────────────────────────────────────────────
+        for inter in ranked:
+            evals += 1
+            if callback: callback(evals, len(selected))      # progress tick first
+
+            if len(selected) >= n:                           # quota hit
+                if callback: callback(len(ranked), len(selected), force_complete=True)
+                break
+
+            # trial dataframe
+            if inter.require_pipeline or inter.name not in X_copy.columns:
+                X_try = X_base
+            else:
+                X_try = X_base.copy()
+                X_try[inter.name] = X_copy[inter.name].values
+
+            # trial pipeline & score
+            pipe_iter = self._extend_pipeline(self.pipeline,
+                                            self._prepare_pipeline([inter] + selected))
+            _new_train, new_val = self._eval_baseline(X_try, y, pipe_iter)
+
+            delta = (new_val - best_val) if self.scorer.greater_is_better else (best_val - new_val)
+            if delta / (abs(best_val) + 1e-8) >= self.min_pct_gain:            # keep
+                selected.append(inter)
+                X_base, best_val, consec_no_gain = X_try, new_val, 0
+            else:
+                consec_no_gain += 1
+
+            if evals >= min_evals and consec_no_gain >= early_thr:             # early stop
+                if callback: callback(len(ranked), len(selected), force_complete=True)
+                break
+
+        if callback and evals < len(ranked):
+            callback(len(ranked), len(selected), force_complete=True)
+
+        # ── final pipeline ─────────────────────────────────────────────────────
+        final_pipe = self._extend_pipeline(self.pipeline,
+                                        self._prepare_pipeline(selected))
+        return selected, X_base, final_pipe
+
+
+
+        
+
+    def _decay_scheduler(self, progress, gen_number=None) -> tuple[float, float, float, float]:
+        """
+        Calculates annealing parameters based on generation progress and adaptive settings in self.state.
+        
+        Parameters:
+        -----------
+        progress : float
+            Current progress through generations (0.0 to 1.0)
+        gen_number : int, default=None
+            Optional current generation number, used for logging
+            
+        Returns:
+        --------
+        tuple[float, float, float, float]
+            Annealing parameters (tau, beta, gamma, lambda_)
+            - tau: Softmax temperature
+            - beta: Operator rarity weight  
+            - gamma: Novelty importance weight
+            - lambda_: Complexity penalty weight
+        """
+        # Softmax temperature: Cosine annealing from 1.0 to 0.1 for better exploration-exploitation balance
+        tau = max(0.1, 0.1 + 0.9 * (1 + np.cos(progress * np.pi)) / 2)        
+        # Operator rarity decay: Sigmoid-based decay for smoother transition
+        beta = 0.8 * (1 / (1 + np.exp(10 * progress - 5)))
+        # Novelty importance decay: Faster at beginning, slower at end with exponential decay
+        gamma = 0.2 * np.exp(-3 * progress)
+        # Complexity penalty: Sigmoid-based increase (slow start, faster middle, plateau at end)
+        lambda_ = 0.1 + 0.4 * (1 / (1 + np.exp(-10 * (progress - 0.5))))
+        
+        # Check if state exists and handle adaptive adjustments
+        if hasattr(self, 'state'):
+            # Auto-activate adaptive exploration if needed
+            if self.adaptive and not self.state['adaptive']['activated']:
+                counters = self.state['counters']
+                if ((counters['no_feature_gens_count'] >= max(1, self.n_generations * 0.1) or
+                     counters['consecutive_no_improvement_iters'] >= max(1, self.early_stopping_iter * 0.3))
+                     and (gen_number is not None and gen_number < self.n_generations // 2)):
+                    self.state['adaptive']['activated'] = self.adaptive = True
+                    if gen_number is not None:
+                        self._log(f"Auto-activating adaptive exploration after {gen_number+1} generations due to stalled progress")
+                    
+            # Adjust min_pct_gain if adaptive mode is active
+            if self.state['adaptive']['activated'] and (gen_number is None or gen_number < self.n_generations * 2 // 3):
+                counters = self.state['counters']
+                
+                # Adjust min_pct_gain if no new features for several generations
+                if counters['no_feature_gens_count'] >= 2:
+                    new_min_pct_gain = max(0.0001, self.min_pct_gain * 0.5)
+                    if new_min_pct_gain != self.min_pct_gain:
+                        if gen_number is not None:
+                            self._log(f"  Adaptive: min_pct_gain {self.min_pct_gain:.5f} → {new_min_pct_gain:.5f}")
+                        self.min_pct_gain = new_min_pct_gain
+                        self.state['adaptive']['min_pct_gain_history'].append(self.min_pct_gain)
+                
+                # If in early exploration phase, adjust parameters for more exploration
+                if self.state['adaptive']['early_exploration_phase']:
+                    gamma = min(0.8, gamma * 2.0)       # Boost novelty
+                    lambda_ = max(0.05, lambda_ * 0.5)  # Reduce complexity penalty
+                    tau = min(2.0, tau * 1.5)          # Higher temperature for diversity
+            
+        return tau, beta, gamma, lambda_
+
+
+
+
+
+    def search(self, X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, PipelineWrapper, list[Feature], list[Interaction]]:
+        """
+        Searches new features using a genetic algorithm approach.
+        This method implements an evolutionary algorithm that iteratively creates, 
+        evaluates, and selects features to improve model performance. It uses 
+        unary and binary operations to create candidate features, evaluates their 
+        impact on model performance, and selectively adds the most beneficial ones.
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Input features dataset
+        y : pandas.Series
+            Target variable
+        Returns
+        -------
+        pandas.DataFrame
+            Enhanced dataset with generated features, where possible without pipeline
+        Pipeline
+            Pipeline containing encoding transformations
+        list
+            Final generation of Feature objects. Includes all features (original + all generated features)
+        list
+            Includes all used Interaction objects to generate new features
+        Notes
+        -----        - Uses adaptive exploration strategies if enabled
+        - Implements early stopping if no improvement is observed
+        - Respects time budget if specified
+        - Tracks performance metrics throughout generations
+        - Maintains global counters for operation frequency to encourage diversity
+        - Can revert to best generation if later generations don't improve
+        - Uses a progress bar (tqdm)
+        """
+
+        # Initialize start time for time budget tracking, set defaults, infer dtypes
+        start_time = time.time()
+        self._set_defaults(X, y)
+        self.initial_features = list(X.columns)
+        num_cols, cat_cols = self._get_num_cat_cols(X)
+        self.max_gen_new_feats = int(self.max_new_feats * len(self.initial_features)) if isinstance(self.max_new_feats, float) \
+                                 else self.max_new_feats if isinstance(self.max_new_feats, int) \
+                                 else float('inf')
+                                 # depends on number of features in X, can't be handled in the constructor
+
+        # Ensure the target is label encoded as expected by GBMs (if needed)
+        if self.task != "regression":
+            unique_vals = np.unique(y)
+            if not np.array_equal(unique_vals, np.arange(len(unique_vals))):
+                self._log("Factorizing labels...")
+                y, _ = y.factorize()
+                self._log("Done.")
+            else:
+                self._log("Label factorization not needed.")
+        
+        # Initial logging
+        self._log(f"Starting feature generation - Task: {self.task}, Device: {self.device}\n")
+        self._log(f"Params: generations = {self.n_generations}, parents = {self.n_parents}, children = {self.n_children}, min_gain = {self.min_pct_gain}")
+        if self.time_budget:
+            self._log(f"Time budget: {self.time_budget} seconds")
+        self._log(f"Dataset: {X.shape[0]} samples, {X.shape[1]} features, " + 
+                  f"Limit: {self.max_gen_new_feats if self.max_gen_new_feats != float('inf') else 'Unlimited'} new features max")
+        # Fit baseline model and initialize best tracking
+        self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(X, y, self.pipeline)
+        self._log(f"Gen 0: Training with original features. Mean Train {self.scorer.name} = {self.state['best']['train_score']:.5f}. " +
+                  f"Mean Val {self.scorer.name} = {self.state['best']['val_score']:.5f}")
+        self.state['best']['X'], self.state['best']['pipeline'] = X.copy(), deepcopy(self.pipeline)
+        
+        # Generation 0: top (2 * n_parents original) features
+        top_feats_df = self._get_top_k_features(X, y, k = 2 * self.n_parents, pipeline = self.pipeline)
+        generation = [Feature(name = feat, dtype = "num" if feat in num_cols else "cat", 
+                              weight = top_feats_df.loc[feat, "weighted_importance"], 
+                            #   depth=0
+                              ) for feat in top_feats_df.index]
+        self.state['best']['generation'] = generation.copy()
+        
+
+
+        # Main genetic algorithm loop
+        with tqdm(total=self.n_generations, desc = "Generations") as pbar:
+            for N in range(self.n_generations):
+
+                # Check if time budget is exceeded
+                if self.time_budget and (time.time() - start_time) > self.time_budget:
+                    self._log(f"Time budget of {self.time_budget} seconds exceeded. Stopping optimization.")
+                    break 
+                
+                # Get adaptive annealing parameters based on progress
+                progress = N / self.n_generations
+                tau, beta, gamma, lambda_ = self._decay_scheduler(progress, gen_number=N)
+                
+                # Parents sampling selection
+                unary, binary = self._sample_parents(generation, n = self.n_parents, tau = tau)
+
+                # Create candidate interactions pool
+                candidates_pool = []
+                for feat in unary:
+                    self.state['seen_feats'].add(feat)
+                    candidates_pool.extend([Interaction(feat, op) for op in self.ops[feat.dtype]["unary"]])
+                for feat1, feat2 in binary:
+                    self.state['seen_feats'].update({feat1, feat2})
+                    op_list = self.ops["num" if feat1.dtype == feat2.dtype == "num" else "cat"]["binary"]
+                    candidates_pool.extend([Interaction(feat1, op, feat2) for op in op_list])
+
+                # Sample children and run selection
+                batch = self._sample_children(candidates_pool, self.n_children, beta, gamma, lambda_, tau)
+                pbar.set_description(f"Gen {N+1}: Testing batch of {len(batch)} candidates children")
+            
+                # Calculate remaining feature budget for this generation
+                max_features_this_gen = self.max_gen_new_feats - self.state['counters']['total_new_features'] if self.max_gen_new_feats != float('inf') else None
+                
+                # Select elites with progress tracking
+                with tqdm(total = len(batch), desc = "Evaluating children features", leave = False) as inner_pbar:
+                    def update_callback(evaluated_count, selected_count, force_complete=False):
+                        inner_pbar.update(max(0, evaluated_count - inner_pbar.n if not force_complete else len(batch) - inner_pbar.n))
+                        inner_pbar.set_description(f"Evaluated: {evaluated_count}/{len(batch)}, Selected: {selected_count}")
+                        # Check time budget during feature evaluation
+                        if self.time_budget and (time.time() - start_time) > self.time_budget:
+                            return True  # Signal to stop evaluation
+                    
+                    elites, X, self.pipeline = self._select_elites(
+                        batch, 
+                        max_features_this_gen if max_features_this_gen is not None else self.max_gen_new_feats, 
+                        X, y, update_callback
+                    )
+                    
+                # Check again if time budget is exceeded after feature evaluation
+                if self.time_budget and (time.time() - start_time) > self.time_budget:
+                    self._log(f"Time budget of {self.time_budget} seconds exceeded during feature evaluation. Stopping optimization.")
+                    break
+                
+                # Update weights and generation - Always recalculate weights when elites exist
+                new_feature_names = [elite.name for elite in elites]
+                
+                # Create new generation with elite features first
+                new_generation = generation.copy()
+                for interaction in elites:
+                    feat = interaction.get_new_feature_instance()
+                    feat.set_generating_interaction(interaction)
+                    new_generation.append(feat)
+                
+                # Recalculate weights for all features if we have any changes
+                if new_feature_names or len(elites) > 0:
+                    weights = self._get_top_k_features(X, y, k=-1, pipeline=self.pipeline)
+                    # Update weights for all features in the new generation
+                    for feat in new_generation:
+                        if feat.name in weights.index:
+                            feat.update_weight(weights.loc[feat.name, "weighted_importance"])
+                        elif hasattr(feat, 'weight') and feat.weight > 0:
+                            # Apply small decay for features not found in importance ranking
+                            feat.update_weight(feat.weight * 0.95)
+                
+                generation = new_generation
+                
+                # Update feature counts and tracking variables
+                features_added = len(elites)
+                self.state['counters']['total_new_features'] += features_added
+                self.state['counters']['no_feature_gens_count'] = 0 if features_added > 0 else self.state['counters']['no_feature_gens_count'] + 1
+                
+                # End early exploration if we're finding features consistently
+                if features_added > 0 and self.state['adaptive']['early_exploration_phase'] and N >= self.n_generations // 5:
+                    self.state['adaptive']['early_exploration_phase'] = False
+                    if self.adaptive and len(self.state['adaptive']['min_pct_gain_history']) > 1:
+                        self.min_pct_gain = self.original_min_pct_gain
+                        self._log(f"  Adaptive: Restoring min_pct_gain to {self.min_pct_gain:.5f}")
+                
+                # Evaluate performance
+                new_train_score, new_val_score = self._eval_baseline(X, y, self.pipeline)
+                delta = new_val_score - self.state['best']['val_score'] if self.scorer.greater_is_better else self.state['best']['val_score'] - new_val_score
+                
+                # Revert if no improvement but features were added
+                if delta <= 0 and features_added > 0:
+                    self._log(f"  Gen {N+1} added {features_added} features but didn't improve. Reverting to best gen ({self.state['best']['gen_num']}).")
+                    X, self.pipeline, generation = self.state['best']['X'].copy(), self.state['best']['pipeline'], self.state['best']['generation'].copy()
+                    new_val_score, delta = self.state['best']['val_score'], 0
+                    self.state['counters']['total_new_features'] -= features_added
+                    elites = []
+                
+                # Update best state tracking
+                if delta > 0:
+                    self.state['best']['gen_num'], self.state['best']['val_score'], self.state['best']['X'] = N + 1, new_val_score, X.copy()
+                    self.state['best']['generation'], self.state['best']['pipeline'] = generation.copy(), self.pipeline
+                    self.state['counters']['consecutive_no_improvement_iters'] = 0
+                else:
+                    self.state['counters']['consecutive_no_improvement_iters'] += 1
+                # Log progress and update display
+                improvement = f"No improvement yet. Best generation: {self.state['best']['gen_num']}." if delta <= 0 else f"Score improved by {delta:.5f}. Best generation: {N+1}."
+                adaptivity_info = f"\n  Adaptive min_pct_gain: {self.min_pct_gain:.5f} (original: {self.original_min_pct_gain:.5f})" if self.adaptive and len(self.state['adaptive']['min_pct_gain_history']) > 1 else ""
+                
+                self._log(f"Gen {N+1}:\n  Added {features_added} features, now using {X.shape[1]} features ({self.state['counters']['total_new_features']} new).\n" +                          f"  Mean Train {self.scorer.name} = {new_train_score:.5f}." +
+                          f"  Mean Val {self.scorer.name} = {new_val_score:.5f}.\n  {improvement}{adaptivity_info}\n" +
+                          f"  Annealing: τ={tau:.2f}, β={beta:.2f}, γ={gamma:.2f}, λ={lambda_:.2f}")
+                
+                # Display newly added features if any were added in this generation
+                if features_added > 0:
+                    # Find new simple features (non-pipeline features)
+                    new_simple = set(X.columns) - set(self.initial_features)
+                    if features_added > 0 and elites:
+                        new_simple_from_this_gen = set([elite.name for elite in elites if not elite.require_pipeline])
+                        if new_simple_from_this_gen:
+                            self._log(f"  New simple features: {new_simple_from_this_gen}")
+                    
+                    # Get encoded features from the pipeline
+                    new_target = self.pipeline.encoder.target_enc_cols
+                    new_count = self.pipeline.encoder.count_enc_cols
+                    new_freq = self.pipeline.encoder.freq_enc_cols
+                    
+                    # Print the encoded features only if they exist
+                    if new_target:
+                        self._log(f"  New target encoded features: {new_target}")
+                    if new_count:
+                        self._log(f"  New count encoded features: {new_count}")
+                    if new_freq:
+                        self._log(f"  New freq encoded features: {new_freq}")
+                
+                pbar.set_postfix({f"{self.scorer.name}": f"{new_val_score:.5f}", "features": X.shape[1], 
+                                 "new_features": self.state['counters']['total_new_features'], "best_gen": self.state['best']['gen_num']})
+                pbar.update(1)
+                
+                # Check termination conditions
+                if self.max_gen_new_feats != float('inf') and self.state['counters']['total_new_features'] >= self.max_gen_new_feats:
+                    self._log(f"Reached maximum allowed new features ({self.state['counters']['total_new_features']}/{self.max_gen_new_feats}). Stopping optimization.")
+                    break
+                
+                if self.state['counters']['consecutive_no_improvement_iters'] >= self.early_stopping_iter:
+                    self._log(f"Early stopping after {self.state['counters']['consecutive_no_improvement_iters']} generations without improvement.")
+                    break
+        
+        # Calculate execution time and handle adaptive parameters
+        elapsed_time = time.time() - start_time
+        
+        # Reset adaptive param - min_pct_gain -
+        if self.adaptive and self.min_pct_gain != self.original_min_pct_gain:
+            self.min_pct_gain = self.original_min_pct_gain
+        
+        # Ensure we return the best generation found
+        if self.state['best']['gen_num'] < self.n_generations and not X.equals(self.state['best']['X']):
+            self._log(f"Reverting to best generation ({self.state['best']['gen_num']}).")
+            X, self.pipeline, generation = self.state['best']['X'], self.state['best']['pipeline'], self.state['best']['generation']
+                    
+        # Calculate metrics and store as instance attributes
+        n_init_feats = len(self.initial_features)
+        n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats
+        
+        # Evaluate and store performance metrics
+        self.initial_train_metric, self.initial_val_metric = self._eval_baseline(X[self.initial_features], y, self.pipeline)
+        self.final_metric = self.state['best']['val_score']
+        self.gain = self.final_metric - self.initial_val_metric if self.scorer.greater_is_better else self.initial_val_metric - self.final_metric
+        self.pct_gain = self.gain / (abs(self.initial_val_metric) + 1e-8)
+        
+        # Store additional statistics
+        self.n_samples, self.n_init_feats, self.n_added_feats = len(X), n_init_feats, n_added_feats
+        self.n_final_feats, self.elapsed_time = n_init_feats + n_added_feats, elapsed_time
+        
+        # Log summary statistics
+        self._log(
+            f"\nFeature generation complete: {elapsed_time:.2f}s, Best gen: {self.state['best']['gen_num']}, "
+            f"Best {self.scorer.name}: {self.state['best']['val_score']:.5f}, "
+            f"Features added/total: {n_added_feats}/{n_init_feats + n_added_feats}"
+        )
+        
+        # Log new features by type (more compact)
+        new_features = {
+            "simple": set(X.columns) - set(self.initial_features),
+            "target": self.pipeline.encoder.target_enc_cols,
+            "count": self.pipeline.encoder.count_enc_cols,
+            "freq": self.pipeline.encoder.freq_enc_cols
+        }
+        
+        for feat_type, features in new_features.items():
+            self._log(f"New {feat_type} features: {features}")
+        
+        # Reset for further calls if needed
+        if self.infer_task:
+            self.baseline_model = self.task = self.scorer = None
+    
+        self.X, self.pipeline, self.generation = X, self.pipeline.get_pipeline(X), generation
+        self.interactions = []
+        for feat in self.generation:
+            if feat.generating_interaction:
+                self.interactions.append(feat.generating_interaction)
+        
+        return self.X, self.pipeline, self.generation, self.interactions
+        
+
+
+
+
+
+    def _set_defaults(self, X: pd.DataFrame, y: pd.Series) -> None:
+
+        #  task / model / scorer
+        self.task = self.task or ("regression" if type_of_target(y) == "continuous" else "classification")
+        is_reg = self.task == "regression"
+        if self.baseline_model is None:
+            self.baseline_model = (XGBRegressor if is_reg else XGBClassifier)(
+                device=self.device, enable_categorical=True, verbosity=0
+            )
+        if self.scorer is None:
+            self.scorer = (
+                PREDEFINED_REG_SCORERS["rmse"] if is_reg
+                else PREDEFINED_CLS_SCORERS["binary_crossentropy"]
+                if len(np.unique(y)) == 2
+                else PREDEFINED_CLS_SCORERS["categorical_crossentropy"]
+            )
+
+        #  pipeline & hyper-params
+        self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+        self.min_pct_gain, self.initial_features = self.original_min_pct_gain, None
+
+        #  search-state containers
+        self.state = {
+            "best": dict(gen_num=0, val_score=0, train_score=0, X=None, generation=None, pipeline=None),
+            "counters": dict(total_new_features=0, no_feature_gens_count=0, consecutive_no_improvement_iters=0),
+            "adaptive": dict(activated=self.adaptive, early_exploration_phase=True,
+                            min_pct_gain_history=[self.original_min_pct_gain]),
+            "seen_feats": set(),
+            "op_freq": Counter(),
+        }
+
+        #  metric reset
+        self.initial_metric = self.final_metric = self.gain = self.pct_gain = None
+        self.n_samples = self.n_init_feats = self.n_added_feats = self.n_final_feats = self.elapsed_time = None
+        self.adaptive = self.original_adaptive
+
+
+
+
+
+
+
+
+    def fit(self, X: pd.DataFrame, y: Optional[pd.Series] = None) -> 'FeatureGenerator':
+        """
+        Fit the feature generator's pipeline on the input data.
+        This method uses self.interactions to create features and then fits 
+        the pipeline on these features. This is needed because some of the categorical
+        features handled by the pipeline might have as parents features generated without it.
+        
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Input features
+        y : array-like, optional
+            Target values for supervised transformations
+            
+        Returns
+        -------
+        self : FeatureGenerator
+            Returns self for method chaining
+        """
+        if not getattr(self, 'interactions', None):
+            self._log("Warning: No interactions found in self.interactions. No features will be generated.")
+            return self
+            
+        # Create default pipeline if needed
+        if not getattr(self, 'pipeline', None):
+            self._log("Warning: No pipeline found. Creating a default pipeline.")
+            self.pipeline = PipelineWrapper(
+                imputer=None, scaler=None, encoder=CategoricalEncoder()
+            ).get_pipeline()
+        
+        # Convert X to DataFrame if needed and apply transformations
+        X_transformed = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+        
+        # Generate features using non-pipeline requiring interactions
+        for interaction in self.interactions:
+            if interaction.name not in X_transformed.columns and not interaction.require_pipeline:
+                try:
+                    result = interaction.generate(X_transformed)
+                    if result is not None:
+                        X_transformed[result[0]] = result[1]
+                except Exception as e:
+                    self._log(f"Error generating feature {interaction.name}: {str(e)}")
+                    
+        # Fit the pipeline with the generated features
+        self.pipeline.fit(X_transformed, y)
+        return self
+    
+
+    def transform(self, X: pd.DataFrame):
+        """
+        Transform input data by applying all interactions in self.interactions
+        and then transforming with the fitted pipeline.
+        
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Input features to transform
+            
+        Returns
+        -------
+        pd.DataFrame
+            Transformed features with all generated features added
+        """
+        if not getattr(self, 'interactions', None):
+            self._log("Warning: No interactions found in self.interactions. Returning input features unchanged.")
+            return X
+            
+        # Convert X to DataFrame if needed
+        X_transformed = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+            
+        # Create features using interactions
+        for interaction in self.interactions:
+            if interaction.name not in X_transformed.columns and not interaction.require_pipeline:
+                try:
+                    result = interaction.generate(X_transformed)
+                    if result is not None:
+                        X_transformed[result[0]] = result[1]
+                except Exception as e:
+                    self._log(f"Error generating feature {interaction.name}: {str(e)}")
+        
+        # Apply pipeline transformations
+        pipeline = getattr(self, 'pipeline', None)
+        if pipeline is not None:
+            try:
+                X_transformed = pipeline.transform(X_transformed)
+            except Exception as e:
+                self._log(f"Error applying pipeline transformations: {str(e)}")
+        
+        return X_transformed
+        
+
+
+    def fit_transform(self, X, y=None):
+
+        """
+        Fit the feature generator on the input data and then transform it.
+        This is equivalent to calling fit(X, y) followed by transform(X), but is more efficient.
+        
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Input features
+        y : array-like, optional
+            Target values for supervised transformations
+            
+        Returns
+        -------
+        pd.DataFrame
+            Transformed features with all generated features added        
+            """
+        return self.fit(X, y).transform(X)
+    
+    def save(self, filepath):
+        """
+        Save the feature generator state to a file using cloudpickle for complete serialization.
+        
+        Recursively serializes the entire class instance with all attributes, including complex
+        objects like Feature instances, Interactions, lambda functions, and nested data structures.
+        
+        Parameters:
+        -----------
+        filepath : str
+            Path where the state will be saved
+        """
+        import os
+        
+        try:
+            import cloudpickle
+        except ImportError:
+            raise ImportError("cloudpickle is required for serialization. Install with: pip install cloudpickle")
+        
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        with open(filepath, 'wb') as f:
+            cloudpickle.dump(self, f)
+        self._log(f"Feature generator state saved to {filepath}")
+    
+    @classmethod
+    def load(cls, filepath):
+        """
+        Load a feature generator state from a file using cloudpickle.
+        
+        Parameters:
+        -----------
+        filepath : str
+            Path to the saved state file
+            
+        Returns:
+        --------
+        FeatureGenerator
+            Loaded feature generator instance with all attributes restored
+        """
+        import os
+        
+        try:
+            import cloudpickle
+        except ImportError:
+            raise ImportError("cloudpickle is required for deserialization. Install with: pip install cloudpickle")
+        
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"The file {filepath} does not exist. Please check the path.")
+        
+        try:    
+            with open(filepath, 'rb') as f:
+                return cloudpickle.load(f)
+        except Exception as e:
+            raise ValueError(f"Failed to load file: {str(e)}")
+

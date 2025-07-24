@@ -1,0 +1,10 @@
+[2025-04-21 19:30:54] [INFO] Starting feature generation: 20250421_193054
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-21 19:30:54] Starting feature generation - Task: regression, Device: cuda
+[2025-04-21 19:30:54] Dataset: 1460 samples, 80 features, Limit: 160 new features max
+[2025-04-21 19:31:02] Gen 0: Training with original features. Mean Val rmse = 29943.42997
+[2025-04-21 19:37:59] Gen 1:
+  Added 7 features, now using 87 features (7 new).
+  Mean Val rmse = 28382.79298.
+  Score improved by 1560.63699. Best generation: 1.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10

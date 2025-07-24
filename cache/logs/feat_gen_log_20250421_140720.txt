@@ -1,0 +1,7 @@
+[2025-04-21 14:07:20] [INFO] Starting new feature generation with timestamp: 20250421_140720
+[2025-04-21 14:07:20] [DEBUG] Parameters: n_generations=20, n_parents=30, n_children=150
+[2025-04-21 14:07:20] [DEBUG] Greeks parameters: min_pct_gain=0.01, early_stopping_child_eval=1.0, early_stopping_iter=inf
+[2025-04-21 14:07:20] [DEBUG] Max new features: -1
+[2025-04-21 14:07:20] Starting feature generation process - Task: regression, Device: cuda
+[2025-04-21 14:07:20] Initial dataset: 1460 samples, 80 features
+[2025-04-21 14:07:20] Feature limit: Unlimited (max_gen_new_feats_pct=-1)

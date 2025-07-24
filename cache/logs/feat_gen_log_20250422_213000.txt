@@ -1,0 +1,6 @@
+[2025-04-22 21:30:00] [INFO] Starting feature generation: 20250422_213000
+Params: generations=36, parents=35, children=210, min_gain=0.003
+[2025-04-22 21:30:00] Starting feature generation - Task: regression, Device: cpu
+[2025-04-22 21:30:00] Time budget: 3600 seconds
+[2025-04-22 21:30:00] Dataset: 1460 samples, 43 features, Limit: 32 new features max
+[2025-04-22 21:30:22] Gen 0: Training with original features. Mean Val rmse = 38933.09400

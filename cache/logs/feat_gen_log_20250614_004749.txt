@@ -1,0 +1,6 @@
+[2025-06-14 00:47:49] [INFO] Starting feature generation: 20250614_004749
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-06-14 00:47:49] [INFO] FeatureGenerator state reset for new dataset
+[2025-06-14 00:47:49] Starting feature generation - Task: regression, Device: cuda
+[2025-06-14 00:47:49] Dataset: 7649 samples, 6 features, Limit: 1000 new features max
+[2025-06-14 00:48:07] Gen 0: Training with original features. Mean Val rmse_exp = 0.58001

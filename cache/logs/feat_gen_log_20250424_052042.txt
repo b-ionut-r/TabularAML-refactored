@@ -1,0 +1,6 @@
+[2025-04-24 05:20:42] [INFO] Starting feature generation: 20250424_052042
+Params: generations=10, parents=12, children=72, min_gain=0.004
+[2025-04-24 05:20:42] [INFO] FeatureGenerator state reset for new dataset
+[2025-04-24 05:20:42] Starting feature generation - Task: classification, Device: cuda
+[2025-04-24 05:20:42] Time budget: 300 seconds
+[2025-04-24 05:20:42] Dataset: 8844 samples, 60 features, Limit: 21 new features max

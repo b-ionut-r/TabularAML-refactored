@@ -1,0 +1,5 @@
+[2025-06-12 22:29:55] [INFO] Starting feature generation: 20250612_222955
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-06-12 22:29:55] [INFO] FeatureGenerator state reset for new dataset
+[2025-06-12 22:29:55] Starting feature generation - Task: regression, Device: cuda
+[2025-06-12 22:29:55] Dataset: 7649 samples, 6 features, Limit: 12 new features max

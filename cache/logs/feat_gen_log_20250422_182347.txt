@@ -1,0 +1,6 @@
+[2025-04-22 18:23:47] [INFO] Starting feature generation: 20250422_182347
+Params: generations=8, parents=12, children=60, min_gain=0.01
+[2025-04-22 18:23:47] Starting feature generation - Task: regression, Device: cuda
+[2025-04-22 18:23:47] Time budget: 300 seconds
+[2025-04-22 18:23:47] Dataset: 8192 samples, 32 features, Limit: 32 new features max
+[2025-04-22 18:24:02] Gen 0: Training with original features. Mean Val rmse = 0.08738

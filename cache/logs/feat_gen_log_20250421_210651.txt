@@ -1,0 +1,61 @@
+[2025-04-21 21:06:51] [INFO] Starting feature generation: 20250421_210651
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-21 21:06:51] Starting feature generation - Task: regression, Device: cpu
+[2025-04-21 21:06:51] Dataset: 1460 samples, 80 features, Limit: 160 new features max
+[2025-04-21 21:06:58] Gen 0: Training with original features. Mean Val rmse = 29943.42871
+[2025-04-21 21:08:34]   Gen 1 added 3 features but didn't improve. Reverting to best gen (0).
+[2025-04-21 21:08:34] Gen 1:
+  Added 3 features, now using 80 features (0 new).
+  Mean Val rmse = 29943.42871.
+  No improvement yet. Best generation: 0.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-21 21:10:16] Gen 2:
+  Added 3 features, now using 83 features (3 new).
+  Mean Val rmse = 29645.55801.
+  Score improved by 297.87070. Best generation: 2.
+  Annealing: τ=0.99, β=0.79, γ=0.16, λ=0.11
+[2025-04-21 21:11:28]   Gen 3 added 1 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:11:28] Gen 3:
+  Added 1 features, now using 83 features (3 new).
+  Mean Val rmse = 29645.55801.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.96, β=0.78, γ=0.13, λ=0.11
+[2025-04-21 21:12:51]   Gen 4 added 2 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:12:51] Gen 4:
+  Added 2 features, now using 83 features (3 new).
+  Mean Val rmse = 29645.55801.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.91, β=0.76, γ=0.11, λ=0.12
+[2025-04-21 21:12:51] Auto-activating adaptive exploration after 5 generations due to stalled progress
+[2025-04-21 21:14:02]   Gen 5 added 1 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:14:02] Gen 5:
+  Added 1 features, now using 83 features (3 new).
+  Mean Val rmse = 29645.55801.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.85, β=0.73, γ=0.09, λ=0.14
+[2025-04-21 21:15:17]   Gen 6 added 1 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:15:17] Gen 6:
+  Added 1 features, now using 83 features (3 new).
+  Mean Val rmse = 29645.55801.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.78, β=0.67, γ=0.07, λ=0.16
+[2025-04-21 21:16:49]   Gen 7 added 1 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:16:49] Gen 7:
+  Added 1 features, now using 83 features (3 new).
+  Mean Val rmse = 29645.55801.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.69, β=0.58, γ=0.06, λ=0.21
+[2025-04-21 21:19:37]   Gen 8 added 4 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:19:37] Gen 8:
+  Added 4 features, now using 83 features (3 new).
+  Mean Val rmse = 29645.55801.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.60, β=0.47, γ=0.05, λ=0.27
+[2025-04-21 21:19:37] Early stopping after 6 generations without improvement.
+[2025-04-21 21:19:37] Final generation wasn't the best. Reverting to best generation (2).
+[2025-04-21 21:19:37] 
+Feature generation complete:
+  Best generation: 2
+  Best rmse: 29645.55801
+  Features added: 3
+  Total features: 83

@@ -1,0 +1,40 @@
+[2025-04-21 21:23:18] [INFO] Starting feature generation: 20250421_212318
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-21 21:23:18] Starting feature generation - Task: regression, Device: cpu
+[2025-04-21 21:23:18] Dataset: 1460 samples, 80 features, Limit: 160 new features max
+[2025-04-21 21:23:29] Gen 0: Training with original features. Mean Val rmse = 29943.42871
+[2025-04-21 21:25:47]   Gen 1 added 3 features but didn't improve. Reverting to best gen (0).
+[2025-04-21 21:25:47] Gen 1:
+  Added 3 features, now using 80 features (0 new).
+  Mean Val rmse = 29943.42871.
+  No improvement yet. Best generation: 0.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-21 21:29:49] Gen 2:
+  Added 7 features, now using 87 features (7 new).
+  Mean Val rmse = 28990.29432.
+  Score improved by 953.13439. Best generation: 2.
+  Annealing: τ=0.99, β=0.79, γ=0.16, λ=0.11
+[2025-04-21 21:31:29]   Gen 3 added 1 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:31:29] Gen 3:
+  Added 1 features, now using 87 features (7 new).
+  Mean Val rmse = 28990.29432.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.96, β=0.78, γ=0.13, λ=0.11
+[2025-04-21 21:33:14]   Gen 4 added 1 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:33:14] Gen 4:
+  Added 1 features, now using 87 features (7 new).
+  Mean Val rmse = 28990.29432.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.91, β=0.76, γ=0.11, λ=0.12
+[2025-04-21 21:33:14] Auto-activating adaptive exploration after 5 generations due to stalled progress
+[2025-04-21 21:35:22]   Gen 5 added 2 features but didn't improve. Reverting to best gen (2).
+[2025-04-21 21:35:22] Gen 5:
+  Added 2 features, now using 87 features (7 new).
+  Mean Val rmse = 28990.29432.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.85, β=0.73, γ=0.09, λ=0.14
+[2025-04-21 21:37:07] Gen 6:
+  Added 1 features, now using 88 features (8 new).
+  Mean Val rmse = 28971.40439.
+  Score improved by 18.88993. Best generation: 6.
+  Annealing: τ=0.78, β=0.67, γ=0.07, λ=0.16

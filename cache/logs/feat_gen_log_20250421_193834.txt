@@ -1,0 +1,83 @@
+[2025-04-21 19:38:34] [INFO] Starting feature generation: 20250421_193834
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-21 19:38:34] Starting feature generation - Task: regression, Device: cuda
+[2025-04-21 19:38:34] Dataset: 1460 samples, 80 features, Limit: 160 new features max
+[2025-04-21 19:38:42] Gen 0: Training with original features. Mean Val rmse = 29943.42997
+[2025-04-21 19:41:00]   Gen 1 added 2 features but didn't improve. Reverting to best gen (0).
+[2025-04-21 19:41:00] Gen 1:
+  Added 2 features, now using 80 features (0 new).
+  Mean Val rmse = 29943.42997.
+  No improvement yet. Best generation: 0.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-21 19:44:29] Gen 2:
+  Added 4 features, now using 84 features (4 new).
+  Mean Val rmse = 29739.59724.
+  Score improved by 203.83274. Best generation: 2.
+  Annealing: τ=0.99, β=0.79, γ=0.16, λ=0.11
+[2025-04-21 19:58:10] Gen 3:
+  Added 5 features, now using 89 features (9 new).
+  Mean Val rmse = 28299.84453.
+  Score improved by 1439.75271. Best generation: 3.
+  Annealing: τ=0.96, β=0.78, γ=0.13, λ=0.11
+[2025-04-21 20:00:27]   Gen 4 added 1 features but didn't improve. Reverting to best gen (3).
+[2025-04-21 20:00:27] Gen 4:
+  Added 1 features, now using 89 features (9 new).
+  Mean Val rmse = 28299.84453.
+  No improvement yet. Best generation: 3.
+  Annealing: τ=0.91, β=0.76, γ=0.11, λ=0.12
+[2025-04-21 20:02:48]   Gen 5 added 1 features but didn't improve. Reverting to best gen (3).
+[2025-04-21 20:02:48] Gen 5:
+  Added 1 features, now using 89 features (9 new).
+  Mean Val rmse = 28299.84453.
+  No improvement yet. Best generation: 3.
+  Annealing: τ=0.85, β=0.73, γ=0.09, λ=0.14
+[2025-04-21 20:02:48] Auto-activating adaptive exploration after 6 generations due to stalled progress
+[2025-04-21 20:16:05] Gen 6:
+  Added 3 features, now using 92 features (12 new).
+  Mean Val rmse = 27847.25309.
+  Score improved by 452.59144. Best generation: 6.
+  Annealing: τ=0.78, β=0.67, γ=0.07, λ=0.16
+[2025-04-21 20:18:18]   Gen 7 added 1 features but didn't improve. Reverting to best gen (6).
+[2025-04-21 20:18:18] Gen 7:
+  Added 1 features, now using 92 features (12 new).
+  Mean Val rmse = 27847.25309.
+  No improvement yet. Best generation: 6.
+  Annealing: τ=0.69, β=0.58, γ=0.06, λ=0.21
+[2025-04-21 20:20:39]   Gen 8 added 1 features but didn't improve. Reverting to best gen (6).
+[2025-04-21 20:20:39] Gen 8:
+  Added 1 features, now using 92 features (12 new).
+  Mean Val rmse = 27847.25309.
+  No improvement yet. Best generation: 6.
+  Annealing: τ=0.60, β=0.47, γ=0.05, λ=0.27
+[2025-04-21 20:28:31]   Gen 9 added 1 features but didn't improve. Reverting to best gen (6).
+[2025-04-21 20:28:31] Gen 9:
+  Added 1 features, now using 92 features (12 new).
+  Mean Val rmse = 27847.25309.
+  No improvement yet. Best generation: 6.
+  Annealing: τ=0.50, β=0.33, γ=0.04, λ=0.33
+[2025-04-21 20:31:01]   Gen 10 added 1 features but didn't improve. Reverting to best gen (6).
+[2025-04-21 20:31:01] Gen 10:
+  Added 1 features, now using 92 features (12 new).
+  Mean Val rmse = 27847.25309.
+  No improvement yet. Best generation: 6.
+  Annealing: τ=0.41, β=0.22, γ=0.03, λ=0.39
+[2025-04-21 20:33:57]   Gen 11 added 2 features but didn't improve. Reverting to best gen (6).
+[2025-04-21 20:33:57] Gen 11:
+  Added 2 features, now using 92 features (12 new).
+  Mean Val rmse = 27847.25309.
+  No improvement yet. Best generation: 6.
+  Annealing: τ=0.33, β=0.13, γ=0.03, λ=0.44
+[2025-04-21 20:39:05]   Gen 12 added 2 features but didn't improve. Reverting to best gen (6).
+[2025-04-21 20:39:05] Gen 12:
+  Added 2 features, now using 92 features (12 new).
+  Mean Val rmse = 27847.25309.
+  No improvement yet. Best generation: 6.
+  Annealing: τ=0.25, β=0.07, γ=0.02, λ=0.46
+[2025-04-21 20:39:05] Early stopping after 6 generations without improvement.
+[2025-04-21 20:39:05] Final generation wasn't the best. Reverting to best generation (6).
+[2025-04-21 20:39:05] 
+Feature generation complete:
+  Best generation: 6
+  Best rmse: 27847.25309
+  Features added: 12
+  Total features: 92

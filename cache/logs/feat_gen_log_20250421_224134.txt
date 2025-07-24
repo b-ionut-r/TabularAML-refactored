@@ -1,0 +1,23 @@
+[2025-04-21 22:41:34] [INFO] Starting feature generation: 20250421_224134
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-21 22:41:34] Starting feature generation - Task: regression, Device: cpu
+[2025-04-21 22:41:34] Dataset: 1460 samples, 80 features, Limit: 160 new features max
+[2025-04-21 22:41:50] Gen 0: Training with original features. Mean Val rmse = 29943.42871
+[2025-04-21 22:43:25] Gen 1:
+  Added 2 features, now using 82 features (2 new).
+  Mean Val rmse = 29705.29434.
+  Score improved by 238.13437. Best generation: 1.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-21 22:44:42]   Gen 2 added 1 features but didn't improve. Reverting to best gen (1).
+[2025-04-21 22:44:42] Gen 2:
+  Added 1 features, now using 82 features (2 new).
+  Mean Val rmse = 29705.29434.
+  No improvement yet. Best generation: 1.
+  Annealing: τ=0.99, β=0.79, γ=0.16, λ=0.11
+[2025-04-21 22:46:48]   Gen 3 added 4 features but didn't improve. Reverting to best gen (1).
+[2025-04-21 22:46:48] Gen 3:
+  Added 4 features, now using 82 features (2 new).
+  Mean Val rmse = 29705.29434.
+  No improvement yet. Best generation: 1.
+  Annealing: τ=0.96, β=0.78, γ=0.13, λ=0.11
+[2025-04-21 22:46:48] Auto-activating adaptive exploration after 4 generations due to stalled progress

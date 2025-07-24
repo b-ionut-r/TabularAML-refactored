@@ -1,0 +1,2 @@
+# self.seen_feats: no of times features are seen. force genetic algo to explore
+# beyond seen (another param with scheduling).

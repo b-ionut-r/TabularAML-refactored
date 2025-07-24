@@ -1,0 +1,32 @@
+[2025-04-21 16:22:59] [INFO] Starting new feature generation with timestamp: 20250421_162259
+[2025-04-21 16:22:59] [DEBUG] Parameters: n_generations=10, n_parents=30, n_children=150
+[2025-04-21 16:22:59] [DEBUG] Greeks parameters: min_pct_gain=0.01, early_stopping_child_eval=1.0, early_stopping_iter=inf
+[2025-04-21 16:22:59] [DEBUG] Max new features: -1
+[2025-04-21 16:22:59] Starting feature generation process - Task: regression, Device: cuda
+[2025-04-21 16:22:59] Initial dataset: 37137 samples, 9 features
+[2025-04-21 16:22:59] Feature limit: Unlimited (max_gen_new_feats_pct=-1)
+[2025-04-21 16:23:08] Gen 0:
+  Training with original features.
+  Mean Val rmse = 0.58663.
+  No improvement yet, as this is the base generation.
+
+[2025-04-21 16:28:48] Gen 1:
+  Generated 0 new features, now using 9 features (0 new).
+  Mean Val rmse = 0.58663.
+  No improvement yet. Best generation: 0.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-21 16:34:33] Gen 2:
+  Generated 0 new features, now using 9 features (0 new).
+  Mean Val rmse = 0.58663.
+  No improvement yet. Best generation: 0.
+  Annealing: τ=0.98, β=0.79, γ=0.15, λ=0.11
+[2025-04-21 16:40:27] Gen 3:
+  Generated 0 new features, now using 9 features (0 new).
+  Mean Val rmse = 0.58663.
+  No improvement yet. Best generation: 0.
+  Annealing: τ=0.91, β=0.76, γ=0.11, λ=0.12
+[2025-04-21 16:46:34] Gen 4:
+  Generated 0 new features, now using 9 features (0 new).
+  Mean Val rmse = 0.58663.
+  No improvement yet. Best generation: 0.
+  Annealing: τ=0.81, β=0.70, γ=0.08, λ=0.15

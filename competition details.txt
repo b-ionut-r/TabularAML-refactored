@@ -1,0 +1,38 @@
+Brief
+Welcome to the Air Pollution Prediction Challenge!
+Air pollution remains one of the world’s most pressing public-health threats, contributing to millions of premature deaths each year. Understanding and anticipating how pollution levels change across space and time is essential for issuing timely health warnings, shaping urban policy, and helping communities respond to environmental risks.
+
+In this competition, your mission is simple: build a model that predicts future air pollution measurements as accurately as possible. You’ll work with historical observations and contextual data to forecast unseen conditions. Submissions are evaluated based on prediction accuracy, and top-performing models will rise to the top of the leaderboard. Join us in developing data-driven tools for a cleaner, healthier future.
+
+Data Breakdown
+Air Quality Prediction Challenge
+Your challenge in this competition is to predict air pollution levels at specific locations and times using spatial and temporal features. Can you build a model that accurately predicts air quality based on geographic coordinates and time patterns? Let's find out!
+
+Data Breakdown:
+Downloadable file "air_pollution_dataset.zip" includes the following files:
+
+train.csv: file to train your machine learning model.
+
+test.csv: This is the file you're going to make predictions on with your trained model and create a submission file.
+
+submission_example.csv: example of the format that the submission file needs to be in to be properly scored.
+
+Data Dictionary
+id: Unique identifier for each observation
+latitude: Geographic latitude coordinate (anonymized with deterministic jitter)
+longitude: Geographic longitude coordinate (anonymized with deterministic jitter)
+day_of_year: Day of the year (1-365, captures seasonal patterns)
+day_of_week: Day of the week (0=Monday, 6=Sunday)
+hour: Hour of the day (0-23, captures daily pollution cycles)
+month: Month of the year (1-12, captures seasonal variations)
+pollution_value: Target variable. Pollution level in the air.
+Important Notes:
+The submission file should follow the same format as the example file (submission_format.csv). It should contain two columns: id and pollution_value. The pollution_value should be a numeric (float) prediction.Submissions are evaluated by Root Mean Square Error (RMSE) - specifically, exp(-RMSE/100), where 100 is a scaling factor.
+
+Final competition results are based on the Private Leaderboard results, and the winner will be the user at the top of the Private Leaderboard.
+
+This dataset represents real-world air quality measurements from monitoring stations worldwide, making accurate predictions valuable for environmental and public health applications.
+
+The use of any external dataset is not allowed. Please abide by the rules.
+
+.

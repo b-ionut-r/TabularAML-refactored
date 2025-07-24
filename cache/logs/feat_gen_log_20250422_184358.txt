@@ -1,0 +1,5 @@
+[2025-04-22 18:43:58] [INFO] Starting feature generation: 20250422_184358
+Params: generations=32, parents=35, children=180, min_gain=0.004
+[2025-04-22 18:43:58] Starting feature generation - Task: regression, Device: cuda
+[2025-04-22 18:43:58] Time budget: 3600 seconds
+[2025-04-22 18:43:58] Dataset: 1460 samples, 80 features, Limit: 40 new features max

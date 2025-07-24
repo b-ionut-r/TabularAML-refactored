@@ -1,0 +1,30 @@
+[2025-04-22 17:35:43] [INFO] Starting feature generation: 20250422_173543
+Params: generations=8, parents=12, children=60, min_gain=0.01
+[2025-04-22 17:35:43] Starting feature generation - Task: regression, Device: cuda
+[2025-04-22 17:35:43] Time budget: 300 seconds
+[2025-04-22 17:35:43] Dataset: 1000 samples, 50 features, Limit: 50 new features max
+[2025-04-22 17:35:56] Gen 0: Training with original features. Mean Val rmse = 0.33531
+[2025-04-22 17:36:28] Gen 1:
+  Added 2 features, now using 52 features (2 new).
+  Mean Val rmse = 0.32508.
+  Score improved by 0.01023. Best generation: 1.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-22 17:37:02] Gen 2:
+  Added 2 features, now using 54 features (4 new).
+  Mean Val rmse = 0.30110.
+  Score improved by 0.02398. Best generation: 2.
+  Annealing: τ=0.97, β=0.78, γ=0.14, λ=0.11
+[2025-04-22 17:37:32] Gen 3:
+  Added 0 features, now using 54 features (4 new).
+  Mean Val rmse = 0.30110.
+  No improvement yet. Best generation: 2.
+  Annealing: τ=0.87, β=0.74, γ=0.09, λ=0.13
+[2025-04-22 17:37:32] Early stopping after 1 generations without improvement.
+[2025-04-22 17:37:32] Total execution time: 108.97 seconds
+[2025-04-22 17:37:32] Final generation wasn't the best. Reverting to best generation (2).
+[2025-04-22 17:37:32] 
+Feature generation complete:
+  Best generation: 2
+  Best rmse: 0.30110
+  Features added: 4
+  Total features: 54

@@ -1,0 +1,95 @@
+[2025-04-21 23:18:16] [INFO] Starting feature generation: 20250421_231816
+Params: generations=15, parents=40, children=200, min_gain=0.005
+[2025-04-21 23:18:16] Starting feature generation - Task: regression, Device: cuda
+[2025-04-21 23:18:16] Dataset: 186 samples, 60 features, Limit: 120 new features max
+[2025-04-21 23:18:30] Gen 0: Training with original features. Mean Val rmse = 0.13556
+[2025-04-21 23:23:05] Gen 1:
+  Added 5 features, now using 65 features (5 new).
+  Mean Val rmse = 0.12379.
+  Score improved by 0.01177. Best generation: 1.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-21 23:25:09] Gen 2:
+  Added 0 features, now using 65 features (5 new).
+  Mean Val rmse = 0.12379.
+  No improvement yet. Best generation: 1.
+  Annealing: τ=0.99, β=0.79, γ=0.16, λ=0.11
+[2025-04-21 23:27:17] Gen 3:
+  Added 0 features, now using 65 features (5 new).
+  Mean Val rmse = 0.12379.
+  No improvement yet. Best generation: 1.
+  Annealing: τ=0.96, β=0.78, γ=0.13, λ=0.11
+[2025-04-21 23:27:17] Auto-activating adaptive exploration after 4 generations due to stalled progress
+[2025-04-21 23:27:17]   Adaptive: min_pct_gain 0.00500 → 0.00250
+[2025-04-21 23:33:35]   Adaptive: Restoring min_pct_gain to 0.00500
+[2025-04-21 23:33:38] Gen 4:
+  Added 6 features, now using 71 features (11 new).
+  Mean Val rmse = 0.11150.
+  Score improved by 0.01229. Best generation: 4.
+  Adaptive min_pct_gain: 0.00500 (original: 0.00500)
+  Annealing: τ=1.37, β=0.76, γ=0.22, λ=0.06
+[2025-04-21 23:35:45] Gen 5:
+  Added 0 features, now using 71 features (11 new).
+  Mean Val rmse = 0.11150.
+  No improvement yet. Best generation: 4.
+  Adaptive min_pct_gain: 0.00500 (original: 0.00500)
+  Annealing: τ=0.85, β=0.73, γ=0.09, λ=0.14
+[2025-04-21 23:37:48] Gen 6:
+  Added 0 features, now using 71 features (11 new).
+  Mean Val rmse = 0.11150.
+  No improvement yet. Best generation: 4.
+  Adaptive min_pct_gain: 0.00500 (original: 0.00500)
+  Annealing: τ=0.78, β=0.67, γ=0.07, λ=0.16
+[2025-04-21 23:37:48]   Adaptive: min_pct_gain 0.00500 → 0.00250
+[2025-04-21 23:40:52] Gen 7:
+  Added 1 features, now using 72 features (12 new).
+  Mean Val rmse = 0.11084.
+  Score improved by 0.00065. Best generation: 7.
+  Adaptive min_pct_gain: 0.00250 (original: 0.00500)
+  Annealing: τ=0.69, β=0.58, γ=0.06, λ=0.21
+[2025-04-21 23:42:54] Gen 8:
+  Added 0 features, now using 72 features (12 new).
+  Mean Val rmse = 0.11084.
+  No improvement yet. Best generation: 7.
+  Adaptive min_pct_gain: 0.00250 (original: 0.00500)
+  Annealing: τ=0.60, β=0.47, γ=0.05, λ=0.27
+[2025-04-21 23:44:58] Gen 9:
+  Added 0 features, now using 72 features (12 new).
+  Mean Val rmse = 0.11084.
+  No improvement yet. Best generation: 7.
+  Adaptive min_pct_gain: 0.00250 (original: 0.00500)
+  Annealing: τ=0.50, β=0.33, γ=0.04, λ=0.33
+[2025-04-21 23:44:58]   Adaptive: min_pct_gain 0.00250 → 0.00125
+[2025-04-21 23:47:01] Gen 10:
+  Added 0 features, now using 72 features (12 new).
+  Mean Val rmse = 0.11084.
+  No improvement yet. Best generation: 7.
+  Adaptive min_pct_gain: 0.00125 (original: 0.00500)
+  Annealing: τ=0.41, β=0.22, γ=0.03, λ=0.39
+[2025-04-21 23:49:02] Gen 11:
+  Added 0 features, now using 72 features (12 new).
+  Mean Val rmse = 0.11084.
+  No improvement yet. Best generation: 7.
+  Adaptive min_pct_gain: 0.00125 (original: 0.00500)
+  Annealing: τ=0.33, β=0.13, γ=0.03, λ=0.44
+[2025-04-21 23:51:05] Gen 12:
+  Added 0 features, now using 72 features (12 new).
+  Mean Val rmse = 0.11084.
+  No improvement yet. Best generation: 7.
+  Adaptive min_pct_gain: 0.00125 (original: 0.00500)
+  Annealing: τ=0.25, β=0.07, γ=0.02, λ=0.46
+[2025-04-21 23:53:09] Gen 13:
+  Added 0 features, now using 72 features (12 new).
+  Mean Val rmse = 0.11084.
+  No improvement yet. Best generation: 7.
+  Adaptive min_pct_gain: 0.00125 (original: 0.00500)
+  Annealing: τ=0.19, β=0.04, γ=0.02, λ=0.48
+[2025-04-21 23:53:09] Early stopping after 6 generations without improvement.
+[2025-04-21 23:53:09] Total execution time: 2092.77 seconds
+[2025-04-21 23:53:09] Restoring original min_pct_gain: 0.005
+[2025-04-21 23:53:09] Final generation wasn't the best. Reverting to best generation (7).
+[2025-04-21 23:53:09] 
+Feature generation complete:
+  Best generation: 7
+  Best rmse: 0.11084
+  Features added: 12
+  Total features: 72

@@ -1,0 +1,73 @@
+[2025-04-21 11:21:17] [INFO] Starting new feature generation with timestamp: 20250421_112117
+[2025-04-21 11:21:17] [DEBUG] Parameters: n_generations=10, n_parents=30, n_children=150
+[2025-04-21 11:21:17] [DEBUG] Greeks parameters: min_pct_gain=0.01, early_stopping_child_eval=1.0, early_stopping_iter=inf
+[2025-04-21 11:21:17] [DEBUG] Max new features: -1
+[2025-04-21 11:21:17] Starting feature generation process - Task: regression, Device: cuda
+[2025-04-21 11:21:17] Initial dataset: 1460 samples, 80 features
+[2025-04-21 11:21:17] Feature limit: Unlimited (max_gen_new_feats_pct=-1)
+[2025-04-21 11:21:26] Gen 0:
+  Training with original features.
+  Mean Val rmse = 29943.42997.
+  No improvement yet, as this is the base generation.
+
+[2025-04-21 11:26:50] Gen 1:
+  Generated 2 new features, now using 82 features (2 new).
+  Mean Val rmse = 29767.20179.
+  Score improved by 176.22818. Best generation: 1.
+  Annealing: τ=1.00, β=0.79, γ=0.20, λ=0.10
+[2025-04-21 11:32:24]   Generation 2 added 3 features but didn't improve performance. Reverting to best generation (1).
+[2025-04-21 11:32:24] Gen 2:
+  Generated 0 new features, now using 82 features (2 new).
+  Mean Val rmse = 29767.20179.
+  No improvement yet. Best generation: 1.
+  Annealing: τ=0.98, β=0.79, γ=0.15, λ=0.11
+[2025-04-21 11:37:56] Gen 3:
+  Generated 2 new features, now using 84 features (4 new).
+  Mean Val rmse = 28980.49766.
+  Score improved by 786.70413. Best generation: 3.
+  Annealing: τ=0.91, β=0.76, γ=0.11, λ=0.12
+[2025-04-21 11:43:29] Gen 4:
+  Generated 1 new features, now using 85 features (5 new).
+  Mean Val rmse = 28978.96292.
+  Score improved by 1.53474. Best generation: 4.
+  Annealing: τ=0.81, β=0.70, γ=0.08, λ=0.15
+[2025-04-21 11:49:13] Gen 5:
+  Generated 1 new features, now using 86 features (6 new).
+  Mean Val rmse = 28974.90047.
+  Score improved by 4.06244. Best generation: 5.
+  Annealing: τ=0.69, β=0.58, γ=0.06, λ=0.21
+[2025-04-21 11:54:41] Gen 6:
+  Generated 1 new features, now using 87 features (7 new).
+  Mean Val rmse = 28873.56100.
+  Score improved by 101.33947. Best generation: 6.
+  Annealing: τ=0.55, β=0.40, γ=0.04, λ=0.30
+[2025-04-21 12:00:15] Gen 7:
+  Generated 1 new features, now using 88 features (8 new).
+  Mean Val rmse = 28814.01421.
+  Score improved by 59.54679. Best generation: 7.
+  Annealing: τ=0.41, β=0.22, γ=0.03, λ=0.39
+[2025-04-21 12:05:41]   Generation 8 added 1 features but didn't improve performance. Reverting to best generation (7).
+[2025-04-21 12:05:41] Gen 8:
+  Generated 0 new features, now using 88 features (8 new).
+  Mean Val rmse = 28814.01421.
+  No improvement yet. Best generation: 7.
+  Annealing: τ=0.29, β=0.10, γ=0.02, λ=0.45
+[2025-04-21 12:11:06]   Generation 9 added 1 features but didn't improve performance. Reverting to best generation (7).
+[2025-04-21 12:11:06] Gen 9:
+  Generated 0 new features, now using 88 features (8 new).
+  Mean Val rmse = 28814.01421.
+  No improvement yet. Best generation: 7.
+  Annealing: τ=0.19, β=0.04, γ=0.02, λ=0.48
+[2025-04-21 12:16:32]   Generation 10 added 1 features but didn't improve performance. Reverting to best generation (7).
+[2025-04-21 12:16:32] Gen 10:
+  Generated 0 new features, now using 88 features (8 new).
+  Mean Val rmse = 28814.01421.
+  No improvement yet. Best generation: 7.
+  Annealing: τ=0.12, β=0.01, γ=0.01, λ=0.49
+[2025-04-21 12:16:32] Final generation wasn't the best. Reverting to best generation (7).
+[2025-04-21 12:16:32] 
+Feature generation complete:
+  Best generation: 7
+  Best rmse: 28814.01421
+  Features added: 8
+  Total features: 88
