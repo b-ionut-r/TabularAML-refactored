@@ -671,8 +671,11 @@
                     </div>
                     
                     <div class="action-buttons">
-                        <button class="btn btn-primary" onclick="startGeneration()">
+                        <button class="btn btn-primary" onclick="startGeneration()" id="startBtn">
                             🚀 Start Feature Generation
+                        </button>
+                        <button class="btn btn-danger" onclick="stopGeneration()" id="stopBtn" style="display: none;">
+                            ⏹️ Stop Generation
                         </button>
                         <button class="btn btn-success" onclick="saveGenerator()" id="saveBtn" disabled>
                             💾 Save Generator
@@ -975,8 +978,7 @@
         
         socket.on('generation_complete', function(data) {
             console.log('🎉 Generation complete!', data);
-            generationState.isRunning = false;
-            document.querySelector('.btn-primary').disabled = false;
+            resetButtonStates();
             document.getElementById('saveBtn').disabled = false;
             savedGeneratorData = data.generator_data;
             showResults(data.results);
@@ -995,8 +997,7 @@
         socket.on('error', function(data) {
             console.error('❌ Server error:', data.message);
             addLogMessage('ERROR: ' + data.message);
-            generationState.isRunning = false;
-            document.querySelector('.btn-primary').disabled = false;
+            resetButtonStates();
         });
 
         // UI Update functions
@@ -1124,8 +1125,11 @@
         // Generation functions
         async function startGeneration() {
             console.log('🚀 Starting comprehensive feature generation...');
-            const startBtn = document.querySelector('.btn-primary');
-            startBtn.disabled = true;
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-block';
             
             generationState.isRunning = true;
             generationState.startTime = new Date();
@@ -1177,9 +1181,47 @@
             } catch (error) {
                 console.error('❌ Start generation error:', error);
                 addLogMessage('Error: ' + error.message);
-                startBtn.disabled = false;
-                generationState.isRunning = false;
+                resetButtonStates();
             }
+        }
+
+        async function stopGeneration() {
+            console.log('🛑 Stopping feature generation...');
+            
+            try {
+                const response = await fetch('/stop_generation', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                const result = await response.json();
+                if (response.ok) {
+                    console.log('✅ Stop request sent:', result.status);
+                    addLogMessage('🛑 Stop request sent...');
+                    
+                    // Disable stop button to prevent multiple clicks
+                    document.getElementById('stopBtn').disabled = true;
+                } else {
+                    console.error('❌ Stop error:', result.error);
+                    addLogMessage('Error stopping generation: ' + result.error);
+                }
+            } catch (error) {
+                console.error('❌ Stop generation error:', error);
+                addLogMessage('Error: ' + error.message);
+            }
+        }
+
+        function resetButtonStates() {
+            const startBtn = document.getElementById('startBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+            stopBtn.disabled = false;
+            
+            generationState.isRunning = false;
         }
 
         async function saveGenerator() {

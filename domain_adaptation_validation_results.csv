@@ -1,0 +1,10 @@
+,Value
+baseline_rmse,69.15231969585761
+temporal_rmse,67.8244337503393
+temporal_improvement_pct,1.9202334084504495
+geographic_rmse,67.94529512170412
+geographic_improvement_pct,1.7454578233415314
+combined_rmse,69.14864115078979
+combined_improvement_pct,0.005319481810598477
+ensemble_rmse,66.26613413713274
+ensemble_improvement_pct,4.173664124961761

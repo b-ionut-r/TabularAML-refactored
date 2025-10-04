@@ -994,9 +994,8 @@ class FeatureGenerator:
             else:
                 consec_no_gain += 1
 
-            # Only apply early stopping if not in severe stagnation
-            if (evals >= min_evals and consec_no_gain >= early_thr and 
-                self.adaptive_controller.state.stagnation_level.value < StagnationLevel.SEVERE.value):
+            # Always apply early stopping based on configured threshold
+            if evals >= min_evals and consec_no_gain >= early_thr:
                 break
 
         if callback: callback(len(ranked), len(selected), force_complete=True)
@@ -1230,6 +1229,11 @@ class FeatureGenerator:
         with tqdm(total=self.n_generations, desc="Generations") as pbar:
             for N in range(self.n_generations):
                 self.state['counters']['current_gen'] = N
+                
+                # Check for stop request
+                if hasattr(self, 'stop_requested') and self.stop_requested:
+                    self._log(f"🛑 Generation stopped by user request at generation {N}")
+                    break
                 
                 if self.time_budget and (time.time() - start_time) > self.time_budget:
                     self._log(f"Time budget exceeded. Stopping.")
@@ -1524,7 +1528,7 @@ class FeatureGenerator:
         is_reg = self.task == "regression"
         if self.baseline_model is None:
             self.baseline_model = (XGBRegressor if is_reg else XGBClassifier)(
-                device=self.device, enable_categorical=True, verbosity=0)
+                device=self.device, n_jobs=-1, enable_categorical=True, verbosity=0)
         if self.scorer is None:
             self.scorer = (PREDEFINED_REG_SCORERS["rmse"] if is_reg else 
                           PREDEFINED_CLS_SCORERS["binary_crossentropy"] 

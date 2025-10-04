@@ -33,7 +33,9 @@ server_state = {
     'is_training': False,
     'trained_generator': None,
     'current_generation': 0,
-    'total_generations': 0
+    'total_generations': 0,
+    'stop_requested': False,
+    'generator_thread': None
 }
 
 class ComprehensiveFeatureGenerator(FeatureGenerator):
@@ -42,6 +44,7 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.current_generation = 0
+        self.stop_requested = False
         
     def _log(self, message):
         """Override logging to emit real log messages"""
@@ -82,13 +85,13 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
                     # Extract score from messages like "Val rmse=0.12345"
                     parts = message.split("Val ")[1].split("=")
                     if len(parts) >= 2:
-                        score_str = parts[1].split()[0].replace(",", "")
+                        score_str = parts[1].split()[0].replace(",", "").rstrip(".")
                         score = float(score_str)
                 elif "Best " in message and ":" in message:
                     # Extract score from messages like "Best rmse: 0.12345"
                     parts = message.split("Best ")[1].split(": ")
                     if len(parts) >= 2:
-                        score_str = parts[1].split()[0].replace(",", "")
+                        score_str = parts[1].split()[0].replace(",", "").rstrip(".")
                         score = float(score_str)
                 
                 if score is not None:
@@ -281,6 +284,7 @@ def start_generation():
         server_state['is_training'] = True
         server_state['current_generation'] = 0
         server_state['total_generations'] = generations
+        server_state['stop_requested'] = False
         
         # Start comprehensive generation in background thread
         def run_comprehensive_generation():
@@ -317,6 +321,9 @@ def start_generation():
                 # Create comprehensive generator
                 generator = ComprehensiveFeatureGenerator(**generator_params)
                 
+                # Store generator in server state for stop functionality
+                server_state['trained_generator'] = generator
+                
                 print("🚀 Running comprehensive FeatureGenerator.search()...")
                 start_time = time.time()
                 
@@ -343,12 +350,26 @@ def start_generation():
                 }
                 
                 server_state['is_training'] = False
+                server_state['stop_requested'] = False
                 
                 # Auto-save if path provided
                 if save_path:
                     try:
                         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                        generator.save(save_path)
+                        # Safely serialize without UI/socket references
+                        try:
+                            from tabularaml.generate.features import FeatureGenerator as _BaseFG
+                            orig_cls = generator.__class__
+                            generator.__class__ = _BaseFG
+                            # Bind base _log to avoid capturing SocketIO in closures
+                            try:
+                                generator._log = _BaseFG._log.__get__(generator, _BaseFG)
+                            except Exception:
+                                pass
+                            _BaseFG.save(generator, save_path)
+                        finally:
+                            # Restore original class regardless of save outcome
+                            generator.__class__ = orig_cls
                         print(f"💾 Auto-saved to {save_path}")
                     except Exception as e:
                         print(f"❌ Auto-save failed: {e}")
@@ -365,6 +386,7 @@ def start_generation():
                 import traceback
                 traceback.print_exc()
                 server_state['is_training'] = False
+                server_state['stop_requested'] = False
                 socketio.emit('error', {'message': str(e)})
         
         # Start comprehensive generation thread
@@ -377,6 +399,27 @@ def start_generation():
     except Exception as e:
         print(f"❌ Start generation error: {e}")
         server_state['is_training'] = False
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/stop_generation', methods=['POST'])
+def stop_generation():
+    """Stop the running feature generation"""
+    try:
+        if not server_state['is_training']:
+            return jsonify({'error': 'No generation is currently running'}), 400
+        
+        print("🛑 Stop generation requested")
+        server_state['stop_requested'] = True
+        
+        # Signal the ComprehensiveFeatureGenerator to stop
+        if server_state['trained_generator']:
+            server_state['trained_generator'].stop_requested = True
+        
+        socketio.emit('status_update', {'message': 'Stopping generation...'})
+        return jsonify({'status': 'Stop request sent'})
+        
+    except Exception as e:
+        print(f"❌ Stop generation error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/save_generator', methods=['POST'])
@@ -392,8 +435,19 @@ def save_generator():
         # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        # Save the generator
-        server_state['trained_generator'].save(save_path)
+        # Save the generator using a plain FeatureGenerator snapshot to avoid pickling UI locks
+        gen = server_state['trained_generator']
+        from tabularaml.generate.features import FeatureGenerator as _BaseFG
+        try:
+            orig_cls = gen.__class__
+            gen.__class__ = _BaseFG
+            try:
+                gen._log = _BaseFG._log.__get__(gen, _BaseFG)
+            except Exception:
+                pass
+            _BaseFG.save(gen, save_path)
+        finally:
+            gen.__class__ = orig_cls
         
         socketio.emit('save_complete', {'path': save_path})
         return jsonify({'status': 'Generator saved successfully', 'path': save_path})

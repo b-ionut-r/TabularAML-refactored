@@ -1,0 +1,66 @@
+================================================================================
+DISTRIBUTION SHIFT ANALYSIS REPORT
+================================================================================
+
+DATASET OVERVIEW:
+• Training set: 7,649 samples, 8 features
+• Test set: 2,739 samples, 7 features
+• Common features analyzed: 6
+• Numeric features: 3
+• Categorical features: 3
+
+SIGNIFICANT DISTRIBUTION SHIFTS (p < 0.05):
+• day_of_year (KS Test): p-value = 0.0000
+• hour (Chi-square): p-value = 0.0000
+• day_of_week (Chi-square): p-value = 0.0000
+• month (Chi-square): p-value = 0.0000
+• latitude (KS Test): p-value = 0.0000
+• longitude (KS Test): p-value = 0.0000
+
+DETAILED FEATURE ANALYSIS:
+
+DAY_OF_YEAR:
+  • Type: Numeric
+  • Train: mean=203.555, std=79.877, range=[1.000, 366.000]
+  • Test:  mean=28.414, std=5.725, range=[2.000, 32.000]
+  • ALERT: Substantial difference in central tendency detected
+  • ALERT: Substantial difference in variability detected
+
+HOUR:
+  • Type: Categorical
+  • Unique values: 24
+  • ALERT: Largest proportion difference at value '12': 0.380
+
+DAY_OF_WEEK:
+  • Type: Categorical
+  • Unique values: 7
+  • ALERT: Largest proportion difference at value '4': 0.611
+
+MONTH:
+  • Type: Categorical
+  • Unique values: 12
+  • ALERT: Largest proportion difference at value '1': 0.956
+
+LATITUDE:
+  • Type: Numeric
+  • Train: mean=31.880, std=17.799, range=[-74.187, 70.094]
+  • Test:  mean=36.772, std=23.565, range=[-47.269, 68.049]
+  • ALERT: Substantial difference in central tendency detected
+  • ALERT: Substantial difference in variability detected
+
+LONGITUDE:
+  • Type: Numeric
+  • Train: mean=32.101, std=97.812, range=[-161.756, 153.388]
+  • Test:  mean=25.156, std=72.758, range=[-135.087, 174.785]
+  • ALERT: Substantial difference in variability detected
+
+RECOMMENDATIONS:
+• Significant distribution shifts detected - consider the following:
+  - Use domain adaptation techniques
+  - Apply importance weighting during training
+  - Monitor model performance more carefully on test set
+  - Consider collecting more representative training data
+  - Geographic distribution shift detected - consider spatial validation strategies
+  - Temporal distribution shift detected - consider time-based validation splits
+
+================================================================================
