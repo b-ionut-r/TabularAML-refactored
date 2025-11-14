@@ -34,7 +34,7 @@ PRESET_PARAMS = {
         "early_stopping_iter": 8, 
         "min_pct_gain": 0.0015, 
         "max_gen_new_feats_pct": 2.0,
-        "time_budget": 60 * 60,
+        "time_budget": 60 * 60 * 2, # 1 before
         "cv": 5,
         "ranking_method": "multi_criteria"
     },
