@@ -1207,7 +1207,7 @@ class FeatureGenerator:
         self.pruned_features = set()
         self._parent_usage = {}
         self._log(f"Starting {self.task} on {self.device} - {X.shape[0]} samples, {X.shape[1]} features")
-        self._log(f"Params: gen={self.n_generations}, parents={self.n_parents}, children={self.n_children}, limit={self.max_gen_new_feats}")
+        self._log(f"Params: gen={self.n_generations}, parents={self.n_parents}, children={self.n_children}, limit={self.max_gen_new_feats}, time_budget={self.time_budget}s.")
         self.adaptive_controller.initialize_operations(self.ops)
         self.adaptive_controller.reset_for_new_run()
         self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(X, y, self.pipeline)
