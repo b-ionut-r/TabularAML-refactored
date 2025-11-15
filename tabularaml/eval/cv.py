@@ -157,13 +157,13 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
             one_hot = OneHotEncoder(sparse_output=False, handle_unknown = "ignore")
             one_hot.fit(y_train.to_numpy().reshape(-1, 1))
             # one_hot.fit(y_train.reshape(-1, 1))
-        val_score = scorer.score(y_true = y_val if not requires_onehot else one_hot.transform(y_val.reshape(-1, 1)), 
+        val_score = scorer.score(y_true = y_val if not requires_onehot else one_hot.transform(y_val.numpy().reshape(-1, 1)), 
                                  y_pred = val_preds)        
         val_results.append(val_score)
         
         if return_dict:
             train_preds = model_clone.predict_proba(X_train) if scorer.from_probs else model_clone.predict(X_train)
-            train_score = scorer.score(y_true = y_train if not requires_onehot else one_hot.transform(y_train.reshape(-1, 1)), 
+            train_score = scorer.score(y_true = y_train if not requires_onehot else one_hot.transform(y_train.numpy().reshape(-1, 1)), 
                                        y_pred = train_preds)
             train_results.append(train_score)
             fold_result = {
