@@ -155,7 +155,8 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
         if scorer.name == "categorical_crossentropy":
             requires_onehot = True
             one_hot = OneHotEncoder(sparse_output=False, handle_unknown = "ignore")
-            one_hot.fit(y_train.reshape(-1, 1))
+            one_hot.fit(y_train.to_numpy().reshape(-1, 1))
+            # one_hot.fit(y_train.reshape(-1, 1))
         val_score = scorer.score(y_true = y_val if not requires_onehot else one_hot.transform(y_val.reshape(-1, 1)), 
                                  y_pred = val_preds)        
         val_results.append(val_score)
