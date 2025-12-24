@@ -51,10 +51,24 @@ class PipelineWrapper:
         encoder = self.encoder if self.encoder is not None else "passthrough"
         imputer = self.imputer if self.imputer is not None else FunctionTransformer()
 
+        # Get columns that will be created by the encoder to avoid duplicates
+        encoder_output_cols = set()
+        if hasattr(self.encoder, 'target_enc_cols'):
+            encoder_output_cols.update(f"{col}_target" for col in self.encoder.target_enc_cols)
+        if hasattr(self.encoder, 'count_enc_cols'):
+            encoder_output_cols.update(f"{col}_count" for col in self.encoder.count_enc_cols)
+        if hasattr(self.encoder, 'freq_enc_cols'):
+            encoder_output_cols.update(f"{col}_freq" for col in self.encoder.freq_enc_cols)
+
+        # Filter out columns that will be created by encoder from numerical columns
+        # This prevents duplicate feature name errors in ColumnTransformer
+        filtered_numerical_columns = [col for col in self.numerical_columns
+                                      if col not in encoder_output_cols]
+
         # ColumnTransformer
         ct = ColumnTransformer(
             transformers = [
-                ("scaling", scaler, self.numerical_columns),
+                ("scaling", scaler, filtered_numerical_columns),
                 ("encoding", encoder, self.categorical_columns),
             ],
             remainder = "passthrough",
