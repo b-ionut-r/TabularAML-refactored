@@ -1,0 +1,109 @@
+Variable name,Storage type,Variable label
+sample,str8,Data Type
+hhid,int,Household unique identifier
+com,byte,Identifier of household member
+weight,int,Household sampling weight
+strata,byte,Stratification variable
+cons_ppp17,float,Target variable: Per-capita daily expenditure (PPP17)
+utl_exp_ppp17,float,Expenditure on utilities (PPP17)
+male,byte,Household head is male
+hsize,byte,Number of members in main household
+num_children5,byte,Number of children (under 5) in household
+num_children10,byte,Number of children (5-10) in household
+num_children18,byte,Number of children (10-18) in household
+age,byte,Age of household head
+owner,byte,Owner of dwelling?
+water,byte,Does the dwelling have access to a water supply system?
+toilet,byte,Are there toilet facilities in the dwelling?
+sewer,byte,Are the toilet facilities linked to the sewer?
+elect,byte,Does the dwelling have access to electricity?
+water_source,byte,Sources of drinking water
+sanitation_source,byte,Main sanitation source
+dweltyp,byte,Types of Dwelling
+num_adult_female,byte,Number of female adults (18-69) in household
+num_adult_male,byte,Number of male adults (18-69) in household
+num_elderly,byte,Number of elderly (70+) in household
+employed,byte,Household head is employed
+sworkershh,float,Share of adults working in the household
+share_secondary,float,Share of adults with secondary education in the household
+educ_max,byte,Highest education level in household
+sfworkershh,float,Share of working adults in formal employment
+any_nonagric,byte,Any household member working in non-agriculture sector
+sector1d,byte,Employment sector of household head (1 digit ISIC)
+region1,byte,Region 1
+region2,byte,Region 2
+region3,byte,Region 3
+region4,byte,Region 4
+region5,byte,Region 5
+region6,byte,Region 6
+region7,byte,Region 7
+urban,byte,Urban indicator
+consumed100,byte,Breads
+consumed200,byte,Pastries
+consumed300,byte,Rice (regular and superior)
+consumed400,byte,"Milk (evaporated, fresh, etc.)"
+consumed500,byte,Potato (white and others)
+consumed600,byte,Sugar (white and brown)
+consumed700,byte,Egg
+consumed800,byte,Beef and other red meats
+consumed900,byte,Chicken meat and other poultry
+consumed1000,byte,Poultry offal
+consumed1100,byte,Meat by-products
+consumed1200,byte,Beef liver
+consumed1300,byte,Beef tripe
+consumed1400,byte,Other offal
+consumed1500,byte,"Corn, corn flour, canchita"
+consumed1600,byte,"Wheat, wheat flour, and others"
+consumed1700,byte,"Quinoa, quinoa flour"
+consumed1800,byte,"Pea flour, bean flour"
+consumed1900,byte,"Noodles (bulk, packaged)"
+consumed2000,byte,Fresh fish
+consumed2100,byte,"Tuna, sardines, and other canned fish"
+consumed2200,byte,Seafood
+consumed2300,byte,Oil (bottled and bulk)
+consumed2400,byte,Fresh cheese
+consumed2500,byte,Margarine (bulk and packaged)
+consumed2600,byte,Butter (bulk and packaged)
+consumed2700,byte,Other dairy products
+consumed2800,byte,Iodized salt
+consumed2900,byte,"Chili (whole, fresh)"
+consumed3000,byte,Spices and seasonings
+consumed3100,byte,"Lentils, peas, beans"
+consumed3200,byte,"Onion (red, white, etc.)"
+consumed3300,byte,"Tomato (Italian, red)"
+consumed3400,byte,"Carrot, squash"
+consumed3500,byte,Corn on the cob
+consumed3600,byte,"Sweet potato, cassava, and olluco"
+consumed3700,byte,Other vegetables and legumes
+consumed3800,byte,Lemon
+consumed3900,byte,"Mandarin, orange, and papaya"
+consumed4000,byte,"Banana (silk, green, etc.)"
+consumed4100,byte,"Other fruits (apple, pineapple, etc.)"
+consumed4200,byte,"Coffee, tea, cocoa, herbs"
+consumed4300,byte,"Candies, chocolates, honey"
+consumed4400,byte,Alcoholic beverages for consumption
+consumed4500,byte,Soft drinks for consumption
+consumed4600,byte,Mineral water and juices for consumption
+consumed4700,byte,Prepared meals for consumption
+consumed4800,byte,Other foods for consumption
+consumed4900,byte,Animal feed
+consumed5000,byte,Other foods consumed
+_pline5,float,Poverty line: 5th percentile of welfare distribution in Training 3 data
+_pline10,float,Poverty line: 10th percentile of welfare distribution in Training 3 data
+_pline15,float,Poverty line: 15th percentile of welfare distribution in Training 3 data
+_pline20,float,Poverty line: 20th percentile of welfare distribution in Training 3 data
+_pline25,float,Poverty line: 25th percentile of welfare distribution in Training 3 data
+_pline30,float,Poverty line: 30th percentile of welfare distribution in Training 3 data
+_pline35,float,Poverty line: 35th percentile of welfare distribution in Training 3 data
+_pline40,float,Poverty line: 40th percentile of welfare distribution in Training 3 data
+_pline45,float,Poverty line: 45th percentile of welfare distribution in Training 3 data
+_pline50,float,Poverty line: 50th percentile of welfare distribution in Training 3 data
+_pline55,float,Poverty line: 55th percentile of welfare distribution in Training 3 data
+_pline60,float,Poverty line: 60th percentile of welfare distribution in Training 3 data
+_pline65,float,Poverty line: 65th percentile of welfare distribution in Training 3 data
+_pline70,float,Poverty line: 70th percentile of welfare distribution in Training 3 data
+_pline75,float,Poverty line: 75th percentile of welfare distribution in Training 3 data
+_pline80,float,Poverty line: 80th percentile of welfare distribution in Training 3 data
+_pline85,float,Poverty line: 85th percentile of welfare distribution in Training 3 data
+_pline90,float,Poverty line: 90th percentile of welfare distribution in Training 3 data
+_pline95,float,Poverty line: 95th percentile of welfare distribution in Training 3 data

@@ -1575,9 +1575,9 @@ class FeatureGenerator:
                 except Exception as e:
                     self._log(f"Error generating {interaction.name}: {str(e)}")
                     
-        # Fit pipeline
+        # Fit pipeline - use X_transformed to build pipeline with correct columns
         if isinstance(self.pipeline, PipelineWrapper):
-            self.pipeline = self.pipeline.get_pipeline(X)
+            self.pipeline = self.pipeline.get_pipeline(X_transformed)
         self.pipeline.fit(X_transformed, y)
         return self
 

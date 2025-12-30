@@ -1,0 +1,180 @@
+Variable name,Variable label,Value,Value label
+any_nonagric,Any household member working in non-agriculture sector,0,No
+any_nonagric,Any household member working in non-agriculture sector,1,Yes
+consumed100,Breads,0,No
+consumed100,Breads,1,Yes
+consumed1000,Poultry offal,0,No
+consumed1000,Poultry offal,1,Yes
+consumed1100,Meat by-products,0,No
+consumed1100,Meat by-products,1,Yes
+consumed1200,Beef liver,0,No
+consumed1200,Beef liver,1,Yes
+consumed1300,Beef tripe,0,No
+consumed1300,Beef tripe,1,Yes
+consumed1400,Other offal,0,No
+consumed1400,Other offal,1,Yes
+consumed1500,"Corn, corn flour, canchita",0,No
+consumed1500,"Corn, corn flour, canchita",1,Yes
+consumed1600,"Wheat, wheat flour, and others",0,No
+consumed1600,"Wheat, wheat flour, and others",1,Yes
+consumed1700,"Quinoa, quinoa flour",0,No
+consumed1700,"Quinoa, quinoa flour",1,Yes
+consumed1800,"Pea flour, bean flour",0,No
+consumed1800,"Pea flour, bean flour",1,Yes
+consumed1900,"Noodles (bulk, packaged)",0,No
+consumed1900,"Noodles (bulk, packaged)",1,Yes
+consumed200,Pastries,0,No
+consumed200,Pastries,1,Yes
+consumed2000,Fresh fish,0,No
+consumed2000,Fresh fish,1,Yes
+consumed2100,"Tuna, sardines, and other canned fish",0,No
+consumed2100,"Tuna, sardines, and other canned fish",1,Yes
+consumed2200,Seafood,0,No
+consumed2200,Seafood,1,Yes
+consumed2300,Oil (bottled and bulk),0,No
+consumed2300,Oil (bottled and bulk),1,Yes
+consumed2400,Fresh cheese,0,No
+consumed2400,Fresh cheese,1,Yes
+consumed2500,Margarine (bulk and packaged),0,No
+consumed2500,Margarine (bulk and packaged),1,Yes
+consumed2600,Butter (bulk and packaged),0,No
+consumed2600,Butter (bulk and packaged),1,Yes
+consumed2700,Other dairy products,0,No
+consumed2700,Other dairy products,1,Yes
+consumed2800,Iodized salt,0,No
+consumed2800,Iodized salt,1,Yes
+consumed2900,"Chili (whole, fresh)",0,No
+consumed2900,"Chili (whole, fresh)",1,Yes
+consumed300,Rice (regular and superior),0,No
+consumed300,Rice (regular and superior),1,Yes
+consumed3000,Spices and seasonings,0,No
+consumed3000,Spices and seasonings,1,Yes
+consumed3100,"Lentils, peas, beans",0,No
+consumed3100,"Lentils, peas, beans",1,Yes
+consumed3200,"Onion (red, white, etc.)",0,No
+consumed3200,"Onion (red, white, etc.)",1,Yes
+consumed3300,"Tomato (Italian, red)",0,No
+consumed3300,"Tomato (Italian, red)",1,Yes
+consumed3400,"Carrot, squash",0,No
+consumed3400,"Carrot, squash",1,Yes
+consumed3500,Corn on the cob,0,No
+consumed3500,Corn on the cob,1,Yes
+consumed3600,"Sweet potato, cassava, and olluco",0,No
+consumed3600,"Sweet potato, cassava, and olluco",1,Yes
+consumed3700,Other vegetables and legumes,0,No
+consumed3700,Other vegetables and legumes,1,Yes
+consumed3800,Lemon,0,No
+consumed3800,Lemon,1,Yes
+consumed3900,"Mandarin, orange, and papaya",0,No
+consumed3900,"Mandarin, orange, and papaya",1,Yes
+consumed400,"Milk (evaporated, fresh, etc.)",0,No
+consumed400,"Milk (evaporated, fresh, etc.)",1,Yes
+consumed4000,"Banana (silk, green, etc.)",0,No
+consumed4000,"Banana (silk, green, etc.)",1,Yes
+consumed4100,"Other fruits (apple, pineapple, etc.)",0,No
+consumed4100,"Other fruits (apple, pineapple, etc.)",1,Yes
+consumed4200,"Coffee, tea, cocoa, herbs",0,No
+consumed4200,"Coffee, tea, cocoa, herbs",1,Yes
+consumed4300,"Candies, chocolates, honey",0,No
+consumed4300,"Candies, chocolates, honey",1,Yes
+consumed4400,Alcoholic beverages for consumption,0,No
+consumed4400,Alcoholic beverages for consumption,1,Yes
+consumed4500,Soft drinks for consumption,0,No
+consumed4500,Soft drinks for consumption,1,Yes
+consumed4600,Mineral water and juices for consumption,0,No
+consumed4600,Mineral water and juices for consumption,1,Yes
+consumed4700,Prepared meals for consumption,0,No
+consumed4700,Prepared meals for consumption,1,Yes
+consumed4800,Other foods for consumption,0,No
+consumed4800,Other foods for consumption,1,Yes
+consumed4900,Animal feed,0,No
+consumed4900,Animal feed,1,Yes
+consumed500,Potato (white and others),0,No
+consumed500,Potato (white and others),1,Yes
+consumed5000,Other foods consumed,0,No
+consumed5000,Other foods consumed,1,Yes
+consumed600,Sugar (white and brown),0,No
+consumed600,Sugar (white and brown),1,Yes
+consumed700,Egg,0,No
+consumed700,Egg,1,Yes
+consumed800,Beef and other red meats,0,No
+consumed800,Beef and other red meats,1,Yes
+consumed900,Chicken meat and other poultry,0,No
+consumed900,Chicken meat and other poultry,1,Yes
+dweltyp,Types of Dwelling,1,Detached house
+dweltyp,Types of Dwelling,2,Multi-family house
+dweltyp,Types of Dwelling,3,Separate apartment
+dweltyp,Types of Dwelling,4,Communal apartment
+dweltyp,Types of Dwelling,5,Room in a larger dwelling
+dweltyp,Types of Dwelling,6,Several buildings connected
+dweltyp,Types of Dwelling,7,Several separate buildings
+dweltyp,Types of Dwelling,8,Improvised housing unit
+dweltyp,Types of Dwelling,99,Other
+educ_max,Highest education level in household,0,Never attended
+educ_max,Highest education level in household,1,Incomplete Primary Education
+educ_max,Highest education level in household,2,Complete Primary Education
+educ_max,Highest education level in household,3,Incomplete Secondary Education
+educ_max,Highest education level in household,4,Complete Secondary Education
+educ_max,Highest education level in household,5,Incomplete Tertiary Education
+educ_max,Highest education level in household,6,Complete Tertiary Education
+elect,Does the dwelling have access to electricity?,0,No access
+elect,Does the dwelling have access to electricity?,1,Access
+employed,Household head is employed,0,Not employed
+employed,Household head is employed,1,Employed
+male,Household head is male,0,Female
+male,Household head is male,1,Male
+owner,Owner of dwelling?,0,Not owner
+owner,Owner of dwelling?,1,Owner
+sanitation_source,Main sanitation source,1,A flush toilet
+sanitation_source,Main sanitation source,2,A piped sewer system
+sanitation_source,Main sanitation source,3,A septic tank
+sanitation_source,Main sanitation source,4,Pit latrine
+sanitation_source,Main sanitation source,5,Ventilated improved pit latrine
+sanitation_source,Main sanitation source,6,Pit latrine with slab
+sanitation_source,Main sanitation source,7,Composting toilet
+sanitation_source,Main sanitation source,8,Special case
+sanitation_source,Main sanitation source,9,A flush/pour flush to elsewhere
+sanitation_source,Main sanitation source,10,A pit latrine without slab
+sanitation_source,Main sanitation source,11,Bucket
+sanitation_source,Main sanitation source,12,Hanging toilet or hanging latrine
+sanitation_source,Main sanitation source,13,No facilities or bush or field
+sanitation_source,Main sanitation source,14,Other
+sector1d,Employment sector of household head (1 digit ISIC),1,"Agriculture, hunting and forestry"
+sector1d,Employment sector of household head (1 digit ISIC),2,Fishing
+sector1d,Employment sector of household head (1 digit ISIC),3,Mining and quarrying
+sector1d,Employment sector of household head (1 digit ISIC),4,Manufacturing
+sector1d,Employment sector of household head (1 digit ISIC),5,"Electricity, gas and water supply"
+sector1d,Employment sector of household head (1 digit ISIC),6,Construction
+sector1d,Employment sector of household head (1 digit ISIC),7,Wholesale and retail trade
+sector1d,Employment sector of household head (1 digit ISIC),8,Hotels and restaurants
+sector1d,Employment sector of household head (1 digit ISIC),9,"Transport, storage and communications"
+sector1d,Employment sector of household head (1 digit ISIC),10,Financial intermediation
+sector1d,Employment sector of household head (1 digit ISIC),11,"Real estate, renting and business activities"
+sector1d,Employment sector of household head (1 digit ISIC),12,Public administration and defence
+sector1d,Employment sector of household head (1 digit ISIC),13,Education
+sector1d,Employment sector of household head (1 digit ISIC),14,Health and social work
+sector1d,Employment sector of household head (1 digit ISIC),15,"Other community, social and personal service activities"
+sector1d,Employment sector of household head (1 digit ISIC),16,Activities of private households as employers 
+sector1d,Employment sector of household head (1 digit ISIC),17, Extraterritorial organizations and bodies
+sewer,Are the toilet facilities linked to the sewer?,0,No access
+sewer,Are the toilet facilities linked to the sewer?,1,Access
+toilet,Are there toilet facilities in the dwelling?,0,No access
+toilet,Are there toilet facilities in the dwelling?,1,Access
+urban,Urban indicator,0,Rural
+urban,Urban indicator,1,Urban
+water,Does the dwelling have access to a water supply system?,0,No access
+water,Does the dwelling have access to a water supply system?,1,Access
+water_source,Sources of drinking water,1,Piped water into dwelling
+water_source,Sources of drinking water,2,Piped water to yard/plot
+water_source,Sources of drinking water,3,Public tap or standpipe
+water_source,Sources of drinking water,4,Tubewell or borehole
+water_source,Sources of drinking water,5,Protected dug well
+water_source,Sources of drinking water,6,Protected spring
+water_source,Sources of drinking water,7,Bottled water
+water_source,Sources of drinking water,8,Rainwater
+water_source,Sources of drinking water,9,Unprotected spring
+water_source,Sources of drinking water,10,Unprotected dug well
+water_source,Sources of drinking water,11,Cart with small tank/drum
+water_source,Sources of drinking water,12,Tanker-truck
+water_source,Sources of drinking water,13,Surface water
+water_source,Sources of drinking water,14,Other

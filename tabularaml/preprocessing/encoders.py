@@ -87,11 +87,11 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
         current_cols = [col for col in cols if col in X_df.columns]
         if not current_cols:
             return
-            
+
         # Create a subset with only the required columns
         # This ensures we pass only the exact columns needed to the encoder
         X_subset = X_df[current_cols].copy()
-        
+
         # For single column case, ensure we don't have DataFrame indexing issues
         # Category encoders has issues when you pass a DataFrame slice and then tries to do X[col]
         if len(current_cols) == 1:
@@ -100,7 +100,7 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
             col_name = current_cols[0]
             new_df = pd.DataFrame({col_name: X_subset[col_name]}, index=X_subset.index)
             X_subset = new_df
-            
+
         encoder.fit(X_subset, y)
 
     def transform(self, X):

@@ -1,38 +1,325 @@
-Brief
-Welcome to the Air Pollution Prediction Challenge!
-Air pollution remains one of the world’s most pressing public-health threats, contributing to millions of premature deaths each year. Understanding and anticipating how pollution levels change across space and time is essential for issuing timely health warnings, shaping urban policy, and helping communities respond to environmental risks.
+Skip to main content
 
-In this competition, your mission is simple: build a model that predicts future air pollution measurements as accurately as possible. You’ll work with historical observations and contextual data to forecast unseen conditions. Submissions are evaluated based on prediction accuracy, and top-performing models will rise to the top of the leaderboard. Join us in developing data-driven tools for a cleaner, healthier future.
+Competitions
+How it works
+Partner with us
+DrivenDataLABS
+Blog
 
-Data Breakdown
-Air Quality Prediction Challenge
-Your challenge in this competition is to predict air pollution levels at specific locations and times using spatial and temporal features. Can you build a model that accurately predicts air quality based on geographic coordinates and time patterns? Let's find out!
+Profile
+development
+Poverty Prediction Challenge
+Estimate individual and aggregate household consumption from limited survey data.
 
-Data Breakdown:
-Downloadable file "air_pollution_dataset.zip" includes the following files:
+$10,000 in prizes
+6 weeks left
+454 joined
+Hosted by The World Bank
+Navigation
+Home
+Problem description
+About
+Official rules
+Leaderboard
+Discussion 1
+Data download
+Submissions
+Share your work
+Team
+Overview
+Accurate poverty measurement is essential for directing global development efforts and informing evidence-based policies for poverty reduction and equity enhancement, yet many countries lack recent data due to the high costs and complexity of collecting comparable comprehensive household expenditure surveys.
 
-train.csv: file to train your machine learning model.
+This challenge simulates a common real-world scenario faced by World Bank economists, who are tasked with producing up-to-date poverty measurements and additional welfare indicators, even in cases where fully detailed recent information on household expenditure is unavailable. Your goal is to develop survey-to-survey imputation models that predict both poverty rates and per capita household consumption from anonymized historical survey data.
 
-test.csv: This is the file you're going to make predictions on with your trained model and create a submission file.
+Competition Notes
+Research focus. This competition is designed for research purposes to explore imputation methods, and has a limited test set reflecting the real-world challenges faced by researchers. As a result, the submission rate is limited and the public leaderboard for this competition may not be indicative of final rankings.
 
-submission_example.csv: example of the format that the submission file needs to be in to be properly scored.
+Competition End Date:
+Feb. 4, 2026, 11:59 p.m. UTC
+Place	Prize Amount
+1st	$4,000
+2nd	$2,500
+3rd	$1,500
+Bonus	$2,000
+Bonus prize: best poverty rate predictions
+The team that submits poverty rate predictions with the lowest error on the private test set and whose solution is verified will receive a $2,000 bonus prize.
 
-Data Dictionary
-id: Unique identifier for each observation
-latitude: Geographic latitude coordinate (anonymized with deterministic jitter)
-longitude: Geographic longitude coordinate (anonymized with deterministic jitter)
-day_of_year: Day of the year (1-365, captures seasonal patterns)
-day_of_week: Day of the week (0=Monday, 6=Sunday)
-hour: Hour of the day (0-23, captures daily pollution cycles)
-month: Month of the year (1-12, captures seasonal variations)
-pollution_value: Target variable. Pollution level in the air.
-Important Notes:
-The submission file should follow the same format as the example file (submission_format.csv). It should contain two columns: id and pollution_value. The pollution_value should be a numeric (float) prediction.Submissions are evaluated by Root Mean Square Error (RMSE) - specifically, exp(-RMSE/100), where 100 is a scaling factor.
+How to compete
+Click the "Compete!" button in the sidebar on the competition homepage to enroll in the competition.
+Get familiar with the problem through the overview and problem description. You might also want to reference additional resources available on the about page.
+Download the data from the data tab.
+Create and train your own model.
+Use your model to generate predictions that match the submission format.
+Click "Submit" in the sidebar, and then "Make new submission". You’re in! You can make up to three submissions per week.
+Before the submission deadline, select the solution you wish to use for final evaluation. You may select only one solution for final evaluation.
+Competition rules
+The challenge rules are in place to promote fair competition and useful solutions. If you are ever unsure whether your solution meets the competition rules, ask the challenge organizers in the competition forum or send an email to info@drivendata.org. A few key rules are highlighted below. For more details, see the official rules page.
 
-Final competition results are based on the Private Leaderboard results, and the winner will be the user at the top of the Private Leaderboard.
+Eligibility
+Individuals currently affiliated with the World Bank Group, including staff and consultants, are encouraged to participate but are not eligible to receive any prizes or awards.
 
-This dataset represents real-world air quality measurements from monitoring stations worldwide, making accurate predictions valuable for environmental and public health applications.
+Use of test data
+A unique feature of this challenge is that the prediction of poverty rates relates to the prediction of household consumption, and in this sense your predictions on the test set are not "independent". For the purposes of this competition, you should treat each survey (i.e., collection of household responses) as an independent sample. The imputed values for an individual household's consumption and the overall poverty rate may leverage multiple households’ responses but the predicted poverty rates must be a function of each survey alone. Your models should be capable of accepting an arbitrary number of surveys and survey responses within each survey, and the predictions for households within each survey and the poverty rates predicted from a survey should be made independently of the other surveys.
 
-The use of any external dataset is not allowed. Please abide by the rules.
+Use of external data
+The use of external data is not allowed in this competition. You may only use the data provided in the training and test sets, as well as any additional information provided in the problem description and about pages.
 
+Tool use
+The use of pre-trained models is allowed, as long as the models used were 1) available freely and openly in that form at the start of the competition and 2) not trained on any data associated with the ground truth data for this challenge.
+
+Participants may not upload competition data to tools like ChatGPT or Gemini, but may load open-source model weights into an environment that they can wipe the data from afterwards, such as their local machine or a cloud compute environment.
+
+PRIVACY NOTICE
+The World Bank Group, (“we” or “us”), respects your concerns about your privacy and is committed to protecting it by establishing and complying with this Privacy Notice which adheres to the core privacy principles set forth in the Personal Data Privacy Policy of World Bank Group Institutions.
+
+The WBG has engaged a vendor, DrivenData, to host the competition on the DrivenData Platform
+
+Participation in the competition is entirely voluntary. By registering for the competition, you acknowledge that you will be sharing personal data directly with DrivenData. They will process your personal data according to their privacy policy and notice and in compliance with applicable laws.
+
+Sponsor
+This challenge is sponsored by the World Bank Group.
+
+
+
+Images courtesy of the World Bank Group
+
+On this page
+Competition Notes
+How to compete
+Competition rules
+PRIVACY NOTICE
+Sponsor
+DrivenData
+We run data science competitions that
+create AI solutions for social good.
+
+Work with us
+As a partner
+As a competitor
+Join a competition
+Careers
+About us
+What we do
+Who we are
+Blog
+Open source
+Get in touch
+Contact us
+Mailing list
+Twitter
+LinkedIn
+© 2025 Driven Data Inc., 700 Colorado Blvd #611, Denver, CO 80206, info@drivendata.org
+
+Terms
+Privacy
+Copyright policy
+
+Skip to main content
+
+Competitions
+How it works
+Partner with us
+DrivenDataLABS
+Blog
+
+Profile
+development
+Poverty Prediction Challenge
+Estimate individual and aggregate household consumption from limited survey data.
+
+$10,000 in prizes
+6 weeks left
+454 joined
+Hosted by The World Bank
+Navigation
+Home
+Problem description
+About
+Official rules
+Leaderboard
+Discussion 1
+Data download
+Submissions
+Share your work
+Team
+Problem description
+For this challenge, your task is to use survey data to predict both the population’s poverty rate at various thresholds as well as household-level daily per capita consumption.
+
+This challenge mimics a common challenge faced in real-time poverty monitoring in which older surveys fully capture household consumption data but more recent surveys lack the detailed information needed to directly measure poverty rates. The process of inferring consumption data from less detailed surveys is called imputation. In this challenge, you will impute both household consumption and, with that information, the population-level poverty rate.
+
+This competition is designed for research purposes to explore imputation methods, and has a limited test set reflecting the real-world challenges faced by researchers. As a result, the number of submissions you can make is limited and the public leaderboard for this competition may not be indicative of final rankings.
+Datasets
+You are provided a training dataset consisting of three panels of household surveys that were conducted in different years. Each household responds to a variety of questions, and their responses are recorded. The household’s daily consumption per capita is also recorded. Weights were assigned to each household according to the number of people in the household and the degree to which the household is representative of the overall population. From the consumption values and the weights, the consumption distribution is computed and the poverty rate–the proportion of the population with a per capita consumption below a certain consumption level or poverty threshold–was calculated.
+
+An overview of the files available on the data download page is below, followed by more detailed information about each file:
+
+data/
+├── feature_descriptions.csv          # Survey data dictionary
+├── feature_value_descriptions.csv    # Survey codes data dictionary
+├── submission_format.zip             # Submission format example
+├── test_hh_features.csv              # Household-level survey responses for test set
+├── train_hh_features.csv             # Household-level survey responses for training set
+├── train_hh_gt.csv                   # Household-level consumption for each response in each survey
+└── train_rates_gt.csv                # Computed poverty rates at given thresholds for training surveys
+Survey features
+The household-level surveys have the following sets features, provided in train_hh_features.csv:
+
+Identifiers & sampling information
+The weights in the dataset are population-expanded weights, meaning that they reflect the probability of sampling times the number of members in the household. These are used to convert household-level survey data to accurate population-level estimates.
+Welfare & expenditure information
+Demographics & household composition
+Education & employment
+Housing & utilities
+Geography
+Food-consumption indicators (last 7 days)
+In addition, the household-level consumption labels are provided in train_hh_gt.csv in dollars per day per capita.
+
+The full data dictionary for the survey data is provided in feature_descriptions.csv and the values for certain coded indicators are provided in feature_value_descriptions.csv.
+
+For your solution, you should predict the household-level consumption for each survey response in the test set in dollars per day per capita (2017 USD PPP).
+
+Poverty thresholds
+In addition to household-level per capita consumption, the training set also contains the computed poverty rates at various thresholds, provided in train_rates_gt.csv. The poverty rate is defined as the percentage of the population with a consumption strictly below each threshold. The thresholds are set approximately at the ventiles of the consumption distribution for survey 300000:
+
+Poverty Threshold
+(per capita consumption)
+Poverty Rate
+2017 USD PPP	Survey 300000
+$3.17	5%
+$3.94	10%
+$4.60	15%
+$5.26	20%
+$5.88	25%
+$6.47	30%
+$7.06	35%
+$7.70	40%
+$8.40	45%
+$9.13	50%
+$9.87	55%
+$10.70	60%
+$11.62	65%
+$12.69	70%
+$14.03	75%
+$15.64	80%
+$17.76	85%
+$20.99	90%
+$27.37	95%
+
+For your solution, you should predict the percentage of the overall population strictly below (i.e., strictly less than) each of these thresholds for each of the three surveys in the test set.
+
+Training dataset
+The training set consists of three surveys (IDs 100000, 200000 and 300000) and the computed poverty rates at specified thresholds. Each survey contains approximately 35,000 responses.
+
+Test dataset
+The test set contains responses from an additional three surveys (IDs 400000, 500000 and 600000), each with approximately 35,000 responses. These survey responses, provided in test_hh_features.csv, contain the same features as the surveys in the training set, but lack the household consumption and poverty rate labels.
+
+One of the three test set surveys will be used for validation purposes and your score on this survey panel will be reflected on the leaderboard during the competition. The scores for the other two surveys are privately withheld and only the withheld surveys are used for final ranking. Note that this may result in the leaderboard serving as a poor indicator of where you will eventually place in the competition.
+
+You should treat each survey in the test set as an independent sample, and your predictions for households within each survey and the poverty rates predicted from a survey should be made independently of the other surveys. You may not train models on the test set data, and you may not use the test set data in any way other than to generate predictions.
+
+Performance metric
+Performance is evaluated according to a weighted average of the per capita consumption prediction error and the poverty rate ratel prediction error:
+
+As accurately predicting poverty rates is the most important and challenging task for the World Bank Group, 90% of the weighted average is computed as the weighted mean absolute percentage error between your predicted poverty rates at various poverty thresholds and the actual rates at those thresholds, averaged across all surveys in the test set.
+The poverty thresholds were derived from the ventiles of the consumption distribution for survey ID 300000 in the training dataset.
+The weights are computed as 
+ where 
+ is the percentile rank corresponding to threshold 
+. This weighting prioritizes the poverty thresholds more the closer they are to the threshold corresponding to a 40% poverty rate in the training dataset from which the thresholds were derived.
+The remaining 10% of the weighted average consists of a mean absolute percentage error between predicted household-level per capita consumption and actual per capita consumption across all responses in the test set.
+Mathematically, this looks like:
+
+ 
+ 
+ 
+ 
+ 
+
+where 
+ is the predicted poverty rate at poverty threshold 
+ for survey 
+, 
+ is the actual poverty rate at poverty threshold 
+ for survey 
+, 
+ is the predicted per capita consumption for household 
+ in survey 
+, 
+ is the actual household per capita consumption for household 
+ in survey 
+, 
+ is the total number of surveys, 
+ is the total number of households, and 
+ where 
+ is the percentile rank corresponding to threshold 
 .
+
+The leaderboard will show this blended metric as the primary competition metric, which will be used for rankings. In addition, a secondary indicator will show the contribution of errors in poverty rate prediction, i.e., the weighted mean absolute percentage error between your predicted poverty rates at various poverty thresholds and the actual rates at those thresholds.
+
+Submission format
+The format for the submission file is a zip file containing two CSV files at the root level:
+
+submission.zip
+├── predicted_household_consumption.csv
+└── predicted_poverty_distribution.csv
+The household consumption CSV will contain the survey ID, the household ID, and the corresponding predicted per capita consumption value for that household. In total, this CSV should have 3 columns and 103,024 rows. A truncated example is shown below:
+
+survey_id,household_id,per_capita_household_consumption
+400000,400001,1.23
+400000,400002,4.56
+...
+400000,434565,7.89
+500000,500001,12.3
+...
+500000,534245,45.6
+600000,600001,78.9
+...
+600000,634213,0.01
+The poverty distribution CSV has twenty columns and four rows, including a header row. Each row is one survey dataset, labeled by its survey id in the first column. The remaining 19 columns contain the calculated poverty rates at various poverty thresholds. A truncated example is shown below:
+
+survey_id,pct_hh_below_3.17,pct_hh_below_3.94,...,pct_hh_below_27.37
+400000,0.001,0.002,...,0.999
+500000,0.001,0.002,...,0.999
+600000,0.001,0.002,...,0.999
+Submission limits and submission selection
+Due to the limited size of the test set, you are limited to only three submissions per week over the course of the challenge. In addition, you may select only one of these submissions to use for final ranking purposes. You should choose the model you believe will best generalize unseen test data, which may not necessarily be the model with the best score on the leaderboard.
+
+Good luck!
+Good luck and enjoy this challenge! If you have any questions, you can always visit the user forum!
+
+On this page
+Datasets
+Survey features
+Poverty thresholds
+Training dataset
+Test dataset
+Performance metric
+Submission format
+Submission limits and submission selection
+Good luck!
+DrivenData
+We run data science competitions that
+create AI solutions for social good.
+
+Work with us
+As a partner
+As a competitor
+Join a competition
+Careers
+About us
+What we do
+Who we are
+Blog
+Open source
+Get in touch
+Contact us
+Mailing list
+Twitter
+LinkedIn
+© 2025 Driven Data Inc., 700 Colorado Blvd #611, Denver, CO 80206, info@drivendata.org
+
+Terms
+Privacy
+Copyright policy
+
+

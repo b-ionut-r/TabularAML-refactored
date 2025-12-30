@@ -469,7 +469,6 @@ class FeatureImportanceAnalyzer:
                     
                     # Then convert to categorical
                     X_result[col] = X_result[col].astype('category')
-                    print(f"Converted {col} to category with {len(X_result[col].cat.categories)} categories")
                         
                 except Exception as e:
                     print(f"Error converting column {col} to category: {str(e)}")
