@@ -15,8 +15,6 @@ if not hasattr(pd.Series, 'numpy'):
     def _numpy(self):
         return self.values
     pd.Series.numpy = _numpy
-    print("Added numpy() method to pandas Series")
-
 
 def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_state = 42,
                     pipeline: Union[Pipeline, PipelineWrapper] = None, return_dict = False,
