@@ -476,9 +476,10 @@ class FeatureGenerator:
                  adaptive: bool = True, 
                  time_budget=None, 
                  max_ops_per_generation=None,
-                 exploration_factor: float = 0.2, 
-                 save_path=None):        
-        
+                 exploration_factor: float = 0.2,
+                 save_path=None,
+                 save_each_trial: bool = False):
+
         # Capture provided parameters
         provided_params = locals().copy()
         provided_params.pop('self')
@@ -510,6 +511,7 @@ class FeatureGenerator:
         self.max_new_feats = max_new_feats
         self.adaptive = adaptive
         self.save_path = save_path
+        self.save_each_trial = save_each_trial
         
         # Early stopping
         self.early_stopping_iter = (int(early_stopping_iter * n_generations) 
@@ -1460,10 +1462,15 @@ class FeatureGenerator:
                     if self.pipeline.encoder.count_enc_cols: self._log(f"  Count encoded: {self.pipeline.encoder.count_enc_cols}")
                     if self.pipeline.encoder.freq_enc_cols: self._log(f"  Freq encoded: {self.pipeline.encoder.freq_enc_cols}")
                 
-                pbar.set_postfix({f"{self.scorer.name}": f"{new_val_score:.5f}", "features": X.shape[1], 
+                pbar.set_postfix({f"{self.scorer.name}": f"{new_val_score:.5f}", "features": X.shape[1],
                                  "new": self.state['counters']['total_new_features'], "best_gen": self.state['best']['gen_num']})
                 pbar.update(1)
-                
+
+                # Save after each trial if enabled
+                if self.save_each_trial and self.save_path:
+                    self._sync_state_components(X, self.pipeline, generation)
+                    self.save(self.save_path)
+
                 # Check termination conditions
                 if self.max_gen_new_feats != float('inf') and self.state['counters']['total_new_features'] >= self.max_gen_new_feats:
                     self._log(f"Reached max new features ({self.state['counters']['total_new_features']}/{self.max_gen_new_feats}). Stopping.")
