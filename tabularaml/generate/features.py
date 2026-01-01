@@ -1139,14 +1139,20 @@ class FeatureGenerator:
         
         return X_restart, new_generation
 
-    def _sync_state_components(self, X: pd.DataFrame, pipeline: PipelineWrapper, generation: list):
-        """Ensure all state components are consistent and save current state as best if needed."""
+    def _sync_state_components(self, X: pd.DataFrame, pipeline, generation: list,
+                                preserve_pruned: bool = False):
+        """Ensure all state components are consistent.
+
+        Args:
+            preserve_pruned: If True, keep pruned_features as-is (used when reverting to best)
+        """
         self.X = X.copy()
         self.pipeline = pipeline
-        self.generation = generation.copy()
-        self.interactions = [feat.generating_interaction for feat in self.generation 
+        self.generation = list(generation)  # Shallow copy is fine here
+        self.interactions = [feat.generating_interaction for feat in self.generation
                            if hasattr(feat, 'generating_interaction') and feat.generating_interaction]
-        if hasattr(self, 'pruned_features'):
+        if hasattr(self, 'pruned_features') and not preserve_pruned:
+            # Only filter pruned features during normal search, not when reverting
             self.pruned_features = {feat for feat in self.pruned_features if feat not in X.columns}
     
     def _save_current_as_best(self):
@@ -1154,9 +1160,10 @@ class FeatureGenerator:
         if hasattr(self, 'state') and 'best' in self.state:
             self.state['best'].update(
                 X=self.X.copy(),
-                pipeline=self.pipeline,
-                generation=self.generation.copy(),
-                pruned_features=getattr(self, 'pruned_features', set()).copy()
+                pipeline=deepcopy(self.pipeline),  # Deep copy to prevent mutation
+                generation=deepcopy(self.generation),  # Deep copy to preserve interaction refs
+                pruned_features=getattr(self, 'pruned_features', set()).copy(),
+                interactions=deepcopy(getattr(self, 'interactions', []))  # Save interactions too
             )
             if hasattr(self, 'save_path') and self.save_path:
                 self.save(self.save_path)
@@ -1165,10 +1172,16 @@ class FeatureGenerator:
         """Revert to best saved state."""
         if hasattr(self, 'state') and 'best' in self.state and self.state['best']['X'] is not None:
             self.X = self.state['best']['X'].copy()
-            self.pipeline = self.state['best']['pipeline']
-            self.generation = self.state['best']['generation'].copy()
+            self.pipeline = deepcopy(self.state['best']['pipeline'])  # Deep copy to prevent mutation
+            self.generation = deepcopy(self.state['best']['generation'])
             self.pruned_features = self.state['best']['pruned_features'].copy()
-            self._sync_state_components(self.X, self.pipeline, self.generation)
+            # Restore interactions from saved state if available (backwards compat)
+            if 'interactions' in self.state['best'] and self.state['best']['interactions']:
+                self.interactions = deepcopy(self.state['best']['interactions'])
+            else:
+                # Fallback: rebuild from generation
+                self.interactions = [feat.generating_interaction for feat in self.generation
+                                   if hasattr(feat, 'generating_interaction') and feat.generating_interaction]
             return True
         return False
 
@@ -1524,8 +1537,10 @@ class FeatureGenerator:
         
         # Reset for further calls
         if self.infer_task: self.baseline_model = self.task = self.scorer = None
-    
-        self._sync_state_components(X, self.pipeline.get_pipeline(X), generation)
+
+        # Final sync - use current pipeline (don't create new one which would lose encoder settings)
+        # Pipeline will be converted to sklearn Pipeline in fit() when needed
+        self._sync_state_components(X, self.pipeline, generation, preserve_pruned=True)
         return self.X, self.pipeline, self.generation, self.interactions
 
     def _set_defaults(self, X: pd.DataFrame, y: pd.Series) -> None:
@@ -1549,9 +1564,10 @@ class FeatureGenerator:
 
         # Search state
         self.state = {
-            "best": dict(gen_num=0, val_score=0, train_score=0, X=None, 
-                        generation=None, pipeline=None, pruned_features=set()),
-            "counters": dict(total_new_features=0, no_feature_gens_count=0, 
+            "best": dict(gen_num=0, val_score=0, train_score=0, X=None,
+                        generation=None, pipeline=None, pruned_features=set(),
+                        interactions=None),  # Store interactions for proper restoration
+            "counters": dict(total_new_features=0, no_feature_gens_count=0,
                            consecutive_no_improvement_iters=0, current_gen=0),
             "seen_feats": set(),
         }
@@ -1652,15 +1668,43 @@ class FeatureGenerator:
             import cloudpickle
         except ImportError:
             raise ImportError("cloudpickle required. Install with: pip install cloudpickle")
-        
+
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File {filepath} not found.")
-        
-        try:    
+
+        try:
             with open(filepath, 'rb') as f:
-                return cloudpickle.load(f)
+                instance = cloudpickle.load(f)
+            # Ensure backwards compatibility with older saved files
+            instance._ensure_backwards_compat()
+            return instance
         except Exception as e:
             raise ValueError(f"Failed to load: {str(e)}")
+
+    def _ensure_backwards_compat(self):
+        """Ensure backwards compatibility with older saved pkl files."""
+        # Ensure pruned_features exists
+        if not hasattr(self, 'pruned_features'):
+            self.pruned_features = set()
+
+        # Ensure save_each_trial exists
+        if not hasattr(self, 'save_each_trial'):
+            self.save_each_trial = False
+
+        # Ensure interactions exist and are populated
+        if not hasattr(self, 'interactions') or not self.interactions:
+            if hasattr(self, 'generation') and self.generation:
+                self.interactions = [feat.generating_interaction for feat in self.generation
+                                   if hasattr(feat, 'generating_interaction') and feat.generating_interaction]
+            else:
+                self.interactions = []
+
+        # Ensure state dict has interactions in best (for future reverts)
+        if hasattr(self, 'state') and 'best' in self.state:
+            if 'interactions' not in self.state['best']:
+                self.state['best']['interactions'] = deepcopy(self.interactions)
+            if 'pruned_features' not in self.state['best']:
+                self.state['best']['pruned_features'] = set()
 
     def generate(self, X: pd.DataFrame, y: pd.Series):
         """Main entry point for feature generation."""
