@@ -459,22 +459,23 @@ class FeatureGenerator:
                  model_fit_kwargs: dict = {},
                  task: Optional[Literal["regression", "classification"]] = None,
                  scorer: Optional[Scorer] = None,
+                 logging_scorers: Optional[List[Scorer]] = None,
                  mode: Optional[str] = None,
-                 n_generations: int = 15, 
-                 n_parents: int = 40,                 
+                 n_generations: int = 15,
+                 n_parents: int = 40,
                  n_children: int = 200,
                  ranking_method: Literal["multi_criteria", "shap", "none"] = "multi_criteria",
-                 min_pct_gain: float = 0.001, 
-                 imp_weights=None, 
+                 min_pct_gain: float = 0.001,
+                 imp_weights=None,
                  max_new_feats=None,
-                 early_stopping_iter: Union[float, int, bool] = 0.4, 
+                 early_stopping_iter: Union[float, int, bool] = 0.4,
                  early_stopping_child_eval: Union[float, int, bool] = 0.3,
-                 ops=None, 
-                 cv: Union[int, BaseCrossValidator] = 5, 
+                 ops=None,
+                 cv: Union[int, BaseCrossValidator] = 5,
                  use_gpu: bool = True,
                  log_file: Union[str, Path] = "cache/logs/feat_gen_log.txt",
-                 adaptive: bool = True, 
-                 time_budget=None, 
+                 adaptive: bool = True,
+                 time_budget=None,
                  max_ops_per_generation=None,
                  exploration_factor: float = 0.2,
                  save_path=None,
@@ -506,6 +507,7 @@ class FeatureGenerator:
         self.model_fit_kwargs = model_fit_kwargs
         self.task = task
         self.scorer = scorer
+        self.logging_scorers = logging_scorers or []
         self.infer_task = any(p is None for p in (baseline_model, task, scorer))
         self.imp_weights = imp_weights
         self.max_new_feats = max_new_feats
@@ -600,6 +602,34 @@ class FeatureGenerator:
         cv_dict = cross_val_score(self.baseline_model, X, y, self.scorer, cv=self.cv,
                                  return_dict=True, pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs)
         return cv_dict["mean_train_score"], cv_dict["mean_val_score"]
+
+    def _eval_logging_scorers(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> Dict[str, Tuple[float, float]]:
+        """Evaluate all logging scorers and return dict of {scorer_name: (train_score, val_score)}."""
+        if not self.logging_scorers:
+            return {}
+
+        results = {}
+        pipeline_obj = pipeline.get_pipeline(X) if pipeline is not None else pipeline
+
+        for scorer in self.logging_scorers:
+            try:
+                cv_dict = cross_val_score(self.baseline_model, X, y, scorer, cv=self.cv,
+                                         return_dict=True, pipeline=pipeline_obj,
+                                         model_fit_kwargs=self.model_fit_kwargs)
+                results[scorer.name] = (cv_dict["mean_train_score"], cv_dict["mean_val_score"])
+            except Exception as e:
+                self._log(f"Warning: Failed to evaluate logging scorer {scorer.name}: {str(e)}")
+
+        return results
+
+    def _format_logging_scores(self, scores_dict: Dict[str, Tuple[float, float]]) -> str:
+        """Format logging scorer results for display."""
+        if not scores_dict:
+            return ""
+        parts = []
+        for name, (train, val) in scores_dict.items():
+            parts.append(f"{name}: Train={train:.5f}, Val={val:.5f}")
+        return " | ".join(parts)
 
     def _softmax_temp_sampling(self, pool, weights, n=1, tau=0.5) -> list:
         """Sample items using softmax temperature sampling."""
@@ -1226,7 +1256,11 @@ class FeatureGenerator:
         self.adaptive_controller.initialize_operations(self.ops)
         self.adaptive_controller.reset_for_new_run()
         self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(X, y, self.pipeline)
-        self._log(f"Gen 0: Train {self.scorer.name}={self.state['best']['train_score']:.5f}, Val {self.scorer.name}={self.state['best']['val_score']:.5f}")
+        gen0_log = f"Gen 0: Train {self.scorer.name}={self.state['best']['train_score']:.5f}, Val {self.scorer.name}={self.state['best']['val_score']:.5f}"
+        if self.logging_scorers:
+            logging_scores = self._eval_logging_scorers(X, y, self.pipeline)
+            gen0_log += f" | {self._format_logging_scores(logging_scores)}"
+        self._log(gen0_log)
         self.state['best']['X'], self.state['best']['pipeline'] = X.copy(), deepcopy(self.pipeline)
         self.state['best']['pruned_features'] = getattr(self, 'pruned_features', set()).copy()
         
@@ -1459,12 +1493,18 @@ class FeatureGenerator:
                 # Enhanced logging
                 improvement = "No improvement." if delta <= 0 else f"Score improved by {delta:.5f}."
                 adaptive_status = self.adaptive_controller.get_status_summary()
-                
+
                 gen_log = f"Gen {N+1}: Added {features_added} features, {X.shape[1]} total ({self.state['counters']['total_new_features']} new)."
                 gen_log += f" Train {self.scorer.name}={new_train_score:.5f}, Val {self.scorer.name}={new_val_score:.5f}. {improvement}"
                 gen_log += f" Status: {adaptive_status['stagnation_level']}, Strategy success: {adaptive_status['strategy_success']}"
-                
+
                 self._log(gen_log)
+
+                # Log additional scorers if configured
+                if self.logging_scorers:
+                    logging_scores = self._eval_logging_scorers(X, y, self.pipeline)
+                    if logging_scores:
+                        self._log(f"  Logging scorers: {self._format_logging_scores(logging_scores)}")
                 
                 # Log new features
                 if features_added > 0 and elites:
@@ -1534,7 +1574,14 @@ class FeatureGenerator:
         }
         for feat_type, features in new_features.items():
             if features: self._log(f"New {feat_type}: {features}")
-        
+
+        # Log final logging scorer results
+        if self.logging_scorers:
+            self._log("Final logging scorer results:")
+            logging_scores = self._eval_logging_scorers(X, y, self.pipeline)
+            if logging_scores:
+                self._log(f"  {self._format_logging_scores(logging_scores)}")
+
         # Reset for further calls
         if self.infer_task: self.baseline_model = self.task = self.scorer = None
 
@@ -1690,6 +1737,10 @@ class FeatureGenerator:
         # Ensure save_each_trial exists
         if not hasattr(self, 'save_each_trial'):
             self.save_each_trial = False
+
+        # Ensure logging_scorers exists
+        if not hasattr(self, 'logging_scorers'):
+            self.logging_scorers = []
 
         # Ensure interactions exist and are populated
         if not hasattr(self, 'interactions') or not self.interactions:
