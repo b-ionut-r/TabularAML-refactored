@@ -1245,7 +1245,7 @@ class FeatureGenerator:
         if self.task != "regression":
             unique_vals = np.unique(y)
             if not np.array_equal(unique_vals, np.arange(len(unique_vals))):
-                y_encoded, _ = y.factorize()
+                y_encoded, _ = y.factorize(sort=True)
                 y = pd.Series(y_encoded, index=y.index, name=y.name)
         
         # Initialize
@@ -1493,8 +1493,9 @@ class FeatureGenerator:
                 # Enhanced logging
                 improvement = "No improvement." if delta <= 0 else f"Score improved by {delta:.5f}."
                 adaptive_status = self.adaptive_controller.get_status_summary()
+                n_encoded = self.pipeline.encoder.n_new_feats if hasattr(self.pipeline, 'encoder') else 0
 
-                gen_log = f"Gen {N+1}: Added {features_added} features, {X.shape[1]} total ({self.state['counters']['total_new_features']} new)."
+                gen_log = f"Gen {N+1}: Added {features_added} features, {X.shape[1] + n_encoded} total ({self.state['counters']['total_new_features'] + n_encoded} new)."
                 gen_log += f" Train {self.scorer.name}={new_train_score:.5f}, Val {self.scorer.name}={new_val_score:.5f}. {improvement}"
                 gen_log += f" Status: {adaptive_status['stagnation_level']}, Strategy success: {adaptive_status['strategy_success']}"
 
@@ -1515,8 +1516,8 @@ class FeatureGenerator:
                     if self.pipeline.encoder.count_enc_cols: self._log(f"  Count encoded: {self.pipeline.encoder.count_enc_cols}")
                     if self.pipeline.encoder.freq_enc_cols: self._log(f"  Freq encoded: {self.pipeline.encoder.freq_enc_cols}")
                 
-                pbar.set_postfix({f"{self.scorer.name}": f"{new_val_score:.5f}", "features": X.shape[1],
-                                 "new": self.state['counters']['total_new_features'], "best_gen": self.state['best']['gen_num']})
+                pbar.set_postfix({f"{self.scorer.name}": f"{new_val_score:.5f}", "features": X.shape[1] + n_encoded,
+                                 "new": self.state['counters']['total_new_features'] + n_encoded, "best_gen": self.state['best']['gen_num']})
                 pbar.update(1)
 
                 # Save after each trial if enabled
@@ -1632,7 +1633,14 @@ class FeatureGenerator:
         if not getattr(self, 'pipeline', None):
             self._log("Warning: No pipeline. Creating default.")
             self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder()).get_pipeline(X)
-        
+
+        # Label encode target (same as search) — category_encoders internally
+        # converts non-numeric y to numpy via LabelEncoder without wrapping back in Series
+        if y is not None and getattr(self, 'task', None) != "regression":
+            unique_vals = np.unique(y)
+            if not np.array_equal(unique_vals, np.arange(len(unique_vals))):
+                y_encoded, _ = y.factorize(sort=True)
+                y = pd.Series(y_encoded, index=y.index, name=y.name)      
         X_transformed = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
         
         # Generate non-pipeline features
@@ -1672,6 +1680,9 @@ class FeatureGenerator:
         # Apply pipeline
         pipeline = getattr(self, 'pipeline', None)
         if pipeline is not None:
+            if isinstance(pipeline, PipelineWrapper):
+                pipeline = pipeline.get_pipeline(X_transformed)
+                self.pipeline = pipeline
             try:
                 X_transformed = pipeline.transform(X_transformed)
             except Exception as e:
