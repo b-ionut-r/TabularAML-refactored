@@ -861,12 +861,15 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script>
         const socket = io({
-            transports: ['websocket', 'polling'],
+            // Prefer polling for stability in hosted environments where long-running websocket
+            // sessions can be dropped by intermediaries during CPU-heavy jobs.
+            transports: ['polling'],
+            upgrade: false,
             reconnection: true,
             reconnectionAttempts: Infinity,
             reconnectionDelay: 1000,
             reconnectionDelayMax: 10000,
-            timeout: 30000
+            timeout: 60000
         });
         let currentMode = 'train';
         let savedGeneratorData = null;
@@ -1034,6 +1037,11 @@
         socket.on('connect_error', function(err) {
             console.error('❌ Connection error:', err);
             addLogMessage('Connection error - retrying...');
+        });
+
+        socket.on('keepalive', function(data) {
+            // Silent keepalive: prevents idle disconnects without flooding the UI log.
+            console.debug('🫀 Keepalive', data);
         });
 
         socket.on('progress_update', function(data) {

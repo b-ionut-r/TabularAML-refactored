@@ -31,8 +31,8 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    ping_interval=25,
-    ping_timeout=300,
+    ping_interval=20,
+    ping_timeout=1800,
 )
 
 # Global state
@@ -42,7 +42,8 @@ server_state = {
     'current_generation': 0,
     'total_generations': 0,
     'stop_requested': False,
-    'generator_thread': None
+    'generator_thread': None,
+    'training_started_at': None,
 }
 
 class ComprehensiveFeatureGenerator(FeatureGenerator):
@@ -366,6 +367,23 @@ def start_generation():
         server_state['current_generation'] = 0
         server_state['total_generations'] = generations
         server_state['stop_requested'] = False
+        server_state['training_started_at'] = time.time()
+
+        def keepalive_loop():
+            # Keep a small stream of traffic during long compute windows so hosted proxies do not
+            # treat the socket as idle and drop it.
+            while server_state['is_training']:
+                started_at = server_state.get('training_started_at') or time.time()
+                elapsed = int(max(0, time.time() - started_at))
+                socketio.emit('keepalive', {
+                    'elapsed_seconds': elapsed,
+                    'current_generation': server_state.get('current_generation', 0),
+                    'total_generations': server_state.get('total_generations', 0)
+                })
+                time.sleep(15)
+
+        keepalive_thread = threading.Thread(target=keepalive_loop, daemon=True)
+        keepalive_thread.start()
         
         # Start comprehensive generation in background thread
         def run_comprehensive_generation():
@@ -434,6 +452,7 @@ def start_generation():
                 
                 server_state['is_training'] = False
                 server_state['stop_requested'] = False
+                server_state['training_started_at'] = None
                 
                 # Auto-save if path provided
                 if save_path:
@@ -470,6 +489,7 @@ def start_generation():
                 traceback.print_exc()
                 server_state['is_training'] = False
                 server_state['stop_requested'] = False
+                server_state['training_started_at'] = None
                 socketio.emit('error', {'message': str(e)})
         
         # Start comprehensive generation thread
