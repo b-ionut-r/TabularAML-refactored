@@ -28,7 +28,12 @@ from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORE
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'tabularaml_feature_gen_complete'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    ping_interval=25,
+    ping_timeout=300,
+)
 
 # Global state
 server_state = {
@@ -61,6 +66,8 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
         socketio.emit('log_update', {
             'message': f'[{datetime.now().strftime("%H:%M:%S")}] {message}'
         })
+        # Yield so heartbeat/reconnect traffic is serviced during long jobs.
+        socketio.sleep(0)
         
         # Parse generation info from log messages
         if message.startswith("Gen ") and ":" in message:
