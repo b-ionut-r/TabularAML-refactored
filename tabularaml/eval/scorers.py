@@ -21,6 +21,38 @@ from typing import Optional, Dict, Union, List
 import xgboost as xgb
 
 
+def _prepare_metric_inputs(name: str, from_probs: bool,
+                           y_true: Union[np.ndarray, list],
+                           y_pred: Union[np.ndarray, list]) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize y_true/y_pred shapes for robust metric evaluation."""
+    y_true_arr = np.asarray(y_true)
+    y_pred_arr = np.asarray(y_pred)
+
+    # Most metrics here expect a 1D target vector.
+    if y_true_arr.ndim == 2 and y_true_arr.shape[1] == 1:
+        y_true_arr = y_true_arr.ravel()
+
+    # Keep one-hot targets only for multiclass cross-entropy.
+    if name != "categorical_crossentropy" and y_true_arr.ndim > 1:
+        y_true_arr = np.ravel(y_true_arr)
+
+    if from_probs:
+        # sklearn's binary roc_auc_score expects 1D positive-class scores.
+        if name == "binary_roc_auc":
+            if y_pred_arr.ndim == 2 and y_pred_arr.shape[1] == 2:
+                y_pred_arr = y_pred_arr[:, 1]
+            elif y_pred_arr.ndim == 2 and y_pred_arr.shape[1] == 1:
+                y_pred_arr = y_pred_arr.ravel()
+    else:
+        # Convert probability-like predictions to class labels when needed.
+        if y_pred_arr.ndim == 2:
+            y_pred_arr = y_pred_arr.argmax(axis=-1)
+        elif ((y_true_arr == 0) | (y_true_arr == 1)).all():
+            y_pred_arr = np.round(y_pred_arr)
+
+    return y_true_arr, y_pred_arr
+
+
 class CatScorer:
 
     def __init__(self,
@@ -72,6 +104,7 @@ class CatScorer:
         Returns:
             float: The calculated score.
         """
+        y_true, y_pred = _prepare_metric_inputs(self.name, self.from_probs, y_true, y_pred)
         return self.scorer(y_true, y_pred, **self.extra_params)
     
 
@@ -222,14 +255,7 @@ class Scorer:
         Returns:
             float: The calculated score.
         """
-        if not self.from_probs:
-            if len(y_pred.shape) == 2: # check for multiclass
-                y_pred = y_pred.argmax(axis=-1)
-                
-            elif ((y_true==0) | (y_true==1)).all(): # check for binary
-                y_pred = np.round(y_pred)
-                
-
+        y_true, y_pred = _prepare_metric_inputs(self.name, self.from_probs, y_true, y_pred)
         return self.scorer(y_true, y_pred, **self.extra_params)
         
     

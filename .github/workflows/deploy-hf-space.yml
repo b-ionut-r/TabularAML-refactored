@@ -1,0 +1,60 @@
+name: Deploy to Hugging Face Space
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required files
+        run: |
+          test -f Dockerfile.hf || (echo "Dockerfile.hf is missing" && exit 1)
+          test -f requirements.hf.txt || (echo "requirements.hf.txt is missing" && exit 1)
+
+      - name: Build sync directory
+        run: |
+          mkdir -p hf_sync
+          rsync -av --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude '.gitignore' \
+            ./ hf_sync/
+
+          cp Dockerfile.hf hf_sync/Dockerfile
+          cp requirements.hf.txt hf_sync/requirements.txt
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_SPACE_ID: ${{ secrets.HF_SPACE_ID }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "Missing secret: HF_TOKEN"
+            exit 1
+          fi
+
+          if [ -z "$HF_SPACE_ID" ]; then
+            echo "Missing secret: HF_SPACE_ID (format: username/space-name)"
+            exit 1
+          fi
+
+          cd hf_sync
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git commit -m "Sync from GitHub ${GITHUB_SHA}" || echo "No changes to commit"
+          git branch -M main
+          git remote add space "https://oauth2:${HF_TOKEN}@huggingface.co/spaces/${HF_SPACE_ID}"
+          git push --force space main

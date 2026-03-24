@@ -1,0 +1,12 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Local artifacts
+*.log
+*.pkl
+tmpclaude-*

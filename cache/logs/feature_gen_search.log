@@ -1,3 +1,0 @@
-[2025-12-21 21:14:20] Starting regression on cuda - 104234 samples, 86 features
-[2025-12-21 21:14:20] Params: gen=25, parents=25, children=150, limit=64, time_budget=1800s.
-[2025-12-21 21:14:35] Gen 0: Train weighted_mape=0.26466, Val weighted_mape=0.30516
