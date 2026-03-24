@@ -350,7 +350,7 @@ def start_generation():
         
         # Ensure y remains as pandas Series (don't convert to numpy array)
         if not isinstance(y, pd.Series):
-            y = pd.Series(y, name=target)
+            y = pd.Series(y, name=target) #
         
         print(f"📊 Dataset: {X.shape[0]} rows, {X.shape[1]} features")
         
