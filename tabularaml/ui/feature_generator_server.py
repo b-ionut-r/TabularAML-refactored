@@ -8,6 +8,8 @@ import json
 import time
 import threading
 import pickle
+import queue
+from collections import deque
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
@@ -31,9 +33,14 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
+    async_mode='gevent',
     ping_interval=20,
     ping_timeout=1800,
 )
+
+KEEPALIVE_INTERVAL_SECONDS = 10
+RECENT_LOG_LIMIT = 200
+_event_pump_lock = threading.Lock()
 
 # Global state
 server_state = {
@@ -41,10 +48,126 @@ server_state = {
     'trained_generator': None,
     'current_generation': 0,
     'total_generations': 0,
+    'current_child_eval': 0,
+    'total_child_eval': 0,
+    'selected_count': 0,
+    'best_score': 0.0,
+    'total_features': 0,
+    'stagnation_level': 'NONE',
+    'strategy': 'normal',
     'stop_requested': False,
     'generator_thread': None,
     'training_started_at': None,
+    'latest_results': None,
+    'last_error': None,
+    'recent_logs': deque(maxlen=RECENT_LOG_LIMIT),
+    'last_emit_at': None,
+    'event_pump_started': False,
+    'event_queue': queue.Queue(),
 }
+
+def _update_status_snapshot(event_name, payload):
+    """Keep the latest UI-visible state available across reconnects."""
+    if event_name == 'log_update':
+        message = payload.get('message')
+        if message:
+            server_state['recent_logs'].append(message)
+    elif event_name == 'progress_update':
+        if payload.get('type') == 'generation':
+            server_state['current_generation'] = payload.get('current', server_state['current_generation'])
+            server_state['total_generations'] = payload.get('total', server_state['total_generations'])
+        elif payload.get('type') == 'child_eval':
+            server_state['current_child_eval'] = payload.get('evaluated', 0)
+            server_state['total_child_eval'] = payload.get('total', 0)
+            server_state['selected_count'] = payload.get('selected', 0)
+    elif event_name == 'score_update':
+        server_state['best_score'] = payload.get('score', server_state['best_score'])
+    elif event_name == 'feature_count_update':
+        server_state['total_features'] = payload.get('count', server_state['total_features'])
+    elif event_name == 'stagnation_update':
+        server_state['stagnation_level'] = payload.get('level', server_state['stagnation_level'])
+    elif event_name == 'strategy_update':
+        server_state['strategy'] = payload.get('strategy', server_state['strategy'])
+    elif event_name == 'generation_complete':
+        server_state['latest_results'] = payload.get('results')
+        server_state['is_training'] = False
+    elif event_name == 'error':
+        server_state['last_error'] = payload.get('message')
+        server_state['is_training'] = False
+
+def get_status_snapshot():
+    started_at = server_state.get('training_started_at')
+    elapsed_seconds = 0
+    if server_state['is_training'] and started_at:
+        elapsed_seconds = int(max(0, time.time() - started_at))
+
+    return {
+        'is_training': server_state['is_training'],
+        'current_generation': server_state['current_generation'],
+        'total_generations': server_state['total_generations'],
+        'current_child_eval': server_state['current_child_eval'],
+        'total_child_eval': server_state['total_child_eval'],
+        'selected_count': server_state['selected_count'],
+        'best_score': server_state['best_score'],
+        'total_features': server_state['total_features'],
+        'stagnation_level': server_state['stagnation_level'],
+        'strategy': server_state['strategy'],
+        'elapsed_seconds': elapsed_seconds,
+        'results': server_state['latest_results'],
+        'last_error': server_state['last_error'],
+        'has_trained_generator': server_state['trained_generator'] is not None,
+        'recent_logs': list(server_state['recent_logs']),
+    }
+
+def socket_event_pump():
+    """Emit UI events from a Socket.IO-managed background task."""
+    while True:
+        emitted = False
+
+        while True:
+            try:
+                event_name, payload = server_state['event_queue'].get_nowait()
+            except queue.Empty:
+                break
+
+            socketio.emit(event_name, payload)
+            emitted = True
+            socketio.sleep(0)
+
+        if server_state['is_training']:
+            now = time.time()
+            last_emit_at = server_state.get('last_emit_at') or now
+            if now - last_emit_at >= KEEPALIVE_INTERVAL_SECONDS:
+                started_at = server_state.get('training_started_at') or now
+                socketio.emit('keepalive', {
+                    'elapsed_seconds': int(max(0, now - started_at)),
+                    'current_generation': server_state.get('current_generation', 0),
+                    'total_generations': server_state.get('total_generations', 0)
+                })
+                server_state['last_emit_at'] = now
+                emitted = True
+                socketio.sleep(0)
+
+        socketio.sleep(0.25 if emitted else 1.0)
+
+def ensure_event_pump():
+    if server_state['event_pump_started']:
+        return
+
+    with _event_pump_lock:
+        if server_state['event_pump_started']:
+            return
+
+        socketio.start_background_task(socket_event_pump)
+        server_state['event_pump_started'] = True
+
+def queue_socket_event(event_name, payload):
+    ensure_event_pump()
+    normalized_payload = dict(payload)
+    _update_status_snapshot(event_name, normalized_payload)
+    if event_name != 'keepalive':
+        server_state['last_emit_at'] = time.time()
+    server_state['event_queue'].put((event_name, normalized_payload))
 
 class ComprehensiveFeatureGenerator(FeatureGenerator):
     """Enhanced FeatureGenerator with comprehensive progress tracking"""
@@ -63,12 +186,10 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
             # Just print to console
             print(message)
         
-        # Emit to UI
-        socketio.emit('log_update', {
+        # Emit through the background pump so cross-thread delivery stays reliable.
+        queue_socket_event('log_update', {
             'message': f'[{datetime.now().strftime("%H:%M:%S")}] {message}'
         })
-        # Yield so heartbeat/reconnect traffic is serviced during long jobs.
-        socketio.sleep(0)
         
         # Parse generation info from log messages
         if message.startswith("Gen ") and ":" in message:
@@ -78,7 +199,7 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
                     gen_num = int(gen_part)
                     self.current_generation = gen_num
                     server_state['current_generation'] = gen_num
-                    socketio.emit('progress_update', {
+                    queue_socket_event('progress_update', {
                         'type': 'generation',
                         'current': gen_num,
                         'total': self.n_generations
@@ -105,7 +226,7 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
                         score = float(score_str)
                 
                 if score is not None:
-                    socketio.emit('score_update', {'score': score})
+                    queue_socket_event('score_update', {'score': score})
                     print(f"📈 Score update: {score}")
             except Exception as e:
                 print(f"Error parsing score: {e}")
@@ -118,7 +239,7 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
                     total_part = message.split("total")[0].split()[-1]
                     if total_part.isdigit():
                         total_features = int(total_part)
-                        socketio.emit('feature_count_update', {'count': total_features})
+                        queue_socket_event('feature_count_update', {'count': total_features})
                         print(f"✨ Total features: {total_features}")
             except Exception as e:
                 print(f"Error parsing features: {e}")
@@ -127,27 +248,27 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
         if "Status:" in message:
             try:
                 status_part = message.split("Status: ")[1].split(",")[0].strip()
-                socketio.emit('stagnation_update', {'level': status_part})
+                queue_socket_event('stagnation_update', {'level': status_part})
                 print(f"⚠️ Stagnation: {status_part}")
             except Exception as e:
                 print(f"Error parsing stagnation: {e}")
         
         # Parse strategy changes
         if "Creative HM" in message or "hopeful monster" in message.lower():
-            socketio.emit('strategy_update', {'strategy': 'hopeful_monster'})
+            queue_socket_event('strategy_update', {'strategy': 'hopeful_monster'})
             print("🎯 Strategy: Hopeful Monster")
         elif "beam search" in message.lower():
-            socketio.emit('strategy_update', {'strategy': 'beam_search'})
+            queue_socket_event('strategy_update', {'strategy': 'beam_search'})
             print("🎯 Strategy: Beam Search")
         elif message.startswith("Gen ") and "Added" in message:
-            socketio.emit('strategy_update', {'strategy': 'normal'})
+            queue_socket_event('strategy_update', {'strategy': 'normal'})
     
     def _select_elites(self, batch, n, X, y, callback=None):
         """Override to capture child evaluation progress"""
         
         def progress_callback(evaluated_count, selected_count, force_complete=False):
             # Emit real-time child evaluation progress
-            socketio.emit('progress_update', {
+            queue_socket_event('progress_update', {
                 'type': 'child_eval',
                 'evaluated': evaluated_count,
                 'total': len(batch),
@@ -269,6 +390,8 @@ def start_generation():
         return jsonify({'error': 'Generation already running'}), 400
     
     try:
+        ensure_event_pump()
+
         # Get basic parameters
         file = request.files.get('dataset')
         target = request.form.get('target')
@@ -366,24 +489,19 @@ def start_generation():
         server_state['is_training'] = True
         server_state['current_generation'] = 0
         server_state['total_generations'] = generations
+        server_state['current_child_eval'] = 0
+        server_state['total_child_eval'] = 0
+        server_state['selected_count'] = 0
+        server_state['best_score'] = 0.0
+        server_state['total_features'] = X.shape[1]
+        server_state['stagnation_level'] = 'NONE'
+        server_state['strategy'] = 'normal'
         server_state['stop_requested'] = False
         server_state['training_started_at'] = time.time()
-
-        def keepalive_loop():
-            # Keep a small stream of traffic during long compute windows so hosted proxies do not
-            # treat the socket as idle and drop it.
-            while server_state['is_training']:
-                started_at = server_state.get('training_started_at') or time.time()
-                elapsed = int(max(0, time.time() - started_at))
-                socketio.emit('keepalive', {
-                    'elapsed_seconds': elapsed,
-                    'current_generation': server_state.get('current_generation', 0),
-                    'total_generations': server_state.get('total_generations', 0)
-                })
-                time.sleep(15)
-
-        keepalive_thread = threading.Thread(target=keepalive_loop, daemon=True)
-        keepalive_thread.start()
+        server_state['latest_results'] = None
+        server_state['last_error'] = None
+        server_state['recent_logs'].clear()
+        server_state['last_emit_at'] = time.time()
         
         # Start comprehensive generation in background thread
         def run_comprehensive_generation():
@@ -477,7 +595,7 @@ def start_generation():
                         print(f"❌ Auto-save failed: {e}")
                 
                 # Emit completion with generator data
-                socketio.emit('generation_complete', {
+                queue_socket_event('generation_complete', {
                     'results': results,
                     'generator_data': True  # Indicates generator is available for saving
                 })
@@ -490,7 +608,7 @@ def start_generation():
                 server_state['is_training'] = False
                 server_state['stop_requested'] = False
                 server_state['training_started_at'] = None
-                socketio.emit('error', {'message': str(e)})
+                queue_socket_event('error', {'message': str(e)})
         
         # Start comprehensive generation thread
         thread = threading.Thread(target=run_comprehensive_generation)
@@ -518,7 +636,7 @@ def stop_generation():
         if server_state['trained_generator']:
             server_state['trained_generator'].stop_requested = True
         
-        socketio.emit('status_update', {'message': 'Stopping generation...'})
+        queue_socket_event('status_update', {'message': 'Stopping generation...'})
         return jsonify({'status': 'Stop request sent'})
         
     except Exception as e:
@@ -552,7 +670,7 @@ def save_generator():
         finally:
             gen.__class__ = orig_cls
         
-        socketio.emit('save_complete', {'path': save_path})
+        queue_socket_event('save_complete', {'path': save_path})
         return jsonify({'status': 'Generator saved successfully', 'path': save_path})
         
     except Exception as e:
@@ -621,7 +739,7 @@ def transform_data():
         df_transformed.to_csv(csv_buffer, index=False)
         csv_data = csv_buffer.getvalue()
         
-        socketio.emit('transform_complete', {
+        queue_socket_event('transform_complete', {
             'original_features': original_features,
             'transformed_features': transformed_features,
             'features_added': features_added,
@@ -637,7 +755,9 @@ def transform_data():
 
 @socketio.on('connect')
 def handle_connect():
+    ensure_event_pump()
     print('🔌 Client connected for comprehensive feature generation')
+    emit('status_snapshot', get_status_snapshot())
 
 @socketio.on('disconnect')
 def handle_disconnect():

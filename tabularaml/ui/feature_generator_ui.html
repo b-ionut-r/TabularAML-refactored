@@ -861,10 +861,10 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <script>
         const socket = io({
-            // Prefer polling for stability in hosted environments where long-running websocket
-            // sessions can be dropped by intermediaries during CPU-heavy jobs.
-            transports: ['polling'],
-            upgrade: false,
+            // Prefer websocket for long-running jobs, but keep polling as a fallback.
+            transports: ['websocket', 'polling'],
+            upgrade: true,
+            rememberUpgrade: true,
             reconnection: true,
             reconnectionAttempts: Infinity,
             reconnectionDelay: 1000,
@@ -889,6 +889,61 @@
             strategy: 'normal',
             stagnationLevel: 'NONE'
         };
+
+        function setLogContent(messages = []) {
+            const logContent = document.getElementById('logContent');
+            logContent.textContent = messages.length ? messages.join('\n') + '\n' : '';
+            logContent.scrollTop = logContent.scrollHeight;
+        }
+
+        function applyStatusSnapshot(snapshot = {}) {
+            if (Array.isArray(snapshot.recent_logs) && snapshot.recent_logs.length) {
+                setLogContent(snapshot.recent_logs);
+            }
+
+            if (typeof snapshot.current_generation === 'number' || typeof snapshot.total_generations === 'number') {
+                updateGenerationProgress(snapshot.current_generation || 0, snapshot.total_generations || 0);
+            }
+
+            if (typeof snapshot.current_child_eval === 'number' || typeof snapshot.total_child_eval === 'number') {
+                updateChildProgress(
+                    snapshot.current_child_eval || 0,
+                    snapshot.total_child_eval || 0,
+                    snapshot.selected_count || 0
+                );
+            }
+
+            if (typeof snapshot.total_features === 'number') {
+                updateFeatureCount(snapshot.total_features);
+            }
+
+            if (typeof snapshot.best_score === 'number') {
+                updateBestScore(snapshot.best_score);
+            }
+
+            updateStagnationLevel(snapshot.stagnation_level || 'NONE');
+            updateStrategy(snapshot.strategy || 'normal');
+
+            savedGeneratorData = snapshot.has_trained_generator ? true : null;
+            document.getElementById('saveBtn').disabled = snapshot.is_training || !snapshot.has_trained_generator;
+
+            if (snapshot.is_training) {
+                generationState.isRunning = true;
+                generationState.startTime = snapshot.elapsed_seconds
+                    ? new Date(Date.now() - (snapshot.elapsed_seconds * 1000))
+                    : new Date();
+                document.getElementById('progressSection').classList.add('active');
+                document.getElementById('resultsSection').classList.remove('active');
+                document.getElementById('startBtn').style.display = 'none';
+                document.getElementById('stopBtn').style.display = 'inline-block';
+                document.getElementById('stopBtn').disabled = false;
+            } else {
+                resetButtonStates();
+                if (snapshot.results) {
+                    showResults(snapshot.results);
+                }
+            }
+        }
 
         // Mode switching
         function switchMode(mode) {
@@ -1039,6 +1094,11 @@
             addLogMessage('Connection error - retrying...');
         });
 
+        socket.on('status_snapshot', function(data) {
+            console.log('📦 Status snapshot:', data);
+            applyStatusSnapshot(data);
+        });
+
         socket.on('keepalive', function(data) {
             // Silent keepalive: prevents idle disconnects without flooding the UI log.
             console.debug('🫀 Keepalive', data);
@@ -1104,6 +1164,12 @@
             resetButtonStates();
         });
 
+        socket.on('status_update', function(data) {
+            if (data && data.message) {
+                addLogMessage(data.message);
+            }
+        });
+
         // UI Update functions
         function updateGenerationProgress(current, total) {
             generationState.currentGen = current;
@@ -1112,7 +1178,7 @@
             document.getElementById('currentGen').textContent = current;
             document.getElementById('genProgress').textContent = `${current}/${total}`;
             
-            const progress = (current / total) * 100;
+            const progress = total > 0 ? (current / total) * 100 : 0;
             document.getElementById('genProgressBar').style.width = `${progress}%`;
         }
 
