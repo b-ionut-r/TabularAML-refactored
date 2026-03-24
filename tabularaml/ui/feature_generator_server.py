@@ -9,12 +9,13 @@ import time
 import threading
 import pickle
 from datetime import datetime
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
 import pandas as pd
 import numpy as np
 from pathlib import Path
 import io
+from sklearn.utils.multiclass import type_of_target
 
 # Import our actual FeatureGenerator
 import sys
@@ -22,6 +23,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from tabularaml.generate.features import FeatureGenerator
 from tabularaml.configs.feature_gen import PRESET_PARAMS
+from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'tabularaml_feature_gen_complete'
@@ -157,9 +159,9 @@ def index():
     """Serve the comprehensive UI"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     ui_file_path = os.path.join(script_dir, 'feature_generator_ui.html')
-    
-    with open(ui_file_path, 'r') as f:
-        return f.read()
+
+    # Serve as bytes to avoid platform default text-decoding issues (cp1252 on Windows).
+    return send_file(ui_file_path, mimetype='text/html')
 
 @app.route('/get_mode_presets', methods=['GET'])
 def get_mode_presets():
@@ -195,6 +197,45 @@ def get_mode_presets():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/get_metric_options', methods=['GET'])
+def get_metric_options():
+    """Expose available metrics for regression and classification tasks."""
+    try:
+        # Human-friendly labels for the UI while keeping scorer keys stable.
+        reg_labels = {
+            'rmse': 'RMSE (Root Mean Squared Error)',
+            'mae': 'MAE (Mean Absolute Error)',
+            'mse': 'MSE (Mean Squared Error)',
+            'r2': 'R2 (Coefficient of Determination)'
+        }
+        cls_labels = {
+            'accuracy': 'Accuracy',
+            'precision': 'Precision',
+            'recall': 'Recall',
+            'f1': 'F1 Score',
+            'binary_crossentropy': 'Binary Cross-Entropy (Log Loss)',
+            'categorical_crossentropy': 'Categorical Cross-Entropy (Log Loss)',
+            'binary_roc_auc': 'ROC AUC (Binary)',
+            'categorical_roc_auc': 'ROC AUC (Multiclass OVR)'
+        }
+
+        regression = [
+            {'value': key, 'label': reg_labels.get(key, key)}
+            for key in PREDEFINED_REG_SCORERS.keys()
+        ]
+        classification = [
+            {'value': key, 'label': cls_labels.get(key, key)}
+            for key in PREDEFINED_CLS_SCORERS.keys()
+        ]
+
+        return jsonify({
+            'regression': regression,
+            'classification': classification
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/get_columns', methods=['POST'])
 def get_columns():
     """Get column names from uploaded dataset"""
@@ -224,6 +265,7 @@ def start_generation():
         file = request.files.get('dataset')
         target = request.form.get('target')
         task = request.form.get('task', 'auto')
+        metric = request.form.get('metric', 'auto')
         mode = request.form.get('mode', 'medium')
         
         # Helper function to parse parameters (empty = use default)
@@ -273,6 +315,38 @@ def start_generation():
         # Prepare data
         X = df.drop(columns=[target])
         y = df[target]
+
+        # Resolve task if not explicitly set so metric validation can be deterministic.
+        if task == 'auto':
+            inferred_task = 'regression' if type_of_target(y) == 'continuous' else 'classification'
+        else:
+            inferred_task = task
+
+        scorer = None
+        if metric and metric != 'auto':
+            if inferred_task == 'regression':
+                scorer = PREDEFINED_REG_SCORERS.get(metric)
+            else:
+                scorer = PREDEFINED_CLS_SCORERS.get(metric)
+
+            if scorer is None and inferred_task == 'classification':
+                # Soft compatibility mapping for binary vs multiclass-specific classification metrics.
+                n_classes = int(y.nunique(dropna=True))
+                if metric == 'binary_crossentropy' and n_classes > 2:
+                    scorer = PREDEFINED_CLS_SCORERS.get('categorical_crossentropy')
+                    print("ℹ️ Switched metric binary_crossentropy -> categorical_crossentropy for multiclass target")
+                elif metric == 'categorical_crossentropy' and n_classes == 2:
+                    scorer = PREDEFINED_CLS_SCORERS.get('binary_crossentropy')
+                    print("ℹ️ Switched metric categorical_crossentropy -> binary_crossentropy for binary target")
+                elif metric == 'binary_roc_auc' and n_classes > 2:
+                    scorer = PREDEFINED_CLS_SCORERS.get('categorical_roc_auc')
+                    print("ℹ️ Switched metric binary_roc_auc -> categorical_roc_auc for multiclass target")
+                elif metric == 'categorical_roc_auc' and n_classes == 2:
+                    scorer = PREDEFINED_CLS_SCORERS.get('binary_roc_auc')
+                    print("ℹ️ Switched metric categorical_roc_auc -> binary_roc_auc for binary target")
+
+            if scorer is None:
+                return jsonify({'error': f'Invalid metric "{metric}" for task "{inferred_task}"'}), 400
         
         # Ensure y remains as pandas Series (don't convert to numpy array)
         if not isinstance(y, pd.Series):
@@ -311,6 +385,8 @@ def start_generation():
                     generator_params['mode'] = mode
                 if task != 'auto':
                     generator_params['task'] = task
+                if scorer is not None:
+                    generator_params['scorer'] = scorer
                 if max_new_feats:
                     generator_params['max_new_feats'] = int(max_new_feats)
                 if time_budget:
@@ -542,7 +618,11 @@ def handle_disconnect():
 
 if __name__ == '__main__':
     print("🚀 Starting Comprehensive TabularAML Feature Generator Server")
-    print("📱 Open http://localhost:5000 in your browser")
+    host = os.environ.get('HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT', '5000'))
+    debug = os.environ.get('DEBUG', 'false').lower() == 'true'
+
+    print(f"📱 Open http://localhost:{port} in your browser")
     print("🎛️ Features:")
     print("   • Train mode: Full parameter control + real progress tracking")
     print("   • Transform mode: Load saved generators + transform new data")
@@ -553,4 +633,4 @@ if __name__ == '__main__':
     os.makedirs("cache", exist_ok=True)
     os.makedirs("cache/logs", exist_ok=True)
     
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+    socketio.run(app, debug=debug, host=host, port=port)

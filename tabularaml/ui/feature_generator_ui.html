@@ -551,6 +551,14 @@
                                     <option value="regression">Regression</option>
                                 </select>
                             </div>
+                            <div class="form-group">
+                                <label for="metric" class="tooltip">Optimization Metric ℹ️
+                                    <span class="tooltiptext">Choose which metric the feature search should optimize. Leave as Auto for defaults.</span>
+                                </label>
+                                <select id="metric">
+                                    <option value="auto">Auto (default)</option>
+                                </select>
+                            </div>
                         </div>
                     </div>
                     
@@ -887,6 +895,7 @@
 
         // Dynamic placeholder updates based on mode (loaded from server)
         let modePresets = {};
+        let metricOptions = { regression: [], classification: [] };
 
         async function loadModePresets() {
             try {
@@ -901,6 +910,67 @@
                 modePresets = {
                     'none': { generations: 15, parents: 40, children: 200, early_stop_child: 0.3, early_stop_iter: 0.4, min_pct_gain: 0.001, cv_folds: 5, time_budget: '' }
                 };
+            }
+        }
+
+        async function loadMetricOptions() {
+            try {
+                const response = await fetch('/get_metric_options');
+                const data = await response.json();
+                metricOptions = data;
+                updateMetricOptions();
+            } catch (error) {
+                console.error('❌ Failed to load metric options:', error);
+                metricOptions = {
+                    regression: [
+                        { value: 'rmse', label: 'RMSE' },
+                        { value: 'mae', label: 'MAE' },
+                        { value: 'mse', label: 'MSE' },
+                        { value: 'r2', label: 'R2' }
+                    ],
+                    classification: [
+                        { value: 'accuracy', label: 'Accuracy' },
+                        { value: 'precision', label: 'Precision' },
+                        { value: 'recall', label: 'Recall' },
+                        { value: 'f1', label: 'F1 Score' },
+                        { value: 'binary_crossentropy', label: 'Binary Cross-Entropy' },
+                        { value: 'categorical_crossentropy', label: 'Categorical Cross-Entropy' },
+                        { value: 'binary_roc_auc', label: 'ROC AUC (Binary)' },
+                        { value: 'categorical_roc_auc', label: 'ROC AUC (Multiclass)' }
+                    ]
+                };
+                updateMetricOptions();
+            }
+        }
+
+        function updateMetricOptions() {
+            const task = document.getElementById('task').value;
+            const metricSelect = document.getElementById('metric');
+
+            metricSelect.innerHTML = '';
+
+            const autoOption = document.createElement('option');
+            autoOption.value = 'auto';
+            autoOption.textContent = 'Auto (default)';
+            metricSelect.appendChild(autoOption);
+
+            const addOptions = (opts, prefix = '') => {
+                opts.forEach((opt) => {
+                    const option = document.createElement('option');
+                    option.value = opt.value;
+                    option.textContent = prefix ? `${prefix}: ${opt.label}` : opt.label;
+                    metricSelect.appendChild(option);
+                });
+            };
+
+            if (task === 'regression') {
+                addOptions(metricOptions.regression || []);
+            } else if (task === 'classification') {
+                addOptions(metricOptions.classification || []);
+            } else {
+                // Auto task: show both sets to let advanced users pick explicitly.
+                addOptions(metricOptions.regression || [], 'Regression');
+                addOptions(metricOptions.classification || [], 'Classification');
             }
         }
 
@@ -921,11 +991,17 @@
         document.addEventListener('DOMContentLoaded', function() {
             // Load presets from server
             loadModePresets();
+            loadMetricOptions();
             
             // Setup mode change handler
             const modeSelect = document.getElementById('mode');
             if (modeSelect) {
                 modeSelect.addEventListener('change', updatePlaceholders);
+            }
+
+            const taskSelect = document.getElementById('task');
+            if (taskSelect) {
+                taskSelect.addEventListener('change', updateMetricOptions);
             }
         });
 
@@ -1147,6 +1223,7 @@
             // Basic parameters
             formData.append('target', document.getElementById('target').value);
             formData.append('task', document.getElementById('task').value);
+            formData.append('metric', document.getElementById('metric').value);
             formData.append('mode', document.getElementById('mode').value);
             formData.append('generations', document.getElementById('generations').value);
             formData.append('parents', document.getElementById('parents').value);
