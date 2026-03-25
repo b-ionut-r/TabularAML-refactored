@@ -1410,23 +1410,51 @@
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        save_path: savePath
+                        save_path: savePath,
+                        download: true
                     })
                 });
                 
-                const result = await response.json();
-                
                 if (!response.ok) {
-                    throw new Error(result.error || 'Failed to save generator');
+                    const contentType = response.headers.get('content-type') || '';
+                    let errorMessage = 'Failed to save generator';
+                    
+                    if (contentType.includes('application/json')) {
+                        const result = await response.json();
+                        errorMessage = result.error || errorMessage;
+                    } else {
+                        const errorText = await response.text();
+                        if (errorText) {
+                            errorMessage = errorText;
+                        }
+                    }
+                    
+                    throw new Error(errorMessage);
                 }
                 
-                console.log('✅ Generator saved successfully');
+                const blob = await response.blob();
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+                const simpleMatch = disposition.match(/filename=\"?([^\";]+)\"?/i);
+                const rawFilename = utf8Match ? utf8Match[1] : (simpleMatch ? simpleMatch[1] : '');
+                const fallbackFilename = savePath.split('/').pop() || 'feature_generator.pkl';
+                const filename = rawFilename ? decodeURIComponent(rawFilename) : fallbackFilename;
+                
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                window.URL.revokeObjectURL(url);
+                
+                console.log('✅ Generator saved and downloaded successfully');
             } catch (error) {
                 console.error('❌ Save error:', error);
                 alert('Error saving generator: ' + error.message);
             }
         }
-
         async function loadGenerator() {
             const fileInput = document.getElementById('generatorFile');
             if (!fileInput.files[0]) {

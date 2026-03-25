@@ -1713,7 +1713,9 @@ class FeatureGenerator:
         if hasattr(self, 'X') and hasattr(self, 'pipeline') and hasattr(self, 'generation'):
             self._sync_state_components(self.X, self.pipeline, self.generation)
         
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        save_dir = os.path.dirname(filepath)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
         with open(filepath, 'wb') as f:
             cloudpickle.dump(self, f)
         self._log(f"State saved to {filepath}")

@@ -669,11 +669,14 @@ def save_generator():
         if not server_state['trained_generator']:
             return jsonify({'error': 'No trained generator available'}), 400
         
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         save_path = data.get('save_path', 'cache/feature_generator.pkl')
+        should_download = bool(data.get('download', False))
         
         # Ensure directory exists
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
         
         # Save the generator using a plain FeatureGenerator snapshot to avoid pickling UI locks
         gen = server_state['trained_generator']
@@ -690,6 +693,14 @@ def save_generator():
             gen.__class__ = orig_cls
         
         queue_socket_event('save_complete', {'path': save_path})
+        if should_download:
+            download_name = os.path.basename(save_path) or 'feature_generator.pkl'
+            return send_file(
+                os.path.abspath(save_path),
+                as_attachment=True,
+                download_name=download_name,
+                mimetype='application/octet-stream'
+            )
         return jsonify({'status': 'Generator saved successfully', 'path': save_path})
         
     except Exception as e:
