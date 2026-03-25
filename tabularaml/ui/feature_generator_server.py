@@ -120,6 +120,14 @@ def get_status_snapshot():
         'recent_logs': list(server_state['recent_logs']),
     }
 
+def _emit_live_socket_event(event_name, payload):
+    sid = server_state.get('last_client_sid')
+    if sid:
+        socketio.emit(event_name, payload, to=sid, namespace='/')
+    else:
+        socketio.emit(event_name, payload, namespace='/')
+    socketio.sleep(0)
+
 def socket_event_pump():
     """Emit UI events from a Socket.IO-managed background task."""
     while True:
@@ -132,13 +140,8 @@ def socket_event_pump():
                 break
 
             try:
-                sid = server_state.get('last_client_sid')
-                if sid:
-                    socketio.emit(event_name, payload, to=sid)
-                else:
-                    socketio.emit(event_name, payload)
+                _emit_live_socket_event(event_name, payload)
                 emitted = True
-                socketio.sleep(0)
             except Exception as e:
                 print(f"Socket event pump failed for {event_name}: {e}")
 
@@ -153,14 +156,9 @@ def socket_event_pump():
                     'total_generations': server_state.get('total_generations', 0)
                 }
                 try:
-                    sid = server_state.get('last_client_sid')
-                    if sid:
-                        socketio.emit('keepalive', keepalive_payload, to=sid)
-                    else:
-                        socketio.emit('keepalive', keepalive_payload)
+                    _emit_live_socket_event('keepalive', keepalive_payload)
                     server_state['last_emit_at'] = now
                     emitted = True
-                    socketio.sleep(0)
                 except Exception as e:
                     print(f"Keepalive emit failed: {e}")
 
@@ -183,11 +181,7 @@ def queue_socket_event(event_name, payload):
     if event_name != 'keepalive':
         server_state['last_emit_at'] = time.time()
     try:
-        sid = server_state.get('last_client_sid')
-        if sid:
-            socketio.emit(event_name, normalized_payload, to=sid)
-        else:
-            socketio.emit(event_name, normalized_payload)
+        _emit_live_socket_event(event_name, normalized_payload)
     except Exception as e:
         print(f"Direct emit failed for {event_name}, queueing fallback: {e}")
         ensure_event_pump()
@@ -636,10 +630,9 @@ def start_generation():
                 server_state['training_started_at'] = None
                 queue_socket_event('error', {'message': str(e)})
         
-        # Start comprehensive generation thread
-        thread = threading.Thread(target=run_comprehensive_generation)
-        thread.daemon = True
-        thread.start()
+        # Run generation inside the Socket.IO async runtime so emits flush correctly.
+        thread = socketio.start_background_task(run_comprehensive_generation)
+        server_state['generator_thread'] = thread
         
         return jsonify({'status': 'Comprehensive generation started with all parameters'})
         
