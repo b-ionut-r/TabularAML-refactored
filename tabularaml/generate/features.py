@@ -1,11 +1,15 @@
+import io
 import os, random, time
+import pickle
+import sys
+import warnings
 from pathlib import Path
 from collections import Counter, defaultdict
 from datetime import datetime
 from itertools import combinations
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Union, List, Optional, Callable, Literal, Dict, Set, Tuple
+from typing import Any, Union, List, Optional, Callable, Literal, Dict, Set, Tuple
 from copy import deepcopy
 import numpy as np
 import pandas as pd
@@ -23,6 +27,53 @@ from tabularaml.preprocessing.imputers import SimpleImputer
 from tabularaml.preprocessing.pipeline import PipelineWrapper
 from tabularaml.configs.feature_gen import PRESET_PARAMS
 from tabularaml.utils import is_gpu_available
+
+_FEATURE_GENERATOR_SAVE_FORMAT = "tabularaml.feature_generator"
+_FEATURE_GENERATOR_SAVE_VERSION = 2
+_FEATURE_GENERATOR_PICKLE_PROTOCOL = 4
+_PICKLE_MODULE_ALIASES = {
+    "numpy._core": "numpy.core",
+    "numpy.core": "numpy._core",
+}
+
+
+def _iter_compatible_module_names(module_name: str):
+    """Yield module name candidates for cross-version pickle compatibility."""
+    yield module_name
+    for source_prefix, target_prefix in _PICKLE_MODULE_ALIASES.items():
+        if module_name == source_prefix or module_name.startswith(f"{source_prefix}."):
+            yield f"{target_prefix}{module_name[len(source_prefix):]}"
+
+
+class _CompatibleUnpickler(pickle.Unpickler):
+    """Unpickler that remaps known module paths that changed across versions."""
+
+    def find_class(self, module, name):
+        last_exc = None
+        tried = set()
+
+        for candidate in _iter_compatible_module_names(module):
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+            try:
+                return super().find_class(candidate, name)
+            except (ModuleNotFoundError, ImportError, AttributeError) as exc:
+                last_exc = exc
+
+        if last_exc is not None:
+            raise last_exc
+        return super().find_class(module, name)
+
+
+def _compatible_pickle_load(file_obj):
+    """Load pickle bytes using compatibility module remapping."""
+    return _CompatibleUnpickler(file_obj).load()
+
+
+def _compatible_pickle_loads(payload: bytes):
+    """Load pickled bytes using compatibility module remapping."""
+    return _compatible_pickle_load(io.BytesIO(payload))
 
 class Feature:
     """Feature with name, dtype, weight, depth, and pipeline requirements."""
@@ -1700,14 +1751,57 @@ class FeatureGenerator:
     def fit_transform(self, X, y=None):
         """Fit and transform in one step."""
         return self.fit(X, y).transform(X)
+
+    def _build_save_metadata(self, serializer: str) -> Dict[str, Optional[str]]:
+        """Capture the runtime that produced the save file for troubleshooting."""
+        return {
+            "python_version": sys.version.split()[0],
+            "numpy_version": getattr(np, "__version__", None),
+            "pandas_version": getattr(pd, "__version__", None),
+            "serializer": serializer,
+            "pickle_protocol": str(_FEATURE_GENERATOR_PICKLE_PROTOCOL),
+        }
+
+    def _get_serializable_state(self) -> Dict[str, Any]:
+        """Return instance state without forcing class-level code serialization."""
+        return dict(self.__dict__)
+
+    @classmethod
+    def _from_serialized_state(cls, state: Dict[str, Any]) -> "FeatureGenerator":
+        """Rebuild an instance from a serialized state dict."""
+        instance = cls.__new__(cls)
+        instance.__dict__.update(state)
+        instance._ensure_backwards_compat()
+        return instance
+
+    @classmethod
+    def _warn_for_runtime_mismatch(cls, metadata: Optional[Dict[str, str]]) -> None:
+        """Warn when loading across different runtimes that may affect pickle compatibility."""
+        if not metadata:
+            return
+
+        current_versions = {
+            "python_version": sys.version.split()[0],
+            "numpy_version": getattr(np, "__version__", None),
+            "pandas_version": getattr(pd, "__version__", None),
+        }
+
+        mismatches = []
+        for key, current_value in current_versions.items():
+            saved_value = metadata.get(key)
+            if saved_value and current_value and saved_value != current_value:
+                mismatches.append(f"{key} saved={saved_value}, current={current_value}")
+
+        if mismatches:
+            warnings.warn(
+                "Loading a FeatureGenerator saved in a different runtime: "
+                + "; ".join(mismatches),
+                RuntimeWarning,
+            )
     
     def save(self, filepath):
-        """Save current state using cloudpickle."""
+        """Save current state using a versioned, more portable state envelope."""
         import os
-        try:
-            import cloudpickle
-        except ImportError:
-            raise ImportError("cloudpickle required. Install with: pip install cloudpickle")
         
         # Ensure current state is consistent before saving
         if hasattr(self, 'X') and hasattr(self, 'pipeline') and hasattr(self, 'generation'):
@@ -1716,28 +1810,65 @@ class FeatureGenerator:
         save_dir = os.path.dirname(filepath)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
+
+        state = self._get_serializable_state()
+        serializer = "pickle"
+
+        try:
+            state_bytes = pickle.dumps(state, protocol=_FEATURE_GENERATOR_PICKLE_PROTOCOL)
+        except Exception:
+            # Fall back to cloudpickle when users pass custom objects that stdlib pickle cannot handle.
+            try:
+                import cloudpickle
+            except ImportError:
+                raise ImportError("cloudpickle required for this generator state. Install with: pip install cloudpickle")
+            serializer = "cloudpickle"
+            state_bytes = cloudpickle.dumps(state, protocol=_FEATURE_GENERATOR_PICKLE_PROTOCOL)
+
+        payload = {
+            "format": _FEATURE_GENERATOR_SAVE_FORMAT,
+            "format_version": _FEATURE_GENERATOR_SAVE_VERSION,
+            "class_name": self.__class__.__name__,
+            "metadata": self._build_save_metadata(serializer),
+            "state": state_bytes,
+        }
+
         with open(filepath, 'wb') as f:
-            cloudpickle.dump(self, f)
+            pickle.dump(payload, f, protocol=_FEATURE_GENERATOR_PICKLE_PROTOCOL)
         self._log(f"State saved to {filepath}")
     
     @classmethod
     def load(cls, filepath):
-        """Load state from file using cloudpickle."""
+        """Load state from file, supporting both new portable saves and legacy pickles."""
         import os
-        try:
-            import cloudpickle
-        except ImportError:
-            raise ImportError("cloudpickle required. Install with: pip install cloudpickle")
 
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File {filepath} not found.")
 
         try:
             with open(filepath, 'rb') as f:
-                instance = cloudpickle.load(f)
-            # Ensure backwards compatibility with older saved files
-            instance._ensure_backwards_compat()
-            return instance
+                loaded_obj = _compatible_pickle_load(f)
+
+            if isinstance(loaded_obj, dict) and loaded_obj.get("format") == _FEATURE_GENERATOR_SAVE_FORMAT:
+                metadata = loaded_obj.get("metadata", {})
+                state_payload = loaded_obj.get("state")
+
+                if not isinstance(state_payload, (bytes, bytearray)):
+                    raise ValueError("Invalid serialized state payload.")
+
+                state = _compatible_pickle_loads(state_payload)
+                instance = cls._from_serialized_state(state)
+                cls._warn_for_runtime_mismatch(metadata)
+                return instance
+
+            if isinstance(loaded_obj, cls):
+                loaded_obj._ensure_backwards_compat()
+                return loaded_obj
+
+            if isinstance(loaded_obj, dict):
+                return cls._from_serialized_state(loaded_obj)
+
+            raise TypeError(f"Unsupported save format: {type(loaded_obj).__name__}")
         except Exception as e:
             raise ValueError(f"Failed to load: {str(e)}")
 
