@@ -62,6 +62,7 @@ server_state = {
     'last_error': None,
     'recent_logs': deque(maxlen=RECENT_LOG_LIMIT),
     'last_emit_at': None,
+    'last_client_sid': None,
     'event_pump_started': False,
     'event_queue': queue.Queue(),
 }
@@ -130,23 +131,38 @@ def socket_event_pump():
             except queue.Empty:
                 break
 
-            socketio.emit(event_name, payload)
-            emitted = True
-            socketio.sleep(0)
+            try:
+                sid = server_state.get('last_client_sid')
+                if sid:
+                    socketio.emit(event_name, payload, to=sid)
+                else:
+                    socketio.emit(event_name, payload)
+                emitted = True
+                socketio.sleep(0)
+            except Exception as e:
+                print(f"Socket event pump failed for {event_name}: {e}")
 
         if server_state['is_training']:
             now = time.time()
             last_emit_at = server_state.get('last_emit_at') or now
             if now - last_emit_at >= KEEPALIVE_INTERVAL_SECONDS:
                 started_at = server_state.get('training_started_at') or now
-                socketio.emit('keepalive', {
+                keepalive_payload = {
                     'elapsed_seconds': int(max(0, now - started_at)),
                     'current_generation': server_state.get('current_generation', 0),
                     'total_generations': server_state.get('total_generations', 0)
-                })
-                server_state['last_emit_at'] = now
-                emitted = True
-                socketio.sleep(0)
+                }
+                try:
+                    sid = server_state.get('last_client_sid')
+                    if sid:
+                        socketio.emit('keepalive', keepalive_payload, to=sid)
+                    else:
+                        socketio.emit('keepalive', keepalive_payload)
+                    server_state['last_emit_at'] = now
+                    emitted = True
+                    socketio.sleep(0)
+                except Exception as e:
+                    print(f"Keepalive emit failed: {e}")
 
         socketio.sleep(0.25 if emitted else 1.0)
 
@@ -162,12 +178,20 @@ def ensure_event_pump():
         server_state['event_pump_started'] = True
 
 def queue_socket_event(event_name, payload):
-    ensure_event_pump()
     normalized_payload = dict(payload)
     _update_status_snapshot(event_name, normalized_payload)
     if event_name != 'keepalive':
         server_state['last_emit_at'] = time.time()
-    server_state['event_queue'].put((event_name, normalized_payload))
+    try:
+        sid = server_state.get('last_client_sid')
+        if sid:
+            socketio.emit(event_name, normalized_payload, to=sid)
+        else:
+            socketio.emit(event_name, normalized_payload)
+    except Exception as e:
+        print(f"Direct emit failed for {event_name}, queueing fallback: {e}")
+        ensure_event_pump()
+        server_state['event_queue'].put((event_name, normalized_payload))
 
 class ComprehensiveFeatureGenerator(FeatureGenerator):
     """Enhanced FeatureGenerator with comprehensive progress tracking"""
@@ -274,6 +298,8 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
                 'total': len(batch),
                 'selected': selected_count
             })
+            if force_complete or evaluated_count <= 3 or evaluated_count % 10 == 0:
+                print(f"📶 Child progress emitted: {evaluated_count}/{len(batch)} selected={selected_count}")
             
             # Call original callback if provided
             if callback:
@@ -756,11 +782,14 @@ def transform_data():
 @socketio.on('connect')
 def handle_connect():
     ensure_event_pump()
+    server_state['last_client_sid'] = request.sid
     print('🔌 Client connected for comprehensive feature generation')
     emit('status_snapshot', get_status_snapshot())
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    if server_state.get('last_client_sid') == request.sid:
+        server_state['last_client_sid'] = None
     print('🔌 Client disconnected')
 
 if __name__ == '__main__':
