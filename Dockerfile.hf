@@ -18,4 +18,4 @@ COPY . /app
 
 EXPOSE 7860
 
-CMD ["sh", "-c", "gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 -b 0.0.0.0:${PORT:-7860} tabularaml.ui.feature_generator_server:app"]
+CMD ["sh", "-c", "gunicorn -k geventwebsocket.gunicorn.workers.GeventWebSocketWorker -w 1 --timeout ${GUNICORN_TIMEOUT:-0} --graceful-timeout ${GUNICORN_GRACEFUL_TIMEOUT:-120} --keep-alive ${GUNICORN_KEEPALIVE:-75} -b 0.0.0.0:${PORT:-7860} tabularaml.ui.feature_generator_server:app"]
