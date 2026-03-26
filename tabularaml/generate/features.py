@@ -1811,19 +1811,49 @@ class FeatureGenerator:
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
 
-        state = self._get_serializable_state()
-        serializer = "pickle"
+        removed_X = getattr(self, "X", None) if hasattr(self, "X") else None
+        removed_y = getattr(self, "y", None) if hasattr(self, "y") else None
+        removed_best_X = None
+        removed_best_y = None
+        had_X = hasattr(self, "X")
+        had_y = hasattr(self, "y")
+        had_best_X = hasattr(self, "state") and "best" in self.state and "X" in self.state["best"]
+        had_best_y = hasattr(self, "state") and "best" in self.state and "y" in self.state["best"]
+
+        if had_X:
+            del self.X
+        if had_y:
+            del self.y
+        if had_best_X:
+            removed_best_X = self.state["best"]["X"]
+            del self.state["best"]["X"]
+        if had_best_y:
+            removed_best_y = self.state["best"]["y"]
+            del self.state["best"]["y"]
 
         try:
-            state_bytes = pickle.dumps(state, protocol=_FEATURE_GENERATOR_PICKLE_PROTOCOL)
-        except Exception:
-            # Fall back to cloudpickle when users pass custom objects that stdlib pickle cannot handle.
+            state = self._get_serializable_state()
+            serializer = "pickle"
+
             try:
-                import cloudpickle
-            except ImportError:
-                raise ImportError("cloudpickle required for this generator state. Install with: pip install cloudpickle")
-            serializer = "cloudpickle"
-            state_bytes = cloudpickle.dumps(state, protocol=_FEATURE_GENERATOR_PICKLE_PROTOCOL)
+                state_bytes = pickle.dumps(state, protocol=_FEATURE_GENERATOR_PICKLE_PROTOCOL)
+            except Exception:
+                # Fall back to cloudpickle when users pass custom objects that stdlib pickle cannot handle.
+                try:
+                    import cloudpickle
+                except ImportError:
+                    raise ImportError("cloudpickle required for this generator state. Install with: pip install cloudpickle")
+                serializer = "cloudpickle"
+                state_bytes = cloudpickle.dumps(state, protocol=_FEATURE_GENERATOR_PICKLE_PROTOCOL)
+        finally:
+            if had_X:
+                self.X = removed_X
+            if had_y:
+                self.y = removed_y
+            if had_best_X:
+                self.state["best"]["X"] = removed_best_X
+            if had_best_y:
+                self.state["best"]["y"] = removed_best_y
 
         payload = {
             "format": _FEATURE_GENERATOR_SAVE_FORMAT,
@@ -1896,6 +1926,8 @@ class FeatureGenerator:
 
         # Ensure state dict has interactions in best (for future reverts)
         if hasattr(self, 'state') and 'best' in self.state:
+            if 'X' not in self.state['best']:
+                self.state['best']['X'] = None
             if 'interactions' not in self.state['best']:
                 self.state['best']['interactions'] = deepcopy(self.interactions)
             if 'pruned_features' not in self.state['best']:

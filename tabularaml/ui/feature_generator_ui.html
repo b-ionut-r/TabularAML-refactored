@@ -901,6 +901,10 @@
                 setLogContent(snapshot.recent_logs);
             }
 
+            if (Array.isArray(snapshot.generated_features)) {
+                renderGeneratedFeatures(snapshot.generated_features);
+            }
+
             if (typeof snapshot.current_generation === 'number' || typeof snapshot.total_generations === 'number') {
                 updateGenerationProgress(snapshot.current_generation || 0, snapshot.total_generations || 0);
             }
@@ -1125,6 +1129,11 @@
             updateFeatureCount(data.count);
         });
         
+        socket.on('generated_features_update', function(data) {
+            console.log('Generated features:', data.features);
+            renderGeneratedFeatures(data.features || []);
+        });
+
         socket.on('score_update', function(data) {
             console.log('📈 Score update:', data.score);
             updateBestScore(data.score);
@@ -1222,6 +1231,27 @@
             }
         }
 
+        function renderGeneratedFeatures(features = []) {
+            generationState.features = Array.isArray(features) ? features : [];
+            const featureGrid = document.getElementById('featureGrid');
+            featureGrid.innerHTML = '';
+
+            if (!generationState.features.length) {
+                const emptyItem = document.createElement('div');
+                emptyItem.className = 'feature-item';
+                emptyItem.textContent = 'No generated features yet.';
+                featureGrid.appendChild(emptyItem);
+                return;
+            }
+
+            generationState.features.forEach(function(featureName) {
+                const featureItem = document.createElement('div');
+                featureItem.className = 'feature-item new';
+                featureItem.textContent = featureName;
+                featureGrid.appendChild(featureItem);
+            });
+        }
+
         function addLogMessage(message) {
             const timestamp = new Date().toLocaleTimeString();
             const logEntry = `[${timestamp}] ${message}`;
@@ -1282,7 +1312,7 @@
             document.querySelector('.btn-primary').disabled = false;
             document.getElementById('saveBtn').disabled = true;
             document.getElementById('logContent').textContent = '[INFO] Ready for comprehensive feature generation...\n';
-            document.getElementById('featureGrid').innerHTML = '';
+            renderGeneratedFeatures([]);
             
             updateGenerationProgress(0, 15);
             updateChildProgress(0, 0, 0);
@@ -1291,6 +1321,8 @@
             updateStagnationLevel('NONE');
             updateStrategy('normal');
         }
+
+        renderGeneratedFeatures([]);
 
         // Generation functions
         async function startGeneration() {

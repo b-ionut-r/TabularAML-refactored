@@ -9,6 +9,7 @@ import time
 import threading
 import pickle
 import queue
+import ast
 from collections import deque
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify, send_file
@@ -65,6 +66,7 @@ server_state = {
     'last_client_sid': None,
     'event_pump_started': False,
     'event_queue': queue.Queue(),
+    'generated_features': [],
 }
 
 def _update_status_snapshot(event_name, payload):
@@ -92,6 +94,8 @@ def _update_status_snapshot(event_name, payload):
     elif event_name == 'generation_complete':
         server_state['latest_results'] = payload.get('results')
         server_state['is_training'] = False
+    elif event_name == 'generated_features_update':
+        server_state['generated_features'] = payload.get('features', server_state['generated_features'])
     elif event_name == 'error':
         server_state['last_error'] = payload.get('message')
         server_state['is_training'] = False
@@ -118,6 +122,7 @@ def get_status_snapshot():
         'last_error': server_state['last_error'],
         'has_trained_generator': server_state['trained_generator'] is not None,
         'recent_logs': list(server_state['recent_logs']),
+        'generated_features': list(server_state['generated_features']),
     }
 
 def _emit_live_socket_event(event_name, payload):
@@ -280,6 +285,38 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
             print("🎯 Strategy: Beam Search")
         elif message.startswith("Gen ") and "Added" in message:
             queue_socket_event('strategy_update', {'strategy': 'normal'})
+
+        stripped_message = message.strip()
+        feature_prefixes = (
+            "Simple:",
+            "Target encoded:",
+            "Count encoded:",
+            "Freq encoded:",
+            "New simple:",
+            "New target:",
+            "New count:",
+            "New freq:",
+        )
+        for prefix in feature_prefixes:
+            if stripped_message.startswith(prefix):
+                try:
+                    parsed = ast.literal_eval(stripped_message.split(":", 1)[1].strip())
+                    if isinstance(parsed, str):
+                        parsed = [parsed]
+                    elif isinstance(parsed, set):
+                        parsed = sorted(parsed)
+                    elif not isinstance(parsed, (list, tuple)):
+                        parsed = []
+
+                    generated_features = list(server_state.get('generated_features', []))
+                    for feature_name in parsed:
+                        if isinstance(feature_name, str) and feature_name not in generated_features:
+                            generated_features.append(feature_name)
+
+                    queue_socket_event('generated_features_update', {'features': generated_features})
+                except Exception as e:
+                    print(f"Error parsing generated features: {e}")
+                break
     
     def _select_elites(self, batch, n, X, y, callback=None):
         """Override to capture child evaluation progress"""
@@ -522,6 +559,7 @@ def start_generation():
         server_state['last_error'] = None
         server_state['recent_logs'].clear()
         server_state['last_emit_at'] = time.time()
+        server_state['generated_features'] = []
         
         # Start comprehensive generation in background thread
         def run_comprehensive_generation():
