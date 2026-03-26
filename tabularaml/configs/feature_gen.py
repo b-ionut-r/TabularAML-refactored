@@ -45,9 +45,9 @@ PRESET_PARAMS = {
         "n_children": 360,
         "early_stopping_child_eval": 80, 
         "early_stopping_iter": 12,
-        "min_pct_gain": 0.001, 
+        "min_pct_gain": 0.0010, 
         "max_gen_new_feats_pct": 3.0,
-        "time_budget": 240 * 60, # 4 hours
+        "time_budget": 60 * 60 * 4, # 4 hours
         "cv": 5,
         "ranking_method": "multi_criteria"
     }
