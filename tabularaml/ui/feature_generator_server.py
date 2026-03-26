@@ -391,6 +391,7 @@ def get_metric_options():
         # Human-friendly labels for the UI while keeping scorer keys stable.
         reg_labels = {
             'rmse': 'RMSE (Root Mean Squared Error)',
+            'rmsle': 'RMSLE (Root Mean Squared Logarithmic Error)',
             'mae': 'MAE (Mean Absolute Error)',
             'mse': 'MSE (Mean Squared Error)',
             'r2': 'R2 (Coefficient of Determination)'

@@ -54,6 +54,24 @@ def root_mean_squared_error(y_true, y_pred):
     return np.sqrt(mean_squared_error(y_true, y_pred))
 
 
+def root_mean_squared_log_error(y_true, y_pred):
+    """
+    Calculate the Root Mean Squared Logarithmic Error (RMSLE).
+
+    RMSLE is defined for non-negative targets. Negative predictions are clipped
+    to zero before applying log1p so the metric remains usable for regressors
+    that can produce small negative values.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    if np.any(y_true < 0):
+        raise ValueError("RMSLE is undefined for negative target values.")
+
+    y_pred = np.maximum(y_pred, 0.0)
+    return np.sqrt(np.mean(np.square(np.log1p(y_pred) - np.log1p(y_true))))
+
+
 def r2_score(y_true, y_pred):
     """
     Calculate the R-squared (coefficient of determination) regression score.
@@ -106,6 +124,7 @@ def regression_score(y_true, y_pred):
         - "mae": Mean Absolute Error
         - "mse": Mean Squared Error
         - "rmse": Root Mean Squared Error
+        - "rmsle": Root Mean Squared Logarithmic Error
         - "r2": R-squared Score
     """
     # Convert to numpy arrays once
@@ -119,5 +138,6 @@ def regression_score(y_true, y_pred):
         "mae": mean_absolute_error(y_true, y_pred),
         "mse": mse,
         "rmse": np.sqrt(mse),
+        "rmsle": root_mean_squared_log_error(y_true, y_pred),
         "r2": r2_score(y_true, y_pred)
     }

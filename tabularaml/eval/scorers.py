@@ -14,7 +14,13 @@ to work with any of the supported gradient boosting frameworks' early stopping i
 
 import numpy as np
 import pandas as pd
-from .metrics.regression import root_mean_squared_error, mean_absolute_error, mean_squared_error, r2_score
+from .metrics.regression import (
+    root_mean_squared_error,
+    root_mean_squared_log_error,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
 from .metrics.classification import accuracy_score, precision_score, recall_score, f1_score, log_loss, multi_log_loss
 from sklearn.metrics import roc_auc_score
 from typing import Optional, Dict, Union, List
@@ -311,6 +317,11 @@ rmse = Scorer(name = "rmse",
               greater_is_better = False,
               extra_params = {},
               type = None)  # Set type when using with specific model
+rmsle = Scorer(name = "rmsle",
+               scorer = root_mean_squared_log_error,
+               greater_is_better = False,
+               extra_params = {},
+               type = None)  # Set type when using with specific model
 mae = Scorer(name = "mae",
              scorer = mean_absolute_error,
              greater_is_better = False,
@@ -328,6 +339,7 @@ r2 = Scorer(name = "r2",
             type = None)  # Set type when using with specific model
 PREDEFINED_REG_SCORERS = {
     "rmse": rmse,
+    "rmsle": rmsle,
     "mae": mae,
     "mse": mse,
     "r2": r2
