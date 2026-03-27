@@ -108,7 +108,7 @@
         
         .control-group {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 20px;
             margin-bottom: 20px;
         }
@@ -151,14 +151,20 @@
         .checkbox-group {
             display: flex;
             align-items: center;
+            gap: 12px;
             margin-top: 5px;
         }
-        
+
+        .checkbox-group label {
+            margin-bottom: 0;
+        }
+
         .action-buttons {
             display: flex;
             gap: 15px;
-            margin-top: 20px;
+            margin-top: 28px;
             flex-wrap: wrap;
+            align-items: center;
         }
         
         .btn {
@@ -184,10 +190,20 @@
             background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
             color: white;
         }
-        
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ff6a88 0%, #ff3d54 100%);
+            color: white;
+        }
+
         .btn-info {
             background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
             color: white;
+        }
+
+        .action-buttons .btn {
+            min-width: 220px;
+            justify-content: center;
         }
         
         .btn:hover {
@@ -201,6 +217,60 @@
             transform: none;
         }
         
+        .advanced-panel {
+            background: rgba(255,255,255,0.35);
+            border: 1px solid rgba(255,255,255,0.5);
+            border-radius: 18px;
+            padding: 24px;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
+        }
+
+        .advanced-grid {
+            display: grid;
+            grid-template-columns: repeat(12, minmax(0, 1fr));
+            gap: 18px 20px;
+        }
+
+        .advanced-grid + .advanced-grid,
+        .advanced-grid + .advanced-toggles,
+        .advanced-toggles + .action-buttons {
+            margin-top: 18px;
+        }
+
+        .advanced-grid .form-group {
+            grid-column: span 3;
+            min-width: 0;
+        }
+
+        .advanced-grid.secondary .form-group {
+            grid-column: span 4;
+        }
+
+        .advanced-grid .form-group.span-8 {
+            grid-column: span 8;
+        }
+
+        .advanced-toggles {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+        }
+
+        .toggle-card {
+            background: rgba(255,255,255,0.72);
+            border: 1px solid rgba(255,255,255,0.65);
+            border-radius: 14px;
+            padding: 14px 16px;
+            min-height: 64px;
+            display: flex;
+            align-items: center;
+        }
+
+        .toggle-card .checkbox-group {
+            width: 100%;
+            margin-top: 0;
+        }
+
         .progress-section {
             padding: 30px;
             display: none;
@@ -305,19 +375,55 @@
         }
         
         .log-section {
-            background: #1e1e1e;
-            border-radius: 10px;
-            padding: 20px;
-            max-height: 400px;
+            background: #1b1f26;
+            border-radius: 16px;
+            padding: 18px;
+            max-height: 420px;
             overflow-y: auto;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
         }
-        
+
         .log-content {
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            color: #00ff00;
-            line-height: 1.4;
-            white-space: pre-wrap;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+            font-size: 13px;
+            color: #e7f7ec;
+            line-height: 1.55;
+            white-space: normal;
+        }
+
+        .log-line {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 6px;
+        }
+
+        .log-line.with-timestamp {
+            grid-template-columns: auto 1fr;
+            align-items: start;
+            gap: 12px;
+        }
+
+        .log-timestamp {
+            color: #65f2a5;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+
+        .log-message {
+            color: #e7f7ec;
+            word-break: break-word;
+        }
+
+        .log-line.is-error .log-timestamp,
+        .log-line.is-error .log-message {
+            color: #ff9b9b;
+        }
+
+        .log-line.is-status .log-message {
+            color: #9fd2ff;
         }
         
         .feature-list {
@@ -507,6 +613,63 @@
             visibility: visible;
             opacity: 1;
         }
+
+        @media (max-width: 1200px) {
+            .advanced-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+
+            .advanced-grid .form-group,
+            .advanced-grid.secondary .form-group,
+            .advanced-grid .form-group.span-8 {
+                grid-column: span 1;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 16px;
+            }
+
+            .controls,
+            .progress-section,
+            .results-section {
+                padding: 22px;
+            }
+
+            .mode-selector {
+                flex-direction: column;
+            }
+
+            .mode-btn,
+            .action-buttons .btn {
+                width: 100%;
+            }
+
+            .advanced-panel {
+                padding: 18px;
+            }
+
+            .advanced-grid,
+            .control-group,
+            .control-group.wide,
+            .status-cards,
+            .results-grid,
+            .feature-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .advanced-grid .form-group,
+            .advanced-grid.secondary .form-group,
+            .advanced-grid .form-group.span-8 {
+                grid-column: auto;
+            }
+
+            .log-line.with-timestamp {
+                grid-template-columns: 1fr;
+                gap: 4px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -602,83 +765,85 @@
                     <!-- Advanced Parameters -->
                     <div class="control-section">
                         <div class="section-title">⚙️ Advanced Parameters</div>
-                        <div class="control-group">
-                            <div class="form-group">
-                                <label for="min_pct_gain" class="tooltip">Min Percentage Gain ℹ️
-                                    <span class="tooltiptext">Minimum improvement required to keep a feature</span>
-                                </label>
-                                <input type="number" id="min_pct_gain" placeholder="0.001" min="0.0001" max="0.1" step="0.0001" />
-                            </div>
-                            <div class="form-group">
-                                <label for="early_stop_iter" class="tooltip">Early Stop Iterations ℹ️
-                                    <span class="tooltiptext">Early stopping as fraction of total generations (e.g. 0.4 = 40% of generations)</span>
-                                </label>
-                                <input type="number" id="early_stop_iter" placeholder="0.4" min="0.1" max="1" step="0.1" />
-                            </div>
-                            <div class="form-group">
-                                <label for="early_stop_child" class="tooltip">Early Stop Child Eval ℹ️
-                                    <span class="tooltiptext">Fraction of candidates to evaluate before early stopping</span>
-                                </label>
-                                <input type="number" id="early_stop_child" placeholder="0.3" min="0.01" max="1" step="0.01" />
-                            </div>
-                            <div class="form-group">
-                                <label for="max_new_feats" class="tooltip">Max New Features ℹ️
-                                    <span class="tooltiptext">Maximum number of new features to generate (leave empty for unlimited)</span>
-                                </label>
-                                <input type="number" id="max_new_feats" placeholder="Unlimited" min="1" max="1000" />
-                            </div>
-                        </div>
-                        <div class="control-group">
-                            <div class="form-group">
-                                <label for="ranking_method" class="tooltip">Ranking Method ℹ️
-                                    <span class="tooltiptext">Method for ranking feature importance</span>
-                                </label>
-                                <select id="ranking_method">
-                                    <option value="multi_criteria">Multi-Criteria</option>
-                                    <option value="shap">SHAP</option>
-                                    <option value="none">None</option>
-                                </select>
-                            </div>
-                            <div class="form-group">
-                                <label for="cv_folds" class="tooltip">CV Folds ℹ️
-                                    <span class="tooltiptext">Number of cross-validation folds</span>
-                                </label>
-                                <input type="number" id="cv_folds" placeholder="5" min="2" max="20" />
-                            </div>
-                            <div class="form-group">
-                                <label for="time_budget" class="tooltip">Time Budget (minutes) ℹ️
-                                    <span class="tooltiptext">Maximum time to run (leave empty for no limit)</span>
-                                </label>
-                                <input type="number" id="time_budget" placeholder="No limit" min="1" max="1440" />
-                            </div>
-                            <div class="form-group">
-                                <label for="save_path" class="tooltip">Save Path ℹ️
-                                    <span class="tooltiptext">Where to save the trained generator (optional)</span>
-                                </label>
-                                <input type="text" id="save_path" placeholder="cache/feature_generator.pkl" />
-                            </div>
-                            <div class="form-group">
-                                <label for="search_sample_size" class="tooltip">Search Sample Size ℹ️
-                                    <span class="tooltiptext">Number of rows to sample for search (for faster evaluation on large datasets). Leave empty for full dataset.</span>
-                                </label>
-                                <input type="number" id="search_sample_size" placeholder="Use full dataset" min="100" max="1000000" />
-                            </div>
-                        </div>
-                        <div class="control-group">
-                            <div class="form-group">
-                                <div class="checkbox-group">
-                                    <input type="checkbox" id="use_gpu" checked />
-                                    <label for="use_gpu" class="tooltip">Use GPU ℹ️
-                                        <span class="tooltiptext">Enable GPU acceleration if available</span>
+                        <div class="advanced-panel">
+                            <div class="advanced-grid">
+                                <div class="form-group">
+                                    <label for="min_pct_gain" class="tooltip">Min Percentage Gain ℹ️
+                                        <span class="tooltiptext">Minimum improvement required to keep a feature</span>
                                     </label>
+                                    <input type="number" id="min_pct_gain" placeholder="0.001" min="0.0001" max="0.1" step="0.0001" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="early_stop_iter" class="tooltip">Early Stop Iterations ℹ️
+                                        <span class="tooltiptext">Early stopping as fraction of total generations (e.g. 0.4 = 40% of generations)</span>
+                                    </label>
+                                    <input type="number" id="early_stop_iter" placeholder="0.4" min="0.1" max="1" step="0.1" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="early_stop_child" class="tooltip">Early Stop Child Eval ℹ️
+                                        <span class="tooltiptext">Fraction of candidates to evaluate before early stopping</span>
+                                    </label>
+                                    <input type="number" id="early_stop_child" placeholder="0.3" min="0.01" max="1" step="0.01" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="max_new_feats" class="tooltip">Max New Features ℹ️
+                                        <span class="tooltiptext">Maximum number of new features to generate (leave empty for unlimited)</span>
+                                    </label>
+                                    <input type="number" id="max_new_feats" placeholder="Unlimited" min="1" max="1000" />
                                 </div>
                             </div>
-                            <div class="form-group">
-                                <div class="checkbox-group">
-                                    <input type="checkbox" id="adaptive" checked />
-                                    <label for="adaptive" class="tooltip">Adaptive Mode ℹ️
-                                        <span class="tooltiptext">Enable adaptive parameter adjustment</span>
+                            <div class="advanced-grid secondary">
+                                <div class="form-group">
+                                    <label for="ranking_method" class="tooltip">Ranking Method ℹ️
+                                        <span class="tooltiptext">Method for ranking feature importance</span>
                                     </label>
+                                    <select id="ranking_method">
+                                        <option value="multi_criteria">Multi-Criteria</option>
+                                        <option value="shap">SHAP</option>
+                                        <option value="none">None</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="cv_folds" class="tooltip">CV Folds ℹ️
+                                        <span class="tooltiptext">Number of cross-validation folds</span>
+                                    </label>
+                                    <input type="number" id="cv_folds" placeholder="5" min="2" max="20" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="time_budget" class="tooltip">Time Budget (minutes) ℹ️
+                                        <span class="tooltiptext">Maximum time to run (leave empty for no limit)</span>
+                                    </label>
+                                    <input type="number" id="time_budget" placeholder="No limit" min="1" max="1440" />
+                                </div>
+                                <div class="form-group span-8">
+                                    <label for="save_path" class="tooltip">Save Path ℹ️
+                                        <span class="tooltiptext">Where to save the trained generator (optional)</span>
+                                    </label>
+                                    <input type="text" id="save_path" placeholder="cache/feature_generator.pkl" />
+                                </div>
+                                <div class="form-group">
+                                    <label for="search_sample_size" class="tooltip">Search Sample Size ℹ️
+                                        <span class="tooltiptext">Number of rows to sample for search (for faster evaluation on large datasets). Leave empty for full dataset.</span>
+                                    </label>
+                                    <input type="number" id="search_sample_size" placeholder="Use full dataset" min="100" max="1000000" />
+                                </div>
+                            </div>
+                            <div class="advanced-toggles">
+                                <div class="toggle-card">
+                                    <div class="checkbox-group">
+                                        <input type="checkbox" id="use_gpu" checked />
+                                        <label for="use_gpu" class="tooltip">Use GPU ℹ️
+                                            <span class="tooltiptext">Enable GPU acceleration if available</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="toggle-card">
+                                    <div class="checkbox-group">
+                                        <input type="checkbox" id="adaptive" checked />
+                                        <label for="adaptive" class="tooltip">Adaptive Mode ℹ️
+                                            <span class="tooltiptext">Enable adaptive parameter adjustment</span>
+                                        </label>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -739,9 +904,7 @@
                     </div>
                     
                     <div class="log-section scrollbar-custom">
-                        <div class="log-content" id="logContent">
-                            [INFO] Feature generation initialized...\n
-                        </div>
+                        <div class="log-content" id="logContent" aria-live="polite"></div>
                     </div>
                     
                     <div class="feature-list">
@@ -896,10 +1059,101 @@
             stagnationLevel: 'NONE'
         };
 
-        function setLogContent(messages = []) {
+        const MAX_CLIENT_LOG_LINES = 400;
+        const LOG_TIMESTAMP_PATTERN = /^\[(\d{2}:\d{2}:\d{2})\]\s*(.*)$/;
+
+        function getLogElements() {
             const logContent = document.getElementById('logContent');
-            logContent.textContent = messages.length ? messages.join('\n') + '\n' : '';
-            logContent.scrollTop = logContent.scrollHeight;
+            return {
+                logContent,
+                logSection: logContent ? logContent.closest('.log-section') : null,
+            };
+        }
+
+        function formatLogTimestamp() {
+            return new Date().toLocaleTimeString('en-GB', {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                hour12: false,
+            });
+        }
+
+        function normalizeLogEntries(messages = []) {
+            const entries = Array.isArray(messages) ? messages : [messages];
+            return entries.flatMap(function(message) {
+                if (message === null || message === undefined) {
+                    return [];
+                }
+
+                return String(message)
+                    .replace(/\[(\d{2}:\d{2}:\d{2})\]\s*\n\s*/g, '[$1] ')
+                    .replace(/\r\n/g, '\n')
+                    .replace(/\r/g, '\n')
+                    .split('\n')
+                    .map(function(line) {
+                        return line.replace(/^\s+/, '').trimEnd();
+                    })
+                    .filter(function(line) {
+                        return line.length > 0;
+                    });
+            });
+        }
+
+        function buildLogLine(entry) {
+            const line = document.createElement('div');
+            const timestampMatch = entry.match(LOG_TIMESTAMP_PATTERN);
+            const messageText = (timestampMatch ? timestampMatch[2] : entry).replace(/^\s+/, '').trim();
+            const normalizedMessage = messageText || entry;
+
+            line.className = timestampMatch ? 'log-line with-timestamp' : 'log-line';
+
+            if (/^error[:\s]/i.test(normalizedMessage)) {
+                line.classList.add('is-error');
+            } else if (
+                /^\[info\]/i.test(normalizedMessage) ||
+                /^(connected|disconnected|reconnecting|reconnected|connection error|ready|stopping|stop request sent)/i.test(normalizedMessage)
+            ) {
+                line.classList.add('is-status');
+            }
+
+            if (timestampMatch) {
+                const timestamp = document.createElement('span');
+                timestamp.className = 'log-timestamp';
+                timestamp.textContent = `[${timestampMatch[1]}]`;
+                line.appendChild(timestamp);
+            }
+
+            const message = document.createElement('span');
+            message.className = 'log-message';
+            message.textContent = normalizedMessage;
+            line.appendChild(message);
+
+            return line;
+        }
+
+        function renderLogMessages(messages = []) {
+            const entries = normalizeLogEntries(messages).slice(-MAX_CLIENT_LOG_LINES);
+            const { logContent, logSection } = getLogElements();
+
+            if (!logContent) {
+                return;
+            }
+
+            generationState.logs = entries;
+            logContent.innerHTML = '';
+
+            entries.forEach(function(entry) {
+                logContent.appendChild(buildLogLine(entry));
+            });
+
+            if (logSection) {
+                logSection.scrollTop = logSection.scrollHeight;
+            }
+        }
+
+        function setLogContent(messages = []) {
+            renderLogMessages(messages);
         }
 
         function applyStatusSnapshot(snapshot = {}) {
@@ -1137,9 +1391,7 @@
         
         socket.on('log_update', function(data) {
             console.log('📝 Log:', data.message);
-            const logContent = document.getElementById('logContent');
-            logContent.textContent += data.message + '\n';
-            logContent.scrollTop = logContent.scrollHeight;
+            addLogMessage(data.message, { addTimestamp: false });
         });
         
         socket.on('feature_count_update', function(data) {
@@ -1270,12 +1522,20 @@
             });
         }
 
-        function addLogMessage(message) {
-            const timestamp = new Date().toLocaleTimeString();
-            const logEntry = `[${timestamp}] ${message}`;
-            const logContent = document.getElementById('logContent');
-            logContent.textContent += logEntry + '\n';
-            logContent.scrollTop = logContent.scrollHeight;
+        function addLogMessage(message, options = {}) {
+            const addTimestamp = options.addTimestamp !== false;
+            const entries = normalizeLogEntries(message).map(function(entry) {
+                if (!addTimestamp || LOG_TIMESTAMP_PATTERN.test(entry)) {
+                    return entry;
+                }
+                return `[${formatLogTimestamp()}] ${entry}`;
+            });
+
+            if (!entries.length) {
+                return;
+            }
+
+            renderLogMessages(generationState.logs.concat(entries));
         }
 
         function showResults(results = {}) {
@@ -1332,7 +1592,8 @@
             document.getElementById('resultsSection').classList.remove('active');
             document.querySelector('.btn-primary').disabled = false;
             document.getElementById('saveBtn').disabled = true;
-            document.getElementById('logContent').textContent = '[INFO] Ready for comprehensive feature generation...\n';
+            setLogContent([]);
+            addLogMessage('Ready for comprehensive feature generation.');
             // Don't clear generated features - keep them persistent
             // renderGeneratedFeatures([]);
             
@@ -1386,6 +1647,7 @@
             formData.append('cv_folds', document.getElementById('cv_folds').value);
             formData.append('time_budget', document.getElementById('time_budget').value || '');
             formData.append('save_path', document.getElementById('save_path').value || '');
+            formData.append('search_sample_size', document.getElementById('search_sample_size').value || '');
             formData.append('use_gpu', document.getElementById('use_gpu').checked);
             formData.append('adaptive', document.getElementById('adaptive').checked);
             
