@@ -1,16 +1,65 @@
-#IDE settings
+# IDE settings
 .vscode/
+.idea/
 
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
 
 # Python bytecode and caches
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyo
+*.pyd
 
-# Notebook checkpoints
+# Python packaging/build
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
 .ipynb_checkpoints/
 
-# Local artifacts
+# Local artifacts and outputs
 *.log
+*.out
+*.err
 *.pkl
+*.joblib
 tmpclaude-*
+cache/
+catboost_info/
+
+# Optional local data and temp folders
+tmp/
+temp/
+
+# Java/Maven artifacts (safe if present)
+target/
+
+# Local env/config files
+.env
+.env.*
