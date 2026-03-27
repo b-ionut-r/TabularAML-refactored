@@ -2,6 +2,7 @@
 .vscode/
 .idea/
 .claude/
+tabularaml/.github/
 
 # OS files
 .DS_Store
