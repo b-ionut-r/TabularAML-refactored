@@ -472,6 +472,10 @@ def start_generation():
             if value == '' or value is None:
                 return default
             try:
+                # If param_type is float, check if it's actually an integer masquerading as a float 
+                # (e.g. "12") so that features.py doesn't misinterpret "12.0" as 1200% percent
+                if param_type == float and '.' not in str(value):
+                    return int(value)
                 return param_type(value)
             except:
                 return default
