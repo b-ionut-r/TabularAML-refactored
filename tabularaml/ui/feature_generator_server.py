@@ -210,8 +210,9 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
             print(message)
         
         # Emit through the background pump so cross-thread delivery stays reliable.
+        # Note: Do not prepend timestamp here; let the UI handle timestamps so they use a consistent format.
         queue_socket_event('log_update', {
-            'message': f'[{datetime.now().strftime("%H:%M:%S")}] {message}'
+            'message': message
         })
         
         # Parse generation info from log messages

@@ -1401,7 +1401,9 @@
         
         socket.on('log_update', function(data) {
             console.log('📝 Log:', data.message);
-            addLogMessage(data.message, { addTimestamp: false });
+            // The generator already added its own timestamp in the message string initially, but we removed it.
+            // Just pass it along and let addLogMessage decide to prepend or not.
+            addLogMessage(data.message);
         });
         
         socket.on('feature_count_update', function(data) {

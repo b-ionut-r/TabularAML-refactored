@@ -627,11 +627,12 @@ class FeatureGenerator:
         
     def _log(self, message):
         """Log message to terminal and file."""
-        print(message)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_message = f"[{timestamp}] {message}"
+        print(formatted_message)
         if self.log_file:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.log_file, "a") as f:
-                f.write(f"[{timestamp}] {message}\n")
+                f.write(f"{formatted_message}\n")
 
     def _get_num_cat_cols(self, X: pd.DataFrame) -> tuple[list, list]:
         return (X.select_dtypes(include=['number']).columns.tolist(),
@@ -1308,9 +1309,29 @@ class FeatureGenerator:
             base_lambda * (1 - 0.7 * intensity)  # Less exploitation
         )
 
+    def _drop_id_columns(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Drop columns that appear to be IDs to not be considered for feature generation."""
+        cols_to_drop = []
+        for col in X.columns:
+            col_str = str(col).lower()
+            is_id_name = col_str in ["id", "index"] or col_str.endswith("_id")
+            
+            # If it's explicitly named like an ID, or acts like a perfect ID (all uniquely categorical)
+            if is_id_name or (X[col].nunique() == len(X) and not pd.api.types.is_float_dtype(X[col])):
+                cols_to_drop.append(col)
+        
+        if cols_to_drop:
+            self._log(f"Dropping ID columns from generation: {cols_to_drop}")
+            if not hasattr(self, 'dropped_id_cols'):
+                self.dropped_id_cols = set()
+            self.dropped_id_cols.update(cols_to_drop)
+            return X.drop(columns=cols_to_drop)
+        return X
+
     def search(self, X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, PipelineWrapper, list[Feature], list[Interaction]]:
         """Enhanced genetic algorithm with better stagnation handling."""
         start_time = time.time()
+        X = self._drop_id_columns(X)
         self._set_defaults(X, y)
         self.initial_features = list(X.columns)
         num_cols, cat_cols = self._get_num_cat_cols(X)
