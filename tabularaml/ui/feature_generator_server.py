@@ -287,17 +287,17 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
             queue_socket_event('strategy_update', {'strategy': 'normal'})
 
         stripped_message = message.strip()
-        feature_prefixes = (
-            "Simple:",
-            "Target encoded:",
-            "Count encoded:",
-            "Freq encoded:",
-            "New simple:",
-            "New target:",
-            "New count:",
-            "New freq:",
-        )
-        for prefix in feature_prefixes:
+        feature_prefixes = {
+            "Simple:": "simple",
+            "Target encoded:": "_target_enc",
+            "Count encoded:": "_count_enc",
+            "Freq encoded:": "_freq_enc",
+            "New simple:": "simple",
+            "New target:": "_target_enc",
+            "New count:": "_count_enc",
+            "New freq:": "_freq_enc",
+        }
+        for prefix, encoding_type in feature_prefixes.items():
             if stripped_message.startswith(prefix):
                 try:
                     parsed = ast.literal_eval(stripped_message.split(":", 1)[1].strip())
@@ -311,7 +311,11 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
                     generated_features = list(server_state.get('generated_features', []))
                     for feature_name in parsed:
                         if isinstance(feature_name, str) and feature_name not in generated_features:
-                            generated_features.append(feature_name)
+                            # Add encoding type suffix to categorical encoded features (except simple)
+                            annotated_name = feature_name
+                            if encoding_type != "simple" and not feature_name.endswith(encoding_type):
+                                annotated_name = f"{feature_name}{encoding_type}"
+                            generated_features.append(annotated_name)
 
                     queue_socket_event('generated_features_update', {'features': generated_features})
                 except Exception as e:
@@ -364,7 +368,8 @@ def get_mode_presets():
                 'early_stop_iter': params.get('early_stopping_iter', 0.4),
                 'min_pct_gain': params.get('min_pct_gain', 0.001),
                 'cv_folds': params.get('cv', 5),
-                'time_budget': params.get('time_budget', '') if params.get('time_budget') else ''
+                'time_budget': params.get('time_budget', '') if params.get('time_budget') else '',
+                'search_sample_size': params.get('search_sample_size', '')
             }
         
         # Add 'none' mode with defaults
@@ -376,7 +381,8 @@ def get_mode_presets():
             'early_stop_iter': 0.4,
             'min_pct_gain': 0.001,
             'cv_folds': 5,
-            'time_budget': ''
+            'time_budget': '',
+            'search_sample_size': ''
         }
         
         return jsonify(ui_presets)
@@ -481,6 +487,7 @@ def start_generation():
         ranking_method = request.form.get('ranking_method', 'multi_criteria')
         time_budget = request.form.get('time_budget', '')
         save_path = request.form.get('save_path', '')
+        search_sample_size = request.form.get('search_sample_size', '')
         use_gpu = request.form.get('use_gpu', 'false').lower() == 'true'
         adaptive = request.form.get('adaptive', 'false').lower() == 'true'
         
@@ -560,7 +567,8 @@ def start_generation():
         server_state['last_error'] = None
         server_state['recent_logs'].clear()
         server_state['last_emit_at'] = time.time()
-        server_state['generated_features'] = []
+        # Don't clear generated_features - keep them persistent across runs
+        # server_state['generated_features'] = []  # Features now persist after search ends
         
         # Start comprehensive generation in background thread
         def run_comprehensive_generation():
@@ -595,6 +603,8 @@ def start_generation():
                     generator_params['time_budget'] = int(time_budget) * 60  # Convert minutes to seconds
                 if save_path:
                     generator_params['save_path'] = save_path
+                if search_sample_size:
+                    generator_params['search_sample_size'] = int(search_sample_size)
                 
                 # Create comprehensive generator
                 generator = ComprehensiveFeatureGenerator(**generator_params)
@@ -615,6 +625,23 @@ def start_generation():
                 server_state['trained_generator'] = generator
                 
                 # Calculate comprehensive results
+                # Extract strategy success rates
+                adaptive_ctrl = getattr(generator, 'adaptive_controller', None)
+                if adaptive_ctrl:
+                    normal_success = adaptive_ctrl.strategy_success.get('normal', 0)
+                    hopeful_success = adaptive_ctrl.strategy_success.get('hopeful_monster', 0)
+                    beam_success = adaptive_ctrl.strategy_success.get('beam_search', 0)
+                    
+                    normal_attempts = adaptive_ctrl.strategy_attempts.get('normal', 1)
+                    hopeful_attempts = adaptive_ctrl.strategy_attempts.get('hopeful_monster', 1)
+                    beam_attempts = adaptive_ctrl.strategy_attempts.get('beam_search', 1)
+                    
+                    normal_rate = (normal_success / normal_attempts * 100) if normal_attempts > 0 else 0.0
+                    hopeful_rate = (hopeful_success / hopeful_attempts * 100) if hopeful_attempts > 0 else 0.0
+                    beam_rate = (beam_success / beam_attempts * 100) if beam_attempts > 0 else 0.0
+                else:
+                    normal_rate, hopeful_rate, beam_rate = 0.0, 0.0, 0.0
+                
                 results = {
                     'total_time': round(end_time - start_time, 2),
                     'completed_gens': generator.current_generation,
@@ -624,7 +651,10 @@ def start_generation():
                     'improvement': getattr(generator, 'gain', 0.0),
                     'percent_gain': getattr(generator, 'pct_gain', 0.0) * 100,
                     'total_restarts': getattr(generator.adaptive_controller.state, 'total_restarts', 0) if hasattr(generator, 'adaptive_controller') else 0,
-                    'best_generation': getattr(generator.state['best'], 'gen_num', 0) if hasattr(generator, 'state') else 0
+                    'best_generation': getattr(generator.state['best'], 'gen_num', 0) if hasattr(generator, 'state') else 0,
+                    'normal_strategy_success': round(normal_rate, 2),
+                    'hopeful_monster_success': round(hopeful_rate, 2),
+                    'beam_search_success': round(beam_rate, 2)
                 }
                 
                 server_state['is_training'] = False

@@ -657,6 +657,12 @@
                                 </label>
                                 <input type="text" id="save_path" placeholder="cache/feature_generator.pkl" />
                             </div>
+                            <div class="form-group">
+                                <label for="search_sample_size" class="tooltip">Search Sample Size ℹ️
+                                    <span class="tooltiptext">Number of rows to sample for search (for faster evaluation on large datasets). Leave empty for full dataset.</span>
+                                </label>
+                                <input type="number" id="search_sample_size" placeholder="Use full dataset" min="100" max="1000000" />
+                            </div>
                         </div>
                         <div class="control-group">
                             <div class="form-group">
@@ -977,7 +983,7 @@
                 console.error('❌ Failed to load mode presets:', error);
                 // Fallback to defaults if server fails
                 modePresets = {
-                    'none': { generations: 15, parents: 40, children: 200, early_stop_child: 0.3, early_stop_iter: 0.4, min_pct_gain: 0.001, cv_folds: 5, time_budget: '' }
+                    'none': { generations: 15, parents: 40, children: 200, early_stop_child: 0.3, early_stop_iter: 0.4, min_pct_gain: 0.001, cv_folds: 5, time_budget: '', search_sample_size: '' }
                 };
             }
         }
@@ -1048,11 +1054,22 @@
             const selectedMode = document.getElementById('mode').value;
             const presets = modePresets[selectedMode] || modePresets['none'] || {};
             
-            // Update placeholders for all mode-affected parameters
+            // Update placeholders and values for all mode-affected parameters
+            const fieldsToUpdate = ['generations', 'parents', 'children', 'cv_folds', 'search_sample_size'];
+            
             Object.keys(presets).forEach(param => {
                 const element = document.getElementById(param);
                 if (element) {
-                    element.placeholder = presets[param];
+                    const value = presets[param];
+                    element.placeholder = value;
+                    
+                    // Fill in the actual value only for numeric fields and when not in 'none' mode
+                    if (selectedMode !== 'none' && fieldsToUpdate.includes(param) && value) {
+                        element.value = value;
+                    } else if (selectedMode === 'none') {
+                        // Clear values when 'none' is selected
+                        element.value = '';
+                    }
                 }
             });
         }
@@ -1275,6 +1292,9 @@
             if (results.percent_gain) document.getElementById('percentGain').textContent = (results.percent_gain > 0 ? '+' : '') + results.percent_gain.toFixed(2) + '%';
             if (results.total_restarts) document.getElementById('totalRestarts').textContent = results.total_restarts;
             if (results.best_generation) document.getElementById('bestGeneration').textContent = results.best_generation;
+            if (results.normal_strategy_success !== undefined) document.getElementById('normalSuccess').textContent = results.normal_strategy_success.toFixed(2) + '%';
+            if (results.hopeful_monster_success !== undefined) document.getElementById('hopefulSuccess').textContent = results.hopeful_monster_success.toFixed(2) + '%';
+            if (results.beam_search_success !== undefined) document.getElementById('beamSuccess').textContent = results.beam_search_success.toFixed(2) + '%';
         }
 
         function showTransformResults(data) {
@@ -1313,7 +1333,8 @@
             document.querySelector('.btn-primary').disabled = false;
             document.getElementById('saveBtn').disabled = true;
             document.getElementById('logContent').textContent = '[INFO] Ready for comprehensive feature generation...\n';
-            renderGeneratedFeatures([]);
+            // Don't clear generated features - keep them persistent
+            // renderGeneratedFeatures([]);
             
             updateGenerationProgress(0, 15);
             updateChildProgress(0, 0, 0);
