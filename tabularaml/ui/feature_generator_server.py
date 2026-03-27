@@ -311,12 +311,14 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
 
                     generated_features = list(server_state.get('generated_features', []))
                     for feature_name in parsed:
-                        if isinstance(feature_name, str) and feature_name not in generated_features:
+                        if isinstance(feature_name, str):
                             # Add encoding type suffix to categorical encoded features (except simple)
                             annotated_name = feature_name
                             if encoding_type != "simple" and not feature_name.endswith(encoding_type):
                                 annotated_name = f"{feature_name}{encoding_type}"
-                            generated_features.append(annotated_name)
+                                
+                            if annotated_name not in generated_features:
+                                generated_features.append(annotated_name)
 
                     queue_socket_event('generated_features_update', {'features': generated_features})
                 except Exception as e:
