@@ -527,6 +527,7 @@ class FeatureGenerator:
                  log_file: Union[str, Path] = "cache/logs/feat_gen_log.txt",
                  adaptive: bool = True,
                  time_budget=None,
+                 search_sample_size: Optional[int] = None,
                  max_ops_per_generation=None,
                  exploration_factor: float = 0.2,
                  save_path=None,
@@ -552,7 +553,8 @@ class FeatureGenerator:
             self.early_stopping_child_eval = early_stopping_child_eval
             self.cv = cv
             self.time_budget = time_budget
-        
+            self.search_sample_size = search_sample_size
+
         # Core parameters (always set normally)
         self.baseline_model = baseline_model
         self.model_fit_kwargs = model_fit_kwargs
@@ -632,9 +634,32 @@ class FeatureGenerator:
                 f.write(f"[{timestamp}] {message}\n")
 
     def _get_num_cat_cols(self, X: pd.DataFrame) -> tuple[list, list]:
-        return (X.select_dtypes(include=['number']).columns.tolist(), 
+        return (X.select_dtypes(include=['number']).columns.tolist(),
                 X.select_dtypes(include=['object', 'category']).columns.tolist())
-    
+
+    def _create_search_subsample(self, X: pd.DataFrame, y: pd.Series, sample_size: int) -> tuple[pd.DataFrame, pd.Series]:
+        """Create a stratified subsample for the search phase."""
+        if len(X) <= sample_size:
+            return X, y
+
+        from sklearn.model_selection import StratifiedShuffleSplit
+
+        try:
+            if self.task != "regression":
+                stratify_labels = y
+            else:
+                # Bin regression target into quantiles for stratification
+                n_bins = min(10, len(y.unique()))
+                stratify_labels = pd.qcut(y, q=n_bins, labels=False, duplicates="drop")
+
+            sss = StratifiedShuffleSplit(n_splits=1, train_size=sample_size, random_state=42)
+            indices, _ = next(sss.split(X, stratify_labels))
+        except Exception:
+            # Fallback to random sampling if stratification fails
+            indices = np.random.RandomState(42).choice(len(X), size=sample_size, replace=False)
+
+        return X.iloc[indices].copy(), y.iloc[indices].copy()
+
     def _get_top_k_features(self, X: pd.DataFrame, y: pd.Series, k: int = 50, pipeline=None) -> pd.DataFrame:
         """Get top k features by importance."""
         pipeline.imputer = SimpleImputer() 
@@ -1298,7 +1323,15 @@ class FeatureGenerator:
             if not np.array_equal(unique_vals, np.arange(len(unique_vals))):
                 y_encoded, _ = y.factorize(sort=True)
                 y = pd.Series(y_encoded, index=y.index, name=y.name)
-        
+
+        # Instance sampling for large datasets
+        X_full, y_full = None, None
+        sample_size = getattr(self, 'search_sample_size', None)
+        if sample_size and len(X) > sample_size:
+            X_full, y_full = X, y
+            X, y = self._create_search_subsample(X, y, sample_size)
+            self._log(f"Instance sampling: {len(X_full)} -> {len(X)} rows for search (search_sample_size={sample_size})")
+
         # Initialize
         self.pruned_features = set()
         self._parent_usage = {}
@@ -1586,19 +1619,50 @@ class FeatureGenerator:
                     break
         
         elapsed_time = time.time() - start_time
-        
-        # Ensure best generation is returned
-        if self.state['best']['gen_num'] < self.n_generations and not X.equals(self.state['best']['X']):
-            self._log(f"Reverting to best generation ({self.state['best']['gen_num']}).")
-            if self._revert_to_best():
-                X, self.pipeline, generation = self.X, self.pipeline, self.generation
-        else:
+
+        # Replay on full data if instance sampling was used
+        if X_full is not None:
+            # Revert to best state from search (sample-sized)
+            if self.state['best']['X'] is not None and not X.equals(self.state['best']['X']):
+                self._revert_to_best()
+                generation = self.generation
+
+            # Replay discovered features on full dataset
+            self._log("Replaying discovered features on full dataset...")
+            X = X_full.copy()
+            for interaction in self.interactions:
+                if interaction.name not in X.columns and not interaction.require_pipeline:
+                    try:
+                        name, val = interaction.generate(X)
+                        X[name] = val
+                    except Exception as e:
+                        self._log(f"Replay warning: {interaction.name}: {e}")
+
+            # Drop pruned features
+            if hasattr(self, 'pruned_features') and self.pruned_features:
+                X = X.drop(columns=[c for c in self.pruned_features if c in X.columns], errors='ignore')
+
+            y = y_full
             self._sync_state_components(X, self.pipeline, generation)
-                    
+            self._save_current_as_best()
+
+            # Re-evaluate on full data for accurate metrics
+            train_score, val_score = self._eval_baseline(X, y, self.pipeline)
+            self.state['best']['train_score'], self.state['best']['val_score'] = train_score, val_score
+            self._log(f"Full-data validation: {self.scorer.name}={val_score:.5f}")
+        else:
+            # No sampling — standard revert-to-best logic
+            if self.state['best']['gen_num'] < self.n_generations and not X.equals(self.state['best']['X']):
+                self._log(f"Reverting to best generation ({self.state['best']['gen_num']}).")
+                if self._revert_to_best():
+                    X, self.pipeline, generation = self.X, self.pipeline, self.generation
+            else:
+                self._sync_state_components(X, self.pipeline, generation)
+
         # Calculate and store metrics
         n_init_feats = len(self.initial_features)
         n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats
-        
+
         self.initial_train_metric, self.initial_val_metric = self._eval_baseline(X[self.initial_features], y, self.pipeline)
         self.final_metric = self.state['best']['val_score']
         self.gain = self.final_metric - self.initial_val_metric if self.scorer.greater_is_better else self.initial_val_metric - self.final_metric
@@ -1923,6 +1987,10 @@ class FeatureGenerator:
                                    if hasattr(feat, 'generating_interaction') and feat.generating_interaction]
             else:
                 self.interactions = []
+
+        # Ensure search_sample_size exists
+        if not hasattr(self, 'search_sample_size'):
+            self.search_sample_size = None
 
         # Ensure state dict has interactions in best (for future reverts)
         if hasattr(self, 'state') and 'best' in self.state:
