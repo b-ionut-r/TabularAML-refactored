@@ -161,16 +161,17 @@
 
         .action-buttons {
             display: flex;
-            gap: 15px;
-            margin-top: 28px;
+            gap: 20px;
+            margin-top: 35px;
             flex-wrap: wrap;
             align-items: center;
+            justify-content: center;
         }
         
         .btn {
             border: none;
-            padding: 15px 30px;
-            font-size: 16px;
+            padding: 18px 36px;
+            font-size: 18px;
             font-weight: 600;
             border-radius: 50px;
             cursor: pointer;
@@ -178,6 +179,7 @@
             text-decoration: none;
             display: inline-flex;
             align-items: center;
+            justify-content: center;
             gap: 10px;
         }
         
@@ -202,8 +204,7 @@
         }
 
         .action-buttons .btn {
-            min-width: 220px;
-            justify-content: center;
+            min-width: 260px;
         }
         
         .btn:hover {
@@ -979,7 +980,7 @@
                         </div>
                     </div>
                     
-                    <div style="text-align: center; margin-top: 30px;">
+                    <div style="display: flex; gap: 20px; justify-content: center; margin-top: 35px; flex-wrap: wrap;">
                         <button class="btn btn-info" onclick="resetInterface()">
                             🔄 Generate New Features
                         </button>
@@ -1001,8 +1002,12 @@
                                 <input type="file" id="generatorFile" accept=".pkl" />
                             </div>
                             <div class="form-group">
-                                <label for="transformDataset">Dataset to Transform</label>
+                                <label for="transformDataset">Train Dataset to Transform</label>
                                 <input type="file" id="transformDataset" accept=".csv,.json" />
+                            </div>
+                            <div class="form-group">
+                                <label for="testDataset">Test Dataset to Transform (Optional)</label>
+                                <input type="file" id="testDataset" accept=".csv,.json" />
                             </div>
                         </div>
                         <div class="action-buttons">
@@ -1018,9 +1023,14 @@
                     <div class="transform-results" id="transformResults" style="display: none;">
                         <h3>✨ Transformation Results</h3>
                         <div id="transformInfo"></div>
-                        <button class="download-btn" onclick="downloadTransformed()" id="downloadBtn" style="display: none;">
-                            📥 Download Transformed Data
-                        </button>
+                        <div style="display: flex; gap: 20px; justify-content: center; margin-top: 25px; flex-wrap: wrap;">
+                            <button class="btn btn-success" onclick="downloadTransformed('train')" id="downloadTrainBtn" style="display: none;">
+                                📥 Download Transformed Train Data
+                            </button>
+                            <button class="btn btn-success" onclick="downloadTransformed('test')" id="downloadTestBtn" style="display: none;">
+                                📥 Download Transformed Test Data
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1561,16 +1571,32 @@
             const resultsDiv = document.getElementById('transformResults');
             const infoDiv = document.getElementById('transformInfo');
             
-            infoDiv.innerHTML = `
-                <p><strong>Original features:</strong> ${data.original_features}</p>
-                <p><strong>Transformed features:</strong> ${data.transformed_features}</p>
-                <p><strong>Features added:</strong> ${data.features_added}</p>
-                <p><strong>Transformation time:</strong> ${data.transform_time}s</p>
-            `;
+            let html = `<p><strong>Transformation time:</strong> ${data.transform_time}s</p>`;
             
-            transformedData = data.transformed_data;
+            if (data.has_train) {
+                html += `<h4>Train Dataset:</h4>`;
+                html += `<p><strong>Original features:</strong> ${data.train_original_features}</p>`;
+                html += `<p><strong>Transformed features:</strong> ${data.train_transformed_features}</p>`;
+                html += `<p><strong>Features added:</strong> ${data.train_features_added}</p>`;
+            }
+            if (data.has_test) {
+                if (data.has_train) html += `<br>`;
+                html += `<h4>Test Dataset:</h4>`;
+                html += `<p><strong>Original features:</strong> ${data.test_original_features}</p>`;
+                html += `<p><strong>Transformed features:</strong> ${data.test_transformed_features}</p>`;
+                html += `<p><strong>Features added:</strong> ${data.test_features_added}</p>`;
+            }
+            
+            infoDiv.innerHTML = html;
+            
+            transformedData = {
+                train: data.train_transformed_data,
+                test: data.test_transformed_data
+            };
+            
             resultsDiv.style.display = 'block';
-            document.getElementById('downloadBtn').style.display = 'inline-block';
+            document.getElementById('downloadTrainBtn').style.display = data.has_train ? 'inline-block' : 'none';
+            document.getElementById('downloadTestBtn').style.display = data.has_test ? 'inline-block' : 'none';
         }
 
         function resetInterface() {
@@ -1803,14 +1829,23 @@
         }
 
         async function transformData() {
-            const datasetInput = document.getElementById('transformDataset');
-            if (!datasetInput.files[0]) {
-                alert('Please select a dataset to transform.');
+            const trainInput = document.getElementById('transformDataset');
+            const testInput = document.getElementById('testDataset');
+            
+            if (!trainInput.files[0] && !testInput.files[0]) {
+                alert('Please select at least one dataset to transform.');
                 return;
             }
             
             const formData = new FormData();
-            formData.append('dataset', datasetInput.files[0]);
+            if (trainInput.files[0]) formData.append('train_dataset', trainInput.files[0]);
+            if (testInput.files[0]) formData.append('test_dataset', testInput.files[0]);
+            
+            // Show loading state
+            const transformBtn = document.getElementById('transformBtn');
+            transformBtn.disabled = true;
+            transformBtn.innerHTML = '⏳ Transforming...';
+            document.getElementById('transformResults').style.display = 'none';
             
             try {
                 const response = await fetch('/transform_data', {
@@ -1828,21 +1863,24 @@
             } catch (error) {
                 console.error('❌ Transform error:', error);
                 alert('Error transforming data: ' + error.message);
+            } finally {
+                transformBtn.disabled = false;
+                transformBtn.innerHTML = '🔄 Transform Data';
             }
         }
 
-        function downloadTransformed() {
-            if (!transformedData) {
-                alert('No transformed data available.');
+        function downloadTransformed(type) {
+            if (!transformedData || !transformedData[type]) {
+                alert('No transformed data available for ' + type + '.');
                 return;
             }
             
             // Create and download CSV
-            const blob = new Blob([transformedData], { type: 'text/csv' });
+            const blob = new Blob([transformedData[type]], { type: 'text/csv' });
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = 'transformed_data.csv';
+            a.download = 'transformed_' + type + '_data.csv';
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);

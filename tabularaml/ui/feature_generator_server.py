@@ -808,46 +808,82 @@ def transform_data():
         if not server_state['trained_generator']:
             return jsonify({'error': 'No generator loaded'}), 400
         
-        file = request.files.get('dataset')
-        if not file:
-            return jsonify({'error': 'No dataset provided'}), 400
+        train_file = request.files.get('train_dataset')
+        test_file = request.files.get('test_dataset')
         
-        # Load dataset
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(file)
-        elif file.filename.endswith('.json'):
-            df = pd.read_json(file)
-        else:
-            return jsonify({'error': 'Unsupported file format'}), 400
+        if not train_file and not test_file:
+            # Fallback to older 'dataset' name just in case
+            train_file = request.files.get('dataset')
+            if not train_file:
+                return jsonify({'error': 'No dataset provided'}), 400
         
-        print(f"🔄 Transforming dataset: {df.shape[0]} rows, {df.shape[1]} features")
+        def load_df(f):
+            if f.filename.endswith('.csv'):
+                return pd.read_csv(f)
+            elif f.filename.endswith('.json'):
+                return pd.read_json(f)
+            else:
+                raise ValueError(f'Unsupported file format: {f.filename}')
         
-        # Transform data
+        df_train = None
+        df_test = None
+
+        if train_file:
+            df_train = load_df(train_file)
+        if test_file:
+            df_test = load_df(test_file)
+            
         start_time = time.time()
-        df_transformed = server_state['trained_generator'].transform(df)
-        end_time = time.time()
         
-        # Prepare results
-        original_features = df.shape[1]
-        transformed_features = df_transformed.shape[1]
-        features_added = transformed_features - original_features
+        # Fit transform on train if present, else just transform
+        # And transform on test if present
+        
+        df_train_transformed = None
+        df_test_transformed = None
+        
+        if df_train is not None:
+            print(f"🔄 Fit-Transforming train dataset: {df_train.shape[0]} rows, {df_train.shape[1]} features")
+            # Usually target 'y' might be needed if they used TargetEncoders, 
+            # but we'll call fit_transform(X) and rely on any fallback Behavior or it just fits imputations
+            df_train_transformed = server_state['trained_generator'].fit_transform(df_train)
+            
+        if df_test is not None:
+            print(f"🔄 Transforming test dataset: {df_test.shape[0]} rows, {df_test.shape[1]} features")
+            df_test_transformed = server_state['trained_generator'].transform(df_test)
+            
+        end_time = time.time()
         transform_time = round(end_time - start_time, 2)
         
-        # Convert to CSV string for download
-        csv_buffer = io.StringIO()
-        df_transformed.to_csv(csv_buffer, index=False)
-        csv_data = csv_buffer.getvalue()
-        
-        queue_socket_event('transform_complete', {
-            'original_features': original_features,
-            'transformed_features': transformed_features,
-            'features_added': features_added,
+        # Prepare results
+        result_payload = {
             'transform_time': transform_time,
-            'transformed_data': csv_data
-        })
+            'has_train': df_train_transformed is not None,
+            'has_test': df_test_transformed is not None
+        }
+        
+        def to_csv_string(df):
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            return csv_buffer.getvalue()
+        
+        if df_train_transformed is not None:
+            result_payload['train_original_features'] = df_train.shape[1]
+            result_payload['train_transformed_features'] = df_train_transformed.shape[1]
+            result_payload['train_features_added'] = df_train_transformed.shape[1] - df_train.shape[1]
+            result_payload['train_transformed_data'] = to_csv_string(df_train_transformed)
+            
+        if df_test_transformed is not None:
+            result_payload['test_original_features'] = df_test.shape[1]
+            result_payload['test_transformed_features'] = df_test_transformed.shape[1]
+            result_payload['test_features_added'] = df_test_transformed.shape[1] - df_test.shape[1]
+            result_payload['test_transformed_data'] = to_csv_string(df_test_transformed)
+        
+        queue_socket_event('transform_complete', result_payload)
         
         return jsonify({'status': 'Data transformed successfully'})
         
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
         print(f"❌ Transform error: {e}")
         return jsonify({'error': str(e)}), 500
