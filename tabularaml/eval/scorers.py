@@ -14,6 +14,7 @@ to work with any of the supported gradient boosting frameworks' early stopping i
 
 import numpy as np
 import pandas as pd
+from scipy.stats import pearsonr
 from .metrics.regression import (
     root_mean_squared_error,
     root_mean_squared_log_error,
@@ -337,12 +338,26 @@ r2 = Scorer(name = "r2",
             greater_is_better = True,
             extra_params = {},
             type = None)  # Set type when using with specific model
+
+def _pearson_correlation_score(y_true, y_pred):
+    y_true_arr = np.asarray(y_true).ravel()
+    y_pred_arr = np.asarray(y_pred).ravel()
+    if np.std(y_pred_arr) < 1e-9 or np.std(y_true_arr) < 1e-9:
+        return 0.0
+    return pearsonr(y_true_arr, y_pred_arr)[0]
+
+pearson = Scorer(name = "pearson",
+                 scorer = _pearson_correlation_score,
+                 greater_is_better = True,
+                 extra_params = {},
+                 type = None)  # Set type when using with specific model
 PREDEFINED_REG_SCORERS = {
     "rmse": rmse,
     "rmsle": rmsle,
     "mae": mae,
     "mse": mse,
-    "r2": r2
+    "r2": r2,
+    "pearson": pearson
 }
 
 

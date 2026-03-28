@@ -811,6 +811,21 @@
                                     <input type="number" id="cv_folds" placeholder="5" min="2" max="20" />
                                 </div>
                                 <div class="form-group">
+                                    <label for="cv_type" class="tooltip">CV Strategy ℹ️
+                                        <span class="tooltiptext">KFold: standard random splits. GroupKFold: keeps entire groups (e.g. time periods) together to prevent data leakage.</span>
+                                    </label>
+                                    <select id="cv_type" onchange="toggleGroupCol()">
+                                        <option value="kfold">KFold (default)</option>
+                                        <option value="groupfold">GroupKFold</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" id="group_col_group" style="display:none;">
+                                    <label for="group_col" class="tooltip">Group Column ℹ️
+                                        <span class="tooltiptext">Column whose values define the groups (e.g. 'moon' or 'date'). All rows with the same value go into the same fold.</span>
+                                    </label>
+                                    <input type="text" id="group_col" placeholder="e.g. moon" />
+                                </div>
+                                <div class="form-group">
                                     <label for="time_budget" class="tooltip">Time Budget (minutes) ℹ️
                                         <span class="tooltiptext">Maximum time to run (leave empty for no limit)</span>
                                     </label>
@@ -1219,6 +1234,12 @@
         }
 
         // Mode switching
+        function toggleGroupCol() {
+            const cvType = document.getElementById('cv_type').value;
+            const groupColGroup = document.getElementById('group_col_group');
+            groupColGroup.style.display = cvType === 'groupfold' ? '' : 'none';
+        }
+
         function switchMode(mode) {
             currentMode = mode;
             
@@ -1265,7 +1286,8 @@
                         { value: 'rmsle', label: 'RMSLE' },
                         { value: 'mae', label: 'MAE' },
                         { value: 'mse', label: 'MSE' },
-                        { value: 'r2', label: 'R2' }
+                        { value: 'r2', label: 'R2' },
+                        { value: 'pearson', label: 'Pearson Correlation' }
                     ],
                     classification: [
                         { value: 'accuracy', label: 'Accuracy' },
@@ -1669,6 +1691,8 @@
             formData.append('max_new_feats', document.getElementById('max_new_feats').value || '');
             formData.append('ranking_method', document.getElementById('ranking_method').value);
             formData.append('cv_folds', document.getElementById('cv_folds').value);
+            formData.append('cv_type', document.getElementById('cv_type').value);
+            formData.append('group_col', document.getElementById('group_col').value || '');
             formData.append('time_budget', document.getElementById('time_budget').value || '');
             formData.append('save_path', document.getElementById('save_path').value || '');
             formData.append('search_sample_size', document.getElementById('search_sample_size').value || '');

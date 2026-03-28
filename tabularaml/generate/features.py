@@ -522,6 +522,7 @@ class FeatureGenerator:
                  early_stopping_child_eval: Union[float, int, bool] = 0.3,
                  ops=None,
                  cv: Union[int, BaseCrossValidator] = 5,
+                 groups=None,
                  use_gpu: bool = True,
                  log_file: Union[str, Path] = "cache/logs/feat_gen_log.txt",
                  adaptive: bool = True,
@@ -585,6 +586,8 @@ class FeatureGenerator:
         )
         self.ops = ops if ops is not None else OPS
         self.cv = cv
+        self.groups = groups
+        self._groups_active = groups
         self.device = "cuda" if is_gpu_available() and use_gpu else "cpu"
         self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
         
@@ -640,10 +643,10 @@ class FeatureGenerator:
         return (X.select_dtypes(include=['number']).columns.tolist(),
                 X.select_dtypes(include=['object', 'category']).columns.tolist())
 
-    def _create_search_subsample(self, X: pd.DataFrame, y: pd.Series, sample_size: int) -> tuple[pd.DataFrame, pd.Series]:
+    def _create_search_subsample(self, X: pd.DataFrame, y: pd.Series, sample_size: int, groups=None) -> tuple:
         """Create a stratified subsample for the search phase."""
         if len(X) <= sample_size:
-            return X, y
+            return X, y, groups
 
         from sklearn.model_selection import StratifiedShuffleSplit
 
@@ -661,7 +664,8 @@ class FeatureGenerator:
             # Fallback to random sampling if stratification fails
             indices = np.random.RandomState(42).choice(len(X), size=sample_size, replace=False)
 
-        return X.iloc[indices].copy(), y.iloc[indices].copy()
+        groups_sub = groups[indices] if groups is not None else None
+        return X.iloc[indices].copy(), y.iloc[indices].copy(), groups_sub
 
     def _get_top_k_features(self, X: pd.DataFrame, y: pd.Series, k: int = 50, pipeline=None) -> pd.DataFrame:
         """Get top k features by importance."""
@@ -679,7 +683,8 @@ class FeatureGenerator:
         """Evaluate baseline model performance."""
         pipeline = pipeline.get_pipeline(X) if pipeline is not None else pipeline
         cv_dict = cross_val_score(self.baseline_model, X, y, self.scorer, cv=self.cv,
-                                 return_dict=True, pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs)
+                                 return_dict=True, pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs,
+                                 groups=self._groups_active)
         return cv_dict["mean_train_score"], cv_dict["mean_val_score"]
 
     def _eval_logging_scorers(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> Dict[str, Tuple[float, float]]:
@@ -694,7 +699,8 @@ class FeatureGenerator:
             try:
                 cv_dict = cross_val_score(self.baseline_model, X, y, scorer, cv=self.cv,
                                          return_dict=True, pipeline=pipeline_obj,
-                                         model_fit_kwargs=self.model_fit_kwargs)
+                                         model_fit_kwargs=self.model_fit_kwargs,
+                                         groups=self._groups_active)
                 results[scorer.name] = (cv_dict["mean_train_score"], cv_dict["mean_val_score"])
             except Exception as e:
                 self._log(f"Warning: Failed to evaluate logging scorer {scorer.name}: {str(e)}")
@@ -1359,8 +1365,11 @@ class FeatureGenerator:
         sample_size = getattr(self, 'search_sample_size', None)
         if sample_size and len(X) > sample_size:
             X_full, y_full = X, y
-            X, y = self._create_search_subsample(X, y, sample_size)
+            X, y, groups_sub = self._create_search_subsample(X, y, sample_size, self.groups)
+            self._groups_active = groups_sub
             self._log(f"Instance sampling: {len(X_full)} -> {len(X)} rows for search (search_sample_size={sample_size})")
+        else:
+            self._groups_active = self.groups
 
         # Initialize
         self.pruned_features = set()

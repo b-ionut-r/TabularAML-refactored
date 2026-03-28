@@ -19,6 +19,7 @@ import numpy as np
 from pathlib import Path
 import io
 from sklearn.utils.multiclass import type_of_target
+from sklearn.model_selection import GroupKFold
 
 # Import our actual FeatureGenerator
 import sys
@@ -402,7 +403,8 @@ def get_metric_options():
             'rmsle': 'RMSLE (Root Mean Squared Logarithmic Error)',
             'mae': 'MAE (Mean Absolute Error)',
             'mse': 'MSE (Mean Squared Error)',
-            'r2': 'R2 (Coefficient of Determination)'
+            'r2': 'R2 (Coefficient of Determination)',
+            'pearson': 'Pearson Correlation'
         }
         cls_labels = {
             'accuracy': 'Accuracy',
@@ -487,7 +489,9 @@ def start_generation():
         early_stop_iter = parse_param('early_stop_iter', 0.4, float)
         early_stop_child = parse_param('early_stop_child', 0.3, float)
         cv_folds = parse_param('cv_folds', 5, int)
-        
+        cv_type = request.form.get('cv_type', 'kfold')
+        group_col = request.form.get('group_col', '').strip()
+
         # Handle optional parameters
         max_new_feats = request.form.get('max_new_feats', '')
         ranking_method = request.form.get('ranking_method', 'multi_criteria')
@@ -554,8 +558,21 @@ def start_generation():
         if not isinstance(y, pd.Series):
             y = pd.Series(y, name=target) #
         
+        # Build CV strategy and extract groups
+        groups = None
+        cv_obj = cv_folds  # default: integer (KFold/StratifiedKFold chosen in cv.py)
+        if cv_type == 'groupfold':
+            if not group_col:
+                return jsonify({'error': 'Group column is required for GroupKFold'}), 400
+            if group_col not in df.columns:
+                return jsonify({'error': f'Group column "{group_col}" not found in dataset'}), 400
+            groups = df[group_col].values  # extract before dropping target
+            # groups must align with X rows (same order)
+            cv_obj = GroupKFold(n_splits=cv_folds)
+            print(f"📊 GroupKFold: {cv_folds} splits on column '{group_col}' ({len(np.unique(groups))} unique groups)")
+
         print(f"📊 Dataset: {X.shape[0]} rows, {X.shape[1]} features")
-        
+
         # Reset state
         server_state['is_training'] = True
         server_state['current_generation'] = 0
@@ -590,7 +607,8 @@ def start_generation():
                     'early_stopping_iter': early_stop_iter,
                     'early_stopping_child_eval': early_stop_child,
                     'ranking_method': ranking_method,
-                    'cv': cv_folds,
+                    'cv': cv_obj,
+                    'groups': groups,
                     'use_gpu': use_gpu,
                     'adaptive': adaptive,
                     'log_file': None  # We handle logging ourselves

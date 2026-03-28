@@ -18,7 +18,7 @@ if not hasattr(pd.Series, 'numpy'):
 
 def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_state = 42,
                     pipeline: Union[Pipeline, PipelineWrapper] = None, return_dict = False,
-                    model_fit_kwargs = {}, folds_weights = None):
+                    model_fit_kwargs = {}, folds_weights = None, groups = None):
     """
     Perform cross-validation evaluation of a model.
     This function evaluates a machine learning model using cross-validation,
@@ -113,7 +113,7 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
     train_results = []
     val_results = []
     
-    for idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+    for idx, (train_idx, val_idx) in enumerate(cv.split(X, y, groups)):
         # Always create a fresh copy of the model for each fold
         try:
             model_clone = deepcopy(model)
