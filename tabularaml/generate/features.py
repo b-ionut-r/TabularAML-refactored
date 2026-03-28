@@ -538,22 +538,21 @@ class FeatureGenerator:
         provided_params.pop('self')
         
         self.mode = mode
+
+        # Always set params from constructor args first (preserves explicit UI overrides)
+        self.n_generations = n_generations
+        self.n_parents = n_parents
+        self.n_children = n_children
+        self.ranking_method = ranking_method
+        self.min_pct_gain = min_pct_gain
+        self.early_stopping_iter = early_stopping_iter
+        self.early_stopping_child_eval = early_stopping_child_eval
+        self.time_budget = time_budget
+        self.search_sample_size = search_sample_size
+
+        # Mode overrides only params still at their constructor defaults
         if mode:
             self._set_params_from_mode(provided_params)
-        
-        # Set parameters not handled by mode
-        if not mode:
-            # If no mode, set all parameters normally
-            self.n_generations = n_generations
-            self.n_parents = n_parents
-            self.n_children = n_children
-            self.ranking_method = ranking_method
-            self.min_pct_gain = min_pct_gain
-            self.early_stopping_iter = early_stopping_iter
-            self.early_stopping_child_eval = early_stopping_child_eval
-            self.cv = cv
-            self.time_budget = time_budget
-            self.search_sample_size = search_sample_size
 
         # Core parameters (always set normally)
         self.baseline_model = baseline_model
@@ -567,12 +566,7 @@ class FeatureGenerator:
         self.adaptive = adaptive
         self.save_path = save_path
         self.save_each_trial = save_each_trial
-        
-        # Early stopping - mode preset already applied via _set_params_from_mode;
-        # only overwrite from constructor args when no mode was given.
-        if not mode:
-            self.early_stopping_iter = early_stopping_iter
-            self.early_stopping_child_eval = early_stopping_child_eval
+
         # Convert early_stopping_iter from fraction to absolute generation count if float
         if isinstance(self.early_stopping_iter, float):
             self.early_stopping_iter = int(self.early_stopping_iter * self.n_generations)
@@ -669,10 +663,15 @@ class FeatureGenerator:
 
     def _get_top_k_features(self, X: pd.DataFrame, y: pd.Series, k: int = 50, pipeline=None) -> pd.DataFrame:
         """Get top k features by importance."""
-        pipeline.imputer = SimpleImputer() 
+        from sklearn.model_selection import GroupKFold, KFold
+        # GroupKFold requires groups in cv.split() which FeatureImportanceAnalyzer doesn't pass;
+        # use a plain KFold with the same n_splits for importance ranking.
+        cv_for_importance = (KFold(n_splits=self.cv.n_splits, shuffle=True, random_state=42)
+                             if isinstance(self.cv, GroupKFold) else self.cv)
+        pipeline.imputer = SimpleImputer()
         analyzer = FeatureImportanceAnalyzer(
             task_type=self.task, weights=self.imp_weights, preferred_gbm="xgboost",
-            pipeline=pipeline, cv=self.cv, use_gpu=(self.device == "cuda"))
+            pipeline=pipeline, cv=cv_for_importance, use_gpu=(self.device == "cuda"))
         analyzer.fit(X, y)
         pipeline.imputer = None 
         imp_df = analyzer.get_importance(normalize=False)[["weighted_importance"]]
