@@ -710,9 +710,8 @@
                             </div>
                             <div class="form-group">
                                 <label for="target">Target Column</label>
-                                <select id="target">
-                                    <option value="">Select target column...</option>
-                                </select>
+                                <input type="text" id="target" list="target-options" placeholder="Type or select..." autocomplete="off" />
+                                <datalist id="target-options"></datalist>
                             </div>
                             <div class="form-group">
                                 <label for="task">Task Type</label>
@@ -1915,44 +1914,33 @@
                 const response = await fetch('/get_columns', { method: 'POST', body: fd });
                 const data = await response.json();
                 if (data.error) { addLogMessage('Error: ' + data.error); return; }
-                const targetSelect = document.getElementById('target');
-                targetSelect.innerHTML = '<option value="">Select target column...</option>';
-                data.columns.forEach(col => {
-                    const option = document.createElement('option');
-                    option.value = col; option.textContent = col;
-                    targetSelect.appendChild(option);
-                });
+                populateTargetOptions(data.columns);
                 addLogMessage(`📊 Loaded ${data.columns.length} columns from path`);
             } catch (error) {
                 addLogMessage('Error: ' + error.message);
             }
         }
 
+        function populateTargetOptions(columns) {
+            const datalist = document.getElementById('target-options');
+            datalist.innerHTML = '';
+            columns.forEach(col => {
+                const option = document.createElement('option');
+                option.value = col;
+                datalist.appendChild(option);
+            });
+        }
+
         document.getElementById('dataset').addEventListener('change', async function(e) {
             const file = e.target.files[0];
             if (file) {
                 addLogMessage(`📁 Dataset loaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
-                
                 const formData = new FormData();
                 formData.append('dataset', file);
-                
                 try {
-                    const response = await fetch('/get_columns', {
-                        method: 'POST',
-                        body: formData
-                    });
-                    
+                    const response = await fetch('/get_columns', { method: 'POST', body: formData });
                     const data = await response.json();
-                    const targetSelect = document.getElementById('target');
-                    targetSelect.innerHTML = '<option value="">Select target column...</option>';
-                    
-                    data.columns.forEach(col => {
-                        const option = document.createElement('option');
-                        option.value = col;
-                        option.textContent = col;
-                        targetSelect.appendChild(option);
-                    });
-                    
+                    populateTargetOptions(data.columns);
                     addLogMessage(`📊 Detected ${data.columns.length} columns`);
                 } catch (error) {
                     console.error('❌ Column detection error:', error);

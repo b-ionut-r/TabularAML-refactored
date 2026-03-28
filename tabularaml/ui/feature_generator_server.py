@@ -450,6 +450,10 @@ def _load_dataframe(file=None, file_path=None, nrows=None):
     if ext == '.csv':
         return pd.read_csv(source, nrows=nrows)
     elif ext == '.parquet':
+        if nrows == 0:
+            import pyarrow.parquet as pq
+            schema = pq.read_schema(source)
+            return pd.DataFrame(columns=schema.names)
         df = pd.read_parquet(source)
         return df.iloc[:nrows] if nrows else df
     elif ext == '.json':
