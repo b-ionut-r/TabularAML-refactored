@@ -172,9 +172,9 @@ class ImprovedAdaptiveController:
         self.successful_children = defaultdict(list)  # Track which features produced good children
         
         # Strategy tracking
-        self.strategy_success = {"hopeful_monster": 0, "beam_search": 0, "normal": 0}
-        self.strategy_attempts = {"hopeful_monster": 0, "beam_search": 0, "normal": 0}
-        
+        self.strategy_success = {"hopeful_monster": 0, "normal": 0}
+        self.strategy_attempts = {"hopeful_monster": 0, "normal": 0}
+
         # Memory of what worked
         self.successful_patterns = []  # List of (parent_features, operation, gain) tuples
         self.weight_modifications = {}
@@ -480,15 +480,14 @@ class ImprovedAdaptiveController:
         self.successful_children.clear()
         self.feature_as_parent_attempts.clear()
         self.feature_as_parent_success.clear()
-        self.strategy_success = {"hopeful_monster": 0, "beam_search": 0, "normal": 0}
-        self.strategy_attempts = {"hopeful_monster": 0, "beam_search": 0, "normal": 0}
-    
+        self.strategy_success = {"hopeful_monster": 0, "normal": 0}
+        self.strategy_attempts = {"hopeful_monster": 0, "normal": 0}
+
     def get_status_summary(self) -> dict:
         """Get summary of current adaptive state."""
         hopeful_rate = self.get_strategy_success_rate("hopeful_monster")
-        beam_rate = self.get_strategy_success_rate("beam_search")
         normal_rate = self.get_strategy_success_rate("normal")
-        
+
         return {
             "stagnation_level": self.state.stagnation_level.name,
             "exploration_intensity": f"{self.state.exploration_intensity:.2f}",
@@ -496,7 +495,7 @@ class ImprovedAdaptiveController:
             "consecutive_success": self.state.consecutive_successful_generations,
             "weights_modified": self.state.feature_weights_modified,
             "features_modified": len(self.weight_modifications),
-            "strategy_success": f"HM:{hopeful_rate:.2f}, BS:{beam_rate:.2f}, N:{normal_rate:.2f}",
+            "strategy_success": f"HM:{hopeful_rate:.2f}, N:{normal_rate:.2f}",
             "total_restarts": self.state.total_restarts
         }
 
@@ -1343,8 +1342,10 @@ class FeatureGenerator:
         self._set_defaults(X, y)
         self.initial_features = list(X.columns)
         num_cols, cat_cols = self._get_num_cat_cols(X)
-        self.max_gen_new_feats = (int(self.max_new_feats * len(self.initial_features)) if isinstance(self.max_new_feats, float) 
+        self.max_gen_new_feats = (int(self.max_new_feats * len(self.initial_features)) if isinstance(self.max_new_feats, float)
                                  else self.max_new_feats if isinstance(self.max_new_feats, int) else float('inf'))
+        if self.max_gen_new_feats == float('inf') and hasattr(self, 'max_gen_new_feats_pct'):
+            self.max_gen_new_feats = int(self.max_gen_new_feats_pct * len(self.initial_features))
 
         # Label encode target for GBMs
         if self.task != "regression":
@@ -1480,7 +1481,7 @@ class FeatureGenerator:
                             self._sync_state_components(X, self.pipeline, generation)
                             self._save_current_as_best()
                             self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
-                            
+
                             for elite in elites:
                                 self.adaptive_controller.update_operation_stats(elite, success=True, gain=delta/(abs(best_score) + 1e-8))
                         else:
@@ -1519,30 +1520,18 @@ class FeatureGenerator:
                         self._log(f"Gen {N+1}: No budget remaining. Skipping.")
                         continue
                     
-                    # Skip beam search if it's been failing consistently
-                    use_beam_search = False
-                    
-                    if use_beam_search:
-                        self._log(f"  Starting beam search k=3...")
-                        beam_search_used = True
-                        elites = []
+                    with tqdm(total=len(batch), desc="Evaluating features", leave=False) as inner_pbar:
+                        def update_callback(ec, sc, force_complete=False):
+                            inner_pbar.update(max(0, ec - inner_pbar.n if not force_complete else len(batch) - inner_pbar.n))
+                            inner_pbar.set_description(f"Evaluating features - Selected: {sc}")
+                            return self.time_budget and (time.time() - start_time) > self.time_budget
+
+                        elites, X, self.pipeline = self._select_elites(batch, features_per_gen, X, y, update_callback)
+
+                    if elites:
+                        self.adaptive_controller.update_strategy_stats("normal", True)
                     else:
-                        beam_search_used = False
-                    
-                    # Standard elite selection
-                    if not beam_search_used:
-                        with tqdm(total=len(batch), desc="Evaluating features", leave=False) as inner_pbar:
-                            def update_callback(ec, sc, force_complete=False):
-                                inner_pbar.update(max(0, ec - inner_pbar.n if not force_complete else len(batch) - inner_pbar.n))
-                                inner_pbar.set_description(f"Evaluating features - Selected: {sc}")
-                                return self.time_budget and (time.time() - start_time) > self.time_budget
-                            
-                            elites, X, self.pipeline = self._select_elites(batch, features_per_gen, X, y, update_callback)
-                        
-                        if elites:
-                            self.adaptive_controller.update_strategy_stats("normal", True)
-                        else:
-                            self.adaptive_controller.update_strategy_stats("normal", False)
+                        self.adaptive_controller.update_strategy_stats("normal", False)
                 
                 # Handle generation update (same logic as before)
                 if hopeful_monster_success:
@@ -1593,7 +1582,7 @@ class FeatureGenerator:
                         self.state['counters']['consecutive_no_improvement_iters'] = 0
                         stagnation_counter = 0
                         self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
-                        
+
                         self._sync_state_components(X, self.pipeline, generation)
                         self._save_current_as_best()
                     else:

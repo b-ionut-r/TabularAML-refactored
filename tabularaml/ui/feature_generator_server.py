@@ -283,9 +283,6 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
         if "Creative HM" in message or "hopeful monster" in message.lower():
             queue_socket_event('strategy_update', {'strategy': 'hopeful_monster'})
             print("🎯 Strategy: Hopeful Monster")
-        elif "beam search" in message.lower():
-            queue_socket_event('strategy_update', {'strategy': 'beam_search'})
-            print("🎯 Strategy: Beam Search")
         elif message.startswith("Gen ") and "Added" in message:
             queue_socket_event('strategy_update', {'strategy': 'normal'})
 
@@ -639,17 +636,14 @@ def start_generation():
                 if adaptive_ctrl:
                     normal_success = adaptive_ctrl.strategy_success.get('normal', 0)
                     hopeful_success = adaptive_ctrl.strategy_success.get('hopeful_monster', 0)
-                    beam_success = adaptive_ctrl.strategy_success.get('beam_search', 0)
-                    
+
                     normal_attempts = adaptive_ctrl.strategy_attempts.get('normal', 1)
                     hopeful_attempts = adaptive_ctrl.strategy_attempts.get('hopeful_monster', 1)
-                    beam_attempts = adaptive_ctrl.strategy_attempts.get('beam_search', 1)
-                    
+
                     normal_rate = (normal_success / normal_attempts * 100) if normal_attempts > 0 else 0.0
                     hopeful_rate = (hopeful_success / hopeful_attempts * 100) if hopeful_attempts > 0 else 0.0
-                    beam_rate = (beam_success / beam_attempts * 100) if beam_attempts > 0 else 0.0
                 else:
-                    normal_rate, hopeful_rate, beam_rate = 0.0, 0.0, 0.0
+                    normal_rate, hopeful_rate = 0.0, 0.0
                 
                 results = {
                     'total_time': round(end_time - start_time, 2),
@@ -662,8 +656,7 @@ def start_generation():
                     'total_restarts': getattr(generator.adaptive_controller.state, 'total_restarts', 0) if hasattr(generator, 'adaptive_controller') else 0,
                     'best_generation': getattr(generator.state['best'], 'gen_num', 0) if hasattr(generator, 'state') else 0,
                     'normal_strategy_success': round(normal_rate, 2),
-                    'hopeful_monster_success': round(hopeful_rate, 2),
-                    'beam_search_success': round(beam_rate, 2)
+                    'hopeful_monster_success': round(hopeful_rate, 2)
                 }
                 
                 server_state['is_training'] = False

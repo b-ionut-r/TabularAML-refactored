@@ -49,18 +49,17 @@ def _safe_power(base_series, exp_series):
 OPS = {
     "num": {
         "unary": ["neg", "abs", "square", "sqrt",
-                  "log", "exp", "inv",
+                  "log", "log1p", "exp", "inv",
                   "cube", "sin", "cos", "tan",
                   "sigmoid", "tanh", "reciprocal_sqrt",
-                  "log10", "log2", "cbrt", "floor", "ceil",
+                  "cbrt", "floor", "ceil",
                   "round", "sign", "arcsin", "arccos", "arctan"
                   ],
-        "binary": ["add", "absdiff", "mul", 
+        "binary": ["add", "absdiff", "mul",
                    "div", "logmul", "diff_ratio",
                    "sub", "pow", "mod", "max", "min",
-                   "mean", "geometric_mean", "harmonic_mean",
-                   "relative_diff", "percent_change", "ratio",
-                   "distance_euclidean", "distance_manhattan",
+                   "geometric_mean", "harmonic_mean",
+                   "relative_diff", "log_ratio",
                    "angle_between", "weighted_sum", "weighted_diff"
                    ]
     },
@@ -125,10 +124,15 @@ NUM_OPS_LAMBDAS: Dict[str, Callable[..., Tuple[str, pd.Series]]] = {
     ),
     
     "log": lambda df, a: (
-        f"{a}_log", 
+        f"{a}_log",
         np.log(np.where(df[a] > 0, df[a], np.nan))
     ),
-    
+
+    "log1p": lambda df, a: (
+        f"{a}_log1p",
+        np.where(df[a] >= 0, np.log1p(df[a]), np.nan)
+    ),
+
     "exp": lambda df, a: (
         f"{a}_exp", 
         # First clip values to safe range, *then* calculate exp
@@ -190,16 +194,6 @@ NUM_OPS_LAMBDAS: Dict[str, Callable[..., Tuple[str, pd.Series]]] = {
         )
     ),
     
-    "log10": lambda df, a: (
-        f"{a}_log10", 
-        np.log10(np.where(df[a] > 0, df[a], np.nan))
-    ),
-    
-    "log2": lambda df, a: (
-        f"{a}_log2", 
-        np.log2(np.where(df[a] > 0, df[a], np.nan))
-    ),
-    
     "cbrt": lambda df, a: (f"{a}_cbrt", np.cbrt(df[a])),  # Cube root
     
     "floor": lambda df, a: (f"{a}_floor", np.floor(df[a])),
@@ -211,13 +205,13 @@ NUM_OPS_LAMBDAS: Dict[str, Callable[..., Tuple[str, pd.Series]]] = {
     "sign": lambda df, a: (f"{a}_sign", np.sign(df[a])),
     
     "arcsin": lambda df, a: (
-        f"{a}_arcsin", 
-        np.arcsin(np.clip(df[a], -1, 1))  # Clip to valid range for arcsin
+        f"{a}_arcsin",
+        np.where((df[a] >= -1) & (df[a] <= 1), np.arcsin(df[a]), np.nan)
     ),
-    
+
     "arccos": lambda df, a: (
-        f"{a}_arccos", 
-        np.arccos(np.clip(df[a], -1, 1))  # Clip to valid range for arccos
+        f"{a}_arccos",
+        np.where((df[a] >= -1) & (df[a] <= 1), np.arccos(df[a]), np.nan)
     ),
     
     "arctan": lambda df, a: (f"{a}_arctan", np.arctan(df[a])),
@@ -297,8 +291,6 @@ NUM_OPS_LAMBDAS: Dict[str, Callable[..., Tuple[str, pd.Series]]] = {
     
     "min": lambda df, a, b: (f"{a}_min_{b}", np.minimum(df[a], df[b])),
     
-    "mean": lambda df, a, b: (f"{a}_mean_{b}", (df[a] + df[b]) / 2),
-    
     "geometric_mean": lambda df, a, b: (
         f"{a}_geometric_mean_{b}", 
         np.where(
@@ -318,51 +310,23 @@ NUM_OPS_LAMBDAS: Dict[str, Callable[..., Tuple[str, pd.Series]]] = {
     ),
     
     "relative_diff": lambda df, a, b: (
-        f"{a}_relative_diff_{b}", 
+        f"{a}_relative_diff_{b}",
         np.where(
             np.abs(df[b]) > 1e-15,
             (df[a] - df[b]) / np.abs(df[b]),
             np.nan
         )
     ),
-    
-    "percent_change": lambda df, a, b: (
-        f"{a}_percent_change_{b}", 
+
+    "log_ratio": lambda df, a, b: (
+        f"{a}_log_ratio_{b}",
         np.where(
-            np.abs(df[b]) > 1e-15,
-            100 * (df[a] - df[b]) / np.abs(df[b]),
+            (df[a] > 0) & (df[b] > 0),
+            np.log(df[a] / df[b]),
             np.nan
         )
     ),
-    
-    "ratio": lambda df, a, b: (
-        f"{a}_ratio_{b}", 
-        np.where(
-            np.abs(df[b]) > 1e-15,
-            np.where(
-                np.abs(df[a] / df[b]) < 1e15,
-                df[a] / df[b],
-                np.nan
-            ),
-            np.nan
-        )
-    ),
-    
-    # Spatial operations (useful for lat/lon data)
-    "distance_euclidean": lambda df, a, b: (
-        f"{a}_distance_euclidean_{b}", 
-        np.sqrt(np.where(
-            np.isfinite(df[a]) & np.isfinite(df[b]),
-            (df[a] - df[b]) ** 2,
-            np.nan
-        ))
-    ),
-    
-    "distance_manhattan": lambda df, a, b: (
-        f"{a}_distance_manhattan_{b}", 
-        np.abs(df[a] - df[b])
-    ),
-    
+
     "angle_between": lambda df, a, b: (
         f"{a}_angle_between_{b}", 
         np.arctan2(df[b], df[a])
