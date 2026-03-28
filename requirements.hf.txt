@@ -11,3 +11,4 @@ category-encoders>=2.6.0
 tqdm>=4.65.0
 cloudpickle>=3.0.0
 shap>=0.44.0
+pyarrow>=14.0.0
