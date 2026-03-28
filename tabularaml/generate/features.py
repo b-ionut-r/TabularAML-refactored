@@ -607,7 +607,7 @@ class FeatureGenerator:
         if mode_dict:
             # Get function signature to compare with defaults
             import inspect
-            sig = inspect.signature(self.__init__)
+            sig = inspect.signature(FeatureGenerator.__init__)
             
             for param, value in mode_dict.items():
                 # Only set if parameter wasn't explicitly provided (equals default)
