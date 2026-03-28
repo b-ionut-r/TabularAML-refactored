@@ -67,6 +67,8 @@ server_state = {
     'event_pump_started': False,
     'event_queue': queue.Queue(),
     'generated_features': [],
+    'transformed_train': None,
+    'transformed_test': None,
 }
 
 def _update_status_snapshot(event_name, payload):
@@ -861,29 +863,25 @@ def transform_data():
         end_time = time.time()
         transform_time = round(end_time - start_time, 2)
         
-        # Prepare results
+        # Store transformed DataFrames server-side for download; send only metadata via socket
+        server_state['transformed_train'] = df_train_transformed
+        server_state['transformed_test'] = df_test_transformed
+
         result_payload = {
             'transform_time': transform_time,
             'has_train': df_train_transformed is not None,
             'has_test': df_test_transformed is not None
         }
-        
-        def to_csv_string(df):
-            csv_buffer = io.StringIO()
-            df.to_csv(csv_buffer, index=False)
-            return csv_buffer.getvalue()
-        
+
         if df_train_transformed is not None:
             result_payload['train_original_features'] = df_train.shape[1]
             result_payload['train_transformed_features'] = df_train_transformed.shape[1]
             result_payload['train_features_added'] = df_train_transformed.shape[1] - df_train.shape[1]
-            result_payload['train_transformed_data'] = to_csv_string(df_train_transformed)
-            
+
         if df_test_transformed is not None:
             result_payload['test_original_features'] = df_test.shape[1]
             result_payload['test_transformed_features'] = df_test_transformed.shape[1]
             result_payload['test_features_added'] = df_test_transformed.shape[1] - df_test.shape[1]
-            result_payload['test_transformed_data'] = to_csv_string(df_test_transformed)
         
         queue_socket_event('transform_complete', result_payload)
         
@@ -894,6 +892,27 @@ def transform_data():
     except Exception as e:
         print(f"❌ Transform error: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/get_transformed_data/<dtype>', methods=['GET'])
+def get_transformed_data(dtype):
+    """Serve transformed CSV for download (dtype: 'train' or 'test')"""
+    if dtype == 'train':
+        df = server_state.get('transformed_train')
+        filename = 'transformed_train_data.csv'
+    elif dtype == 'test':
+        df = server_state.get('transformed_test')
+        filename = 'transformed_test_data.csv'
+    else:
+        return jsonify({'error': 'Invalid type, use train or test'}), 400
+
+    if df is None:
+        return jsonify({'error': f'No transformed {dtype} data available'}), 404
+
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    csv_bytes = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
+    csv_bytes.seek(0)
+    return send_file(csv_bytes, mimetype='text/csv', as_attachment=True, download_name=filename)
 
 @socketio.on('connect')
 def handle_connect():

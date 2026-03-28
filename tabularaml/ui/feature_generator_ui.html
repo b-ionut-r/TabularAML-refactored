@@ -1052,7 +1052,6 @@
         });
         let currentMode = 'train';
         let savedGeneratorData = null;
-        let transformedData = null;
         
         // Global state
         let generationState = {
@@ -1591,10 +1590,7 @@
             
             infoDiv.innerHTML = html;
             
-            transformedData = {
-                train: data.train_transformed_data,
-                test: data.test_transformed_data
-            };
+            // Data is served via /get_transformed_data endpoint — no local caching needed.
             
             resultsDiv.style.display = 'block';
             document.getElementById('downloadTrainBtn').style.display = data.has_train ? 'inline-block' : 'none';
@@ -1872,21 +1868,7 @@
         }
 
         function downloadTransformed(type) {
-            if (!transformedData || !transformedData[type]) {
-                alert('No transformed data available for ' + type + '.');
-                return;
-            }
-            
-            // Create and download CSV
-            const blob = new Blob([transformedData[type]], { type: 'text/csv' });
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = 'transformed_' + type + '_data.csv';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            window.URL.revokeObjectURL(url);
+            window.location.href = '/get_transformed_data/' + type;
         }
 
         // File upload handlers
