@@ -31,7 +31,7 @@ from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORE
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'tabularaml_feature_gen_complete'
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB max file size
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",

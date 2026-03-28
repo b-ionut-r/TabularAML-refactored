@@ -1934,17 +1934,26 @@
         document.getElementById('dataset').addEventListener('change', async function(e) {
             const file = e.target.files[0];
             if (file) {
-                addLogMessage(`📁 Dataset loaded: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
+                const sizeMB = file.size / 1024 / 1024;
+                addLogMessage(`📁 Dataset loaded: ${file.name} (${sizeMB.toFixed(1)} MB)`);
+                if (sizeMB > 200) {
+                    addLogMessage(`⚠️ Large file (${sizeMB.toFixed(0)} MB). Consider using the file path input instead to avoid upload overhead.`);
+                }
                 const formData = new FormData();
                 formData.append('dataset', file);
                 try {
                     const response = await fetch('/get_columns', { method: 'POST', body: formData });
+                    if (!response.ok) {
+                        addLogMessage(`❌ Column fetch failed (HTTP ${response.status}). Use the file path input for large files.`);
+                        return;
+                    }
                     const data = await response.json();
+                    if (data.error) { addLogMessage('Error: ' + data.error); return; }
                     populateTargetOptions(data.columns);
                     addLogMessage(`📊 Detected ${data.columns.length} columns`);
                 } catch (error) {
                     console.error('❌ Column detection error:', error);
-                    addLogMessage('Error reading dataset columns: ' + error.message);
+                    addLogMessage('❌ Column detection failed. Use the file path input for large files.');
                 }
             }
         });
