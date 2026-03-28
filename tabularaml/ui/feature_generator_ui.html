@@ -794,9 +794,9 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="max_new_feats" class="tooltip">Max New Features ℹ️
-                                        <span class="tooltiptext">Maximum number of new features to generate (leave empty for unlimited)</span>
+                                        <span class="tooltiptext">Integer = absolute cap (e.g. 75). Float = fraction of original features (e.g. 0.5 = 50%). Leave empty for unlimited.</span>
                                     </label>
-                                    <input type="number" id="max_new_feats" placeholder="Unlimited" min="1" max="1000" />
+                                    <input type="number" id="max_new_feats" placeholder="Unlimited" min="0" step="any" />
                                 </div>
                             </div>
                             <div class="advanced-grid secondary">

@@ -498,8 +498,8 @@ def start_generation():
             if value == '' or value is None:
                 return default
             try:
-                # If param_type is float, check if it's actually an integer masquerading as a float 
-                # (e.g. "12") so that features.py doesn't misinterpret "12.0" as 1200% percent
+                if param_type == int:
+                    return int(float(value))  # handles "1.0", "5.0" etc.
                 if param_type == float and '.' not in str(value):
                     return int(value)
                 return param_type(value)
@@ -644,7 +644,9 @@ def start_generation():
                 if scorer is not None:
                     generator_params['scorer'] = scorer
                 if max_new_feats:
-                    generator_params['max_new_feats'] = int(max_new_feats)
+                    generator_params['max_new_feats'] = (float(max_new_feats)
+                                                         if '.' in str(max_new_feats)
+                                                         else int(max_new_feats))
                 if time_budget:
                     generator_params['time_budget'] = int(time_budget) * 60  # Convert minutes to seconds
                 if save_path:
