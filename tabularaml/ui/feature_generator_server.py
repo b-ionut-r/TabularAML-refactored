@@ -433,18 +433,38 @@ def get_metric_options():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+def _load_dataframe(file=None, file_path=None, nrows=None):
+    """Load a DataFrame from either an uploaded file object or a server-side file path."""
+    if file_path:
+        file_path = file_path.strip()
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f'File not found: {file_path}')
+        ext = os.path.splitext(file_path)[1].lower()
+    elif file and file.filename:
+        ext = os.path.splitext(file.filename)[1].lower()
+    else:
+        raise ValueError('No dataset provided')
+
+    source = file_path if file_path else file
+
+    if ext == '.csv':
+        return pd.read_csv(source, nrows=nrows)
+    elif ext == '.parquet':
+        df = pd.read_parquet(source)
+        return df.iloc[:nrows] if nrows else df
+    elif ext == '.json':
+        return pd.read_json(source, nrows=nrows)
+    else:
+        raise ValueError(f'Unsupported file format: {ext}')
+
+
 @app.route('/get_columns', methods=['POST'])
 def get_columns():
-    """Get column names from uploaded dataset"""
+    """Get column names from uploaded dataset or server-side path"""
     try:
-        file = request.files['dataset']
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(file, nrows=0)
-        elif file.filename.endswith('.json'):
-            df = pd.read_json(file, nrows=0)
-        else:
-            return jsonify({'error': 'Unsupported file format'}), 400
-            
+        file = request.files.get('dataset')
+        file_path = request.form.get('dataset_path', '').strip()
+        df = _load_dataframe(file=file, file_path=file_path or None, nrows=0)
         return jsonify({'columns': list(df.columns)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -462,6 +482,7 @@ def start_generation():
 
         # Get basic parameters
         file = request.files.get('dataset')
+        file_path = request.form.get('dataset_path', '').strip() or None
         target = request.form.get('target')
         task = request.form.get('task', 'auto')
         metric = request.form.get('metric', 'auto')
@@ -504,16 +525,13 @@ def start_generation():
         print(f"🚀 Starting comprehensive generation with {generations} gens, {parents} parents, {children} children")
         print(f"📊 Advanced params: min_gain={min_pct_gain}, early_stop={early_stop_iter}, ranking={ranking_method}")
         
-        if not file or not target:
+        if not (file or file_path) or not target:
             return jsonify({'error': 'Dataset and target column required'}), 400
-        
-        # Load dataset
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(file)
-        elif file.filename.endswith('.json'):
-            df = pd.read_json(file)
-        else:
-            return jsonify({'error': 'Unsupported file format'}), 400
+
+        try:
+            df = _load_dataframe(file=file, file_path=file_path)
+        except (FileNotFoundError, ValueError) as e:
+            return jsonify({'error': str(e)}), 400
         
         if target not in df.columns:
             return jsonify({'error': f'Target column {target} not found'}), 400
@@ -838,12 +856,7 @@ def transform_data():
                 return jsonify({'error': 'No dataset provided'}), 400
         
         def load_df(f):
-            if f.filename.endswith('.csv'):
-                return pd.read_csv(f)
-            elif f.filename.endswith('.json'):
-                return pd.read_json(f)
-            else:
-                raise ValueError(f'Unsupported file format: {f.filename}')
+            return _load_dataframe(file=f)
         
         df_train = None
         df_test = None

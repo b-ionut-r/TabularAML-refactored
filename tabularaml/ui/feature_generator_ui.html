@@ -698,8 +698,19 @@
                         <div class="section-title">📊 Dataset Configuration</div>
                         <div class="control-group">
                             <div class="form-group">
-                                <label for="dataset">Dataset File</label>
-                                <input type="file" id="dataset" accept=".csv,.json" />
+                                <label for="dataset_path" class="tooltip">Dataset File Path ℹ️
+                                    <span class="tooltiptext">Path to a file on the server (recommended for large datasets). Supports .csv, .parquet, .json</span>
+                                </label>
+                                <div style="display:flex;gap:6px;">
+                                    <input type="text" id="dataset_path" placeholder="/path/to/dataset.parquet" style="flex:1;" />
+                                    <button type="button" onclick="loadColumnsFromPath()" style="white-space:nowrap;padding:6px 10px;">Load Columns</button>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label for="dataset" class="tooltip">Upload File ℹ️
+                                    <span class="tooltiptext">Upload a small dataset directly. For files larger than ~50MB use the path option above.</span>
+                                </label>
+                                <input type="file" id="dataset" accept=".csv,.json,.parquet" />
                             </div>
                             <div class="form-group">
                                 <label for="target">Target Column</label>
@@ -1018,11 +1029,11 @@
                             </div>
                             <div class="form-group">
                                 <label for="transformDataset">Train Dataset to Transform</label>
-                                <input type="file" id="transformDataset" accept=".csv,.json" />
+                                <input type="file" id="transformDataset" accept=".csv,.json,.parquet" />
                             </div>
                             <div class="form-group">
                                 <label for="testDataset">Test Dataset to Transform (Optional)</label>
-                                <input type="file" id="testDataset" accept=".csv,.json" />
+                                <input type="file" id="testDataset" accept=".csv,.json,.parquet" />
                             </div>
                         </div>
                         <div class="action-buttons">
@@ -1670,8 +1681,11 @@
             
             // Collect all parameters
             const formData = new FormData();
+            const datasetPath = document.getElementById('dataset_path').value.trim();
             const fileInput = document.getElementById('dataset');
-            if (fileInput.files[0]) {
+            if (datasetPath) {
+                formData.append('dataset_path', datasetPath);
+            } else if (fileInput.files[0]) {
                 formData.append('dataset', fileInput.files[0]);
             }
             
@@ -1896,6 +1910,28 @@
         }
 
         // File upload handlers
+        async function loadColumnsFromPath() {
+            const path = document.getElementById('dataset_path').value.trim();
+            if (!path) { addLogMessage('Enter a file path first.'); return; }
+            try {
+                const fd = new FormData();
+                fd.append('dataset_path', path);
+                const response = await fetch('/get_columns', { method: 'POST', body: fd });
+                const data = await response.json();
+                if (data.error) { addLogMessage('Error: ' + data.error); return; }
+                const targetSelect = document.getElementById('target');
+                targetSelect.innerHTML = '<option value="">Select target column...</option>';
+                data.columns.forEach(col => {
+                    const option = document.createElement('option');
+                    option.value = col; option.textContent = col;
+                    targetSelect.appendChild(option);
+                });
+                addLogMessage(`📊 Loaded ${data.columns.length} columns from path`);
+            } catch (error) {
+                addLogMessage('Error: ' + error.message);
+            }
+        }
+
         document.getElementById('dataset').addEventListener('change', async function(e) {
             const file = e.target.files[0];
             if (file) {
