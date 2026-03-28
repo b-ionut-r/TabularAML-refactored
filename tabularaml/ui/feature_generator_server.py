@@ -506,13 +506,13 @@ def start_generation():
             except:
                 return default
         
-        # Parse parameters - empty values will use constructor defaults (mode will override)
-        generations = parse_param('generations', 15, int)
-        parents = parse_param('parents', 40, int)
-        children = parse_param('children', 200, int)
-        min_pct_gain = parse_param('min_pct_gain', 0.001, float)
-        early_stop_iter = parse_param('early_stop_iter', 0.4, float)
-        early_stop_child = parse_param('early_stop_child', 0.3, float)
+        # Parse parameters - store raw strings so we can tell blank from default
+        generations = request.form.get('generations', '').strip()
+        parents = request.form.get('parents', '').strip()
+        children = request.form.get('children', '').strip()
+        min_pct_gain = request.form.get('min_pct_gain', '').strip()
+        early_stop_iter = request.form.get('early_stop_iter', '').strip()
+        early_stop_child = request.form.get('early_stop_child', '').strip()
         cv_folds = parse_param('cv_folds', 5, int)
         cv_type = request.form.get('cv_type', 'kfold')
         group_col = request.form.get('group_col', '').strip()
@@ -526,8 +526,8 @@ def start_generation():
         use_gpu = request.form.get('use_gpu', 'false').lower() == 'true'
         adaptive = request.form.get('adaptive', 'false').lower() == 'true'
         
-        print(f"🚀 Starting comprehensive generation with {generations} gens, {parents} parents, {children} children")
-        print(f"📊 Advanced params: min_gain={min_pct_gain}, early_stop={early_stop_iter}, ranking={ranking_method}")
+        print(f"🚀 Starting generation — overrides: gens={generations or 'mode'}, parents={parents or 'mode'}, children={children or 'mode'}")
+        print(f"📊 Advanced params: min_gain={min_pct_gain or 'mode'}, early_stop={early_stop_iter or 'mode'}, ranking={ranking_method}")
         
         if not (file or file_path) or not target:
             return jsonify({'error': 'Dataset and target column required'}), 400
@@ -620,21 +620,27 @@ def start_generation():
             try:
                 print("🧠 Creating ComprehensiveFeatureGenerator with all parameters...")
                 
-                # Prepare parameters
+                # Prepare parameters — only include overrides the user explicitly set
                 generator_params = {
-                    'n_generations': generations,
-                    'n_parents': parents,
-                    'n_children': children,
-                    'min_pct_gain': min_pct_gain,
-                    'early_stopping_iter': early_stop_iter,
-                    'early_stopping_child_eval': early_stop_child,
                     'ranking_method': ranking_method,
                     'cv': cv_obj,
                     'groups': groups,
                     'use_gpu': use_gpu,
                     'adaptive': adaptive,
-                    'log_file': None  # We handle logging ourselves
+                    'log_file': None
                 }
+                if generations:
+                    generator_params['n_generations'] = int(float(generations))
+                if parents:
+                    generator_params['n_parents'] = int(float(parents))
+                if children:
+                    generator_params['n_children'] = int(float(children))
+                if min_pct_gain:
+                    generator_params['min_pct_gain'] = float(min_pct_gain)
+                if early_stop_iter:
+                    generator_params['early_stopping_iter'] = float(early_stop_iter) if '.' in early_stop_iter else int(early_stop_iter)
+                if early_stop_child:
+                    generator_params['early_stopping_child_eval'] = float(early_stop_child) if '.' in early_stop_child else int(early_stop_child)
                 
                 # Add optional parameters
                 if mode != 'auto' and mode != 'none':
