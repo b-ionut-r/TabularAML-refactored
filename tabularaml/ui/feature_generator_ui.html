@@ -697,20 +697,16 @@
                     <div class="control-section">
                         <div class="section-title">📊 Dataset Configuration</div>
                         <div class="control-group">
-                            <div class="form-group">
-                                <label for="dataset_path" class="tooltip">Dataset File Path ℹ️
-                                    <span class="tooltiptext">Path to a file on the server (recommended for large datasets). Supports .csv, .parquet, .json</span>
+                            <div class="form-group" style="grid-column: 1 / -1;">
+                                <label class="tooltip">Dataset ℹ️
+                                    <span class="tooltiptext">Enter a server-side file path (recommended for large files) or upload directly. Supports .csv, .parquet, .json</span>
                                 </label>
-                                <div style="display:flex;gap:6px;">
-                                    <input type="text" id="dataset_path" placeholder="/path/to/dataset.parquet" style="flex:1;" />
-                                    <button type="button" onclick="loadColumnsFromPath()" style="white-space:nowrap;padding:6px 10px;">Load Columns</button>
+                                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                                    <input type="text" id="dataset_path" placeholder="/path/to/dataset.parquet" style="flex:2;min-width:200px;" />
+                                    <button type="button" onclick="loadColumnsFromPath()" style="white-space:nowrap;padding:6px 12px;">Load from Path</button>
+                                    <span style="color:var(--text-secondary,#888);font-size:0.85em;">or upload:</span>
+                                    <input type="file" id="dataset" accept=".csv,.json,.parquet" style="flex:1;min-width:160px;" />
                                 </div>
-                            </div>
-                            <div class="form-group">
-                                <label for="dataset" class="tooltip">Upload File ℹ️
-                                    <span class="tooltiptext">Upload a small dataset directly. For files larger than ~50MB use the path option above.</span>
-                                </label>
-                                <input type="file" id="dataset" accept=".csv,.json,.parquet" />
                             </div>
                             <div class="form-group">
                                 <label for="target">Target Column</label>
