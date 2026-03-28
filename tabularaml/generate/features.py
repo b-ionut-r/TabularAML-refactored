@@ -568,13 +568,16 @@ class FeatureGenerator:
         self.save_path = save_path
         self.save_each_trial = save_each_trial
         
-        # Early stopping
-        self.early_stopping_iter = (int(early_stopping_iter * n_generations) 
-                                   if isinstance(early_stopping_iter, float)
-                                   else early_stopping_iter 
-                                   if isinstance(early_stopping_iter, int) 
-                                   else float('inf'))
-        self.early_stopping_child_eval = early_stopping_child_eval
+        # Early stopping - mode preset already applied via _set_params_from_mode;
+        # only overwrite from constructor args when no mode was given.
+        if not mode:
+            self.early_stopping_iter = early_stopping_iter
+            self.early_stopping_child_eval = early_stopping_child_eval
+        # Convert early_stopping_iter from fraction to absolute generation count if float
+        if isinstance(self.early_stopping_iter, float):
+            self.early_stopping_iter = int(self.early_stopping_iter * self.n_generations)
+        elif not isinstance(self.early_stopping_iter, int):
+            self.early_stopping_iter = float('inf')
         
         # Technical setup
         self.adaptive_controller = ImprovedAdaptiveController(
@@ -1066,8 +1069,13 @@ class FeatureGenerator:
         min_evals = max(5, int(0.05 * len(ranked)))
 
         for inter in ranked:
+            if hasattr(self, 'stop_requested') and self.stop_requested:
+                break
+                
             evals += 1
-            if callback: callback(evals, len(selected))
+            if callback and callback(evals, len(selected)):
+                break
+                
             if len(selected) >= n or not all(feat in X_base.columns for feat in ([inter.feature_1.name] + ([inter.feature_2.name] if inter.feature_2 else []))):
                 continue
 
@@ -1512,15 +1520,12 @@ class FeatureGenerator:
                         continue
                     
                     # Skip beam search if it's been failing consistently
-                    use_beam_search = (adaptive_status['stagnation_level'] in ['SEVERE', 'CRITICAL'] and 
-                                     self.adaptive_controller.get_strategy_success_rate("beam_search") > 0.2 and
-                                     random.random() < 0.3)
+                    use_beam_search = False
                     
                     if use_beam_search:
                         self._log(f"  Starting beam search k=3...")
-                        # [Beam search implementation - keeping original logic]
-                        # ... (beam search code remains the same)
                         beam_search_used = True
+                        elites = []
                     else:
                         beam_search_used = False
                     
