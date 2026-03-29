@@ -608,6 +608,7 @@ def start_generation():
                     self._tss = tss
                     self._periods = unique_periods
                     self._groups = groups
+                    self.n_splits = tss.n_splits
                 def split(self, X, y=None, groups=None):
                     # Use groups passed at split-time (may be subsampled), else fall back
                     g = groups if groups is not None else self._groups

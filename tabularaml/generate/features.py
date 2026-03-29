@@ -667,7 +667,8 @@ class FeatureGenerator:
         # GroupKFold requires groups in cv.split() which FeatureImportanceAnalyzer doesn't pass;
         # use a plain KFold with the same n_splits for importance ranking.
         cv_for_importance = (KFold(n_splits=self.cv.n_splits, shuffle=True, random_state=42)
-                             if isinstance(self.cv, GroupKFold) else self.cv)
+                             if isinstance(self.cv, GroupKFold)
+                             else self.cv)
         pipeline.imputer = SimpleImputer()
         analyzer = FeatureImportanceAnalyzer(
             task_type=self.task, weights=self.imp_weights, preferred_gbm="xgboost",
@@ -1366,9 +1367,13 @@ class FeatureGenerator:
             X_full, y_full = X, y
             X, y, groups_sub = self._create_search_subsample(X, y, sample_size, self.groups)
             self._groups_active = groups_sub
+            if hasattr(self.cv, '_groups'):
+                self.cv._groups = groups_sub
             self._log(f"Instance sampling: {len(X_full)} -> {len(X)} rows for search (search_sample_size={sample_size})")
         else:
             self._groups_active = self.groups
+            if hasattr(self.cv, '_groups'):
+                self.cv._groups = self.groups
 
         # Initialize
         self.pruned_features = set()
@@ -1667,6 +1672,8 @@ class FeatureGenerator:
 
             y = y_full
             self._groups_active = self.groups  # restore full groups after subsampled search
+            if hasattr(self.cv, '_groups'):
+                self.cv._groups = self.groups
             self._sync_state_components(X, self.pipeline, generation)
             self._save_current_as_best()
 
