@@ -818,18 +818,36 @@
                                 </div>
                                 <div class="form-group">
                                     <label for="cv_type" class="tooltip">CV Strategy ℹ️
-                                        <span class="tooltiptext">KFold: standard random splits. GroupKFold: keeps entire groups (e.g. time periods) together to prevent data leakage.</span>
+                                        <span class="tooltiptext">KFold: random splits. GroupKFold: keeps groups together. TimeSeriesSplit: chronological with embargo gap. Custom: upload a .py file with your own splitter.</span>
                                     </label>
-                                    <select id="cv_type" onchange="toggleGroupCol()">
+                                    <select id="cv_type" onchange="toggleCVOptions()">
                                         <option value="kfold">KFold (default)</option>
                                         <option value="groupfold">GroupKFold</option>
+                                        <option value="timeseries">TimeSeriesSplit</option>
+                                        <option value="custom">Custom (.py)</option>
                                     </select>
                                 </div>
                                 <div class="form-group" id="group_col_group" style="display:none;">
-                                    <label for="group_col" class="tooltip">Group Column ℹ️
-                                        <span class="tooltiptext">Column whose values define the groups (e.g. 'moon' or 'date'). All rows with the same value go into the same fold.</span>
+                                    <label for="group_col" class="tooltip" id="group_col_label">Group Column ℹ️
+                                        <span class="tooltiptext" id="group_col_tip">Column whose values define the groups (e.g. 'moon' or 'date'). All rows with the same value go into the same fold.</span>
                                     </label>
                                     <input type="text" id="group_col" placeholder="e.g. moon" />
+                                </div>
+                                <div class="form-group" id="cv_gap_group" style="display:none;">
+                                    <label for="cv_gap" class="tooltip">Embargo Gap ℹ️
+                                        <span class="tooltiptext">Number of time periods to skip between train end and validation start (e.g. 4 to enforce a 4-period embargo).</span>
+                                    </label>
+                                    <input type="number" id="cv_gap" placeholder="e.g. 4" min="0" max="100" />
+                                </div>
+                                <div class="form-group span-6" id="custom_splitter_group" style="display:none;">
+                                    <label class="tooltip">Splitter File (.py) ℹ️
+                                        <span class="tooltiptext">Upload a .py file that exposes a splitter variable or a get_splitter(n_splits) function returning an sklearn-compatible CV object.</span>
+                                    </label>
+                                    <div onclick="document.getElementById('custom_splitter_file').click()" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:9px 12px;border:2px dashed #bbb;border-radius:8px;font-size:13px;color:#777;transition:border-color 0.2s,color 0.2s;" onmouseover="this.style.borderColor='#667eea';this.style.color='#667eea'" onmouseout="this.style.borderColor='#bbb';this.style.color='#777'">
+                                        <span style="font-size:18px;line-height:1">⬆</span>
+                                        <span id="custom_splitter_name">Upload .py file</span>
+                                    </div>
+                                    <input type="file" id="custom_splitter_file" accept=".py" style="display:none;" onchange="document.getElementById('custom_splitter_name').textContent=this.files[0]?this.files[0].name:'Upload .py file'" />
                                 </div>
                                 <div class="form-group">
                                     <label for="time_budget" class="tooltip">Time Budget (minutes) ℹ️
@@ -1240,11 +1258,22 @@
         }
 
         // Mode switching
-        function toggleGroupCol() {
+        function toggleCVOptions() {
             const cvType = document.getElementById('cv_type').value;
-            const groupColGroup = document.getElementById('group_col_group');
-            groupColGroup.style.display = cvType === 'groupfold' ? '' : 'none';
+            document.getElementById('group_col_group').style.display  = (cvType === 'groupfold' || cvType === 'timeseries') ? '' : 'none';
+            document.getElementById('cv_gap_group').style.display      = cvType === 'timeseries' ? '' : 'none';
+            document.getElementById('custom_splitter_group').style.display = cvType === 'custom' ? '' : 'none';
+            const label = document.getElementById('group_col_label');
+            const tip   = document.getElementById('group_col_tip');
+            if (cvType === 'timeseries') {
+                label.firstChild.textContent = 'Time Column ℹ️';
+                tip.textContent = 'Column containing the time period (e.g. "moon"). Used to build chronologically ordered folds with the embargo gap.';
+            } else {
+                label.firstChild.textContent = 'Group Column ℹ️';
+                tip.textContent = 'Column whose values define the groups (e.g. "moon" or "date"). All rows with the same value go into the same fold.';
+            }
         }
+        function toggleGroupCol() { toggleCVOptions(); }
 
         function switchMode(mode) {
             currentMode = mode;
@@ -1702,6 +1731,9 @@
             formData.append('cv_folds', document.getElementById('cv_folds').value);
             formData.append('cv_type', document.getElementById('cv_type').value);
             formData.append('group_col', document.getElementById('group_col').value || '');
+            formData.append('cv_gap', document.getElementById('cv_gap').value || '');
+            const splitterFile = document.getElementById('custom_splitter_file').files[0];
+            if (splitterFile) formData.append('custom_splitter_file', splitterFile);
             formData.append('time_budget', document.getElementById('time_budget').value || '');
             formData.append('save_path', document.getElementById('save_path').value || '');
             formData.append('search_sample_size', document.getElementById('search_sample_size').value || '');

@@ -19,7 +19,7 @@ import numpy as np
 from pathlib import Path
 import io
 from sklearn.utils.multiclass import type_of_target
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, TimeSeriesSplit
 
 # Import our actual FeatureGenerator
 import sys
@@ -516,6 +516,7 @@ def start_generation():
         cv_folds = parse_param('cv_folds', 5, int)
         cv_type = request.form.get('cv_type', 'kfold')
         group_col = request.form.get('group_col', '').strip()
+        cv_gap = parse_param('cv_gap', 0, int)
 
         # Handle optional parameters
         max_new_feats = request.form.get('max_new_feats', '')
@@ -588,10 +589,58 @@ def start_generation():
                 return jsonify({'error': 'Group column is required for GroupKFold'}), 400
             if group_col not in df.columns:
                 return jsonify({'error': f'Group column "{group_col}" not found in dataset'}), 400
-            groups = df[group_col].values  # extract before dropping target
-            # groups must align with X rows (same order)
+            groups = df[group_col].values
             cv_obj = GroupKFold(n_splits=cv_folds)
             print(f"📊 GroupKFold: {cv_folds} splits on column '{group_col}' ({len(np.unique(groups))} unique groups)")
+
+        elif cv_type == 'timeseries':
+            if not group_col:
+                return jsonify({'error': 'Time column is required for TimeSeriesSplit'}), 400
+            if group_col not in df.columns:
+                return jsonify({'error': f'Time column "{group_col}" not found in dataset'}), 400
+            groups = df[group_col].values
+            unique_periods = np.sort(np.unique(groups))
+            tss = TimeSeriesSplit(n_splits=cv_folds, gap=cv_gap)
+
+            class _PurgedTimeSeriesSplit:
+                """Wraps TimeSeriesSplit to work on period-level then mask rows."""
+                def __init__(self, tss, unique_periods, groups):
+                    self._tss = tss
+                    self._periods = unique_periods
+                    self._groups = groups
+                def split(self, X, y=None, groups=None):
+                    for tr_p_idx, val_p_idx in self._tss.split(self._periods):
+                        tr_periods  = self._periods[tr_p_idx]
+                        val_periods = self._periods[val_p_idx]
+                        tr_mask  = np.isin(self._groups, tr_periods)
+                        val_mask = np.isin(self._groups, val_periods)
+                        yield np.where(tr_mask)[0], np.where(val_mask)[0]
+                def get_n_splits(self, X=None, y=None, groups=None):
+                    return self._tss.get_n_splits()
+
+            cv_obj = _PurgedTimeSeriesSplit(tss, unique_periods, groups)
+            print(f"📊 TimeSeriesSplit: {cv_folds} splits, gap={cv_gap} on column '{group_col}' ({len(unique_periods)} unique periods)")
+
+        elif cv_type == 'custom':
+            splitter_file = request.files.get('custom_splitter_file')
+            if not splitter_file:
+                return jsonify({'error': 'No splitter file uploaded for Custom CV'}), 400
+            splitter_code = splitter_file.read().decode('utf-8')
+            ns = {}
+            try:
+                exec(compile(splitter_code, splitter_file.filename, 'exec'), ns)
+            except Exception as e:
+                return jsonify({'error': f'Error executing splitter file: {e}'}), 400
+            if 'get_splitter' in ns and callable(ns['get_splitter']):
+                try:
+                    cv_obj = ns['get_splitter'](cv_folds)
+                except Exception as e:
+                    return jsonify({'error': f'get_splitter({cv_folds}) raised: {e}'}), 400
+            elif 'splitter' in ns:
+                cv_obj = ns['splitter']
+            else:
+                return jsonify({'error': 'Splitter file must define a splitter variable or get_splitter(n_splits) function'}), 400
+            print(f"📊 Custom splitter loaded from '{splitter_file.filename}': {type(cv_obj).__name__}")
 
         print(f"📊 Dataset: {X.shape[0]} rows, {X.shape[1]} features")
 
