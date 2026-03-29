@@ -1666,6 +1666,7 @@ class FeatureGenerator:
                 X = X.drop(columns=[c for c in self.pruned_features if c in X.columns], errors='ignore')
 
             y = y_full
+            self._groups_active = self.groups  # restore full groups after subsampled search
             self._sync_state_components(X, self.pipeline, generation)
             self._save_current_as_best()
 
