@@ -609,11 +609,14 @@ def start_generation():
                     self._periods = unique_periods
                     self._groups = groups
                 def split(self, X, y=None, groups=None):
-                    for tr_p_idx, val_p_idx in self._tss.split(self._periods):
-                        tr_periods  = self._periods[tr_p_idx]
-                        val_periods = self._periods[val_p_idx]
-                        tr_mask  = np.isin(self._groups, tr_periods)
-                        val_mask = np.isin(self._groups, val_periods)
+                    # Use groups passed at split-time (may be subsampled), else fall back
+                    g = groups if groups is not None else self._groups
+                    unique_periods = np.sort(np.unique(g))
+                    for tr_p_idx, val_p_idx in self._tss.split(unique_periods):
+                        tr_periods  = unique_periods[tr_p_idx]
+                        val_periods = unique_periods[val_p_idx]
+                        tr_mask  = np.isin(g, tr_periods)
+                        val_mask = np.isin(g, val_periods)
                         yield np.where(tr_mask)[0], np.where(val_mask)[0]
                 def get_n_splits(self, X=None, y=None, groups=None):
                     return self._tss.get_n_splits()
