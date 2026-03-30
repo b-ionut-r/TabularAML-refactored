@@ -187,24 +187,24 @@ class FeatureImportanceAnalyzer:
             warnings.filterwarnings("ignore", category=UserWarning)
             warnings.filterwarnings("ignore", category=FutureWarning)
 
-    def fit(self, X: pd.DataFrame, y: Union[pd.DataFrame, pd.Series]) -> 'FeatureImportanceAnalyzer':
+    def fit(self, X: pd.DataFrame, y: Union[pd.DataFrame, pd.Series], groups=None) -> 'FeatureImportanceAnalyzer':
         """Calculate feature importance using multiple methods."""
         start_time = time()
-        
+
         if self.verbose:
             print(f"Starting feature importance analysis on {X.shape[1]} features")
-            
+
         # Capture original stdout if we need to suppress output
         original_stdout = None
         if self.suppress_warnings:
             from contextlib import redirect_stdout
-            null_output = open(os.devnull, 'w') 
+            null_output = open(os.devnull, 'w')
             original_stdout = sys.stdout
             sys.stdout = null_output
-            
+
         try:
             if self.n_cv_folds is not None:
-                self._fit_with_cv(X, y)
+                self._fit_with_cv(X, y, groups=groups)
             else:
                 self._fit_direct(X, y)
         finally:
@@ -267,15 +267,15 @@ class FeatureImportanceAnalyzer:
             # No cleanup needed for direct fit
             pass
                 
-    def _fit_with_cv(self, X, y):
+    def _fit_with_cv(self, X, y, groups=None):
         """Calculate feature importance with cross-validation."""
         if self.verbose:
             print(f"Running {self.n_cv_folds}-fold cross-validation")
-            
+
         # Initialize CV results dictionary for only the methods specified in weights with non-zero values
-        self.cv_results = {method: {} for method in ["correlation", "tree", "permutation", "shap"] 
+        self.cv_results = {method: {} for method in ["correlation", "tree", "permutation", "shap"]
                           if method in self.weights and self.weights[method] > 0}
-        
+
         # Use provided CV splitter if available, otherwise create default
         if self.cv_splitter is not None:
             cv = self.cv_splitter
@@ -289,9 +289,9 @@ class FeatureImportanceAnalyzer:
                 cv = KFold(n_splits=self.n_cv_folds, shuffle=True, random_state=self.random_state)
             if self.verbose:
                 print(f"Using default CV splitter: {type(cv).__name__} with {self.n_cv_folds} folds")
-            
+
         # Run calculations for each fold
-        for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y)):
+        for fold_idx, (train_idx, val_idx) in enumerate(cv.split(X, y, groups)):
             if self.verbose:
                 print(f"Processing fold {fold_idx + 1}/{self.n_cv_folds}")
                 

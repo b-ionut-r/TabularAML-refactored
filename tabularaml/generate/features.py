@@ -663,17 +663,11 @@ class FeatureGenerator:
 
     def _get_top_k_features(self, X: pd.DataFrame, y: pd.Series, k: int = 50, pipeline=None) -> pd.DataFrame:
         """Get top k features by importance."""
-        from sklearn.model_selection import GroupKFold, KFold
-        # GroupKFold requires groups in cv.split() which FeatureImportanceAnalyzer doesn't pass;
-        # use a plain KFold with the same n_splits for importance ranking.
-        cv_for_importance = (KFold(n_splits=self.cv.n_splits, shuffle=True, random_state=42)
-                             if isinstance(self.cv, GroupKFold)
-                             else self.cv)
         pipeline.imputer = SimpleImputer()
         analyzer = FeatureImportanceAnalyzer(
             task_type=self.task, weights=self.imp_weights, preferred_gbm="xgboost",
-            pipeline=pipeline, cv=cv_for_importance, use_gpu=(self.device == "cuda"))
-        analyzer.fit(X, y)
+            pipeline=pipeline, cv=self.cv, use_gpu=(self.device == "cuda"))
+        analyzer.fit(X, y, groups=self._groups_active)
         pipeline.imputer = None 
         imp_df = analyzer.get_importance(normalize=False)[["weighted_importance"]]
         imp_df.sort_values(by="weighted_importance", axis=0, ascending=False, inplace=True)
