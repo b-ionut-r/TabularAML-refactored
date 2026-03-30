@@ -732,8 +732,9 @@ class FeatureImportanceAnalyzer:
             
             model.fit(X_proper, y)
             
-            # Scale number of repeats based on data size to manage computation time
-            n_repeats = max(5, min(10, 30000 // (X.shape[0] * X.shape[1])))
+            # Scale repeats inversely with feature count: more features → fewer repeats needed
+            # for a stable ranking. 5 repeats on ≤200 features, 1 repeat on ≥1000.
+            n_repeats = max(1, min(5, 1000 // max(1, X.shape[1])))
             
             perm_importance = permutation_importance(
                 model, eval_X_proper, eval_y, n_repeats=n_repeats, 
@@ -794,8 +795,10 @@ class FeatureImportanceAnalyzer:
         # Use validation data if provided, otherwise use training data
         eval_X = X_val if X_val is not None else X
         
-        # Sample data if there are too many instances to speed up SHAP calculation
-        sample_size = min(10000, eval_X.shape[0]) if eval_X.shape[0] > 1000 else eval_X.shape[0]
+        # Sample data for SHAP — cap scales inversely with feature count so total
+        # work (samples × features) stays bounded. Floor at 500 to keep signal.
+        feature_cap = max(500, min(10000, 5_000_000 // max(1, X.shape[1])))
+        sample_size = min(feature_cap, eval_X.shape[0]) if eval_X.shape[0] > 1000 else eval_X.shape[0]
         eval_X_sample = eval_X.sample(sample_size, random_state=self.random_state) if sample_size < eval_X.shape[0] else eval_X
         
         # Handle NaNs and infs explicitly before passing to SHAP
@@ -1053,8 +1056,9 @@ class FeatureImportanceAnalyzer:
                 print("SHAP not available. Install with 'pip install shap'")
             return {}
             
-        # Sample data if there are too many instances to speed up SHAP calculation
-        sample_size = min(5000, X.shape[0]) if X.shape[0] > 1000 else X.shape[0]
+        # Sample data for SHAP interactions — cap scales inversely with feature count.
+        feature_cap = max(200, min(5000, 1_000_000 // max(1, X.shape[1])))
+        sample_size = min(feature_cap, X.shape[0]) if X.shape[0] > 1000 else X.shape[0]
         X_sample = X.sample(sample_size, random_state=self.random_state) if sample_size < X.shape[0] else X
         
         # Handle NaNs and infs explicitly before passing to SHAP
