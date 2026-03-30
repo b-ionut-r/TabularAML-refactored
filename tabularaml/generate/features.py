@@ -638,27 +638,44 @@ class FeatureGenerator:
                 X.select_dtypes(include=['object', 'category']).columns.tolist())
 
     def _create_search_subsample(self, X: pd.DataFrame, y: pd.Series, sample_size: int, groups=None) -> tuple:
-        """Create a stratified subsample for the search phase."""
+        """Create a stratified subsample for the search phase, respecting groups/time if provided."""
         if len(X) <= sample_size:
             return X, y, groups
 
         from sklearn.model_selection import StratifiedShuffleSplit
+        import numpy as np
+        import pandas as pd
+
+        groups_arr = np.asarray(groups) if groups is not None else None
 
         try:
-            if self.task != "regression":
-                stratify_labels = y
+            if groups_arr is not None:
+                frac = sample_size / len(X)
+                df_temp = pd.DataFrame({'idx': np.arange(len(X)), 'g': groups_arr})
+                sampled = df_temp.groupby('g', group_keys=False).sample(frac=frac, random_state=42)
+                indices = sampled['idx'].values
+                
+                if len(indices) > sample_size:
+                    indices = np.random.RandomState(42).choice(indices, sample_size, replace=False)
+                elif len(indices) < sample_size:
+                    remaining = np.setdiff1d(np.arange(len(X)), indices)
+                    extra = np.random.RandomState(42).choice(remaining, sample_size - len(indices), replace=False)
+                    indices = np.concatenate([indices, extra])
+                indices = np.sort(indices)
             else:
-                # Bin regression target into quantiles for stratification
-                n_bins = min(10, len(y.unique()))
-                stratify_labels = pd.qcut(y, q=n_bins, labels=False, duplicates="drop")
-
-            sss = StratifiedShuffleSplit(n_splits=1, train_size=sample_size, random_state=42)
-            indices, _ = next(sss.split(X, stratify_labels))
+                if self.task != "regression":
+                    stratify_labels = y
+                else:
+                    n_bins = min(10, len(y.unique()))
+                    stratify_labels = pd.qcut(y, q=n_bins, labels=False, duplicates="drop")
+                sss = StratifiedShuffleSplit(n_splits=1, train_size=sample_size, random_state=42)
+                indices, _ = next(sss.split(X, stratify_labels))
         except Exception:
-            # Fallback to random sampling if stratification fails
             indices = np.random.RandomState(42).choice(len(X), size=sample_size, replace=False)
+            if groups_arr is not None:
+                indices = np.sort(indices)
 
-        groups_sub = groups[indices] if groups is not None else None
+        groups_sub = groups_arr[indices] if groups_arr is not None else None
         return X.iloc[indices].copy(), y.iloc[indices].copy(), groups_sub
 
     def _get_top_k_features(self, X: pd.DataFrame, y: pd.Series, k: int = 50, pipeline=None) -> pd.DataFrame:
