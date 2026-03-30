@@ -545,6 +545,11 @@ def start_generation():
         X = df.drop(columns=[target])
         y = df[target]
 
+        # Prevent leakage by dropping the group/time column from predictors if used
+        if group_col and group_col in X.columns:
+            print(f"🗑️ Dropping splitting column '{group_col}' from features to prevent leakage.")
+            X = X.drop(columns=[group_col])
+
         # Resolve task if not explicitly set so metric validation can be deterministic.
         if task == 'auto':
             inferred_task = 'regression' if type_of_target(y) == 'continuous' else 'classification'
