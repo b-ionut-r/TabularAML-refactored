@@ -248,13 +248,12 @@ class FeatureImportanceAnalyzer:
             
             if 'tree' in self.weights and self.weights['tree'] > 0:
                 self._calculate_tree_importance(X_transformed, y_copy)
-              # Calculate all requested importance methods, regardless of dimensionality
             if 'permutation' in self.weights and self.weights['permutation'] > 0:
                 # Never skip permutation importance regardless of feature count
                 self._calculate_permutation_importance(X_transformed, y_copy)
                 if self.verbose and X_transformed.shape[1] > self.max_features_for_permutation:
                     print(f"Computing permutation importance despite high dimensionality ({X_transformed.shape[1]} features)")
-            
+
             if 'shap' in self.weights and self.weights['shap'] > 0:
                 if SHAP_AVAILABLE:
                     # Never skip SHAP importance regardless of feature count
@@ -324,13 +323,12 @@ class FeatureImportanceAnalyzer:
             
             if 'tree' in self.weights and self.weights['tree'] > 0:
                 self._calculate_tree_importance(X_train_transformed, y_train, fold_results, X_val_transformed, y_val)
-              # Calculate all requested importance methods, regardless of dimensionality
             if 'permutation' in self.weights and self.weights['permutation'] > 0:
                 # Never skip permutation importance regardless of feature count
                 self._calculate_permutation_importance(X_train_transformed, y_train, fold_results, X_val_transformed, y_val)
                 if self.verbose and X_train_transformed.shape[1] > self.max_features_for_permutation:
                     print(f"Computing permutation importance despite high dimensionality ({X_train_transformed.shape[1]} features)")
-            
+
             if 'shap' in self.weights and self.weights['shap'] > 0:
                 if SHAP_AVAILABLE:
                     # Never skip SHAP importance regardless of feature count

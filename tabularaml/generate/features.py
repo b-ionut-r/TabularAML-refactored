@@ -669,7 +669,7 @@ class FeatureGenerator:
                     n_bins = min(10, len(y.unique()))
                     stratify_labels = pd.qcut(y, q=n_bins, labels=False, duplicates="drop")
                 sfss = StratifiedShuffleSplit(n_splits=1, train_size=sample_size, random_state=42)
-                indices, _ = next(sss.split(X, stratify_labels))
+                indices, _ = next(sfss.split(X, stratify_labels))
         except Exception:
             indices = np.random.RandomState(42).choice(len(X), size=sample_size, replace=False)
             if groups_arr is not None:
