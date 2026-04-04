@@ -183,8 +183,22 @@ def ensure_event_pump():
         socketio.start_background_task(socket_event_pump)
         server_state['event_pump_started'] = True
 
+def _to_serializable(obj):
+    """Recursively convert numpy/non-JSON-serializable types to Python natives."""
+    if isinstance(obj, dict):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
 def queue_socket_event(event_name, payload):
-    normalized_payload = dict(payload)
+    normalized_payload = _to_serializable(dict(payload))
     _update_status_snapshot(event_name, normalized_payload)
     if event_name != 'keepalive':
         server_state['last_emit_at'] = time.time()
