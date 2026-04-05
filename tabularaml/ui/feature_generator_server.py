@@ -774,7 +774,7 @@ def start_generation():
                     'improvement': getattr(generator, 'gain', 0.0),
                     'percent_gain': getattr(generator, 'pct_gain', 0.0) * 100,
                     'total_restarts': getattr(generator.adaptive_controller.state, 'total_restarts', 0) if hasattr(generator, 'adaptive_controller') else 0,
-                    'best_generation': getattr(generator.state['best'], 'gen_num', 0) if hasattr(generator, 'state') else 0,
+                    'best_generation': generator.state['best'].get('gen_num', 0) if hasattr(generator, 'state') else 0,
                     'normal_strategy_success': round(normal_rate, 2),
                     'hopeful_monster_success': round(hopeful_rate, 2)
                 }

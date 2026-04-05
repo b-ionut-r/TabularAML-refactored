@@ -947,14 +947,8 @@
                         <div class="log-content" id="logContent" aria-live="polite"></div>
                     </div>
                     
-                    <div class="feature-list">
-                        <h3>Generated Features</h3>
-                        <div class="feature-grid" id="featureGrid">
-                            <!-- Features will be added dynamically -->
-                        </div>
-                    </div>
                 </div>
-                
+
                 <div class="results-section" id="resultsSection">
                     <h2 style="margin-bottom: 20px; text-align: center;">🎉 Generation Complete!</h2>
                     <div class="results-grid">
@@ -1002,15 +996,11 @@
                             <h3>🎯 Strategy Performance</h3>
                             <div class="metric-item">
                                 <span>Normal Strategy:</span>
-                                <span class="metric-value" id="normalSuccess">0.00</span>
+                                <span class="metric-value" id="normalSuccess">0.00%</span>
                             </div>
                             <div class="metric-item">
                                 <span>Hopeful Monster:</span>
-                                <span class="metric-value" id="hopefulSuccess">0.00</span>
-                            </div>
-                            <div class="metric-item">
-                                <span>Beam Search:</span>
-                                <span class="metric-value" id="beamSuccess">0.00</span>
+                                <span class="metric-value" id="hopefulSuccess">0.00%</span>
                             </div>
                             <div class="metric-item">
                                 <span>Best Generation:</span>
@@ -1028,8 +1018,15 @@
                         </button>
                     </div>
                 </div>
+
+                <div class="feature-list" id="featureListContainer" style="display: none; padding: 30px; padding-top: 0;">
+                    <h3>Generated Features</h3>
+                    <div class="feature-grid" id="featureGrid">
+                        <!-- Features will be added dynamically -->
+                    </div>
+                </div>
             </div>
-            
+
             <!-- TRANSFORM MODE -->
             <div class="mode-panel" id="transformMode">
                 <div class="controls">
@@ -1572,16 +1569,15 @@
         function renderGeneratedFeatures(features = []) {
             generationState.features = Array.isArray(features) ? features : [];
             const featureGrid = document.getElementById('featureGrid');
+            const container = document.getElementById('featureListContainer');
             featureGrid.innerHTML = '';
 
             if (!generationState.features.length) {
-                const emptyItem = document.createElement('div');
-                emptyItem.className = 'feature-item';
-                emptyItem.textContent = 'No generated features yet.';
-                featureGrid.appendChild(emptyItem);
+                container.style.display = 'none';
                 return;
             }
 
+            container.style.display = 'block';
             generationState.features.forEach(function(featureName) {
                 const featureItem = document.createElement('div');
                 featureItem.className = 'feature-item new';
@@ -1622,7 +1618,6 @@
             if (results.best_generation) document.getElementById('bestGeneration').textContent = results.best_generation;
             if (results.normal_strategy_success !== undefined) document.getElementById('normalSuccess').textContent = results.normal_strategy_success.toFixed(2) + '%';
             if (results.hopeful_monster_success !== undefined) document.getElementById('hopefulSuccess').textContent = results.hopeful_monster_success.toFixed(2) + '%';
-            if (results.beam_search_success !== undefined) document.getElementById('beamSuccess').textContent = results.beam_search_success.toFixed(2) + '%';
         }
 
         function showTransformResults(data) {
