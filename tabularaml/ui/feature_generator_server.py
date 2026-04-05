@@ -170,7 +170,7 @@ def socket_event_pump():
                 except Exception as e:
                     print(f"Keepalive emit failed: {e}")
 
-        socketio.sleep(0.25 if emitted else 1.0)
+        socketio.sleep(0.05 if emitted else 0.5)
 
 def ensure_event_pump():
     if server_state['event_pump_started']:
@@ -202,6 +202,16 @@ def queue_socket_event(event_name, payload):
     _update_status_snapshot(event_name, normalized_payload)
     if event_name != 'keepalive':
         server_state['last_emit_at'] = time.time()
+
+    # Log messages are routed exclusively through the queue so the pump greenlet
+    # delivers them reliably even when the generator greenlet is blocked by a long
+    # CPU-bound operation (e.g. baseline cross-validation).  The pump now polls
+    # every 50 ms so the latency is imperceptible in the UI.
+    if event_name == 'log_update':
+        ensure_event_pump()
+        server_state['event_queue'].put((event_name, normalized_payload))
+        return
+
     try:
         _emit_live_socket_event(event_name, normalized_payload)
     except Exception as e:
