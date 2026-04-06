@@ -3,6 +3,12 @@
 Complete Flask server with comprehensive FeatureGenerator controls and dual modes
 """
 
+# Monkey-patch MUST happen before any other imports so that all blocking I/O
+# (sockets, time.sleep, etc.) becomes gevent-cooperative.  Without this, long
+# XGBoost/sklearn evaluations starve the event loop and drop the WebSocket.
+from gevent import monkey
+monkey.patch_all(thread=False)  # thread=False keeps real OS threads for XGBoost
+
 import os
 import json
 import time
