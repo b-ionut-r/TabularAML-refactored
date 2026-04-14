@@ -363,6 +363,100 @@ CAT_OPS_LAMBDAS: Dict[str, Callable[..., Tuple[str, pd.Series]]] = {
 ALL_OPS_LAMBDAS = NUM_OPS_LAMBDAS.copy()
 ALL_OPS_LAMBDAS.update(CAT_OPS_LAMBDAS)
 
+# --- Group-By Aggregation Operations ---
+# These take (df, cat_col, num_col) — a different signature from row-wise ops.
+# They must be computed inside CV folds (pipeline_required=True) to prevent leakage.
+AGG_OPS = {
+    "groupby_mean": lambda df, cat_col, num_col:
+        df.groupby(cat_col)[num_col].transform("mean"),
+    "groupby_std": lambda df, cat_col, num_col:
+        df.groupby(cat_col)[num_col].transform("std"),
+    "groupby_median": lambda df, cat_col, num_col:
+        df.groupby(cat_col)[num_col].transform("median"),
+    "groupby_min": lambda df, cat_col, num_col:
+        df.groupby(cat_col)[num_col].transform("min"),
+    "groupby_max": lambda df, cat_col, num_col:
+        df.groupby(cat_col)[num_col].transform("max"),
+    "groupby_count": lambda df, cat_col, num_col:
+        df.groupby(cat_col)[num_col].transform("count"),
+    "groupby_rank": lambda df, cat_col, num_col:
+        df.groupby(cat_col)[num_col].transform("rank", pct=True),
+    "groupby_zscore": lambda df, cat_col, num_col:
+        (df[num_col] - df.groupby(cat_col)[num_col].transform("mean")) /
+        (df.groupby(cat_col)[num_col].transform("std") + 1e-8),
+}
+
+# Register aggregation ops in the OPS dict
+OPS["agg"] = {"binary": list(AGG_OPS.keys())}
+# --- Temporal / Lag Operations ---
+# These take (df, col, id_col, time_col) — a 4-arg signature.
+# They must be computed inside CV folds (pipeline_required=True) after sorting by time.
+# Only enabled when time_col is provided to FeatureGenerator.
+#
+# Window sizes are parameterized. The default [1, 4] produces the 6 ops recommended
+# by the upgrade report. Users can override via FeatureGenerator(temporal_windows=...)
+# to explore domain-specific windows (e.g., [1, 5, 20, 60] for daily financial data).
+
+DEFAULT_TEMPORAL_WINDOWS = [1, 4]
+
+def _make_lag(w):
+    return lambda df, col, id_col, time_col: (
+        df.sort_values(time_col).groupby(id_col)[col].shift(w)
+    )
+
+def _make_rolling_mean(w):
+    return lambda df, col, id_col, time_col: (
+        df.sort_values(time_col).groupby(id_col)[col].transform(
+            lambda x: x.rolling(w, min_periods=1).mean())
+    )
+
+def _make_rolling_std(w):
+    return lambda df, col, id_col, time_col: (
+        df.sort_values(time_col).groupby(id_col)[col].transform(
+            lambda x: x.rolling(w, min_periods=1).std())
+    )
+
+def _make_momentum(w):
+    return lambda df, col, id_col, time_col: (
+        df[col] - df.sort_values(time_col).groupby(id_col)[col].shift(w)
+    )
+
+def _make_pct_change(w):
+    return lambda df, col, id_col, time_col: (
+        df.sort_values(time_col).groupby(id_col)[col].pct_change(w)
+    )
+
+
+def build_temporal_ops(windows=None):
+    """Build TEMPORAL_OPS dict for given window sizes.
+    
+    Default [1, 4] produces exactly the 6 ops from the upgrade report:
+      lag_1, lag_4, rolling_mean_4, rolling_std_4, momentum_4, pct_change_1
+    
+    Custom windows (e.g., [1, 5, 20]) let the genetic search explore
+    domain-specific lookback periods.
+    """
+    if windows is None:
+        windows = DEFAULT_TEMPORAL_WINDOWS
+    ops = {}
+    for w in windows:
+        ops[f"lag_{w}"] = _make_lag(w)
+        if w >= 2:  # rolling/momentum/pct_change need window >= 2
+            ops[f"rolling_mean_{w}"] = _make_rolling_mean(w)
+            ops[f"rolling_std_{w}"] = _make_rolling_std(w)
+            ops[f"momentum_{w}"] = _make_momentum(w)
+            ops[f"pct_change_{w}"] = _make_pct_change(w)
+        else:  # w == 1: only lag and pct_change make sense
+            ops[f"pct_change_{w}"] = _make_pct_change(w)
+    return ops
+
+
+# Default ops: exactly the 6 from the report
+TEMPORAL_OPS = build_temporal_ops(DEFAULT_TEMPORAL_WINDOWS)
+
+# Register temporal ops in the OPS dict
+OPS["temporal"] = {"unary": list(TEMPORAL_OPS.keys())}
+
 # Utility function to clean dataframe after feature engineering
 def clean_dataframe_for_xgboost(df):
     """

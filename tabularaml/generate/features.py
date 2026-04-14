@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os, random, time
 import pickle
@@ -20,9 +21,9 @@ from xgboost import XGBClassifier, XGBRegressor
 
 from tabularaml.eval.cv import cross_val_score
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, PREDEFINED_SCORERS, Scorer
-from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS
+from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, build_temporal_ops
 from tabularaml.inspect.importance import FeatureImportanceAnalyzer
-from tabularaml.preprocessing.encoders import CategoricalEncoder
+from tabularaml.preprocessing.encoders import CategoricalEncoder, GroupByEncoder, TemporalEncoder
 from tabularaml.preprocessing.imputers import SimpleImputer
 from tabularaml.preprocessing.pipeline import PipelineWrapper
 from tabularaml.configs.feature_gen import PRESET_PARAMS
@@ -105,31 +106,92 @@ class Interaction:
     """Feature interactions for engineering new features via unary/binary operations."""
     def __init__(self, feature_1: Feature, op: str, feature_2: Optional[Feature] = None):
         self.feature_1, self.op, self.feature_2 = feature_1, op, feature_2
-        self.type = "unary" if feature_2 is None else "binary"
-        self.dtype = (feature_1.dtype if feature_2 is None else 
-                    "num" if feature_1.dtype == feature_2.dtype == "num" else "cat")
-        self.depth = (feature_1.depth + 1 if feature_2 is None else 
-                    max(feature_1.depth, feature_2.depth) + 1)
-        self.weight = feature_1.weight if feature_2 is None else (feature_1.weight + feature_2.weight) / 2
-        self.require_pipeline = feature_2 is None and op in ["target", "count", "freq"]
-        self.name = f"{feature_1.name}_{op}" if self.type == "unary" else f"{feature_1.name}_{op}_{feature_2.name}"
+        
+        # Determine if this is an aggregation operation
+        self.is_agg = op in AGG_OPS
+        self.is_temporal = op in TEMPORAL_OPS
+        
+        if self.is_temporal:
+            # Temporal: feature_1 is the numeric column, feature_2 unused (unary-style)
+            self.type = "unary"
+            self.dtype = "num"
+            self.depth = feature_1.depth + 1
+            self.weight = feature_1.weight
+            self.require_pipeline = True  # Must go through pipeline
+            self.name = f"{op}({feature_1.name})"
+        elif self.is_agg:
+            # Aggregation: feature_1 is categorical key, feature_2 is numeric column
+            self.type = "binary"
+            self.dtype = "num"  # Aggregation result is always numeric
+            self.depth = max(feature_1.depth, feature_2.depth) + 1 if feature_2 else feature_1.depth + 1
+            self.weight = (feature_1.weight + feature_2.weight) / 2 if feature_2 else feature_1.weight
+            self.require_pipeline = True  # Must go through pipeline to prevent leakage
+            agg_name = op.replace("groupby_", "")
+            self.name = f"groupby_{agg_name}({feature_1.name}, {feature_2.name})" if feature_2 else f"groupby_{agg_name}({feature_1.name})"
+        else:
+            self.type = "unary" if feature_2 is None else "binary"
+            self.dtype = (feature_1.dtype if feature_2 is None else 
+                        "num" if feature_1.dtype == feature_2.dtype == "num" else "cat")
+            self.depth = (feature_1.depth + 1 if feature_2 is None else 
+                        max(feature_1.depth, feature_2.depth) + 1)
+            self.weight = feature_1.weight if feature_2 is None else (feature_1.weight + feature_2.weight) / 2
+            self.require_pipeline = feature_2 is None and op in ["target", "count", "freq"]
+            self.name = f"{feature_1.name}_{op}" if self.type == "unary" else f"{feature_1.name}_{op}_{feature_2.name}"
          
     def generate(self, X, y = None):
         if not self.require_pipeline:
             try:
                 if self.type == "unary":
-                    return ALL_OPS_LAMBDAS[self.op](X, self.feature_1.name)
+                    return ALL_OPS_LAMBDAS[self.op](X, self.feature_1.name)[1]
                 elif self.type == "binary":
                     # Check for column shape issues
                     if X[self.feature_1.name].ndim > 1 or X[self.feature_2.name].ndim > 1:
                         raise ValueError(f"Multi-dimensional columns detected: {self.feature_1.name} shape={X[self.feature_1.name].shape}, {self.feature_2.name} shape={X[self.feature_2.name].shape}")
-                    return ALL_OPS_LAMBDAS[self.op](X, self.feature_1.name, self.feature_2.name)
+                    return ALL_OPS_LAMBDAS[self.op](X, self.feature_1.name, self.feature_2.name)[1]
             except Exception as e:
                 raise Exception(f"Error generating {self.name}: {str(e)}")
         raise Exception("Can't generate feature using lambdas. Requires pipeline to avoid data leakage.")
     
     def get_new_feature_instance(self):
-        return Feature(name=self.name, dtype=self.dtype, weight=self.weight, require_pipeline=self.require_pipeline)
+        return Feature(name=self.name, dtype=self.dtype, weight=self.weight, depth=self.depth, require_pipeline=self.require_pipeline)
+
+
+class FeatureCache:
+    """Hash-based cache for computed feature values to avoid redundant computation."""
+    def __init__(self, max_size_mb=2000):
+        self._cache = {}
+        self._max_bytes = max_size_mb * 1024 * 1024
+        self._current_bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    def _key(self, parent_names, op_name):
+        # Preserve order: sub(a,b) and sub(b,a) must have different cache keys
+        return hashlib.md5(f"{list(parent_names)}_{op_name}".encode()).hexdigest()
+
+    def get_or_compute(self, parent_names, op_name, compute_fn):
+        """Return cached result or compute and cache it."""
+        key = self._key(parent_names, op_name)
+        if key in self._cache:
+            self.hits += 1
+            return self._cache[key]
+        self.misses += 1
+        result = compute_fn()
+        nbytes = result[1].nbytes if hasattr(result[1], 'nbytes') else 0
+        if self._current_bytes + nbytes < self._max_bytes:
+            self._cache[key] = result
+            self._current_bytes += nbytes
+        return result
+
+    def clear(self):
+        """Clear the cache completely."""
+        self._cache.clear()
+        self._current_bytes = 0
+
+    @property
+    def hit_rate(self):
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0.0
 
 
 class StagnationLevel(Enum):
@@ -182,7 +244,12 @@ class ImprovedAdaptiveController:
     def initialize_operations(self, ops):
         """Initialize operation statistics with diversity bias."""
         for dtype in ops:
+            # Dynamically create op_stats entry for new op categories (agg, temporal, etc.)
+            if dtype not in self.op_stats:
+                self.op_stats[dtype] = {}
             for op_type in ops[dtype]:
+                if op_type not in self.op_stats[dtype]:
+                    self.op_stats[dtype][op_type] = {}
                 for op in ops[dtype][op_type]:
                     if op not in self.op_stats[dtype][op_type]:
                         # Start with higher scores for rarely used operations
@@ -245,8 +312,14 @@ class ImprovedAdaptiveController:
     def update_operation_stats(self, interaction: 'Interaction', success: bool, gain: float = 0.0):
         """Enhanced operation tracking with pattern memory."""
         op = interaction.op
-        dtype = interaction.dtype
-        op_type = interaction.type
+        # Agg/temporal ops are stored under their own dtype key, not "num"/"cat"
+        if getattr(interaction, 'is_agg', False):
+            dtype, op_type = "agg", "binary"
+        elif getattr(interaction, 'is_temporal', False):
+            dtype, op_type = "temporal", "unary"
+        else:
+            dtype = interaction.dtype
+            op_type = interaction.type
         
         # Update usage and success counters
         self.op_usage[op] += 1
@@ -531,7 +604,17 @@ class FeatureGenerator:
                  max_ops_per_generation=None,
                  exploration_factor: float = 0.2,
                  save_path=None,
-                 save_each_trial: bool = False):
+                 save_each_trial: bool = False,
+                 cache_size_mb: int = 2000,
+                 use_proxy_evaluation: bool = True,
+                 proxy_top_pct: float = 0.15,
+                 meta_validation_frac: float = 0.15,
+                 rotate_cv_folds: bool = True,
+                 fold_rotation_period: int = 5,
+                 final_selection: bool = True,
+                 time_col: Optional[str] = None,
+                 id_col: Optional[str] = None,
+                 temporal_windows: Optional[list] = None):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -584,6 +667,35 @@ class FeatureGenerator:
         self._groups_active = groups
         self.device = "cuda" if is_gpu_available() and use_gpu else "cpu"
         self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+        
+        # Feature value cache
+        self._feature_cache = FeatureCache(max_size_mb=cache_size_mb)
+        
+        # Proxy evaluation settings
+        self.use_proxy_evaluation = use_proxy_evaluation
+        self.proxy_top_pct = proxy_top_pct
+        self._lgb_available = None  # Lazy check
+        
+        # CV bias fix settings
+        self.meta_validation_frac = meta_validation_frac
+        self.rotate_cv_folds = rotate_cv_folds
+        self.fold_rotation_period = fold_rotation_period
+        
+        # Regularized post-selection
+        self.final_selection = final_selection
+        
+        # Temporal operator settings
+        self.time_col = time_col
+        self.id_col = id_col
+        self.temporal_windows = temporal_windows
+        
+        # Rebuild temporal ops with custom windows if provided
+        if temporal_windows is not None:
+            custom_temporal = build_temporal_ops(temporal_windows)
+            # Update the module-level dicts so Interaction can reference them
+            TEMPORAL_OPS.clear()
+            TEMPORAL_OPS.update(custom_temporal)
+            OPS["temporal"] = {"unary": list(TEMPORAL_OPS.keys())}
         
         # Legacy compatibility
         self.max_ops_per_generation = max_ops_per_generation
@@ -726,6 +838,310 @@ class FeatureGenerator:
         for name, (train, val) in scores_dict.items():
             parts.append(f"{name}: Train={train:.5f}, Val={val:.5f}")
         return " | ".join(parts)
+
+    def _check_lgb_available(self):
+        """Lazily check if LightGBM is available."""
+        if self._lgb_available is None:
+            try:
+                import lightgbm
+                self._lgb_available = True
+            except ImportError:
+                self._lgb_available = False
+        return self._lgb_available
+
+    def _get_lgb_objective(self):
+        """Get the LightGBM objective string from the current task."""
+        if self.task == "regression":
+            return "regression"
+        else:
+            n_classes = len(np.unique(getattr(self, '_current_y', [0, 1])))
+            return "binary" if n_classes <= 2 else "multiclass"
+
+    def _train_base_model_and_get_residuals(self, X, y, cv):
+        """Train base model on current features, return OOF predictions."""
+        import lightgbm as lgb
+        objective = self._get_lgb_objective()
+        oof_preds = np.zeros(len(y))
+        params = {"objective": objective, "verbosity": -1,
+                  "learning_rate": 0.1, "num_leaves": 31,
+                  "n_jobs": -1}
+        if objective == "multiclass":
+            n_classes = len(np.unique(y))
+            params["num_class"] = n_classes
+            oof_preds = np.zeros((len(y), n_classes))
+
+        for train_idx, val_idx in cv.split(X, y, groups=self._groups_active):
+            X_train = X.iloc[train_idx].copy()
+            X_val = X.iloc[val_idx].copy()
+            for col in X_train.select_dtypes(include=['object']).columns:
+                X_train[col] = X_train[col].astype('category')
+                X_val[col] = pd.Categorical(X_val[col], categories=X_train[col].cat.categories)
+            dtrain = lgb.Dataset(X_train, y.iloc[train_idx])
+            model = lgb.train(params, dtrain, num_boost_round=200)
+            # Must use raw margins for init_score
+            oof_preds[val_idx] = model.predict(X_val, raw_score=True)
+        return oof_preds
+
+    def _featureboost_score(self, candidate_series, y, oof_preds, cv):
+        """Score a single candidate feature via residual-based incremental training.
+        
+        Uses the OpenFE 'FeatureBoost' trick: train a tiny single-feature LightGBM
+        with init_score set to the base model's OOF predictions.
+        """
+        import lightgbm as lgb
+        objective = self._get_lgb_objective()
+        
+        # Prepare candidate values
+        if hasattr(candidate_series, 'values'):
+            cand_vals = candidate_series.values
+        else:
+            cand_vals = np.asarray(candidate_series)
+        
+        if cand_vals.ndim == 1:
+            cand_vals = cand_vals.reshape(-1, 1)
+        
+        # Skip if candidate has too many NaN/inf
+        finite_mask = np.isfinite(cand_vals.ravel())
+        if finite_mask.mean() < 0.5:
+            return -np.inf
+        
+        scores = []
+        params = {"objective": objective, "num_leaves": 16,
+                  "verbosity": -1, "n_jobs": -1, "learning_rate": 0.1}
+        if objective == "multiclass":
+            params["num_class"] = len(np.unique(y))
+
+        for train_idx, val_idx in cv.split(cand_vals, y, groups=self._groups_active):
+            try:
+                train_cand = cand_vals[train_idx].copy()
+                val_cand = cand_vals[val_idx].copy()
+                
+                # Replace non-finite with 0 for LGB
+                train_cand = np.nan_to_num(train_cand, nan=0.0, posinf=0.0, neginf=0.0)
+                val_cand = np.nan_to_num(val_cand, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                init_train = oof_preds[train_idx]
+                init_val = oof_preds[val_idx]
+                
+                dtrain = lgb.Dataset(
+                    train_cand, y.iloc[train_idx],
+                    init_score=init_train
+                )
+                dval = lgb.Dataset(
+                    val_cand, y.iloc[val_idx],
+                    init_score=init_val,
+                    reference=dtrain
+                )
+                model = lgb.train(
+                    params, dtrain, num_boost_round=50,
+                    valid_sets=[dval],
+                    callbacks=[lgb.early_stopping(10, verbose=False),
+                              lgb.log_evaluation(period=0)]
+                )
+                
+                # Score improvement: compare base predictions vs base + residual model
+                # init_val is raw margin
+                tree_margin = model.predict(val_cand, raw_score=True)
+                new_preds_margin = init_val + tree_margin
+                
+                if objective == "binary":
+                    import scipy.special
+                    base_preds = scipy.special.expit(init_val)
+                    new_preds = scipy.special.expit(new_preds_margin)
+                elif objective == "multiclass":
+                    import scipy.special
+                    base_preds = scipy.special.softmax(init_val, axis=1)
+                    new_preds = scipy.special.softmax(new_preds_margin, axis=1)
+                else:
+                    base_preds = init_val
+                    new_preds = new_preds_margin
+
+                base_score = self.scorer.score(y.iloc[val_idx], base_preds)
+                new_score = self.scorer.score(y.iloc[val_idx], new_preds)
+                
+                if self.scorer.greater_is_better:
+                    scores.append(new_score - base_score)
+                else:
+                    scores.append(base_score - new_score)  # Lower is better, so improvement = base - new
+            except Exception:
+                scores.append(-np.inf)
+        
+        return np.mean(scores) if scores else -np.inf
+
+    def _proxy_screen_candidates(self, batch, X, y):
+        """Pre-filter candidates using FeatureBoost proxy scoring.
+        
+        Returns the top proxy_top_pct fraction of non-pipeline candidates,
+        plus all pipeline-required candidates (which skip proxy).
+        """
+        if not self.use_proxy_evaluation or not self._check_lgb_available():
+            return batch
+        
+        # Separate pipeline-required (skip proxy) from scorable candidates
+        pipeline_candidates = [i for i in batch if i.require_pipeline]
+        scorable_candidates = [i for i in batch if not i.require_pipeline]
+        
+        if len(scorable_candidates) <= 5:
+            return batch  # Not enough to filter
+        
+        try:
+            # Get CV splitter
+            cv = self._get_cv_splitter()
+            
+            # Train base model and get OOF predictions (once per generation)
+            if not hasattr(self, '_current_oof_preds') or self._oof_preds_stale:
+                self._current_oof_preds = self._train_base_model_and_get_residuals(X, y, cv)
+                self._oof_preds_stale = False
+            
+            # Score each scorable candidate
+            fb_scores = {}
+            for interaction in scorable_candidates:
+                try:
+                    # Generate candidate values
+                    parent_names = [interaction.feature_1.name]
+                    if interaction.feature_2 is not None:
+                        parent_names.append(interaction.feature_2.name)
+                    
+                    if not all(p in X.columns for p in parent_names):
+                        continue
+                    
+                    name, vals = self._feature_cache.get_or_compute(
+                        parent_names, interaction.op,
+                        lambda inter=interaction: (inter.name, inter.generate(X))
+                    )
+                    
+                    score = self._featureboost_score(
+                        vals, y, self._current_oof_preds, cv
+                    )
+                    fb_scores[id(interaction)] = (interaction, score)
+                except Exception:
+                    pass  # Skip failed candidates
+            
+            if not fb_scores:
+                return batch
+            
+            # Keep top proxy_top_pct
+            n_keep = max(3, int(len(fb_scores) * self.proxy_top_pct))
+            sorted_candidates = sorted(fb_scores.values(), key=lambda x: x[1], reverse=True)
+            top_candidates = [interaction for interaction, _ in sorted_candidates[:n_keep]]
+            
+            self._log(f"  Proxy screening: {len(scorable_candidates)} -> {len(top_candidates)} candidates (top {self.proxy_top_pct*100:.0f}%)")
+            
+            return top_candidates + pipeline_candidates
+            
+        except Exception as e:
+            self._log(f"  Proxy screening failed ({e}), falling back to full evaluation")
+            return batch
+
+    def _get_cv_splitter(self):
+        """Get the CV splitter object from self.cv (handles int and splitter)."""
+        if isinstance(self.cv, int):
+            if self._groups_active is not None:
+                from sklearn.model_selection import GroupKFold
+                return GroupKFold(n_splits=self.cv)
+            from sklearn.model_selection import StratifiedKFold, KFold
+            if self.task == "regression":
+                return KFold(n_splits=self.cv, shuffle=True, random_state=42)
+            else:
+                return StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=42)
+        return self.cv
+
+    def _final_regularized_selection(self, X, y):
+        """After search, use L1 regularization + tree importance to jointly select the best feature subset.
+        
+        Only applies when ≥10 generated features exist. Original features are always kept.
+        Returns a list of features to drop (generated features that didn't survive selection).
+        """
+        generated_features = [col for col in X.columns if col not in self.initial_features]
+        
+        if len(generated_features) < 10:
+            return []  # Not enough generated features to warrant selection
+        
+        self._log(f"Regularized post-selection: evaluating {len(generated_features)} generated features...")
+        
+        try:
+            from sklearn.preprocessing import StandardScaler
+            
+            # Prepare data — only numeric columns
+            numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+            if len(numeric_cols) < 3:
+                return []
+            
+            X_numeric = X[numeric_cols].copy()
+            X_numeric = X_numeric.fillna(X_numeric.median())
+            X_numeric = X_numeric.replace([np.inf, -np.inf], 0)
+            
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_numeric)
+            
+            # Phase 1: L1 regularization
+            l1_selected = set()
+            try:
+                if self.task == "regression":
+                    from sklearn.linear_model import LassoCV
+                    model = LassoCV(cv=5, alphas=np.logspace(-4, 1, 50), max_iter=10000, n_jobs=-1)
+                    model.fit(X_scaled, y)
+                    coef_mask = np.abs(model.coef_) > 1e-6
+                else:
+                    from sklearn.linear_model import LogisticRegressionCV
+                    model = LogisticRegressionCV(cv=5, penalty='l1', solver='saga',
+                                                 max_iter=5000, n_jobs=-1, Cs=50)
+                    model.fit(X_scaled, y)
+                    # For multi-class, take absolute max across classes
+                    if model.coef_.ndim > 1:
+                        coef_mask = np.abs(model.coef_).max(axis=0) > 1e-6
+                    else:
+                        coef_mask = np.abs(model.coef_.ravel()) > 1e-6
+                
+                l1_selected = set(np.array(numeric_cols)[coef_mask].tolist())
+                self._log(f"  L1 selected {len(l1_selected)} features")
+            except Exception as e:
+                self._log(f"  L1 selection failed: {e}")
+                l1_selected = set(numeric_cols)  # Fallback: keep all
+            
+            # Phase 2: Tree-based importance
+            tree_selected = set()
+            try:
+                from xgboost import XGBRegressor, XGBClassifier
+                if self.task == "regression":
+                    tree_model = XGBRegressor(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1)
+                else:
+                    tree_model = XGBClassifier(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1)
+                tree_model.fit(X_numeric, y)
+                importances = pd.Series(tree_model.feature_importances_, index=numeric_cols)
+                # Keep top-K where K = number of L1-selected features (or at least initial features count)
+                n_keep = max(len(l1_selected), len(self.initial_features))
+                tree_selected = set(importances.nlargest(n_keep).index.tolist())
+                self._log(f"  Tree importance selected top {len(tree_selected)} features")
+            except Exception as e:
+                self._log(f"  Tree importance failed: {e}")
+                tree_selected = set(numeric_cols)
+            
+            # Final set: union of L1 and tree selected
+            selected = l1_selected | tree_selected
+            
+            # Original features are ALWAYS kept
+            selected.update(self.initial_features)
+            
+            # Also keep non-numeric generated features (categorical encodings, etc.)
+            non_numeric_generated = [col for col in generated_features if col not in numeric_cols]
+            selected.update(non_numeric_generated)
+            
+            # Features to drop
+            features_to_drop = [col for col in generated_features 
+                               if col in numeric_cols and col not in selected]
+            
+            if features_to_drop:
+                self._log(f"  Regularized selection: dropping {len(features_to_drop)} weak generated features")
+                self._log(f"  Dropped: {features_to_drop}")
+            else:
+                self._log(f"  Regularized selection: all generated features retained")
+            
+            return features_to_drop
+            
+        except Exception as e:
+            self._log(f"  Regularized post-selection failed: {e}")
+            return []
 
     def _softmax_temp_sampling(self, pool, weights, n=1, tau=0.5) -> list:
         """Sample items using softmax temperature sampling."""
@@ -987,16 +1403,63 @@ class FeatureGenerator:
         target_enc_cols = [i.feature_1.name for i in interactions if i.op == "target"]
         count_enc_cols = [i.feature_1.name for i in interactions if i.op == "count"]
         freq_enc_cols = [i.feature_1.name for i in interactions if i.op == "freq"]
-        return PipelineWrapper(imputer=None, scaler=None, 
-                              encoder=CategoricalEncoder(target_enc_cols, count_enc_cols, freq_enc_cols))
+        
+        # Collect GroupBy encoders for agg interactions
+        groupby_encoders = []
+        for i in interactions:
+            if i.is_agg and i.feature_2 is not None:
+                agg_func = i.op.replace("groupby_", "")
+                groupby_encoders.append(
+                    GroupByEncoder(cat_col=i.feature_1.name, num_col=i.feature_2.name,
+                                  agg_func=agg_func, output_col=i.name)
+                )
+        
+        pipeline = PipelineWrapper(imputer=None, scaler=None,
+                                   encoder=CategoricalEncoder(target_enc_cols, count_enc_cols, freq_enc_cols))
+        pipeline.groupby_encoders = groupby_encoders
+        
+        # Collect Temporal encoders for temporal interactions
+        temporal_encoders = []
+        for i in interactions:
+            if getattr(i, 'is_temporal', False):
+                temporal_encoders.append(
+                    TemporalEncoder(col=i.feature_1.name, id_col=self.id_col,
+                                   time_col=self.time_col, op_name=i.op, output_col=i.name)
+                )
+        pipeline.temporal_encoders = temporal_encoders
+        return pipeline
 
     def _extend_pipeline(self, pipeline: PipelineWrapper, new_pipeline: PipelineWrapper) -> PipelineWrapper:
         """Extend pipeline with new_pipeline for categorical encoding."""
-        return PipelineWrapper(imputer=None, scaler=None,
+        # Merge existing GroupBy encoders
+        existing_gb = getattr(pipeline, 'groupby_encoders', [])
+        new_gb = getattr(new_pipeline, 'groupby_encoders', [])
+        # Deduplicate by output_col name
+        seen_gb = {gb.output_col for gb in existing_gb}
+        merged_gb = list(existing_gb)
+        for gb in new_gb:
+            if gb.output_col not in seen_gb:
+                merged_gb.append(gb)
+                seen_gb.add(gb.output_col)
+        
+        result = PipelineWrapper(imputer=None, scaler=None,
             encoder=CategoricalEncoder(
                 target_enc_cols=list(set(pipeline.encoder.target_enc_cols + new_pipeline.encoder.target_enc_cols)),
                 count_enc_cols=list(set(pipeline.encoder.count_enc_cols + new_pipeline.encoder.count_enc_cols)),
                 freq_enc_cols=list(set(pipeline.encoder.freq_enc_cols + new_pipeline.encoder.freq_enc_cols))))
+        result.groupby_encoders = merged_gb
+        
+        # Merge temporal encoders
+        existing_te = getattr(pipeline, 'temporal_encoders', [])
+        new_te = getattr(new_pipeline, 'temporal_encoders', [])
+        seen_te = {te.output_col for te in existing_te}
+        merged_te = list(existing_te)
+        for te in new_te:
+            if te.output_col not in seen_te:
+                merged_te.append(te)
+                seen_te.add(te.output_col)
+        result.temporal_encoders = merged_te
+        return result
         
     def _apply_interactions(self, X: pd.DataFrame, interactions: List[Interaction]) -> tuple[pd.DataFrame, PipelineWrapper]:
         """Apply non-pipeline feature interactions to X."""
@@ -1008,7 +1471,13 @@ class FeatureGenerator:
                     required_features.append(interaction.feature_2.name)
                 if all(feat in X.columns for feat in required_features):
                     try:
-                        name, val = interaction.generate(X)
+                        parent_names = [interaction.feature_1.name]
+                        if interaction.feature_2 is not None:
+                            parent_names.append(interaction.feature_2.name)
+                        name, val = self._feature_cache.get_or_compute(
+                            parent_names, interaction.op,
+                            lambda inter=interaction: (inter.name, inter.generate(X))
+                        )
                         if name not in X.columns and name not in new_features:  # Avoid duplicates
                             new_features[name] = val
                     except Exception as e:
@@ -1110,6 +1579,8 @@ class FeatureGenerator:
             try:
                 _, new_val = self._eval_baseline(X_try, y, pipe_iter)
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 self._log(f"Error evaluating {inter.name}: {str(e)}")
                 continue
             
@@ -1265,6 +1736,7 @@ class FeatureGenerator:
         self.blacklisted_features = set()
         self.previously_pruned_features = set()
         self._parent_usage = {}
+        self._feature_cache.clear()
         
         self._log(f"  Restart complete: kept {len(X_restart.columns)} features (was {X.shape[1]})")
         
@@ -1337,6 +1809,11 @@ class FeatureGenerator:
         """Drop columns that appear to be IDs to not be considered for feature generation."""
         cols_to_drop = []
         for col in X.columns:
+            if hasattr(self, 'time_col') and col == self.time_col:
+                continue
+            if hasattr(self, 'id_col') and col == self.id_col:
+                continue
+            
             col_str = str(col).lower()
             is_id_name = col_str in ["id", "index"] or col_str.endswith("_id")
             
@@ -1389,6 +1866,36 @@ class FeatureGenerator:
         # Initialize
         self.pruned_features = set()
         self._parent_usage = {}
+        self._feature_cache.clear()
+        self._oof_preds_stale = True  # Proxy evaluation: force recompute on first generation
+        self._current_y = y  # Reference for proxy eval objective detection
+
+        # Meta-validation split (CV bias fix)
+        X_meta, y_meta = None, None
+        if self.meta_validation_frac > 0 and len(X) > 2000:
+            try:
+                if self._groups_active is not None:
+                    from sklearn.model_selection import GroupShuffleSplit
+                    gss = GroupShuffleSplit(n_splits=1, test_size=self.meta_validation_frac, random_state=42)
+                    search_idx, meta_idx = next(gss.split(X, y, groups=self._groups_active))
+                else:
+                    from sklearn.model_selection import train_test_split
+                    stratify = y if self.task != "regression" else None
+                    search_idx, meta_idx = train_test_split(
+                        np.arange(len(X)), test_size=self.meta_validation_frac,
+                        stratify=stratify, random_state=42
+                    )
+                X_meta, y_meta = X.iloc[meta_idx].copy(), y.iloc[meta_idx].copy()
+                X, y = X.iloc[search_idx].copy(), y.iloc[search_idx].copy()
+                if self._groups_active is not None:
+                    self._groups_active = np.asarray(self._groups_active)[search_idx]
+                    if hasattr(self.cv, '_groups'):
+                        self.cv._groups = self._groups_active
+                self._log(f"Meta-validation split: {len(X)} search + {len(X_meta)} meta-validation rows")
+            except Exception as e:
+                self._log(f"Meta-validation split failed: {e}")
+                X_meta, y_meta = None, None  # Fallback: no meta split
+
         self._log(f"Starting {self.task} on {self.device} - {X.shape[0]} samples, {X.shape[1]} features")
         self._log(f"Params: gen={self.n_generations}, parents={self.n_parents}, children={self.n_children}, limit={self.max_gen_new_feats}, time_budget={self.time_budget}s.")
         self.adaptive_controller.initialize_operations(self.ops)
@@ -1432,6 +1939,20 @@ class FeatureGenerator:
                     self.state['counters']['no_feature_gens_count'],
                     self.state['counters']['consecutive_no_improvement_iters']
                 )
+                
+                # CV fold rotation (CV bias fix)
+                if self.rotate_cv_folds and N > 0 and N % self.fold_rotation_period == 0:
+                    n_splits = self.cv if isinstance(self.cv, int) else getattr(self.cv, 'n_splits', 5)
+                    if self._groups_active is not None:
+                        from sklearn.model_selection import GroupKFold
+                        self.cv = GroupKFold(n_splits=n_splits)
+                    else:
+                        from sklearn.model_selection import StratifiedKFold, KFold
+                        if self.task == "regression":
+                            self.cv = KFold(n_splits=n_splits, shuffle=True, random_state=42 + N)
+                        else:
+                            self.cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42 + N)
+                    self._oof_preds_stale = True
                 
                 # Check for restart conditions
                 if self.adaptive_controller.should_restart(N):
@@ -1532,9 +2053,45 @@ class FeatureGenerator:
                         self.state['seen_feats'].update({feat1, feat2})
                         op_list = self.ops["num" if feat1.dtype == feat2.dtype == "num" else "cat"]["binary"]
                         candidates_pool.extend([Interaction(feat1, op, feat2) for op in op_list])
+                    
+                    # Generate GroupBy aggregation candidates (cat × num pairs)
+                    if "agg" in self.ops:
+                        cat_parents = [f for f in valid_unary if f.dtype == "cat"]
+                        num_parents = [f for f in valid_unary if f.dtype == "num"]
+                        # Also get num features from binary pairs
+                        for f1, f2 in valid_binary:
+                            if f1.dtype == "num" and f1 not in num_parents:
+                                num_parents.append(f1)
+                            if f2.dtype == "num" and f2 not in num_parents:
+                                num_parents.append(f2)
+                        
+                        if cat_parents and num_parents:
+                            # Sample a subset to avoid explosion
+                            n_agg_pairs = min(len(cat_parents) * len(num_parents), self.n_parents)
+                            for _ in range(n_agg_pairs):
+                                cat_feat = random.choice(cat_parents)
+                                num_feat = random.choice(num_parents)
+                                for agg_op in self.ops["agg"]["binary"]:
+                                    candidates_pool.append(Interaction(cat_feat, agg_op, num_feat))
+
+                    # Generate Temporal candidates (when time_col is specified)
+                    if self.time_col and self.id_col and "temporal" in self.ops:
+                        num_parents_temporal = [f for f in valid_unary if f.dtype == "num" 
+                                                and f.name != self.time_col and f.name != self.id_col]
+                        if num_parents_temporal:
+                            # Sample a reasonable number of temporal candidates
+                            n_temporal = min(len(num_parents_temporal), self.n_parents // 2)
+                            temporal_feats = random.sample(num_parents_temporal, n_temporal)
+                            for feat in temporal_feats:
+                                for temp_op in self.ops["temporal"]["unary"]:
+                                    candidates_pool.append(Interaction(feat, temp_op))
 
                     # Enhanced child sampling
                     batch = self._sample_children_with_creativity(candidates_pool, self.n_children, tau=tau)
+                    
+                    # Phase 1: Proxy screening (fast FeatureBoost pre-filter)
+                    batch = self._proxy_screen_candidates(batch, X, y)
+                    
                     pbar.set_description(f"Gen {N+1}: Testing {len(batch)} candidates")
                 
                     remaining_budget = self.max_gen_new_feats - self.state['counters']['total_new_features'] if self.max_gen_new_feats != float('inf') else float('inf')
@@ -1551,6 +2108,7 @@ class FeatureGenerator:
                             return self.time_budget and (time.time() - start_time) > self.time_budget
 
                         elites, X, self.pipeline = self._select_elites(batch, features_per_gen, X, y, update_callback)
+                        self._oof_preds_stale = True  # Mark OOF preds as stale after features change
 
                     if elites:
                         self.adaptive_controller.update_strategy_stats("normal", True)
@@ -1672,8 +2230,8 @@ class FeatureGenerator:
             for interaction in self.interactions:
                 if interaction.name not in X.columns and not interaction.require_pipeline:
                     try:
-                        name, val = interaction.generate(X)
-                        X[name] = val
+                        val = interaction.generate(X)
+                        X[interaction.name] = val
                     except Exception as e:
                         self._log(f"Replay warning: {interaction.name}: {e}")
 
@@ -1700,6 +2258,53 @@ class FeatureGenerator:
                     X, self.pipeline, generation = self.X, self.pipeline, self.generation
             else:
                 self._sync_state_components(X, self.pipeline, generation)
+
+        # Meta-validation evaluation (CV bias diagnostic)
+        if X_meta is not None and y_meta is not None:
+            try:
+                # Replay features on meta split
+                X_meta_transformed = X_meta.copy()
+                for interaction in self.interactions:
+                    if interaction.name not in X_meta_transformed.columns and not interaction.require_pipeline:
+                        try:
+                            val = interaction.generate(X_meta_transformed)
+                            X_meta_transformed[interaction.name] = val
+                        except Exception:
+                            pass
+                
+                # Drop pruned features from meta
+                if hasattr(self, 'pruned_features') and self.pruned_features:
+                    X_meta_transformed = X_meta_transformed.drop(
+                        columns=[c for c in self.pruned_features if c in X_meta_transformed.columns], errors='ignore')
+                
+                meta_train, meta_val = self._eval_baseline(X_meta_transformed, y_meta, self.pipeline)
+                search_val = self.state['best']['val_score']
+                
+                if self.scorer.greater_is_better:
+                    gap = search_val - meta_val
+                else:
+                    gap = meta_val - search_val
+                
+                self._log(f"Meta-validation: search_val={search_val:.5f}, meta_val={meta_val:.5f}, gap={gap:.5f}")
+                if abs(gap) > 0.02:  # Significant gap suggests overfitting to search folds
+                    self._log(f"  Warning: Notable gap between search and meta-validation scores - possible selection overfitting")
+            except Exception as e:
+                self._log(f"Meta-validation evaluation failed: {e}")
+
+        # Regularized post-selection (Enhancement 5)
+        if self.final_selection and hasattr(self, 'interactions') and self.interactions:
+            features_to_drop = self._final_regularized_selection(X, y)
+            if features_to_drop:
+                X = X.drop(columns=[c for c in features_to_drop if c in X.columns], errors='ignore')
+                if not hasattr(self, 'pruned_features'):
+                    self.pruned_features = set()
+                self.pruned_features.update(features_to_drop)
+                self._sync_state_components(X, self.pipeline, generation, preserve_pruned=True)
+                # Re-evaluate after pruning
+                train_score, val_score = self._eval_baseline(X, y, self.pipeline)
+                self.state['best']['val_score'] = val_score
+                self.state['best']['train_score'] = train_score
+                self._log(f"Post-selection validation: {self.scorer.name}={val_score:.5f}")
 
         # Calculate and store metrics
         n_init_feats = len(self.initial_features)
@@ -1804,12 +2409,12 @@ class FeatureGenerator:
         for interaction in self.interactions:
             if interaction.name not in X_transformed.columns and not interaction.require_pipeline:
                 try:
-                    result = interaction.generate(X_transformed)
-                    if result is not None:
-                        X_transformed[result[0]] = result[1]
+                    val = interaction.generate(X_transformed)
+                    if val is not None:
+                        X_transformed[interaction.name] = val
                 except Exception as e:
                     self._log(f"Error generating {interaction.name}: {str(e)}")
-                    
+
         # Fit pipeline - use X_transformed to build pipeline with correct columns
         if isinstance(self.pipeline, PipelineWrapper):
             self.pipeline = self.pipeline.get_pipeline(X_transformed)
@@ -1828,9 +2433,9 @@ class FeatureGenerator:
         for interaction in self.interactions:
             if interaction.name not in X_transformed.columns and not interaction.require_pipeline:
                 try:
-                    result = interaction.generate(X_transformed)
-                    if result is not None:
-                        X_transformed[result[0]] = result[1]
+                    val = interaction.generate(X_transformed)
+                    if val is not None:
+                        X_transformed[interaction.name] = val
                 except Exception as e:
                     self._log(f"Error generating {interaction.name}: {str(e)}")
         
@@ -2033,6 +2638,36 @@ class FeatureGenerator:
         # Ensure search_sample_size exists
         if not hasattr(self, 'search_sample_size'):
             self.search_sample_size = None
+
+        # Enhancement 1: Feature cache
+        if not hasattr(self, '_feature_cache'):
+            self._feature_cache = FeatureCache(max_size_mb=2000)
+
+        # Enhancement 2: Proxy evaluation
+        if not hasattr(self, 'use_proxy_evaluation'):
+            self.use_proxy_evaluation = True
+        if not hasattr(self, 'proxy_top_pct'):
+            self.proxy_top_pct = 0.15
+        if not hasattr(self, '_lgb_available'):
+            self._lgb_available = None
+
+        # Enhancement 4: CV bias fix
+        if not hasattr(self, 'meta_validation_frac'):
+            self.meta_validation_frac = 0.15
+        if not hasattr(self, 'rotate_cv_folds'):
+            self.rotate_cv_folds = True
+        if not hasattr(self, 'fold_rotation_period'):
+            self.fold_rotation_period = 5
+
+        # Enhancement 5: Regularized post-selection
+        if not hasattr(self, 'final_selection'):
+            self.final_selection = True
+
+        # Enhancement 6: Temporal operators
+        if not hasattr(self, 'time_col'):
+            self.time_col = None
+        if not hasattr(self, 'id_col'):
+            self.id_col = None
 
         # Ensure state dict has interactions in best (for future reverts)
         if hasattr(self, 'state') and 'best' in self.state:

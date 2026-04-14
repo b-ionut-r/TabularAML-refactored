@@ -85,12 +85,16 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
     is_dataframe = isinstance(X, pd.DataFrame)
     
     if isinstance(cv, int):
-        cv = KFold(n_splits = cv, 
-                   shuffle = shuffle, 
-                   random_state = random_state) if type_of_target(y) == "continuous" \
-        else StratifiedKFold(n_splits = cv, 
-                            shuffle = shuffle, 
-                            random_state = random_state)
+        if groups is not None:
+            from sklearn.model_selection import GroupKFold
+            cv = GroupKFold(n_splits=cv)
+        else:
+            cv = KFold(n_splits = cv, 
+                       shuffle = shuffle, 
+                       random_state = random_state) if type_of_target(y) == "continuous" \
+            else StratifiedKFold(n_splits = cv, 
+                                shuffle = shuffle, 
+                                random_state = random_state)
     
     # Validate folds_weights if provided
     if folds_weights is not None:

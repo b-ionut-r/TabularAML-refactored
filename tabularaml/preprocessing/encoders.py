@@ -157,3 +157,171 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
                 "check_dtype_object": "Handles object types internally."
             }
         }
+
+
+class GroupByEncoder(BaseEstimator, TransformerMixin):
+    """Fit-transform group-by statistics within CV folds to prevent leakage.
+    
+    Computes aggregation statistics (mean, std, etc.) of a numeric column
+    grouped by a categorical column. Fitting learns the mapping from the
+    training fold; transform applies it to any fold with unseen-category fallback.
+    """
+    def __init__(self, cat_col, num_col, agg_func, output_col=None):
+        self.cat_col = cat_col
+        self.num_col = num_col
+        self.agg_func = agg_func
+        self.output_col = output_col or f"groupby_{agg_func}({cat_col}, {num_col})"
+        self.mapping_ = None
+        self.global_fallback_ = None
+
+    def fit(self, X, y=None):
+        if self.cat_col not in X.columns or self.num_col not in X.columns:
+            self.mapping_ = pd.Series(dtype=float)
+            self.global_fallback_ = 0.0
+            return self
+        
+        if self.agg_func == "zscore":
+            # For zscore, store both mean and std
+            self.group_mean_ = X.groupby(self.cat_col)[self.num_col].mean()
+            self.group_std_ = X.groupby(self.cat_col)[self.num_col].std().fillna(1e-8)
+            self.global_mean_ = X[self.num_col].mean()
+            self.global_std_ = max(X[self.num_col].std(), 1e-8)
+        elif self.agg_func == "rank":
+            # For rank, store the full distribution per group
+            self.mapping_ = X.groupby(self.cat_col)[self.num_col].agg("mean")  # Fallback
+            self.global_fallback_ = 0.5  # Median percentile rank
+        else:
+            self.mapping_ = X.groupby(self.cat_col)[self.num_col].agg(self.agg_func)
+            self.global_fallback_ = self.mapping_.mean() if self.agg_func != "count" else 0.0
+        return self
+
+    def transform(self, X):
+        if self.cat_col not in X.columns or self.num_col not in X.columns:
+            return pd.DataFrame({self.output_col: np.zeros(len(X))}, index=X.index)
+        
+        if self.agg_func == "zscore":
+            group_means = X[self.cat_col].map(self.group_mean_).fillna(self.global_mean_)
+            group_stds = X[self.cat_col].map(self.group_std_).fillna(self.global_std_)
+            result = (X[self.num_col] - group_means) / (group_stds + 1e-8)
+        elif self.agg_func == "rank":
+            # Rank within group using transform
+            result = X.groupby(self.cat_col)[self.num_col].rank(pct=True)
+            result = result.fillna(self.global_fallback_)
+        else:
+            result = X[self.cat_col].map(self.mapping_)
+            result = result.fillna(self.global_fallback_)
+        
+        return pd.DataFrame({self.output_col: result.values}, index=X.index)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array([self.output_col])
+
+
+class TemporalEncoder(BaseEstimator, TransformerMixin):
+    """Fit-transform temporal/lag features within CV folds to prevent leakage.
+    
+    Computes time-series features (lags, rolling stats, momentum, pct_change)
+    grouped by entity ID and sorted by time column. Only uses backward-looking
+    operations to prevent future data leakage.
+    
+    The op_name encodes both the operation type and window size, e.g.:
+      - 'lag_3'          → shift by 3
+      - 'rolling_mean_7' → rolling mean with window 7
+      - 'momentum_12'    → value - lag_12
+    """
+    
+    # Regex patterns: op_type → (regex, has_window)
+    _OP_PATTERNS = [
+        ("rolling_mean_", "rolling_mean"),
+        ("rolling_std_",  "rolling_std"),
+        ("pct_change_",   "pct_change"),
+        ("momentum_",     "momentum"),
+        ("lag_",          "lag"),
+    ]
+    
+    def __init__(self, col, id_col, time_col, op_name, output_col=None):
+        self.col = col
+        self.id_col = id_col
+        self.time_col = time_col
+        self.op_name = op_name
+        self.output_col = output_col or f"{op_name}({col})"
+        self.global_fallback_ = None
+        
+        # Parse op_type and window from op_name
+        self.op_type, self.window = self._parse_op_name(op_name)
+
+    @staticmethod
+    def _parse_op_name(op_name):
+        """Extract (op_type, window) from names like 'rolling_mean_7' or 'lag_3'."""
+        for prefix, op_type in TemporalEncoder._OP_PATTERNS:
+            if op_name.startswith(prefix):
+                try:
+                    window = int(op_name[len(prefix):])
+                    return op_type, window
+                except ValueError:
+                    pass
+        return op_name, 1  # Fallback
+
+    def fit(self, X, y=None):
+        if self.col not in X.columns or self.id_col not in X.columns or self.time_col not in X.columns:
+            self.global_fallback_ = 0.0
+            return self
+            
+        w = self.window
+        X_sorted = X.sort_values([self.id_col, self.time_col])
+        grouped = X_sorted.groupby(self.id_col)[self.col]
+        
+        if self.op_type == "lag":
+            result = grouped.shift(w)
+        elif self.op_type == "rolling_mean":
+            result = grouped.transform(lambda x: x.rolling(w, min_periods=1).mean())
+        elif self.op_type == "rolling_std":
+            result = grouped.transform(lambda x: x.rolling(w, min_periods=1).std())
+        elif self.op_type == "momentum":
+            result = X_sorted[self.col] - grouped.shift(w)
+        elif self.op_type == "pct_change":
+            result = grouped.pct_change(w)
+        else:
+            result = pd.Series(np.zeros(len(X)), index=X_sorted.index)
+            
+        self.global_fallback_ = result.median()
+        if pd.isna(self.global_fallback_) or np.isinf(self.global_fallback_):
+            self.global_fallback_ = 0.0
+            
+        return self
+
+    def transform(self, X):
+        if self.col not in X.columns or self.id_col not in X.columns or self.time_col not in X.columns:
+            return pd.DataFrame({self.output_col: np.zeros(len(X))}, index=X.index)
+        
+        w = self.window
+        
+        # Sort by time within groups
+        X_sorted = X.sort_values([self.id_col, self.time_col])
+        grouped = X_sorted.groupby(self.id_col)[self.col]
+        
+        if self.op_type == "lag":
+            result = grouped.shift(w)
+        elif self.op_type == "rolling_mean":
+            result = grouped.transform(lambda x: x.rolling(w, min_periods=1).mean())
+        elif self.op_type == "rolling_std":
+            result = grouped.transform(lambda x: x.rolling(w, min_periods=1).std())
+        elif self.op_type == "momentum":
+            result = X_sorted[self.col] - grouped.shift(w)
+        elif self.op_type == "pct_change":
+            result = grouped.pct_change(w)
+        else:
+            result = pd.Series(np.zeros(len(X)), index=X_sorted.index)
+        
+        # Fill NaN from insufficient history
+        result = result.fillna(self.global_fallback_)
+        # Replace inf values
+        result = result.replace([np.inf, -np.inf], self.global_fallback_)
+        
+        # Re-index to match original X order
+        result = result.reindex(X.index)
+        
+        return pd.DataFrame({self.output_col: result.values}, index=X.index)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array([self.output_col])

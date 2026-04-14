@@ -60,17 +60,42 @@ class PipelineWrapper:
         if hasattr(self.encoder, 'freq_enc_cols'):
             encoder_output_cols.update(f"{col}_freq" for col in self.encoder.freq_enc_cols)
 
+        # Also track GroupBy encoder output cols
+        groupby_encoders = getattr(self, 'groupby_encoders', [])
+        for gb_enc in groupby_encoders:
+            encoder_output_cols.add(gb_enc.output_col)
+
         # Filter out columns that will be created by encoder from numerical columns
         # This prevents duplicate feature name errors in ColumnTransformer
         filtered_numerical_columns = [col for col in self.numerical_columns
                                       if col not in encoder_output_cols]
 
+        # Build transformers list
+        transformers = [
+            ("scaling", scaler, filtered_numerical_columns),
+            ("encoding", encoder, self.categorical_columns),
+        ]
+        
+        # Add GroupBy encoder transformers
+        for i, gb_enc in enumerate(groupby_encoders):
+            # Each GroupBy encoder needs access to both cat_col and num_col
+            gb_cols = list(dict.fromkeys([gb_enc.cat_col, gb_enc.num_col]))  # Deduplicate
+            gb_cols_present = [c for c in gb_cols if c in X.columns]
+            if len(gb_cols_present) == len(gb_cols):
+                transformers.append((f"groupby_{i}", gb_enc, gb_cols_present))
+        
+        # Add Temporal encoder transformers
+        temporal_encoders = getattr(self, 'temporal_encoders', [])
+        for i, te_enc in enumerate(temporal_encoders):
+            # Temporal encoder needs col, id_col, and time_col
+            te_cols = list(dict.fromkeys([te_enc.col, te_enc.id_col, te_enc.time_col]))  # Deduplicate
+            te_cols_present = [c for c in te_cols if c in X.columns]
+            if len(te_cols_present) == len(te_cols):
+                transformers.append((f"temporal_{i}", te_enc, te_cols_present))
+        
         # ColumnTransformer
         ct = ColumnTransformer(
-            transformers = [
-                ("scaling", scaler, filtered_numerical_columns),
-                ("encoding", encoder, self.categorical_columns),
-            ],
+            transformers=transformers,
             remainder = "passthrough",
             verbose_feature_names_out = False
         )

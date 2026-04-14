@@ -11,7 +11,13 @@ PRESET_PARAMS = {
         "time_budget": 5 * 60, # 5 minutes
         "cv": 4,
         "ranking_method": "multi_criteria",
-        "search_sample_size": 10_000
+        "search_sample_size": 10_000,
+        "cache_size_mb": 500,
+        "use_proxy_evaluation": True,
+        "proxy_top_pct": 0.20,
+        "meta_validation_frac": 0.15,
+        "rotate_cv_folds": True,
+        "fold_rotation_period": 4
     },
     "medium": {
         # Better exploration/exploitation balance
@@ -25,7 +31,13 @@ PRESET_PARAMS = {
         "time_budget": 15 * 60, # 15 minutes
         "cv": 4,
         "ranking_method": "multi_criteria",
-        "search_sample_size": 10_000
+        "search_sample_size": 10_000,
+        "cache_size_mb": 1000,
+        "use_proxy_evaluation": True,
+        "proxy_top_pct": 0.15,
+        "meta_validation_frac": 0.15,
+        "rotate_cv_folds": True,
+        "fold_rotation_period": 5
     },
     "best": {
         # Deeper search with controlled patience
@@ -39,7 +51,13 @@ PRESET_PARAMS = {
         "time_budget": 60 * 60 * 2, # 2 hours
         "cv": 5,
         "ranking_method": "multi_criteria",
-        "search_sample_size": 15_000
+        "search_sample_size": 15_000,
+        "cache_size_mb": 2000,
+        "use_proxy_evaluation": True,
+        "proxy_top_pct": 0.12,
+        "meta_validation_frac": 0.15,
+        "rotate_cv_folds": True,
+        "fold_rotation_period": 5
     },
     "extreme": {
         # Maximum thoroughness with efficiency guardrails
@@ -53,6 +71,12 @@ PRESET_PARAMS = {
         "time_budget": 60 * 60 * 4, # 4 hours
         "cv": 5,
         "ranking_method": "multi_criteria",
-        "search_sample_size": 15_000
+        "search_sample_size": 15_000,
+        "cache_size_mb": 2000,
+        "use_proxy_evaluation": True,
+        "proxy_top_pct": 0.10,
+        "meta_validation_frac": 0.15,
+        "rotate_cv_folds": True,
+        "fold_rotation_period": 5
     }
 }
