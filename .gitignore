@@ -65,3 +65,6 @@ target/
 # Local env/config files
 .env
 .env.*
+
+# Other files
+reports/

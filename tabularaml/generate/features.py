@@ -740,7 +740,7 @@ class FeatureGenerator:
         """Log message to terminal and file."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_message = f"[{timestamp}] {message}"
-        print(formatted_message)
+        tqdm.write(formatted_message)
         if self.log_file:
             with open(self.log_file, "a") as f:
                 f.write(f"{formatted_message}\n")
@@ -1024,8 +1024,6 @@ class FeatureGenerator:
             n_keep = max(3, int(len(fb_scores) * self.proxy_top_pct))
             sorted_candidates = sorted(fb_scores.values(), key=lambda x: x[1], reverse=True)
             top_candidates = [interaction for interaction, _ in sorted_candidates[:n_keep]]
-            
-            self._log(f"  Proxy screening: {len(scorable_candidates)} -> {len(top_candidates)} candidates (top {self.proxy_top_pct*100:.0f}%)")
             
             return top_candidates + pipeline_candidates
             
@@ -2090,9 +2088,10 @@ class FeatureGenerator:
                     batch = self._sample_children_with_creativity(candidates_pool, self.n_children, tau=tau)
                     
                     # Phase 1: Proxy screening (fast FeatureBoost pre-filter)
+                    n_before_proxy = len(batch)
                     batch = self._proxy_screen_candidates(batch, X, y)
-                    
-                    pbar.set_description(f"Gen {N+1}: Testing {len(batch)} candidates")
+                    proxy_info = f" [{len(batch)}/{n_before_proxy} after proxy]" if self.use_proxy_evaluation and len(batch) < n_before_proxy else ""
+                    pbar.set_description(f"Gen {N+1}: Testing {len(batch)} candidates{proxy_info}")
                 
                     remaining_budget = self.max_gen_new_feats - self.state['counters']['total_new_features'] if self.max_gen_new_feats != float('inf') else float('inf')
                     features_per_gen = max(min(20, remaining_budget), 1) if remaining_budget > 0 else 1
@@ -2190,9 +2189,16 @@ class FeatureGenerator:
                 
                 # Log new features
                 if features_added > 0 and elites:
+                    encoder_feats = set(
+                        self.pipeline.encoder.target_enc_cols +
+                        self.pipeline.encoder.count_enc_cols +
+                        self.pipeline.encoder.freq_enc_cols
+                    )
                     new_simple = [elite.name for elite in elites if not elite.require_pipeline]
+                    new_pipeline = [elite.name for elite in elites if elite.require_pipeline and elite.name not in encoder_feats]
                     if new_simple: self._log(f"  Simple: {new_simple}")
-                    
+                    if new_pipeline: self._log(f"  Pipeline: {new_pipeline}")
+
                     if self.pipeline.encoder.target_enc_cols: self._log(f"  Target encoded: {self.pipeline.encoder.target_enc_cols}")
                     if self.pipeline.encoder.count_enc_cols: self._log(f"  Count encoded: {self.pipeline.encoder.count_enc_cols}")
                     if self.pipeline.encoder.freq_enc_cols: self._log(f"  Freq encoded: {self.pipeline.encoder.freq_enc_cols}")
@@ -2329,11 +2335,17 @@ class FeatureGenerator:
         self._log(f"Total restarts: {strategy_summary['total_restarts']}")
         
         # Log new features by type
+        encoder_feats_final = set(
+            self.pipeline.encoder.target_enc_cols +
+            self.pipeline.encoder.count_enc_cols +
+            self.pipeline.encoder.freq_enc_cols
+        )
+        all_generated = set(X.columns) - set(self.initial_features)
         new_features = {
-            "simple": set(X.columns) - set(self.initial_features),
-            "target": self.pipeline.encoder.target_enc_cols,
-            "count": self.pipeline.encoder.count_enc_cols,
-            "freq": self.pipeline.encoder.freq_enc_cols
+            "generated": all_generated - encoder_feats_final,
+            "target encoded": self.pipeline.encoder.target_enc_cols,
+            "count encoded": self.pipeline.encoder.count_enc_cols,
+            "freq encoded": self.pipeline.encoder.freq_enc_cols,
         }
         for feat_type, features in new_features.items():
             if features: self._log(f"New {feat_type}: {features}")
