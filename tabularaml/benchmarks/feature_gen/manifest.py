@@ -146,7 +146,7 @@ def subset_manifest(manifest: pd.DataFrame, subset: str) -> pd.DataFrame:
     subset = subset.lower()
     if subset == "full":
         return manifest.reset_index(drop=True)
-    counts = {"smoke": 3, "small": 50, "medium": 500}
+    counts = {"smoke": 3, "small": 50, "medium": 1000}
     if subset not in counts:
         raise ValueError(f"Unknown subset {subset!r}; use smoke|small|medium|full")
     n = counts[subset]

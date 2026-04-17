@@ -113,6 +113,13 @@ def score_on_holdout(
     )
 
     model = build_base_learner(task, n_classes, seed, n_jobs=n_jobs)
+    
+    for c in X_tr.columns:
+        if isinstance(X_tr[c].dtype, pd.CategoricalDtype):
+            cats = X_tr[c].cat.categories
+            X_val[c] = pd.Categorical(X_val[c], categories=cats)
+            X_test_fe[c] = pd.Categorical(X_test_fe[c], categories=cats)
+
     model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
     y_pred = _predict_for_scorer(model, X_test_fe, task, n_classes)
     scorer = select_scorer(task, n_classes)

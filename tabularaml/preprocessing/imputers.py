@@ -50,9 +50,23 @@ class SimpleImputer(BaseEstimator, TransformerMixin):
 
         # Categorical imputation
         for col in self.categorical_impute_values_:
-            X[col] = X[col].replace(
-                self._get_missing_value_list(self.categorical_missing_values), np.nan
-            ).fillna(self.categorical_impute_values_[col])
+            # Ensure the fill value is in categories to avoid 'Cannot setitem on a Categorical with a new category'
+            fill_val = self.categorical_impute_values_[col]
+            if pd.api.types.is_categorical_dtype(X[col]) or isinstance(X[col].dtype, pd.CategoricalDtype):
+                if fill_val not in X[col].cat.categories:
+                    X[col] = X[col].cat.add_categories([fill_val])
+                # We should also ensure missing values we replace are handled without crashing.
+                # Converting to object safely handles replace/fillna, then convert back
+                cat_type = X[col].dtype
+                X[col] = X[col].astype('object')
+                X[col] = X[col].replace(
+                    self._get_missing_value_list(self.categorical_missing_values), np.nan
+                ).fillna(fill_val)
+                X[col] = X[col].astype(cat_type)
+            else:
+                X[col] = X[col].replace(
+                    self._get_missing_value_list(self.categorical_missing_values), np.nan
+                ).fillna(fill_val)
         
         return X
 
@@ -109,6 +123,18 @@ class AdvancedImputer(BaseEstimator, TransformerMixin):
         
         # Transform categorical columns
         if self.categorical_columns_ and 'categorical' in self.imputer_:
-            X[self.categorical_columns_] = self.imputer_['categorical'].transform(X[self.categorical_columns_])
+            imputed_cats = self.imputer_['categorical'].transform(X[self.categorical_columns_])
+            for i, col in enumerate(self.categorical_columns_):
+                imputed_col = imputed_cats[:, i]
+                if isinstance(X[col].dtype, pd.CategoricalDtype):
+                    new_cats = set(pd.Series(imputed_col).unique()) - set(X[col].cat.categories)
+                    if new_cats:
+                        X[col] = X[col].cat.add_categories(list(new_cats))
+                    cat_type = X[col].dtype
+                    X[col] = X[col].astype('object')
+                    X[col] = imputed_col
+                    X[col] = X[col].astype(cat_type)
+                else:
+                    X[col] = imputed_col
         
         return X

@@ -45,15 +45,21 @@ class OpenFEAdapter(FEFrameworkAdapter):
         return "classification"  # OpenFE handles binary + multiclass via label dtype
 
     @staticmethod
-    def _patch_sklearn_for_openfe() -> None:
+    def _patch_dependencies_for_openfe() -> None:
         """OpenFE 0.0.12 calls mean_squared_error(..., squared=False) which was
         removed in sklearn 1.4+. Patch before openfe is imported so its
         module-level `from sklearn.metrics import mean_squared_error` gets the
-        compatible version (fork-safe on Linux)."""
+        compatible version (fork-safe on Linux).
+        Also patch LightGBM's Dataset.set_feature_name to strip characters that
+        crash LightGBM >= 4.0.0 (like commas from OpenFE's generated names)."""
         import numpy as np
         import sklearn.metrics as sm
+        import lightgbm as lgb
+        import re
+
         if getattr(sm.mean_squared_error, "_openfe_patched", False):
             return
+
         _orig = sm.mean_squared_error
         def _compat(y_true, y_pred, *, sample_weight=None,
                     multioutput="uniform_average", squared=True):
@@ -63,8 +69,18 @@ class OpenFEAdapter(FEFrameworkAdapter):
         _compat._openfe_patched = True
         sm.mean_squared_error = _compat
 
+        _orig_set_feature_name = lgb.Dataset.set_feature_name
+        def _patched_set_feature_name(self, feature_name):
+            if feature_name is not None:
+                feature_name = [
+                    re.sub(r'[\[\]{}<>\:\"/\\|\?\*\, ]', '_', col)
+                    for col in feature_name
+                ]
+            return _orig_set_feature_name(self, feature_name)
+        lgb.Dataset.set_feature_name = _patched_set_feature_name
+
     def fit_transform(self, X_train: pd.DataFrame, y_train: pd.Series) -> pd.DataFrame:
-        self._patch_sklearn_for_openfe()
+        self._patch_dependencies_for_openfe()
         from openfe import OpenFE, transform  # imported lazily to keep startup light
 
         self._n_features_before = X_train.shape[1]
@@ -72,6 +88,9 @@ class OpenFEAdapter(FEFrameworkAdapter):
         # Reset to 0-based RangeIndex: train_test_split leaves X_train with a
         # scattered subset index; OpenFE's internal .loc[train_idx + val_idx]
         # assumes contiguous 0-based labels and raises KeyError otherwise.
+        # Also clean column names to prevent lightgbm crashes on special characters.
+        import re
+        X_train = X_train.rename(columns=lambda col: re.sub(r'[\[\]{}<>\:\"/\\|\?\*\, ]', '_', str(col)))
         X_train = X_train.reset_index(drop=True)
         y_train = pd.Series(y_train).reset_index(drop=True)
         self._x_train_cache = X_train.copy()
@@ -111,8 +130,10 @@ class OpenFEAdapter(FEFrameworkAdapter):
 
     def transform(self, X_test: pd.DataFrame) -> pd.DataFrame:
         from openfe import transform
+        import re
         if self._features is None or self._x_train_cache is None:
             raise RuntimeError("OpenFEAdapter.transform called before fit_transform")
+        X_test = X_test.rename(columns=lambda col: re.sub(r'[\[\]{}<>\:\"/\\|\?\*\, ]', '_', str(col)))
         _, X_test_fe = transform(
             self._x_train_cache, X_test.reset_index(drop=True), self._features,
             n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),

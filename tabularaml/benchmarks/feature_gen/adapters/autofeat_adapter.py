@@ -103,6 +103,7 @@ class AutoFeatAdapter(FEFrameworkAdapter):
         X_train_fe = self._af.fit_transform(X_pre, pd.Series(y_train).values)
         if not isinstance(X_train_fe, pd.DataFrame):
             X_train_fe = pd.DataFrame(X_train_fe, index=X_pre.index)
+        X_train_fe = X_train_fe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         self._train_columns_fe = list(X_train_fe.columns)
         self._n_features_after = X_train_fe.shape[1]
         return X_train_fe
@@ -114,4 +115,5 @@ class AutoFeatAdapter(FEFrameworkAdapter):
         X_test_fe = self._af.transform(X_pre)
         if not isinstance(X_test_fe, pd.DataFrame):
             X_test_fe = pd.DataFrame(X_test_fe, index=X_pre.index)
+        X_test_fe = X_test_fe.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         return X_test_fe[self._train_columns_fe]

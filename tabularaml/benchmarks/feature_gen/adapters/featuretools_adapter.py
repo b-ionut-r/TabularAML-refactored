@@ -90,7 +90,9 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
 
     def fit_transform(self, X_train: pd.DataFrame, y_train: pd.Series) -> pd.DataFrame:
         self._n_features_before = X_train.shape[1]
-        frame = self._to_index_frame(X_train)
+        keep = [c for c in X_train.columns if not X_train[c].isna().all()]
+        self._valid_cols = keep
+        frame = self._to_index_frame(X_train[keep])
         ft, es = self._dfs(frame)
         matrix, feature_defs = ft.dfs(
             entityset=es,
@@ -110,7 +112,8 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         import featuretools as ft
         if self._feature_defs is None:
             raise RuntimeError("FeaturetoolsAdapter.transform called before fit_transform")
-        frame = self._to_index_frame(X_test)
+        valid_cols = getattr(self, '_valid_cols', X_test.columns.tolist())
+        frame = self._to_index_frame(X_test[[c for c in valid_cols if c in X_test.columns]])
         _, es = self._dfs(frame)
         matrix = ft.calculate_feature_matrix(
             features=self._feature_defs,

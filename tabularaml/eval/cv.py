@@ -89,12 +89,18 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
             from sklearn.model_selection import GroupKFold
             cv = GroupKFold(n_splits=cv)
         else:
-            cv = KFold(n_splits = cv, 
-                       shuffle = shuffle, 
-                       random_state = random_state) if type_of_target(y) == "continuous" \
-            else StratifiedKFold(n_splits = cv, 
-                                shuffle = shuffle, 
-                                random_state = random_state)
+            is_regression = type_of_target(y) in ("continuous", "continuous-multioutput")
+
+            import numpy as np
+            y_arr = np.asarray(y)
+            min_class = np.min(np.bincount(y_arr)) if not is_regression else cv + 1
+
+            use_stratified = (not is_regression) and (min_class >= cv)
+
+            if use_stratified:
+                cv = StratifiedKFold(n_splits=cv, shuffle=shuffle, random_state=random_state)
+            else:
+                cv = KFold(n_splits=cv, shuffle=shuffle, random_state=random_state)
     
     # Validate folds_weights if provided
     if folds_weights is not None:
