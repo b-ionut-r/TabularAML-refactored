@@ -73,7 +73,7 @@ class TabularAMLAdapter(FEFrameworkAdapter):
             task=self.task,
             scorer=scorer,
             mode=self.mode,
-            time_budget=self.time_budget_s,
+            # time_budget=self.time_budget_s,
             use_gpu=self.use_gpu,
             log_file=None,
         )
