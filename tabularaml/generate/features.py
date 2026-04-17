@@ -1485,7 +1485,7 @@ class FeatureGenerator:
             # Check for duplicate columns before concatenating
             X = self._ensure_no_duplicates(X, "before adding features in _apply_interactions")
             
-            X_copy = pd.concat([X.copy(), pd.DataFrame(new_features)], axis=1)
+            X_copy = pd.concat([X.copy(), pd.DataFrame(new_features, index=X.index)], axis=1)
             
             # Verify no duplicates after concatenation
             X_copy = self._ensure_no_duplicates(X_copy, "after adding features in _apply_interactions")

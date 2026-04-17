@@ -82,10 +82,12 @@ def _load_master(csv_path: Path) -> pd.DataFrame:
     return pd.read_csv(csv_path)
 
 
-def _done_key_set(master: pd.DataFrame) -> set:
+def _done_key_set(master: pd.DataFrame, retry_crashes: bool = True) -> set:
     if len(master) == 0:
         return set()
     terminal = {"ok", "timeout", "oom", "contract_violation", "unsupported_task"}
+    if not retry_crashes:
+        terminal.add("crash")
     done = master[master["status"].isin(terminal)]
     return {
         (int(r.dataset_id), str(r.framework), int(r.seed))
@@ -167,7 +169,7 @@ class BenchmarkRunner:
             fws = ["nofe"] + [f for f in fws if f != "nofe"]
 
         master = _load_master(self.master_csv)
-        done = _done_key_set(master) if self.skip_existing else set()
+        done = _done_key_set(master, retry_crashes=self.retry_crashes) if self.skip_existing else set()
 
         n_cpus = multiprocessing.cpu_count()
         n_jobs_per_worker = max(1, n_cpus // self.n_workers)

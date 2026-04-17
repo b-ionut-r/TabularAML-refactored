@@ -18,9 +18,6 @@ wandb>=0.17.0
 psutil>=5.9.0
 filelock>=3.13.0
 
-# Required by AutoFeat preprocessing step
-scikit-learn>=1.3.0
-
 # Models
 xgboost 
 lightgbm
@@ -30,3 +27,4 @@ openml
 
 # Others
 category_encoders
+scikit-learn==1.5.2

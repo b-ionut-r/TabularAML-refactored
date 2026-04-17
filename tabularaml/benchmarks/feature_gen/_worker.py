@@ -68,6 +68,11 @@ def _preprocess(X: pd.DataFrame, y, task: str):
     if const_cols:
         X = X.drop(columns=const_cols)
     X = X.loc[:, ~X.columns.duplicated(keep="first")]
+    # Densify any sparse columns (sparse pandas dtype crashes most FE frameworks).
+    for c in X.columns:
+        if hasattr(X[c], "sparse"):
+            X[c] = X[c].sparse.to_dense()
+
     # Cast object → category.
     for c in X.columns:
         if X[c].dtype == object:
