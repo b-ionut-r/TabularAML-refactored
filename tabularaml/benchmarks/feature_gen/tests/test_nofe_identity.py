@@ -11,7 +11,10 @@ from sklearn.model_selection import train_test_split
 
 from tabularaml.benchmarks.feature_gen.adapters import get_adapter_cls
 from tabularaml.benchmarks.feature_gen.evaluator import (
-    BASE_LEARNER_PARAMS, score_on_holdout, select_scorer,
+    BASE_LEARNER_PARAMS,
+    score_on_holdout,
+    select_scorer,
+    split_early_stopping_validation,
 )
 
 
@@ -26,25 +29,34 @@ def test_nofe_matches_direct_xgb(toy_cls):
     adapter = get_adapter_cls("nofe")(
         task="classification", time_budget_s=60, random_state=7, n_jobs=1,
     )
-    X_tr_fe = adapter.fit_transform(X_tr, y_tr)
+    X_tr_fit, X_tr_val, y_tr_fit, y_tr_val = split_early_stopping_validation(
+        X_tr,
+        y_tr,
+        task="classification",
+        seed=7,
+    )
+    X_tr_fe = adapter.fit_transform(X_tr_fit, y_tr_fit)
+    X_val_fe = adapter.transform(X_tr_val)
     X_te_fe = adapter.transform(X_te)
 
     score, _ = score_on_holdout(
-        X_tr_fe, y_tr, X_te_fe, y_te,
+        X_tr_fe,
+        y_tr_fit,
+        X_val_fe,
+        y_tr_val,
+        X_te_fe,
+        y_te,
         task="classification", n_classes=2, seed=7,
     )
 
-    # Direct XGBoost call mirroring build_base_learner + same 10% early-stop split.
+    # Direct XGBoost call mirroring build_base_learner + same early-stop split.
     params = dict(BASE_LEARNER_PARAMS)
     params["random_state"] = 7
     params["seed"] = 7
     params["objective"] = "binary:logistic"
     params["eval_metric"] = "logloss"
     direct = xgb.XGBClassifier(**params)
-    X_tr_inner, X_val, y_tr_inner, y_val = train_test_split(
-        X_tr, y_tr, test_size=0.1, random_state=7, stratify=y_tr,
-    )
-    direct.fit(X_tr_inner, y_tr_inner, eval_set=[(X_val, y_val)], verbose=False)
+    direct.fit(X_tr_fit, y_tr_fit, eval_set=[(X_tr_val, y_tr_val)], verbose=False)
     y_pred = direct.predict_proba(X_te)[:, 1]
     scorer = select_scorer("classification", 2)
     direct_score = float(scorer.score(y_te, y_pred))

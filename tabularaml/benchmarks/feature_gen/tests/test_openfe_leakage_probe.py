@@ -19,7 +19,10 @@ openfe_available = importlib.util.find_spec("openfe") is not None
 @pytest.mark.skipif(not openfe_available, reason="openfe not installed")
 def test_openfe_leakage_probe_records_result(tmp_path):
     from tabularaml.benchmarks.feature_gen.adapters import get_adapter_cls
-    from tabularaml.benchmarks.feature_gen.evaluator import score_on_holdout
+    from tabularaml.benchmarks.feature_gen.evaluator import (
+        score_on_holdout,
+        split_early_stopping_validation,
+    )
 
     rng = np.random.default_rng(42)
     n, d = 600, 12
@@ -35,13 +38,25 @@ def test_openfe_leakage_probe_records_result(tmp_path):
         task="classification", time_budget_s=120, random_state=42, n_jobs=1,
     )
     try:
-        X_tr_fe = adapter.fit_transform(X_tr, pd.Series(y_tr))
+        X_tr_fit, X_tr_val, y_tr_fit, y_tr_val = split_early_stopping_validation(
+            X_tr,
+            y_tr,
+            task="classification",
+            seed=42,
+        )
+        X_tr_fe = adapter.fit_transform(X_tr_fit, pd.Series(y_tr_fit))
+        X_val_fe = adapter.transform(X_tr_val)
         X_te_fe = adapter.transform(X_te)
     except Exception as e:
         pytest.skip(f"OpenFE fit failed on this environment: {e}")
 
     score, _ = score_on_holdout(
-        X_tr_fe, y_tr, X_te_fe, y_te,
+        X_tr_fe,
+        y_tr_fit,
+        X_val_fe,
+        y_tr_val,
+        X_te_fe,
+        y_te,
         task="classification", n_classes=2, seed=42,
     )
 

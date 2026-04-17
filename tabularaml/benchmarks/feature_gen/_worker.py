@@ -109,7 +109,11 @@ def run(spec: dict) -> dict:
     from sklearn.model_selection import train_test_split
     from tabularaml.benchmarks.feature_gen.adapters import get_adapter_cls
     from tabularaml.benchmarks.feature_gen.adapters.base import _check_contract, ContractViolationError
-    from tabularaml.benchmarks.feature_gen.evaluator import score_on_holdout, select_scorer
+    from tabularaml.benchmarks.feature_gen.evaluator import (
+        score_on_holdout,
+        select_scorer,
+        split_early_stopping_validation,
+    )
     from tabularaml.benchmarks.feature_gen.wandb_logger import (
         wandb_run, derive_tags, log_media_placeholder, log_row,
     )
@@ -199,20 +203,34 @@ def run(spec: dict) -> dict:
                 return row
 
             t_fit_start = time.time()
-            X_train_fe = adapter.fit_transform(X_train, pd.Series(y_train))
+            X_train_fit, X_train_es, y_train_fit, y_train_es = split_early_stopping_validation(
+                X_train,
+                y_train,
+                task=task,
+                seed=int(spec["seed"]),
+            )
+
+            X_train_fe = adapter.fit_transform(X_train_fit, pd.Series(y_train_fit))
             row["wall_time_fit"] = time.time() - t_fit_start
 
             t_tr_start = time.time()
+            X_es_fe = adapter.transform(X_train_es)
             X_test_fe = adapter.transform(X_test)
             row["wall_time_transform"] = time.time() - t_tr_start
 
-            _check_contract(X_train_fe, X_test_fe, len(X_train), len(X_test))
+            _check_contract(X_train_fe, X_es_fe, len(X_train_fit), len(X_train_es))
+            _check_contract(X_train_fe, X_test_fe, len(X_train_fit), len(X_test))
 
             row["n_features_after"] = int(X_train_fe.shape[1])
             row["n_added"] = int(adapter.get_feature_count_added())
 
             score, n_rounds = score_on_holdout(
-                X_train_fe, y_train, X_test_fe, y_test,
+                X_train_fe,
+                y_train_fit,
+                X_es_fe,
+                y_train_es,
+                X_test_fe,
+                y_test,
                 task=task, n_classes=n_classes, seed=int(spec["seed"]),
                 n_jobs=int(spec.get("n_jobs", 1)),
             )
