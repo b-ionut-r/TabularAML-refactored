@@ -73,7 +73,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
         def _patched_set_feature_name(self, feature_name):
             if feature_name is not None:
                 feature_name = [
-                    re.sub(r'[\[\]{}<>\:\"/\\|\?\*\, ]', '_', col)
+                    re.sub(r'[^A-Za-z0-9_]', '_', col)
                     for col in feature_name
                 ]
             return _orig_set_feature_name(self, feature_name)
@@ -90,7 +90,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
         # assumes contiguous 0-based labels and raises KeyError otherwise.
         # Also clean column names to prevent lightgbm crashes on special characters.
         import re
-        X_train = X_train.rename(columns=lambda col: re.sub(r'[\[\]{}<>\:\"/\\|\?\*\, ]', '_', str(col)))
+        X_train = X_train.rename(columns=lambda col: re.sub(r'[^A-Za-z0-9_]', '_', str(col)))
         X_train = X_train.reset_index(drop=True)
         y_train = pd.Series(y_train).reset_index(drop=True)
         self._x_train_cache = X_train.copy()
@@ -133,7 +133,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
         import re
         if self._features is None or self._x_train_cache is None:
             raise RuntimeError("OpenFEAdapter.transform called before fit_transform")
-        X_test = X_test.rename(columns=lambda col: re.sub(r'[\[\]{}<>\:\"/\\|\?\*\, ]', '_', str(col)))
+        X_test = X_test.rename(columns=lambda col: re.sub(r'[^A-Za-z0-9_]', '_', str(col)))
         _, X_test_fe = transform(
             self._x_train_cache, X_test.reset_index(drop=True), self._features,
             n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),

@@ -105,6 +105,7 @@ def _peak_rss_mb() -> float:
 
 
 def run(spec: dict) -> dict:
+    import urllib.error
     from sklearn.model_selection import train_test_split
     from tabularaml.benchmarks.feature_gen.adapters import get_adapter_cls
     from tabularaml.benchmarks.feature_gen.adapters.base import _check_contract, ContractViolationError
@@ -117,7 +118,14 @@ def run(spec: dict) -> dict:
     t0_total = time.time()
 
     try:
-        X_raw, y_raw, task = _load_dataset(spec["dataset_id"], spec["task"])
+        try:
+            X_raw, y_raw, task = _load_dataset(spec["dataset_id"], spec["task"])
+        except (urllib.error.URLError, RuntimeError) as e:
+            if "Dataset could not be fetched" in str(e) or "urlopen error" in str(e):
+                row["status"] = "dataset_fetch_failed"
+                row["error_msg"] = str(e)
+                return row
+            raise
         X, y, n_classes = _preprocess(X_raw, y_raw, task)
         row["n_features_before"] = int(X.shape[1])
 

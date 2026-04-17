@@ -755,9 +755,6 @@ class FeatureGenerator:
             return X, y, groups
 
         from sklearn.model_selection import StratifiedShuffleSplit
-        import numpy as np
-        import pandas as pd
-
         groups_arr = np.asarray(groups) if groups is not None else None
 
         try:

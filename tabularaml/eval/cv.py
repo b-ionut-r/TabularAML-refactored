@@ -91,9 +91,8 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
         else:
             is_regression = type_of_target(y) in ("continuous", "continuous-multioutput")
 
-            import numpy as np
             y_arr = np.asarray(y)
-            min_class = np.min(np.bincount(y_arr)) if not is_regression else cv + 1
+            min_class = np.min(np.bincount(y_arr.astype(int))) if not is_regression else cv + 1
 
             use_stratified = (not is_regression) and (min_class >= cv)
 
