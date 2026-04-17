@@ -10,6 +10,7 @@ annotate it honestly.
 from __future__ import annotations
 import os
 import tempfile
+import warnings
 from typing import Literal, Optional
 import pandas as pd
 
@@ -49,13 +50,9 @@ class OpenFEAdapter(FEFrameworkAdapter):
         """OpenFE 0.0.12 calls mean_squared_error(..., squared=False) which was
         removed in sklearn 1.4+. Patch before openfe is imported so its
         module-level `from sklearn.metrics import mean_squared_error` gets the
-        compatible version (fork-safe on Linux).
-        Also patch LightGBM's Dataset.set_feature_name to strip characters that
-        crash LightGBM >= 4.0.0 (like commas from OpenFE's generated names)."""
+        compatible version (fork-safe on Linux)."""
         import numpy as np
         import sklearn.metrics as sm
-        import lightgbm as lgb
-        import re
 
         if getattr(sm.mean_squared_error, "_openfe_patched", False):
             return
@@ -69,74 +66,69 @@ class OpenFEAdapter(FEFrameworkAdapter):
         _compat._openfe_patched = True
         sm.mean_squared_error = _compat
 
-        _orig_set_feature_name = lgb.Dataset.set_feature_name
-        def _patched_set_feature_name(self, feature_name):
-            if feature_name is not None:
-                feature_name = [
-                    re.sub(r'[^A-Za-z0-9_]', '_', col)
-                    for col in feature_name
-                ]
-            return _orig_set_feature_name(self, feature_name)
-        lgb.Dataset.set_feature_name = _patched_set_feature_name
-
     def fit_transform(self, X_train: pd.DataFrame, y_train: pd.Series) -> pd.DataFrame:
         self._patch_dependencies_for_openfe()
-        from openfe import OpenFE, transform  # imported lazily to keep startup light
+        
+        # Suppress LightGBM warnings about special characters in feature names
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            
+            from openfe import OpenFE, transform  # imported lazily to keep startup light
 
-        self._n_features_before = X_train.shape[1]
+            self._n_features_before = X_train.shape[1]
 
-        # Reset to 0-based RangeIndex: train_test_split leaves X_train with a
-        # scattered subset index; OpenFE's internal .loc[train_idx + val_idx]
-        # assumes contiguous 0-based labels and raises KeyError otherwise.
-        # Also clean column names to prevent lightgbm crashes on special characters.
-        import re
-        X_train = X_train.rename(columns=lambda col: re.sub(r'[^A-Za-z0-9_]', '_', str(col)))
-        X_train = X_train.reset_index(drop=True)
-        y_train = pd.Series(y_train).reset_index(drop=True)
-        self._x_train_cache = X_train.copy()
+            # Reset to 0-based RangeIndex: train_test_split leaves X_train with a
+            # scattered subset index; OpenFE's internal .loc[train_idx + val_idx]
+            # assumes contiguous 0-based labels and raises KeyError otherwise.
+            X_train = X_train.reset_index(drop=True)
+            y_train = pd.Series(y_train).reset_index(drop=True)
+            self._x_train_cache = X_train.copy()
 
-        # OpenFE expects label as a DataFrame with a single column.
-        y_df = pd.DataFrame({"_label": y_train.values}, index=X_train.index)
+            # OpenFE expects label as a DataFrame with a single column.
+            y_df = pd.DataFrame({"_label": y_train.values}, index=X_train.index)
 
-        # Use fewer blocks for small datasets so each block has at least 100 rows.
-        effective_blocks = min(self.n_data_blocks, max(2, len(X_train) // 100))
+            # Use fewer blocks for small datasets so each block has at least 100 rows.
+            effective_blocks = min(self.n_data_blocks, max(2, len(X_train) // 100))
 
-        self._ofe = OpenFE()
-        # OpenFE writes ./openfe_tmp_data_xx.feather to CWD with a predictable
-        # name; chdir to a fresh temp dir so parallel workers don't collide.
-        os.chdir(tempfile.mkdtemp())
-        self._features = self._ofe.fit(
-            data=X_train,
-            label=y_df,
-            task=self._task_for_openfe(y_train),
-            n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
-            n_data_blocks=effective_blocks,
-            feature_boosting=self.feature_boosting,
-            seed=self.random_state,
-            verbose=False,
-        )
+            self._ofe = OpenFE()
+            # OpenFE writes ./openfe_tmp_data_xx.feather to CWD with a predictable
+            # name; chdir to a fresh temp dir so parallel workers don't collide.
+            os.chdir(tempfile.mkdtemp())
+            self._features = self._ofe.fit(
+                data=X_train,
+                label=y_df,
+                task=self._task_for_openfe(y_train),
+                n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+                n_data_blocks=effective_blocks,
+                feature_boosting=self.feature_boosting,
+                seed=self.random_state,
+                verbose=False,
+            )
 
-        # Use a copy of X_train as the "test" input so the returned train frame
-        # is generated through the same `transform()` code path that will later
-        # produce X_test_fe. This guarantees column identity without actually
-        # leaking any extra rows (train == the "test" argument).
-        X_train_fe, _ = transform(
-            X_train, X_train.iloc[:1].copy(),
-            self._features, n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
-        )
-        self._train_columns_fe = list(X_train_fe.columns)
-        self._n_features_after = X_train_fe.shape[1]
-        return X_train_fe
+            # Use a copy of X_train as the "test" input so the returned train frame
+            # is generated through the same `transform()` code path that will later
+            # produce X_test_fe. This guarantees column identity without actually
+            # leaking any extra rows (train == the "test" argument).
+            X_train_fe, _ = transform(
+                X_train, X_train.iloc[:1].copy(),
+                self._features, n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+            )
+            self._train_columns_fe = list(X_train_fe.columns)
+            self._n_features_after = X_train_fe.shape[1]
+            return X_train_fe
 
     def transform(self, X_test: pd.DataFrame) -> pd.DataFrame:
-        from openfe import transform
-        import re
         if self._features is None or self._x_train_cache is None:
             raise RuntimeError("OpenFEAdapter.transform called before fit_transform")
-        X_test = X_test.rename(columns=lambda col: re.sub(r'[^A-Za-z0-9_]', '_', str(col)))
-        _, X_test_fe = transform(
-            self._x_train_cache, X_test.reset_index(drop=True), self._features,
-            n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
-        )
+            
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from openfe import transform
+            
+            _, X_test_fe = transform(
+                self._x_train_cache, X_test.reset_index(drop=True), self._features,
+                n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+            )
+            
         # Enforce the same column order as train.
         return X_test_fe[self._train_columns_fe]
