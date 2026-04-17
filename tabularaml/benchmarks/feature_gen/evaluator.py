@@ -25,7 +25,6 @@ BASE_LEARNER_PARAMS = dict(
     colsample_bytree=0.9,
     reg_lambda=1.0,
     early_stopping_rounds=50,
-    n_jobs=-1,
     verbosity=0,
 )
 
@@ -36,10 +35,11 @@ def select_scorer(task: str, n_classes: int) -> Scorer:
     return binary_roc_auc if n_classes == 2 else categorical_crossentropy
 
 
-def build_base_learner(task: str, n_classes: int, seed: int):
+def build_base_learner(task: str, n_classes: int, seed: int, n_jobs: int = 1):
     params = dict(BASE_LEARNER_PARAMS)
     params["random_state"] = int(seed)
     params["seed"] = int(seed)
+    params["n_jobs"] = int(n_jobs)
     if task == "regression":
         return xgb.XGBRegressor(**params)
     if n_classes == 2:
@@ -60,6 +60,30 @@ def _predict_for_scorer(model, X, task: str, n_classes: int) -> np.ndarray:
     return np.asarray(model.predict_proba(X))
 
 
+def sanitize_features(X: pd.DataFrame) -> pd.DataFrame:
+    """Sanitizes generated features to avoid breaking XGBoost."""
+    X = X.copy()
+    
+    # 1. Replace inf/-inf with NaN
+    X = X.replace([np.inf, -np.inf], np.nan)
+    
+    # 2. Clip numerical columns to avoid extreme values
+    num_cols = X.select_dtypes(include=[np.number]).columns
+    if len(num_cols) > 0:
+        # Cast to float32 or float64 if not already to prevent overflow/dtype issues
+        X[num_cols] = X[num_cols].astype(float).clip(lower=-1e6, upper=1e6)
+        
+    # 3. Fix category indices ending up as floats
+    cat_cols = X.select_dtypes(include=['category']).columns
+    for c in cat_cols:
+        cat_dtype = X[c].cat.categories.dtype
+        if cat_dtype.kind in ('f', 'i', 'c'): # floats, ints, complex
+            # Convert internal categories to string so XGB is happy
+            X[c] = X[c].cat.rename_categories(X[c].cat.categories.astype(str))
+            
+    return X
+
+
 def score_on_holdout(
     X_train_fe: pd.DataFrame,
     y_train: np.ndarray,
@@ -68,12 +92,16 @@ def score_on_holdout(
     task: str,
     n_classes: int,
     seed: int,
+    n_jobs: int = 1,
 ) -> Tuple[float, int]:
     """Train the fixed base learner on (X_train_fe, y_train) with a 10% internal
     val split used for early stopping, then score on (X_test_fe, y_test).
 
     Returns (score, n_boost_rounds_used).
     """
+    X_train_fe = sanitize_features(X_train_fe)
+    X_test_fe = sanitize_features(X_test_fe)
+
     y_train = np.asarray(y_train)
     y_test = np.asarray(y_test)
 
@@ -84,7 +112,7 @@ def score_on_holdout(
         stratify=stratify if (stratify is not None and len(np.unique(stratify)) > 1) else None,
     )
 
-    model = build_base_learner(task, n_classes, seed)
+    model = build_base_learner(task, n_classes, seed, n_jobs=n_jobs)
     model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
     y_pred = _predict_for_scorer(model, X_test_fe, task, n_classes)
     scorer = select_scorer(task, n_classes)

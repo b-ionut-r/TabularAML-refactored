@@ -105,7 +105,7 @@ def run(spec: dict) -> dict:
     from tabularaml.benchmarks.feature_gen.adapters.base import _check_contract, ContractViolationError
     from tabularaml.benchmarks.feature_gen.evaluator import score_on_holdout, select_scorer
     from tabularaml.benchmarks.feature_gen.wandb_logger import (
-        wandb_run, derive_tags, log_row,
+        wandb_run, derive_tags, log_media_placeholder, log_row,
     )
 
     row = _make_row(spec)
@@ -149,8 +149,14 @@ def run(spec: dict) -> dict:
             group=group,
             tags=tags,
             config=wandb_cfg,
+            job_type="worker",
             enabled=wb_enabled,
         ) as wb:
+            log_media_placeholder(
+                wb,
+                key="figure_runtime_vs_improvement",
+                caption="Aggregated runtime-vs-improvement media is logged on the orchestrator run.",
+            )
             adapter_cls = get_adapter_cls(spec["framework"])
 
             adapter_kwargs = dict(spec.get("framework_kwargs") or {})
@@ -195,6 +201,7 @@ def run(spec: dict) -> dict:
             score, n_rounds = score_on_holdout(
                 X_train_fe, y_train, X_test_fe, y_test,
                 task=task, n_classes=n_classes, seed=int(spec["seed"]),
+                n_jobs=int(spec.get("n_jobs", 1)),
             )
             scorer = select_scorer(task, n_classes)
             row["score_holdout"] = float(score)

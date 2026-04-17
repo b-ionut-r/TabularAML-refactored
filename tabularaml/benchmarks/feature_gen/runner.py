@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional, Sequence
@@ -168,6 +169,9 @@ class BenchmarkRunner:
         master = _load_master(self.master_csv)
         done = _done_key_set(master) if self.skip_existing else set()
 
+        n_cpus = multiprocessing.cpu_count()
+        n_jobs_per_worker = max(1, n_cpus // self.n_workers)
+
         specs: list[RunSpec] = []
         for _, row in manifest.iterrows():
             for seed in self.seeds:
@@ -181,6 +185,7 @@ class BenchmarkRunner:
                         framework=fw,
                         seed=int(seed),
                         time_budget_s=self.time_budget_s,
+                        n_jobs=n_jobs_per_worker,
                         mode=self.tabularaml_mode if fw == "tabularaml" else "medium",
                         wandb_enabled=self.wandb_enabled,
                         wandb_project=self.wandb_project,
@@ -322,7 +327,7 @@ class BenchmarkRunner:
                     if self.n_workers == 1:
                         for spec in specs:
                             _, row = _dispatch((self, spec))
-                            self._finalize_row(row, nofe_lookup)
+                            self._finalize_row(row, nofe_lookup, orch)
                             n_done += 1
                             pbar.update(1)
                             if n_done % self.sync_every_rows == 0:
@@ -333,7 +338,7 @@ class BenchmarkRunner:
                             futures = [pool.submit(_dispatch, (self, s)) for s in specs]
                             for fut in as_completed(futures):
                                 _, row = fut.result()
-                                self._finalize_row(row, nofe_lookup)
+                                self._finalize_row(row, nofe_lookup, orch)
                                 n_done += 1
                                 pbar.update(1)
                                 if n_done % self.sync_every_rows == 0:
@@ -354,8 +359,7 @@ class BenchmarkRunner:
             paths.append(self.raw_dir)
         return paths
 
-    def _finalize_row(self, row: dict, nofe_lookup: dict) -> None:
-        # If this is a nofe ok row, remember it for future join.
+    def _finalize_row(self, row: dict, nofe_lookup: dict, orch=None) -> None:
         if row.get("framework") == "nofe" and row.get("status") == "ok":
             nofe_lookup[(int(row["dataset_id"]), int(row["seed"]))] = {
                 "score_holdout": float(row["score_holdout"]),
@@ -365,3 +369,5 @@ class BenchmarkRunner:
         _append_row(self.master_csv, row, RESULT_COLUMNS)
         fw_csv = self.raw_dir / f"{row['framework']}.csv"
         _append_row(fw_csv, row, RESULT_COLUMNS)
+        if orch is not None:
+            orch.append_result(row)

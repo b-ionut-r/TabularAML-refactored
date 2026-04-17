@@ -25,7 +25,7 @@ def main():
     p.add_argument("--frameworks", nargs="+", default=sorted(ADAPTER_NAMES),
                    help=f"Any subset of {sorted(ADAPTER_NAMES)}")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
-    p.add_argument("--time-budget", type=int, default=900)
+    p.add_argument("--time-budget", type=int, default=3600)
     p.add_argument("--subset", choices=["smoke", "small", "medium", "full"], default="medium")
     p.add_argument("--n-workers", type=int, default=1)
     p.add_argument("--results-dir", default="tabularaml/benchmarks/feature_gen/results")

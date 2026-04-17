@@ -146,13 +146,16 @@ def subset_manifest(manifest: pd.DataFrame, subset: str) -> pd.DataFrame:
     subset = subset.lower()
     if subset == "full":
         return manifest.reset_index(drop=True)
-    counts = {"smoke": 3, "small": 50, "medium": 200}
+    counts = {"smoke": 3, "small": 50, "medium": 500}
     if subset not in counts:
         raise ValueError(f"Unknown subset {subset!r}; use smoke|small|medium|full")
     n = counts[subset]
     # Stratified by task so classification and regression are both represented.
     parts = []
     for task in ["regression", "classification"]:
-        sub = manifest[manifest["task"] == task].sort_values(["n_rows", "n_cols"]).head(n // 2 + 1)
+        sub = manifest[manifest["task"] == task]
+        k = min(len(sub), n // 2 + 1)
+        # Select randomly instead of picking the smallest, using a fixed seed for consistency
+        sub = sub.sample(n=k, random_state=42)
         parts.append(sub)
-    return pd.concat(parts, ignore_index=True).head(n).reset_index(drop=True)
+    return pd.concat(parts, ignore_index=True).sample(frac=1, random_state=42).head(n).reset_index(drop=True)
