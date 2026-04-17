@@ -1,3 +1,12 @@
+"""Internal-only self-benchmark for TabularAML's FeatureGenerator.
+
+Measures before/after CV scores on randomly sampled OpenML datasets using
+TabularAML's own internal validation. This is useful for introspection but it
+is NOT a fair cross-framework comparison — for that, see
+`tabularaml.benchmarks.feature_gen.runner.BenchmarkRunner` and the CLI
+`scripts/run_benchmark.py`, which applies every FE framework to the same
+held-out test set under a fixed base learner.
+"""
 from tabularaml.utils.datasets import Dataset
 from tabularaml.generate.features import FeatureGenerator
 from tqdm.auto import tqdm
