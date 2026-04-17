@@ -92,6 +92,11 @@ def _done_key_set(master: pd.DataFrame) -> set:
     }
 
 
+def _dispatch(args: tuple) -> tuple:
+    runner, spec = args
+    return spec, runner._run_one_subprocess(spec)
+
+
 class BenchmarkRunner:
     def __init__(
         self,
@@ -189,6 +194,7 @@ class BenchmarkRunner:
         if self.n_workers > 1:
             env.setdefault("OMP_NUM_THREADS", "1")
             env.setdefault("MKL_NUM_THREADS", "1")
+            env.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
         with tempfile.NamedTemporaryFile(
             prefix="bench_", suffix=".json", delete=False, mode="w", encoding="utf-8"
@@ -224,12 +230,19 @@ class BenchmarkRunner:
                     except json.JSONDecodeError:
                         row = None
             if row is None:
+                stderr = proc.stderr or ""
+                # Prefer the Python traceback (before wandb/tqdm noise floods stderr).
+                tb_start = stderr.find("Traceback (most recent call last)")
+                if tb_start != -1:
+                    error_snippet = stderr[tb_start:][:1200]
+                else:
+                    error_snippet = stderr[-800:]
                 row = {
                     "dataset_id": spec.dataset_id, "task": spec.task,
                     "framework": spec.framework, "seed": spec.seed,
                     "time_budget_s": spec.time_budget_s,
                     "status": "crash",
-                    "error_msg": (proc.stderr or "")[-400:],
+                    "error_msg": error_snippet,
                     "wall_time_total": time.time() - t0,
                 }
         except subprocess.TimeoutExpired:
@@ -298,9 +311,6 @@ class BenchmarkRunner:
                     "scorer_greater_is_better": bool(getattr(r, "scorer_greater_is_better", True)),
                 }
 
-        def _dispatch(spec: RunSpec):
-            return spec, self._run_one_subprocess(spec)
-
         with OrchestratorRun(
             project=self.wandb_project, entity=self.wandb_entity,
             artifact_name=self.artifact_name,
@@ -311,7 +321,7 @@ class BenchmarkRunner:
                 with tqdm(total=len(specs), desc="benchmark") as pbar:
                     if self.n_workers == 1:
                         for spec in specs:
-                            _, row = _dispatch(spec)
+                            _, row = _dispatch((self, spec))
                             self._finalize_row(row, nofe_lookup)
                             n_done += 1
                             pbar.update(1)
@@ -320,7 +330,7 @@ class BenchmarkRunner:
                                           min_interval_s=self.sync_min_interval_s)
                     else:
                         with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
-                            futures = [pool.submit(_dispatch, s) for s in specs]
+                            futures = [pool.submit(_dispatch, (self, s)) for s in specs]
                             for fut in as_completed(futures):
                                 _, row = fut.result()
                                 self._finalize_row(row, nofe_lookup)

@@ -40,16 +40,35 @@ def _probe_one(tid: int, task: str):
     except Exception as e:
         return None, f"dataset_fetch_failed: {type(e).__name__}"
     q = ds.qualities or {}
+
+    def _safe_int(k, default=0):
+        v = q.get(k, default)
+        if pd.isna(v):
+            return default
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return default
+
+    def _safe_float(k, default=0.0):
+        v = q.get(k, default)
+        if pd.isna(v):
+            return default
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return default
+
     row = {
         "tid": int(tid),
         "did": int(task_obj.dataset_id),
         "task": task,
-        "n_rows": int(q.get("NumberOfInstances", 0) or 0),
-        "n_cols": int(q.get("NumberOfFeatures", 0) or 0),
-        "n_numeric": int(q.get("NumberOfNumericFeatures", 0) or 0),
-        "n_categorical": int(q.get("NumberOfSymbolicFeatures", 0) or 0),
-        "n_classes": int(q.get("NumberOfClasses", 0) or 0),
-        "pct_missing": float(q.get("PercentageOfMissingValues", 0.0) or 0.0) / 100.0,
+        "n_rows": _safe_int("NumberOfInstances"),
+        "n_cols": _safe_int("NumberOfFeatures"),
+        "n_numeric": _safe_int("NumberOfNumericFeatures"),
+        "n_categorical": _safe_int("NumberOfSymbolicFeatures"),
+        "n_classes": _safe_int("NumberOfClasses"),
+        "pct_missing": _safe_float("PercentageOfMissingValues") / 100.0,
         "name": str(ds.name)[:64],
     }
     return row, "ok"

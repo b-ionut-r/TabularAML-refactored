@@ -237,10 +237,16 @@ def multi_log_loss(y_true, y_pred):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
 
-
     # Avoid log(0) by clipping y_pred values
     epsilon = 1e-8
     y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
+
+    # Convert integer class indices to one-hot if needed
+    if y_true.ndim == 1:
+        n_classes = y_pred.shape[1]
+        y_true_oh = np.zeros((len(y_true), n_classes), dtype=np.float64)
+        y_true_oh[np.arange(len(y_true)), y_true.astype(int)] = 1.0
+        y_true = y_true_oh
 
     # Compute the multi-class log loss
     return -np.mean(np.sum(y_true * np.log(y_pred), axis=1))

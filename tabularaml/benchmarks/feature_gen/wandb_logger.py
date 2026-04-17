@@ -62,8 +62,6 @@ def wandb_run(
         return
 
     import wandb
-    if not os.environ.get("WANDB_API_KEY"):
-        os.environ.setdefault("WANDB_MODE", "offline")
     run = wandb.init(
         project=project,
         entity=entity,
@@ -146,7 +144,7 @@ def download_results_artifact(
     (first run) or wandb is disabled. Never raises on transient errors —
     errors are printed and we fall through so the benchmark can still run.
     """
-    if not _wandb_enabled() or not os.environ.get("WANDB_API_KEY"):
+    if not _wandb_enabled():
         return False
     try:
         import wandb
@@ -199,7 +197,7 @@ class OrchestratorRun:
         self.project = project
         self.entity = entity
         self.artifact_name = artifact_name
-        self.enabled = bool(enabled and _wandb_enabled() and os.environ.get("WANDB_API_KEY"))
+        self.enabled = bool(enabled and _wandb_enabled())
         self._run = None
         self._last_push = 0.0
 

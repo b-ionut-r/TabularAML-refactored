@@ -235,7 +235,11 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     spec = json.loads(args.spec)
-    row = run(spec)
+    try:
+        row = run(spec)
+    except BaseException as e:
+        row = _make_row(spec, status="crash",
+                        error_msg=f"{type(e).__name__}: {traceback.format_exc()[:1200]}")
 
     payload = json.dumps(row, default=str)
     if args.out:

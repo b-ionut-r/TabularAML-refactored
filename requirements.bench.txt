@@ -20,3 +20,13 @@ filelock>=3.13.0
 
 # Required by AutoFeat preprocessing step
 scikit-learn>=1.3.0
+
+# Models
+xgboost 
+lightgbm
+
+# Datasets
+openml
+
+# Others
+category_encoders
