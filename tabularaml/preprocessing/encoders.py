@@ -173,6 +173,33 @@ class GroupByEncoder(BaseEstimator, TransformerMixin):
         self.output_col = output_col or f"groupby_{agg_func}({cat_col}, {num_col})"
         self.mapping_ = None
         self.global_fallback_ = None
+        self.rank_values_by_group_ = None
+        self.global_rank_values_ = None
+
+    @staticmethod
+    def _empirical_percentile(sorted_values, value):
+        if sorted_values is None or len(sorted_values) == 0:
+            return np.nan
+        if pd.isna(value):
+            return np.nan
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return np.nan
+        pos = np.searchsorted(sorted_values, numeric_value, side="right")
+        return pos / float(len(sorted_values))
+
+    @staticmethod
+    def _map_numeric_with_fallback(cat_series, mapping, fallback):
+        """Map category keys to numeric stats and safely fill missing values.
+
+        Pandas can keep mapped output as categorical dtype when input is
+        categorical. Filling missing values with a float fallback then raises:
+        "Cannot setitem on a Categorical with a new category".
+        """
+        mapped = cat_series.map(mapping)
+        mapped = pd.to_numeric(pd.Series(mapped, index=cat_series.index), errors="coerce")
+        return mapped.fillna(fallback)
 
     def fit(self, X, y=None):
         if self.cat_col not in X.columns or self.num_col not in X.columns:
@@ -187,9 +214,17 @@ class GroupByEncoder(BaseEstimator, TransformerMixin):
             self.global_mean_ = X[self.num_col].mean()
             self.global_std_ = max(X[self.num_col].std(), 1e-8)
         elif self.agg_func == "rank":
-            # For rank, store the full distribution per group
-            self.mapping_ = X.groupby(self.cat_col)[self.num_col].agg("mean")  # Fallback
-            self.global_fallback_ = 0.5  # Median percentile rank
+            # For rank, store sorted train-only distributions and score by
+            # empirical percentile at transform time to avoid transductive leakage.
+            self.rank_values_by_group_ = {}
+            grouped = X.groupby(self.cat_col)[self.num_col]
+            for group_value, series in grouped:
+                values = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=float)
+                self.rank_values_by_group_[group_value] = np.sort(values)
+
+            all_values = pd.to_numeric(X[self.num_col], errors="coerce").dropna().to_numpy(dtype=float)
+            self.global_rank_values_ = np.sort(all_values)
+            self.global_fallback_ = 0.5
         else:
             self.mapping_ = X.groupby(self.cat_col)[self.num_col].agg(self.agg_func)
             self.global_fallback_ = self.mapping_.mean() if self.agg_func != "count" else 0.0
@@ -200,16 +235,31 @@ class GroupByEncoder(BaseEstimator, TransformerMixin):
             return pd.DataFrame({self.output_col: np.zeros(len(X))}, index=X.index)
         
         if self.agg_func == "zscore":
-            group_means = X[self.cat_col].map(self.group_mean_).fillna(self.global_mean_)
-            group_stds = X[self.cat_col].map(self.group_std_).fillna(self.global_std_)
+            group_means = self._map_numeric_with_fallback(X[self.cat_col], self.group_mean_, self.global_mean_)
+            group_stds = self._map_numeric_with_fallback(X[self.cat_col], self.group_std_, self.global_std_)
             result = (X[self.num_col] - group_means) / (group_stds + 1e-8)
         elif self.agg_func == "rank":
-            # Rank within group using transform
-            result = X.groupby(self.cat_col)[self.num_col].rank(pct=True)
-            result = result.fillna(self.global_fallback_)
+            # Train-distribution percentile rank to keep transform batch-independent.
+            group_values = self.rank_values_by_group_ if self.rank_values_by_group_ is not None else {}
+            global_values = self.global_rank_values_
+            numeric = pd.to_numeric(X[self.num_col], errors="coerce")
+
+            out = np.empty(len(X), dtype=float)
+            cats = X[self.cat_col].values
+            vals = numeric.values
+
+            for idx, (cat_value, num_value) in enumerate(zip(cats, vals)):
+                rank_values = group_values.get(cat_value)
+                if rank_values is None:
+                    rank_values = global_values
+                percentile = self._empirical_percentile(rank_values, num_value)
+                if pd.isna(percentile):
+                    percentile = self.global_fallback_
+                out[idx] = percentile
+
+            result = pd.Series(out, index=X.index)
         else:
-            result = X[self.cat_col].map(self.mapping_)
-            result = result.fillna(self.global_fallback_)
+            result = self._map_numeric_with_fallback(X[self.cat_col], self.mapping_, self.global_fallback_)
         
         return pd.DataFrame({self.output_col: result.values}, index=X.index)
 
@@ -239,13 +289,17 @@ class TemporalEncoder(BaseEstimator, TransformerMixin):
         ("lag_",          "lag"),
     ]
     
-    def __init__(self, col, id_col, time_col, op_name, output_col=None):
+    def __init__(self, col, id_col, time_col, op_name, output_col=None,
+                 strict_no_leakage=True):
         self.col = col
         self.id_col = id_col
         self.time_col = time_col
         self.op_name = op_name
         self.output_col = output_col or f"{op_name}({col})"
+        self.strict_no_leakage = bool(strict_no_leakage)
         self.global_fallback_ = None
+        self.id_history_ = {}
+        self.global_history_ = np.array([], dtype=float)
         
         # Parse op_type and window from op_name
         self.op_type, self.window = self._parse_op_name(op_name)
@@ -262,13 +316,43 @@ class TemporalEncoder(BaseEstimator, TransformerMixin):
                     pass
         return op_name, 1  # Fallback
 
+    @staticmethod
+    def _history_lag(history, window):
+        if history is None or len(history) < window or window < 1:
+            return np.nan
+        return float(history[-window])
+
+    @staticmethod
+    def _history_tail(history, window):
+        if history is None or len(history) == 0:
+            return np.array([], dtype=float)
+        width = int(min(window, len(history)))
+        return history[-width:]
+
+    def _get_history_for_id(self, entity_id):
+        history = self.id_history_.get(entity_id)
+        if history is None or len(history) == 0:
+            history = self.global_history_
+        return history
+
     def fit(self, X, y=None):
         if self.col not in X.columns or self.id_col not in X.columns or self.time_col not in X.columns:
             self.global_fallback_ = 0.0
             return self
             
         w = self.window
-        X_sorted = X.sort_values([self.id_col, self.time_col])
+        X_sorted = X.sort_values([self.id_col, self.time_col]).copy()
+        X_sorted[self.col] = pd.to_numeric(X_sorted[self.col], errors="coerce")
+
+        # Persist train-only per-entity history for strict no-leakage transforms.
+        self.id_history_ = {}
+        for entity_id, series in X_sorted.groupby(self.id_col)[self.col]:
+            values = series.dropna().to_numpy(dtype=float)
+            self.id_history_[entity_id] = values
+
+        all_values = X_sorted[self.col].dropna().to_numpy(dtype=float)
+        self.global_history_ = all_values
+
         grouped = X_sorted.groupby(self.id_col)[self.col]
         
         if self.op_type == "lag":
@@ -294,10 +378,52 @@ class TemporalEncoder(BaseEstimator, TransformerMixin):
         if self.col not in X.columns or self.id_col not in X.columns or self.time_col not in X.columns:
             return pd.DataFrame({self.output_col: np.zeros(len(X))}, index=X.index)
         
+        if self.strict_no_leakage:
+            w = self.window
+            numeric = pd.to_numeric(X[self.col], errors="coerce")
+            out = np.empty(len(X), dtype=float)
+
+            entity_values = X[self.id_col].values
+            current_values = numeric.values
+
+            for idx, (entity_id, current_value) in enumerate(zip(entity_values, current_values)):
+                history = self._get_history_for_id(entity_id)
+
+                if self.op_type == "lag":
+                    value = self._history_lag(history, w)
+                elif self.op_type == "rolling_mean":
+                    tail = self._history_tail(history, w)
+                    value = float(np.mean(tail)) if len(tail) else np.nan
+                elif self.op_type == "rolling_std":
+                    tail = self._history_tail(history, w)
+                    value = float(np.std(tail, ddof=1)) if len(tail) > 1 else np.nan
+                elif self.op_type == "momentum":
+                    lag_value = self._history_lag(history, w)
+                    if np.isfinite(current_value) and np.isfinite(lag_value):
+                        value = float(current_value - lag_value)
+                    else:
+                        value = np.nan
+                elif self.op_type == "pct_change":
+                    lag_value = self._history_lag(history, w)
+                    if np.isfinite(current_value) and np.isfinite(lag_value) and abs(lag_value) > 1e-12:
+                        value = float((current_value / lag_value) - 1.0)
+                    else:
+                        value = np.nan
+                else:
+                    value = 0.0
+
+                if not np.isfinite(value):
+                    value = self.global_fallback_
+                out[idx] = value
+
+            result = pd.Series(out, index=X.index)
+            return pd.DataFrame({self.output_col: result.values}, index=X.index)
+
         w = self.window
         
         # Sort by time within groups
-        X_sorted = X.sort_values([self.id_col, self.time_col])
+        X_sorted = X.sort_values([self.id_col, self.time_col]).copy()
+        X_sorted[self.col] = pd.to_numeric(X_sorted[self.col], errors="coerce")
         grouped = X_sorted.groupby(self.id_col)[self.col]
         
         if self.op_type == "lag":

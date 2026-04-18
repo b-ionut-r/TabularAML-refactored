@@ -1,0 +1,14 @@
+Crashes Explanaitions:
+
+*** AutoFeat: ***
+1) Internal Generation of NaNs
+Autofeat's documentation explicitly states that it cannot handle NaN values in the input data because it internally calls scikit-learn's LassoLarsCV, which does not accept them. However, many users, as evidenced in GitHub issues, report that even after rigorously removing all NaNs and infinities from their input data, autofeat still crashes with errors related to NaN or infinite values.
+This is because autofeat's automated feature engineering process (e.g., creating ratios, products, or applying other mathematical transformations) can inadvertently generate new NaN or infinite values from the input data itself. For instance, dividing by zero or taking the logarithm of a negative number during the feature creation steps will result in NaNs or infinities, which then cause the internal LassoLarsCV model to fail.
+2) Known upstream issue: AutoFeat classification can intermittently crash with “inhomogeneous shape (5, 10)” due to an internal LogisticRegressionCV cross-validation fold-shape mismatch on rare-class splits.
+
+
+
+
+
+
+

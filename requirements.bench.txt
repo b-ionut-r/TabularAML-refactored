@@ -20,7 +20,7 @@ filelock>=3.13.0
 
 # Models
 xgboost 
-lightgbm<4.0.0
+lightgbm
 
 # Datasets
 openml

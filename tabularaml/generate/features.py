@@ -2230,7 +2230,7 @@ class FeatureGenerator:
             # Replay discovered features on full dataset
             self._log("Replaying discovered features on full dataset...")
             X = X_full.copy()
-            for interaction in self.interactions:
+            for interaction in getattr(self, 'interactions', []):
                 if interaction.name not in X.columns and not interaction.require_pipeline:
                     try:
                         val = interaction.generate(X)
@@ -2267,7 +2267,7 @@ class FeatureGenerator:
             try:
                 # Replay features on meta split
                 X_meta_transformed = X_meta.copy()
-                for interaction in self.interactions:
+                for interaction in getattr(self, 'interactions', []):
                     if interaction.name not in X_meta_transformed.columns and not interaction.require_pipeline:
                         try:
                             val = interaction.generate(X_meta_transformed)
@@ -2390,6 +2390,11 @@ class FeatureGenerator:
                            consecutive_no_improvement_iters=0, current_gen=0),
             "seen_feats": set(),
         }
+
+        # Keep these attributes available even when no generated feature
+        # is accepted before replay/transform paths run.
+        self.interactions = []
+        self.generation = []
 
         # Reset metrics
         self.initial_metric = self.final_metric = self.gain = self.pct_gain = None

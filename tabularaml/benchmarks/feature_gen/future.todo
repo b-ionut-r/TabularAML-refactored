@@ -1,0 +1,51 @@
+Given the scale of your 1,000‑dataset benchmark, you do not strictly need additional runs for statistical power. However, running a smaller, curated suite serves three important purposes that a random sample cannot:
+
+Comparability: Allows direct comparison with results reported in classic papers (e.g., AutoML Benchmark, Deep Feature Synthesis).
+
+Edge‑Case Coverage: Ensures specific data pathologies (high‑cardinality categoricals, severe class imbalance, datetime columns) are evaluated intentionally.
+
+Reproducibility: Provides a fixed, public list that other researchers can re‑run without needing to sample OpenML.
+
+Here are the three best options, ordered by relevance and ease of use.
+
+1. AMLB Classification Suite (≈ 35 datasets)
+Why this is the best choice:
+This is the exact benchmark used by the AutoML Benchmark (AMLB) paper and the TabPFN paper. It is the de facto standard for tabular AutoML evaluations in 2024–2025. Running your feature engineering tools on this suite allows you to create a table showing "State‑of‑the‑Art Model + Best Framework" against the published leaderboard.
+
+Task: Classification only (you already have 500 regression datasets in the large run, so this fills the classification focus).
+
+Size: ~35 datasets (selected by openml.task_id).
+
+Time: ~1–2 days on a single machine.
+
+Access: Available via openml (look for OpenML-CC18 or the specific task_ids from the AMLB 2024 repository).
+
+2. PMLB "Standard" Suite (≈ 20 datasets)
+Why this is a strong alternative:
+The Penn Machine Learning Benchmarks (PMLB) is the largest curated collection of tabular datasets. Running the "Standard" subset (the 20 most‑used datasets like adult, mushroom, spambase) provides a sanity check. If your 1,000‑dataset random sample has drifted toward obscure UCI datasets, this anchors your results in familiar territory.
+
+Benefit: These datasets are well‑understood; you can easily diagnose why a tool fails (e.g., "OpenFE crashed on adult because of the '?' missing value handling.").
+
+Access: pip install pmlb or use the PMLB GitHub.
+
+3. A Custom "Stress‑Test" Suite (≈ 10 datasets)
+Why this is valuable for feature engineering specifically:
+The random sample of 1,000 datasets may under‑represent datasets with high relational potential or temporal structure (because OpenML is mostly flat tables). Run a tiny suite of 5–10 datasets designed explicitly to test the unique selling points of the tools.
+
+Dataset Name	OpenML ID	Why It Matters
+KDD Cup 1998	1113	Multi‑table relational: Tests featuretools's core strength (Deep Feature Synthesis across multiple tables).
+Bike Sharing	42712	Temporal: Tests tabularaml/openfe ability to extract day_of_week or lag features automatically.
+Airlines	1169	Scale & Cardinality: Tests how tools handle 100k+ rows and high‑cardinality categoricals without blowing up memory.
+Mercedes Greener	23380	Anonymous Features: Many tools (esp. autofeat) rely on column names to guess operations; this dataset uses X1, X2.... Tests robustness.
+Allstate Claims	41207	Skewed Target: Tests whether feature engineering improves or overfits a highly skewed insurance loss model.
+Recommendation Summary
+Since you are likely writing a paper or a technical report, the optimal combination is:
+
+Main Result: The 1,000 dataset random sample (statistical significance).
+
+Supplementary Material: Results on AMLB Classification Suite (to show you beat the state‑of‑the‑art on the standard leaderboard).
+
+Appendix / Case Study: Results on the Custom Stress‑Test Suite (to explain when and why certain tools fail).
+
+If you only have time for one: Run the AMLB Classification Suite. It is the only small benchmark that reviewers will specifically look for in the "Experimental Setup" section.
+
