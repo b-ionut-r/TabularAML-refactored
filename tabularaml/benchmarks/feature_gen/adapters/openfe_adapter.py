@@ -225,7 +225,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
                 data=X_train_safe,
                 label=y_df,
                 task=self._task_for_openfe(y_train),
-                n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+                n_jobs=self.n_jobs,
                 n_data_blocks=effective_blocks,
                 feature_boosting=self.feature_boosting,
                 seed=self.random_state,
@@ -236,7 +236,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
                 X_train_safe,
                 X_train_safe,
                 self._features,
-                n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+                n_jobs=self.n_jobs,
             )
 
             # Restore original column names where possible (base features)
@@ -269,7 +269,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
                 self._x_train_cache.rename(columns=self._col_mapping),
                 X_test_safe,
                 self._features,
-                n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+                n_jobs=self.n_jobs,
             )
 
             reverse_mapping = {v: k for k, v in self._col_mapping.items()}

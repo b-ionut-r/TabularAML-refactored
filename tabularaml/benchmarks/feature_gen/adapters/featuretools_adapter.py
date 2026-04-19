@@ -92,6 +92,7 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
                 target_dataframe_name="df",
                 max_depth=self.max_depth,
                 verbose=False,
+                n_jobs=self.n_jobs,
             )
         except Exception as e:
             if "TypeConversionError" in type(e).__name__ or "TypeConversionError" in str(type(e).__mro__):
@@ -115,6 +116,7 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
             features=self._feature_defs,
             entityset=es,
             verbose=False,
+            n_jobs=self.n_jobs,
         )
         matrix = self._postprocess(matrix, fit=False)
         # Align columns to training schema; missing columns filled with medians.

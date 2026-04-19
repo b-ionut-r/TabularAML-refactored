@@ -613,13 +613,17 @@ class FeatureGenerator:
                  final_selection: bool = True,
                  time_col: Optional[str] = None,
                  id_col: Optional[str] = None,
-                 temporal_windows: Optional[list] = None):
+                 temporal_windows: Optional[list] = None,
+                 random_state: int = 42,
+                 n_jobs: int = -1):
 
         # Capture provided parameters
         provided_params = locals().copy()
         provided_params.pop('self')
         
         self.mode = mode
+        self.random_state = random_state
+        self.n_jobs = n_jobs
 
         # Always set params from constructor args first (preserves explicit UI overrides)
         self.n_generations = n_generations
@@ -765,14 +769,14 @@ class FeatureGenerator:
             if groups_arr is not None:
                 frac = sample_size / len(X)
                 df_temp = pd.DataFrame({'idx': np.arange(len(X)), 'g': groups_arr})
-                sampled = df_temp.groupby('g', group_keys=False).sample(frac=frac, random_state=42)
+                sampled = df_temp.groupby('g', group_keys=False).sample(frac=frac, random_state=self.random_state)
                 indices = sampled['idx'].values
                 
                 if len(indices) > sample_size:
-                    indices = np.random.RandomState(42).choice(indices, sample_size, replace=False)
+                    indices = np.random.RandomState(self.random_state).choice(indices, sample_size, replace=False)
                 elif len(indices) < sample_size:
                     remaining = np.setdiff1d(np.arange(len(X)), indices)
-                    extra = np.random.RandomState(42).choice(remaining, sample_size - len(indices), replace=False)
+                    extra = np.random.RandomState(self.random_state).choice(remaining, sample_size - len(indices), replace=False)
                     indices = np.concatenate([indices, extra])
                 indices = np.sort(indices)
             else:
@@ -781,10 +785,10 @@ class FeatureGenerator:
                 else:
                     n_bins = min(10, len(y.unique()))
                     stratify_labels = pd.qcut(y, q=n_bins, labels=False, duplicates="drop")
-                sfss = StratifiedShuffleSplit(n_splits=1, train_size=sample_size, random_state=42)
+                sfss = StratifiedShuffleSplit(n_splits=1, train_size=sample_size, random_state=self.random_state)
                 indices, _ = next(sfss.split(X, stratify_labels))
         except Exception:
-            indices = np.random.RandomState(42).choice(len(X), size=sample_size, replace=False)
+            indices = np.random.RandomState(self.random_state).choice(len(X), size=sample_size, replace=False)
             if groups_arr is not None:
                 indices = np.sort(indices)
 
@@ -865,7 +869,7 @@ class FeatureGenerator:
         oof_preds = np.zeros(len(y))
         params = {"objective": objective, "verbosity": -1,
                   "learning_rate": 0.1, "num_leaves": 31,
-                  "n_jobs": -1}
+                  "n_jobs": self.n_jobs, "random_state": self.random_state}
         if objective == "multiclass":
             n_classes = len(np.unique(y))
             params["num_class"] = n_classes
@@ -908,7 +912,8 @@ class FeatureGenerator:
         
         scores = []
         params = {"objective": objective, "num_leaves": 16,
-                  "verbosity": -1, "n_jobs": -1, "learning_rate": 0.1}
+                  "verbosity": -1, "n_jobs": self.n_jobs, "learning_rate": 0.1,
+                  "random_state": self.random_state}
         if objective == "multiclass":
             params["num_class"] = len(np.unique(y))
 
@@ -1040,9 +1045,9 @@ class FeatureGenerator:
                 return GroupKFold(n_splits=self.cv)
             from sklearn.model_selection import StratifiedKFold, KFold
             if self.task == "regression":
-                return KFold(n_splits=self.cv, shuffle=True, random_state=42)
+                return KFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
             else:
-                return StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=42)
+                return StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
         return self.cv
 
     def _final_regularized_selection(self, X, y):
@@ -1078,13 +1083,13 @@ class FeatureGenerator:
             try:
                 if self.task == "regression":
                     from sklearn.linear_model import LassoCV
-                    model = LassoCV(cv=5, alphas=np.logspace(-4, 1, 50), max_iter=10000, n_jobs=-1)
+                    model = LassoCV(cv=5, alphas=np.logspace(-4, 1, 50), max_iter=10000, n_jobs=self.n_jobs)
                     model.fit(X_scaled, y)
                     coef_mask = np.abs(model.coef_) > 1e-6
                 else:
                     from sklearn.linear_model import LogisticRegressionCV
                     model = LogisticRegressionCV(cv=5, penalty='l1', solver='saga',
-                                                 max_iter=5000, n_jobs=-1, Cs=50)
+                                                 max_iter=5000, n_jobs=self.n_jobs, Cs=50)
                     model.fit(X_scaled, y)
                     # For multi-class, take absolute max across classes
                     if model.coef_.ndim > 1:
@@ -1104,15 +1109,15 @@ class FeatureGenerator:
                 if self.device == "cuda":
                     from xgboost import XGBRegressor, XGBClassifier
                     if self.task == "regression":
-                        tree_model = XGBRegressor(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1, device="cuda", enable_categorical=True)
+                        tree_model = XGBRegressor(n_estimators=300, max_depth=6, verbosity=0, n_jobs=self.n_jobs, device="cuda", enable_categorical=True)
                     else:
-                        tree_model = XGBClassifier(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1, device="cuda", enable_categorical=True)
+                        tree_model = XGBClassifier(n_estimators=300, max_depth=6, verbosity=0, n_jobs=self.n_jobs, device="cuda", enable_categorical=True)
                 else:
                     from lightgbm import LGBMRegressor, LGBMClassifier
                     if self.task == "regression":
-                        tree_model = LGBMRegressor(n_estimators=300, max_depth=6, n_jobs=-1, verbose=-1)
+                        tree_model = LGBMRegressor(n_estimators=300, max_depth=6, n_jobs=self.n_jobs, verbose=-1)
                     else:
-                        tree_model = LGBMClassifier(n_estimators=300, max_depth=6, n_jobs=-1, verbose=-1)
+                        tree_model = LGBMClassifier(n_estimators=300, max_depth=6, n_jobs=self.n_jobs, verbose=-1)
                 tree_model.fit(X_numeric, y)
                 importances = pd.Series(tree_model.feature_importances_, index=numeric_cols)
                 # Keep top-K where K = number of L1-selected features (or at least initial features count)
@@ -1162,7 +1167,7 @@ class FeatureGenerator:
     def _analyze_feature_interactions(self, X: pd.DataFrame, y: pd.Series, max_pairs: int = 200) -> Dict[tuple, float]:
         """Use SHAP interaction values to identify feature pairs with strong interactions."""
         importance_analyzer = FeatureImportanceAnalyzer(
-            task_type=self.task, use_gpu=self.device == "cuda", verbose=0, n_jobs=-1, preferred_gbm="xgboost" if self.device == "cuda" else "lightgbm")
+            task_type=self.task, use_gpu=self.device == "cuda", verbose=0, n_jobs=self.n_jobs, preferred_gbm="xgboost" if self.device == "cuda" else "lightgbm")
         return importance_analyzer.get_feature_interactions(X, y, max_pairs=max_pairs)
     
     def _get_feature_family(self, feature_name: str) -> str:
@@ -1837,6 +1842,8 @@ class FeatureGenerator:
 
     def search(self, X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, PipelineWrapper, list[Feature], list[Interaction]]:
         """Enhanced genetic algorithm with better stagnation handling."""
+        random.seed(self.random_state)
+        np.random.seed(self.random_state)
         start_time = time.time()
         X = self._drop_id_columns(X)
         self._set_defaults(X, y)
@@ -1882,14 +1889,14 @@ class FeatureGenerator:
             try:
                 if self._groups_active is not None:
                     from sklearn.model_selection import GroupShuffleSplit
-                    gss = GroupShuffleSplit(n_splits=1, test_size=self.meta_validation_frac, random_state=42)
+                    gss = GroupShuffleSplit(n_splits=1, test_size=self.meta_validation_frac, random_state=self.random_state)
                     search_idx, meta_idx = next(gss.split(X, y, groups=self._groups_active))
                 else:
                     from sklearn.model_selection import train_test_split
                     stratify = y if self.task != "regression" else None
                     search_idx, meta_idx = train_test_split(
                         np.arange(len(X)), test_size=self.meta_validation_frac,
-                        stratify=stratify, random_state=42
+                        stratify=stratify, random_state=self.random_state
                     )
                 X_meta, y_meta = X.iloc[meta_idx].copy(), y.iloc[meta_idx].copy()
                 X, y = X.iloc[search_idx].copy(), y.iloc[search_idx].copy()
@@ -1955,9 +1962,9 @@ class FeatureGenerator:
                     else:
                         from sklearn.model_selection import StratifiedKFold, KFold
                         if self.task == "regression":
-                            self.cv = KFold(n_splits=n_splits, shuffle=True, random_state=42 + N)
+                            self.cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state + N)
                         else:
-                            self.cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42 + N)
+                            self.cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state + N)
                     self._oof_preds_stale = True
                 
                 # Check for restart conditions
@@ -2382,11 +2389,12 @@ class FeatureGenerator:
             if self.device == "cuda":
                 from xgboost import XGBRegressor, XGBClassifier
                 self.baseline_model = (XGBRegressor if is_reg else XGBClassifier)(
-                    device=self.device, n_jobs=-1, enable_categorical=True, verbosity=0)
+                    device=self.device, n_jobs=self.n_jobs, enable_categorical=True, verbosity=0,
+                    random_state=self.random_state)
             else:
                 from lightgbm import LGBMRegressor, LGBMClassifier
                 self.baseline_model = (LGBMRegressor if is_reg else LGBMClassifier)(
-                    n_jobs=-1, verbose=-1)
+                    n_jobs=self.n_jobs, verbose=-1, random_state=self.random_state)
         if self.scorer is None:
             self.scorer = (PREDEFINED_REG_SCORERS["rmse"] if is_reg else 
                           PREDEFINED_CLS_SCORERS["binary_crossentropy"] 

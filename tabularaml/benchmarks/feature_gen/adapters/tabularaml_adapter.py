@@ -76,6 +76,8 @@ class TabularAMLAdapter(FEFrameworkAdapter):
             # time_budget=self.time_budget_s,  # Intentionally omitted: mode preset owns the per-run budget
             use_gpu=self.use_gpu,
             log_file=None,
+            random_state=self.random_state,
+            n_jobs=self.n_jobs,
         )
         self._gen.generate(X_train, y_train)
         # Refit the pipeline on the full training frame so transform() is canonical.

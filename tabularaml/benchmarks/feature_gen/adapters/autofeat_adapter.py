@@ -97,14 +97,16 @@ class AutoFeatAdapter(FEFrameworkAdapter):
             self._af = AutoFeatRegressor(
                 feateng_steps=self.feateng_steps,
                 featsel_runs=self.featsel_runs,
-                n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+                n_jobs=self.n_jobs,
+                random_state=self.random_state,
                 verbose=0,
             )
         else:
             self._af = AutoFeatClassifier(
                 feateng_steps=self.feateng_steps,
                 featsel_runs=self.featsel_runs,
-                n_jobs=max(1, self.n_jobs if self.n_jobs > 0 else 1),
+                n_jobs=self.n_jobs,
+                random_state=self.random_state,
                 verbose=0,
             )
 
