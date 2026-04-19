@@ -2,6 +2,7 @@ import category_encoders as ce
 import pandas as pd
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.multiclass import type_of_target
 from sklearn.utils.validation import check_is_fitted, check_array, _check_feature_names_in
 
 class CategoricalEncoder(BaseEstimator, TransformerMixin):
@@ -26,9 +27,14 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
 
         # Initialize encoders with validated columns
         self.n_new_feats = 0
-        self.target_encoder = self._init_encoder(ce.TargetEncoder, self.target_enc_cols)
+        self.target_encoder = None
         self.count_encoder = self._init_encoder(ce.CountEncoder, self.count_enc_cols, normalize=False)
         self.freq_encoder = self._init_encoder(ce.CountEncoder, self.freq_enc_cols, normalize=True)
+
+        self._target_encoding_mode = 'standard'
+        self._target_encoded_output_cols = []
+        self._planned_target_output_cols = []
+        self._planned_multiclass = False
 
         self.feature_names_in_ = None
         self.n_features_in_ = None
@@ -52,6 +58,152 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
                                handle_missing=self.handle_missing, **kwargs)
         return None
 
+    def _count_target_classes(self, y):
+        """Return number of classes for 1D targets, otherwise None."""
+        if y is None:
+            return None
+        y_arr = np.asarray(y)
+        if y_arr.ndim != 1:
+            return None
+        return int(pd.Series(y_arr).dropna().nunique())
+
+    def _is_multiclass_target(self, y):
+        """Detect if y is multiclass for target-encoding mode selection."""
+        if y is None:
+            return bool(self._planned_multiclass)
+        try:
+            tgt_type = type_of_target(y)
+        except Exception:
+            n_classes = self._count_target_classes(y)
+            return bool(n_classes is not None and n_classes > 2)
+
+        if tgt_type in ("multiclass", "multiclass-multioutput"):
+            return True
+        return False
+
+    def set_target_info(self, y=None):
+        """Pre-compute expected target output names for pipeline planning."""
+        if not self.target_enc_cols:
+            self._planned_target_output_cols = []
+            self._planned_multiclass = False
+            self.n_new_feats = len(self.count_enc_cols) + len(self.freq_enc_cols)
+            return self
+
+        is_multiclass = self._is_multiclass_target(y)
+        self._planned_multiclass = is_multiclass
+        n_classes = self._count_target_classes(y)
+
+        if is_multiclass:
+            y_arr = np.asarray(y) if y is not None else np.array([])
+            labels = pd.Series(y_arr).dropna().unique().tolist() if y_arr.ndim == 1 and y_arr.size else []
+
+            if not labels:
+                if n_classes is None:
+                    labels = [0, 1]
+                else:
+                    labels = list(range(n_classes))
+
+            if n_classes is None or n_classes <= 2:
+                self._planned_target_output_cols = [f"{col}_target" for col in self.target_enc_cols]
+            else:
+                self._planned_target_output_cols = [
+                    f"{col}_target_{class_label}"
+                    for class_label in labels
+                    for col in self.target_enc_cols
+                ]
+        else:
+            self._planned_target_output_cols = [f"{col}_target" for col in self.target_enc_cols]
+
+        n_target_per_col = 1 if not is_multiclass or n_classes is None else max(1, n_classes - 1)
+        self.n_new_feats = (
+            n_target_per_col * len(self.target_enc_cols)
+            + len(self.count_enc_cols)
+            + len(self.freq_enc_cols)
+        )
+
+        return self
+
+    def _init_target_encoder(self, y):
+        """Initialize target encoder, using polynomial wrapper for multiclass."""
+        if not self.target_enc_cols:
+            return None
+
+        base_encoder = ce.TargetEncoder(
+            cols=self.target_enc_cols,
+            handle_unknown=self.handle_unknown,
+            handle_missing=self.handle_missing,
+        )
+
+        if self._is_multiclass_target(y):
+            from category_encoders.wrapper import PolynomialWrapper
+            self._target_encoding_mode = 'multiclass'
+            return PolynomialWrapper(base_encoder)
+
+        self._target_encoding_mode = 'standard'
+        return base_encoder
+
+    @staticmethod
+    def _ensure_dataframe(values, index=None):
+        """Normalize encoder outputs to DataFrame for consistent column handling."""
+        if isinstance(values, pd.DataFrame):
+            return values
+        if isinstance(values, pd.Series):
+            return values.to_frame()
+        return pd.DataFrame(values, index=index)
+
+    def _rename_target_output_columns(self, transformed, current_cols):
+        """Rename target-encoder outputs to stable framework-friendly names."""
+        transformed_df = self._ensure_dataframe(transformed)
+        if transformed_df.empty:
+            return transformed_df
+
+        if self._target_encoding_mode == 'multiclass':
+            sorted_cols = sorted(current_cols, key=len, reverse=True)
+            rename_map = {}
+            for out_col in transformed_df.columns:
+                out_col_str = str(out_col)
+                mapped_name = None
+                for source_col in sorted_cols:
+                    if out_col_str == source_col:
+                        mapped_name = f"{source_col}_target"
+                        break
+                    prefix = f"{source_col}_"
+                    if out_col_str.startswith(prefix):
+                        suffix = out_col_str[len(source_col):]
+                        mapped_name = f"{source_col}_target{suffix}"
+                        break
+                if mapped_name is None:
+                    mapped_name = f"target_{out_col_str}"
+                rename_map[out_col] = mapped_name
+            return transformed_df.rename(columns=rename_map)
+
+        rename_map = {}
+        for source_col in current_cols:
+            if source_col in transformed_df.columns:
+                rename_map[source_col] = f"{source_col}_target"
+        return transformed_df.rename(columns=rename_map)
+
+    def _capture_target_output_columns(self, encoder, X_subset, current_cols):
+        """Capture fitted target-encoder output columns for downstream consistency."""
+        transformed = encoder.transform(X_subset)
+        renamed = self._rename_target_output_columns(transformed, current_cols)
+        self._target_encoded_output_cols = list(renamed.columns)
+
+    def get_reserved_output_columns(self):
+        """Return output columns created by this encoder for collision avoidance."""
+        output_cols = []
+
+        if self._target_encoded_output_cols:
+            output_cols.extend(self._target_encoded_output_cols)
+        elif self._planned_target_output_cols:
+            output_cols.extend(self._planned_target_output_cols)
+        else:
+            output_cols.extend(f"{col}_target" for col in self.target_enc_cols)
+
+        output_cols.extend(f"{col}_count" for col in self.count_enc_cols)
+        output_cols.extend(f"{col}_freq" for col in self.freq_enc_cols)
+        return output_cols
+
     def fit(self, X, y=None):
         # Convert to DataFrame and validate
         X_df = self._check_and_convert_X(X)
@@ -60,13 +212,18 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
 
         # Determine valid columns present in the data
         self._encoder_input_features = [col for col in self._all_configured_cols if col in X_df.columns]
+
+        # Build target encoder after we know the target type.
+        self.set_target_info(y)
+        self.target_encoder = self._init_target_encoder(y)
         
         # Fit each encoder on the valid columns
-        self._fit_encoder(self.target_encoder, X_df, y, self.target_enc_cols)
+        self._fit_encoder(self.target_encoder, X_df, y, self.target_enc_cols, is_target=True)
         self._fit_encoder(self.count_encoder, X_df, None, self.count_enc_cols)
         self._fit_encoder(self.freq_encoder, X_df, None, self.freq_enc_cols)
 
         self._feature_names_out = self._generate_output_feature_names(self.feature_names_in_)
+        self.n_new_feats = len(self._generate_output_feature_names(self.feature_names_in_, only_new=True))
         return self
 
     def _check_and_convert_X(self, X):
@@ -80,7 +237,7 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
                 raise ValueError(f"Failed to convert input to DataFrame: {e}")
         return X
 
-    def _fit_encoder(self, encoder, X_df, y, cols):
+    def _fit_encoder(self, encoder, X_df, y, cols, is_target=False):
         """Fit an encoder on the relevant columns if present."""
         if encoder is None:
             return
@@ -102,6 +259,8 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
             X_subset = new_df
 
         encoder.fit(X_subset, y)
+        if is_target:
+            self._capture_target_output_columns(encoder, X_subset, current_cols)
 
     def transform(self, X):
         check_is_fitted(self)
@@ -109,7 +268,7 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
         cols_to_process = [col for col in self._encoder_input_features if col in X_df.columns]
 
         X_encoded = pd.DataFrame(index=X_df.index)
-        X_encoded = self._transform_encoder(self.target_encoder, X_df, cols_to_process, X_encoded, '_target')
+        X_encoded = self._transform_target_encoder(self.target_encoder, X_df, cols_to_process, X_encoded)
         X_encoded = self._transform_encoder(self.count_encoder, X_df, cols_to_process, X_encoded, '_count')
         X_encoded = self._transform_encoder(self.freq_encoder, X_df, cols_to_process, X_encoded, '_freq')
 
@@ -120,6 +279,25 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
 
         expected_cols = self._generate_output_feature_names(X_df.columns, only_new=not self.return_original)
         return X_final.reindex(columns=expected_cols, copy=False)
+
+    def _transform_target_encoder(self, encoder, X_df, cols_to_process, X_encoded):
+        """Apply target encoder transform and append renamed output columns."""
+        if encoder is None:
+            return X_encoded
+
+        current_cols = [col for col in cols_to_process if col in self.target_enc_cols]
+        if not current_cols:
+            return X_encoded
+
+        transformed = encoder.transform(X_df[current_cols])
+        transformed_df = self._rename_target_output_columns(transformed, current_cols)
+
+        target_cols = self._target_encoded_output_cols or list(transformed_df.columns)
+        for col in target_cols:
+            if col in transformed_df.columns:
+                X_encoded[col] = transformed_df[col].values
+
+        return X_encoded
 
     def _transform_encoder(self, encoder, X_df, cols_to_process, X_encoded, suffix):
         """Apply encoder transform and add features."""
@@ -139,15 +317,22 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
         return self._generate_output_feature_names(input_features, only_new=not self.return_original)
 
     def _generate_output_feature_names(self, input_features, only_new=False):
+        input_list = input_features.tolist() if isinstance(input_features, np.ndarray) else list(input_features)
         new_features = []
-        for col in input_features:
-            if col in self.target_enc_cols:
-                new_features.append(f"{col}_target")
+
+        if self._target_encoded_output_cols:
+            new_features.extend(self._target_encoded_output_cols)
+        else:
+            for col in input_list:
+                if col in self.target_enc_cols:
+                    new_features.append(f"{col}_target")
+
+        for col in input_list:
             if col in self.count_enc_cols:
                 new_features.append(f"{col}_count")
             if col in self.freq_enc_cols:
                 new_features.append(f"{col}_freq")
-        return np.array(input_features.tolist() + new_features if not only_new else new_features, dtype=object)
+        return np.array(input_list + new_features if not only_new else new_features, dtype=object)
 
     def _more_tags(self):
         return {

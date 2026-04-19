@@ -801,7 +801,7 @@ class FeatureGenerator:
 
     def _eval_baseline(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> tuple[float, float]:
         """Evaluate baseline model performance."""
-        pipeline = pipeline.get_pipeline(X) if pipeline is not None else pipeline
+        pipeline = pipeline.get_pipeline(X, y) if pipeline is not None else pipeline
         cv_dict = cross_val_score(self.baseline_model, X, y, self.scorer, cv=self.cv,
                                  return_dict=True, pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs,
                                  groups=self._groups_active)
@@ -813,7 +813,7 @@ class FeatureGenerator:
             return {}
 
         results = {}
-        pipeline_obj = pipeline.get_pipeline(X) if pipeline is not None else pipeline
+        pipeline_obj = pipeline.get_pipeline(X, y) if pipeline is not None else pipeline
 
         for scorer in self.logging_scorers:
             try:
@@ -2408,7 +2408,7 @@ class FeatureGenerator:
             
         if not getattr(self, 'pipeline', None):
             self._log("Warning: No pipeline. Creating default.")
-            self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder()).get_pipeline(X)
+            self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder()).get_pipeline(X, y)
 
         # Label encode target (same as search) — category_encoders internally
         # converts non-numeric y to numpy via LabelEncoder without wrapping back in Series
@@ -2431,7 +2431,7 @@ class FeatureGenerator:
 
         # Fit pipeline - use X_transformed to build pipeline with correct columns
         if isinstance(self.pipeline, PipelineWrapper):
-            self.pipeline = self.pipeline.get_pipeline(X_transformed)
+            self.pipeline = self.pipeline.get_pipeline(X_transformed, y)
         self.pipeline.fit(X_transformed, y)
         return self
 

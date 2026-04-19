@@ -46,6 +46,10 @@ class PipelineWrapper:
 
         self._get_dtypes(X)
 
+        # Let custom encoders pre-compute target-dependent output schema.
+        if hasattr(self.encoder, 'set_target_info'):
+            self.encoder.set_target_info(y)
+
         # Fallbacks for None
         scaler = self.scaler if self.scaler is not None else "passthrough"
         encoder = self.encoder if self.encoder is not None else "passthrough"
@@ -53,12 +57,15 @@ class PipelineWrapper:
 
         # Get columns that will be created by the encoder to avoid duplicates
         encoder_output_cols = set()
-        if hasattr(self.encoder, 'target_enc_cols'):
-            encoder_output_cols.update(f"{col}_target" for col in self.encoder.target_enc_cols)
-        if hasattr(self.encoder, 'count_enc_cols'):
-            encoder_output_cols.update(f"{col}_count" for col in self.encoder.count_enc_cols)
-        if hasattr(self.encoder, 'freq_enc_cols'):
-            encoder_output_cols.update(f"{col}_freq" for col in self.encoder.freq_enc_cols)
+        if hasattr(self.encoder, 'get_reserved_output_columns'):
+            encoder_output_cols.update(self.encoder.get_reserved_output_columns())
+        else:
+            if hasattr(self.encoder, 'target_enc_cols'):
+                encoder_output_cols.update(f"{col}_target" for col in self.encoder.target_enc_cols)
+            if hasattr(self.encoder, 'count_enc_cols'):
+                encoder_output_cols.update(f"{col}_count" for col in self.encoder.count_enc_cols)
+            if hasattr(self.encoder, 'freq_enc_cols'):
+                encoder_output_cols.update(f"{col}_freq" for col in self.encoder.freq_enc_cols)
 
         # Also track GroupBy encoder output cols
         groupby_encoders = getattr(self, 'groupby_encoders', [])

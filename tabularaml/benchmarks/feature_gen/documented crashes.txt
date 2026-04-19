@@ -12,3 +12,19 @@ This is because autofeat's automated feature engineering process (e.g., creating
 
 
 
+
+*** OpenFE: ***
+1) Multiclass Initialization Bug (LightGBM Incompatibility & Math Flaw)
+OpenFE severely underperforms (and often crashes) on multiclass datasets due to two interconnected issues with how it handles init_score in LightGBM. First, LightGBM 4.0+ requires multiclass init_score to be a 1D column-major (Fortran-contiguous) array, but OpenFE passes a 2D array, leading to internal memory layout mismatches and crashes (LightGBMError: Length of init_score is not equal to n_samples * n_classes).
+Second, and more critically, OpenFE has a mathematical flaw where it calculates class probabilities for the baseline, but forgets to apply the logit transformation (log-odds) before passing them as the init_score. LightGBM subsequently applies a softmax to these raw probabilities, resulting in an artificially uniform baseline. This destroys gradient calculations, causing OpenFE's feature selection to rank adversarial noise features as highly predictive, which crashes downstream model performance (often yielding massive negative percentage improvements on imbalanced multiclass tasks).
+* Patch Applied: We added _patch_init_score_flatten in our adapter to intercept and correctly flatten the init_score to Fortran order for the downstream model, preventing immediate crashes. However, the internal math bug remains untouched to fairly evaluate the library as distributed.
+
+2) Scikit-Learn squared=False Deprecation Crash
+OpenFE uses the squared=False argument in scikit-learn's mean_squared_error during regression task evaluation. This argument was deprecated and removed in scikit-learn 1.4+. Running OpenFE in modern environments causes immediate TypeErrors during feature evaluation.
+* Patch Applied: We added _patch_sklearn_mse to monkey-patch mean_squared_error, wrapping it to manually compute the square root when squared=False is requested, allowing OpenFE to run on modern scikit-learn versions.
+
+3) Unseen Labels in Validation Split
+OpenFE aggressively subsamples data blocks to speed up its internal successive feature-wise halving (stage1_select and stage2_select). On datasets with rare minority classes, this random subsampling frequently creates validation folds containing classes the training fold has never seen, causing LightGBM to immediately crash with ValueError: y contains previously unseen labels.
+
+4) Data Leakage in Transform
+OpenFE's 	ransform function concatenates the training and test sets *before* computing aggregates (like GroupByThenMean). This causes severe covariate shift and target leakage, as test set distributions actively influence the feature values of the training data. A companion unit test (	est_openfe_leakage_probe.py) was added to detect and flag this behavior.
