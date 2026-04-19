@@ -98,7 +98,6 @@ class AutoFeatAdapter(FEFrameworkAdapter):
                 feateng_steps=self.feateng_steps,
                 featsel_runs=self.featsel_runs,
                 n_jobs=self.n_jobs,
-                random_state=self.random_state,
                 verbose=0,
             )
         else:
@@ -106,7 +105,6 @@ class AutoFeatAdapter(FEFrameworkAdapter):
                 feateng_steps=self.feateng_steps,
                 featsel_runs=self.featsel_runs,
                 n_jobs=self.n_jobs,
-                random_state=self.random_state,
                 verbose=0,
             )
 
