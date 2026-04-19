@@ -1,8 +1,7 @@
 """Adapter wrapping Featuretools in single-table mode.
 
 Uses the modern (1.x) API: ft.EntitySet().add_dataframe + ft.dfs +
-ft.calculate_feature_matrix. Restricted to arithmetic transform primitives to
-keep the operator set comparable to TabularAML's unary/binary numeric ops.
+ft.calculate_feature_matrix. 
 """
 from __future__ import annotations
 from typing import Literal, Optional, Sequence
@@ -11,15 +10,6 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype, is_object_dtype
 
 from .base import FEFrameworkAdapter
-
-
-DEFAULT_PRIMITIVES = (
-    "add_numeric",
-    "subtract_numeric",
-    "multiply_numeric",
-    "divide_numeric",
-    "absolute",
-)
 
 
 class FeaturetoolsAdapter(FEFrameworkAdapter):
@@ -32,12 +22,10 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         time_budget_s: int,
         random_state: int,
         n_jobs: int = -1,
-        trans_primitives: Sequence[str] = DEFAULT_PRIMITIVES,
         max_depth: int = 1,
         **framework_kwargs,
     ):
         super().__init__(task, time_budget_s, random_state, n_jobs, **framework_kwargs)
-        self.trans_primitives = list(trans_primitives)
         self.max_depth = int(max_depth)
         self._feature_defs = None
         self._train_columns_fe: Optional[list] = None
@@ -97,7 +85,6 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         matrix, feature_defs = ft.dfs(
             entityset=es,
             target_dataframe_name="df",
-            trans_primitives=self.trans_primitives,
             max_depth=self.max_depth,
             verbose=False,
         )
