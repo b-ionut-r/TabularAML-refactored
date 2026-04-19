@@ -17,7 +17,6 @@ import pandas as pd
 from sklearn.model_selection import BaseCrossValidator
 from sklearn.utils.multiclass import type_of_target
 from tqdm.auto import tqdm
-from xgboost import XGBClassifier, XGBRegressor
 
 from tabularaml.eval.cv import cross_val_score
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, PREDEFINED_SCORERS, Scorer
@@ -791,7 +790,7 @@ class FeatureGenerator:
         """Get top k features by importance."""
         pipeline.imputer = SimpleImputer()
         analyzer = FeatureImportanceAnalyzer(
-            task_type=self.task, weights=self.imp_weights, preferred_gbm="xgboost",
+            task_type=self.task, weights=self.imp_weights, preferred_gbm="xgboost" if self.device == "cuda" else "lightgbm",
             pipeline=pipeline, cv=self.cv, use_gpu=(self.device == "cuda"))
         analyzer.fit(X, y, groups=self._groups_active)
         pipeline.imputer = None 
@@ -1097,11 +1096,18 @@ class FeatureGenerator:
             # Phase 2: Tree-based importance
             tree_selected = set()
             try:
-                from xgboost import XGBRegressor, XGBClassifier
-                if self.task == "regression":
-                    tree_model = XGBRegressor(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1)
+                if self.device == "cuda":
+                    from xgboost import XGBRegressor, XGBClassifier
+                    if self.task == "regression":
+                        tree_model = XGBRegressor(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1, device="cuda", enable_categorical=True)
+                    else:
+                        tree_model = XGBClassifier(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1, device="cuda", enable_categorical=True)
                 else:
-                    tree_model = XGBClassifier(n_estimators=300, max_depth=6, verbosity=0, n_jobs=-1)
+                    from lightgbm import LGBMRegressor, LGBMClassifier
+                    if self.task == "regression":
+                        tree_model = LGBMRegressor(n_estimators=300, max_depth=6, n_jobs=-1, verbose=-1)
+                    else:
+                        tree_model = LGBMClassifier(n_estimators=300, max_depth=6, n_jobs=-1, verbose=-1)
                 tree_model.fit(X_numeric, y)
                 importances = pd.Series(tree_model.feature_importances_, index=numeric_cols)
                 # Keep top-K where K = number of L1-selected features (or at least initial features count)
@@ -1151,7 +1157,7 @@ class FeatureGenerator:
     def _analyze_feature_interactions(self, X: pd.DataFrame, y: pd.Series, max_pairs: int = 200) -> Dict[tuple, float]:
         """Use SHAP interaction values to identify feature pairs with strong interactions."""
         importance_analyzer = FeatureImportanceAnalyzer(
-            task_type=self.task, use_gpu=self.device == "gpu", verbose=0, n_jobs=-1, preferred_gbm='xgboost')
+            task_type=self.task, use_gpu=self.device == "cuda", verbose=0, n_jobs=-1, preferred_gbm="xgboost" if self.device == "cuda" else "lightgbm")
         return importance_analyzer.get_feature_interactions(X, y, max_pairs=max_pairs)
     
     def _get_feature_family(self, feature_name: str) -> str:
@@ -2368,8 +2374,14 @@ class FeatureGenerator:
         self.task = self.task or ("regression" if type_of_target(y) == "continuous" else "classification")
         is_reg = self.task == "regression"
         if self.baseline_model is None:
-            self.baseline_model = (XGBRegressor if is_reg else XGBClassifier)(
-                device=self.device, n_jobs=-1, enable_categorical=True, verbosity=0)
+            if self.device == "cuda":
+                from xgboost import XGBRegressor, XGBClassifier
+                self.baseline_model = (XGBRegressor if is_reg else XGBClassifier)(
+                    device=self.device, n_jobs=-1, enable_categorical=True, verbosity=0)
+            else:
+                from lightgbm import LGBMRegressor, LGBMClassifier
+                self.baseline_model = (LGBMRegressor if is_reg else LGBMClassifier)(
+                    n_jobs=-1, verbose=-1)
         if self.scorer is None:
             self.scorer = (PREDEFINED_REG_SCORERS["rmse"] if is_reg else 
                           PREDEFINED_CLS_SCORERS["binary_crossentropy"] 
