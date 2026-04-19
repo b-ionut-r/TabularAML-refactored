@@ -11,6 +11,26 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 
 from .base import FEFrameworkAdapter
+import sklearn.utils.validation
+
+
+# Patch check_array for autofeat compatibility with scikit-learn >= 1.6
+_original_check_array = sklearn.utils.validation.check_array
+
+def _patched_check_array(*args, **kwargs):
+    if 'force_all_finite' in kwargs:
+        print(f"DEBUG: patching force_all_finite in check_array: {kwargs['force_all_finite']}")
+        kwargs['ensure_all_finite'] = kwargs.pop('force_all_finite')
+    return _original_check_array(*args, **kwargs)
+
+sklearn.utils.validation.check_array = _patched_check_array
+
+def _patch_autofeat():
+    import sys
+    if 'autofeat.autofeat' in sys.modules:
+        sys.modules['autofeat.autofeat'].check_array = _patched_check_array
+    if 'autofeat.featsel' in sys.modules:
+        sys.modules['autofeat.featsel'].check_array = _patched_check_array
 
 
 class _AutofeatInternalNaNError(RuntimeError):
@@ -92,6 +112,10 @@ class AutoFeatAdapter(FEFrameworkAdapter):
 
         self._n_features_before = X_train.shape[1]
         X_pre = self._pre.fit_transform(X_train)
+
+        from autofeat import AutoFeatRegressor, AutoFeatClassifier
+        import autofeat.autofeat
+        autofeat.autofeat.check_array = _patched_check_array
 
         if self.task == "regression":
             self._af = AutoFeatRegressor(
