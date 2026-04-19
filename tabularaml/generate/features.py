@@ -704,6 +704,11 @@ class FeatureGenerator:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
         self.log_file = log_file
 
+        # Ensure these exist before search() / _set_defaults() is called so that
+        # early-exit paths (e.g. fit/transform without generate) never hit AttributeError.
+        self.interactions: list = []
+        self.generation: list = []
+
     def _ensure_no_duplicates(self, X: pd.DataFrame, context: str = "") -> pd.DataFrame:
         """Ensure DataFrame has no duplicate columns."""
         if X.columns.duplicated().any():

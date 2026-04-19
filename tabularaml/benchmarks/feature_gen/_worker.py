@@ -125,13 +125,17 @@ def run(spec: dict) -> dict:
         try:
             X_raw, y_raw, task = _load_dataset(spec["dataset_id"], spec["task"])
         except (urllib.error.URLError, RuntimeError) as e:
-            if "Dataset could not be fetched" in str(e) or "urlopen error" in str(e):
+            if "could not be fetched" in str(e) or "urlopen error" in str(e):
                 row["status"] = "dataset_fetch_failed"
                 row["error_msg"] = str(e)
                 return row
             raise
         X, y, n_classes = _preprocess(X_raw, y_raw, task)
         row["n_features_before"] = int(X.shape[1])
+        if X.shape[1] == 0:
+            row["status"] = "degenerate_dataset"
+            row["error_msg"] = "Dataset has 0 features after preprocessing"
+            return row
 
         stratify = y if (task == "classification" and len(np.unique(y)) > 1) else None
         X_train, X_test, y_train, y_test = train_test_split(
@@ -257,8 +261,16 @@ def run(spec: dict) -> dict:
         row["status"] = "oom"
         row["error_msg"] = f"MemoryError: {str(e)[:200]}"
     except Exception as e:
-        row["status"] = "crash"
-        row["error_msg"] = f"{type(e).__name__}: {str(e)[:400]}"
+        cls_name = type(e).__name__
+        if cls_name == "_AutofeatInternalNaNError":
+            row["status"] = "autofeat_internal_nan"
+        elif cls_name == "_AutofeatUpstreamBugError":
+            row["status"] = "autofeat_upstream_bug"
+        elif cls_name == "_FeaturetoolsUpstreamBugError":
+            row["status"] = "featuretools_upstream_bug"
+        else:
+            row["status"] = "crash"
+        row["error_msg"] = f"{cls_name}: {str(e)[:400]}"
         traceback.print_exc(file=sys.stderr)
 
     row["wall_time_total"] = time.time() - t0_total

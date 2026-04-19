@@ -7,6 +7,9 @@ from __future__ import annotations
 from typing import Tuple
 import numpy as np
 import pandas as pd
+# XGBoost <=2.0.x references np.NaN which was removed in NumPy 2.0.
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan  # type: ignore[attr-defined]
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 

@@ -13,6 +13,14 @@ from pandas.api.types import is_numeric_dtype
 from .base import FEFrameworkAdapter
 
 
+class _AutofeatInternalNaNError(RuntimeError):
+    """Raised when AutoFeat's internal LassoLarsCV/LogisticRegressionCV hits NaN."""
+
+
+class _AutofeatUpstreamBugError(RuntimeError):
+    """Raised for known AutoFeat upstream bugs (inhomogeneous shape, SymPy codegen)."""
+
+
 class _TrainOnlyPreprocessor:
     """Median-impute numeric cols, ordinal-encode (+ mode-impute) non-numeric cols.
 
@@ -100,7 +108,20 @@ class AutoFeatAdapter(FEFrameworkAdapter):
                 verbose=0,
             )
 
-        X_train_fe = self._af.fit_transform(X_pre, pd.Series(y_train).values)
+        try:
+            X_train_fe = self._af.fit_transform(X_pre, pd.Series(y_train).values)
+        except ValueError as e:
+            msg = str(e)
+            if "missing values" in msg or "does not accept missing" in msg:
+                raise _AutofeatInternalNaNError(msg) from e
+            if "inhomogeneous" in msg or "could not broadcast" in msg:
+                raise _AutofeatUpstreamBugError(msg) from e
+            raise
+        except Exception as e:
+            msg = str(e)
+            if "duplicate argument" in msg or "DuplicateArgumentError" in type(e).__name__:
+                raise _AutofeatUpstreamBugError(msg) from e
+            raise
         if not isinstance(X_train_fe, pd.DataFrame):
             X_train_fe = pd.DataFrame(X_train_fe, index=X_pre.index)
         X_train_fe = X_train_fe.replace([np.inf, -np.inf], np.nan).fillna(0.0)

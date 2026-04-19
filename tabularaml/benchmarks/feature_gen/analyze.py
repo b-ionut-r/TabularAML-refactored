@@ -297,6 +297,33 @@ def build_report(master_path: Path, out_dir: Path) -> None:
     lines.append("![Heatmap](per_dataset_heatmap.png)")
     lines.append("")
 
+    # Emit data-leakage caveat whenever OpenFE results are present.
+    frameworks_present = set(df["framework"].dropna().unique()) if "framework" in df.columns else set()
+    if "openfe" in frameworks_present:
+        lines.append("## ⚠ OpenFE data-leakage caveat")
+        lines.append("")
+        lines.append(
+            "OpenFE's `transform()` concatenates the training and test sets before "
+            "computing `GroupByThenMean`-style aggregate features. As a result, aggregate "
+            "columns in **both** outputs are influenced by test-set rows, introducing "
+            "covariate-shift leakage that artificially inflates OpenFE's holdout scores "
+            "on heavily-aggregated feature sets."
+        )
+        lines.append("")
+        lines.append(
+            "This benchmark deliberately uses the upstream package as distributed "
+            "(`pip install openfe`) to reproduce what a reader would obtain. The companion "
+            "test `tests/test_openfe_leakage_probe.py` quantifies the leakage and will "
+            "fail CI if the upstream package ever makes it worse."
+        )
+        lines.append("")
+        lines.append(
+            "**Interpretation**: OpenFE's `pct_improvement` numbers should be treated as "
+            "an upper bound on its real-world benefit. The other frameworks (TabularAML, "
+            "AutoFeat, Featuretools) are not affected by this issue."
+        )
+        lines.append("")
+
     (out_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 

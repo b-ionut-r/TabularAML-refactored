@@ -20,6 +20,11 @@ from .base import FEFrameworkAdapter
 class OpenFEAdapter(FEFrameworkAdapter):
     name = "openfe"
     version = "upstream-0.0.12"
+    # supports_multiclass is True (default). OpenFE's multiclass has a math flaw
+    # (raw class probabilities used as init_score instead of log-odds) and
+    # calls exit() on any internal LightGBM error, but both are handled by
+    # _patch_init_score_flatten (fixes LightGBM API shape contract) and the
+    # SystemExit catch in fit_transform. Results will be poor but are real data.
 
     def __init__(
         self,
@@ -48,8 +53,21 @@ class OpenFEAdapter(FEFrameworkAdapter):
 
     @staticmethod
     def _patch_init_score_flatten() -> None:
-        """Patch LightGBM.fit to correctly reshape init_score for multiclass tasks.
-        Handles both 2D arrays and list-of-arrays inputs from OpenFE."""
+        """Patch LightGBM.fit to fix two init_score issues from OpenFE multiclass.
+
+        Issue 1 — shape: OpenFE passes init_score as a pandas DataFrame of shape
+        (n_samples, n_classes).  LightGBM 4.0+ requires a 1-D Fortran-order array
+        of length n_samples * n_classes.  len(DataFrame) == n_samples, not n*k,
+        so LightGBM raises 'Length of init_score != n_samples * n_classes'.
+
+        Issue 2 — math: OpenFE's default multiclass path passes raw class
+        probabilities [p0, p1, …] as init_score.  LightGBM applies softmax to
+        init_score, so softmax([0.3, 0.5, 0.2]) ≈ uniform — the prior is lost.
+        The fix (log(p)) restores the correct prior: softmax(log(p)) == p exactly.
+        OpenFE's own check_init_scores() warns about this very problem.
+        The feature_boosting path uses predict_proba(raw_score=True) which already
+        returns raw margins, so it is left untouched.
+        """
         import numpy as np
         import lightgbm as lgb
 
@@ -58,33 +76,51 @@ class OpenFEAdapter(FEFrameworkAdapter):
 
         _orig_fit = lgb.LGBMModel.fit
 
-        def _fit_with_correct_init_score(self_lgb, X, y, **kwargs):
-            init_score = kwargs.get('init_score', None)
-            if init_score is not None:
-                # If init_score is a list of arrays (e.g., per-class scores), stack them
-                if isinstance(init_score, (list, tuple)):
-                    try:
-                        init_score = np.column_stack(init_score)
-                    except ValueError:
-                        # If they are already 2D-like, concatenate along axis 1
-                        init_score = np.concatenate(
-                            [np.asarray(arr).reshape(-1, 1) for arr in init_score],
-                            axis=1
-                        )
-                else:
-                    init_score = np.asarray(init_score)
+        def _to_fortran_1d(score):
+            """Convert a 2-D score array/DataFrame to Fortran-order 1-D; leave 1-D alone.
 
-                # Now init_score is 2D (n_samples, n_classes) for multiclass,
-                # or 1D (n_samples,) for binary/regression.
-                if init_score.ndim == 2:
-                    # LightGBM expects a 1D array in column-major (Fortran) order
-                    kwargs['init_score'] = init_score.ravel(order='F')
-                elif init_score.ndim == 1:
-                    # Binary or regression – leave as is
-                    pass
+            Also fixes OpenFE's multiclass math flaw: its default (no feature_boosting)
+            path passes raw class probabilities as init_score, but LightGBM expects raw
+            margins.  OpenFE's own check_init_scores() warns about this yet its default
+            code violates it.  Detection: 2-D array with all values in [0,1] and rows
+            summing to 1.  Fix: log(p), so softmax(log(p)) == p — same prior, correct
+            representation.  The feature_boosting path already uses predict_proba with
+            raw_score=True, so its scores are outside [0,1] and are left untouched.
+            """
+            if isinstance(score, (list, tuple)):
+                try:
+                    score = np.column_stack(score)
+                except ValueError:
+                    score = np.concatenate(
+                        [np.asarray(arr).reshape(-1, 1) for arr in score], axis=1
+                    )
+            else:
+                score = np.asarray(score, dtype=float)
+            if score.ndim == 2:
+                # Detect probability matrix: values in [0,1], rows sum to ~1
+                if (score.min() >= 0.0 and score.max() <= 1.0 and
+                        np.allclose(score.sum(axis=1), 1.0, atol=1e-6)):
+                    score = np.log(np.clip(score, 1e-15, 1.0))
+                return score.ravel(order='F')
+            if score.ndim == 1:
+                return score
+            return None  # unexpected shape — drop
+
+        def _fit_with_correct_init_score(self_lgb, X, y, **kwargs):
+            if kwargs.get('init_score') is not None:
+                result = _to_fortran_1d(kwargs['init_score'])
+                if result is None:
+                    kwargs.pop('init_score')
                 else:
-                    # Unexpected dimensionality – remove init_score to be safe
-                    kwargs.pop('init_score', None)
+                    kwargs['init_score'] = result
+
+            # eval_init_score is a list (one entry per eval set)
+            if kwargs.get('eval_init_score') is not None:
+                fixed = []
+                for s in kwargs['eval_init_score']:
+                    r = _to_fortran_1d(s)
+                    fixed.append(r if r is not None else np.array([]))
+                kwargs['eval_init_score'] = fixed
 
             return _orig_fit(self_lgb, X, y, **kwargs)
 
@@ -93,9 +129,22 @@ class OpenFEAdapter(FEFrameworkAdapter):
 
     @staticmethod
     def _patch_sklearn_mse() -> None:
-        """Patch sklearn mean_squared_error for squared=False removal (sklearn>=1.4)."""
-        import sklearn.metrics as sm
+        """Patch sklearn mean_squared_error for squared=False removal (sklearn>=1.4).
+
+        Two-part patch:
+        1. Replace sklearn.metrics.mean_squared_error with a compat wrapper.
+        2. Also replace openfe.openfe's own local binding (it uses
+           `from sklearn.metrics import mean_squared_error`, so patching the
+           sklearn module alone is insufficient).
+        3. Replace openfe.openfe.ProcessPoolExecutor with ThreadPoolExecutor so
+           candidate-evaluation workers run as threads in the current process,
+           where our patched mean_squared_error is visible.  ProcessPoolExecutor
+           spawns fresh subprocesses (Windows spawn) that re-import unpatched
+           sklearn, causing the same TypeError in every worker.
+        """
         import numpy as np
+        import sklearn.metrics as sm
+        from concurrent.futures import ThreadPoolExecutor
 
         if getattr(sm.mean_squared_error, "_openfe_patched", False):
             return
@@ -118,6 +167,16 @@ class OpenFEAdapter(FEFrameworkAdapter):
         _compat_mse._openfe_patched = True
         sm.mean_squared_error = _compat_mse
 
+        # Patch openfe's own module-level reference and swap its executor.
+        try:
+            import openfe.openfe as _ofe
+            _ofe.mean_squared_error = _compat_mse
+            if not getattr(_ofe, "_executor_patched", False):
+                _ofe.ProcessPoolExecutor = ThreadPoolExecutor
+                _ofe._executor_patched = True
+        except (ImportError, AttributeError):
+            pass
+
     def _safe_column_names(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         """Replace column names with safe alphanumeric identifiers (col_0, col_1, ...)."""
         safe_names = [f"col_{i}" for i in range(df.shape[1])]
@@ -129,6 +188,17 @@ class OpenFEAdapter(FEFrameworkAdapter):
         self._patch_init_score_flatten()
         self._patch_sklearn_mse()
 
+        try:
+            return self._fit_transform_inner(X_train, y_train)
+        except SystemExit as exc:
+            # OpenFE's _evaluate() calls exit() on any internal LightGBM error.
+            # Catch it so the worker subprocess survives and records a crash row
+            # rather than dying silently.
+            raise RuntimeError(
+                f"OpenFE called exit() internally (multiclass LightGBM error): {exc}"
+            ) from exc
+
+    def _fit_transform_inner(self, X_train: pd.DataFrame, y_train: pd.Series) -> pd.DataFrame:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             from openfe import OpenFE, transform
@@ -161,7 +231,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
                 seed=self.random_state,
                 verbose=False,
             )
-                
+
             X_train_fe_safe, _ = transform(
                 X_train_safe,
                 X_train_safe,

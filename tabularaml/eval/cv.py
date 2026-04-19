@@ -92,7 +92,14 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
             is_regression = type_of_target(y) in ("continuous", "continuous-multioutput")
 
             y_arr = np.asarray(y)
-            min_class = np.min(np.bincount(y_arr.astype(int))) if not is_regression else cv + 1
+            # Guard: np.bincount requires non-negative integers; fall back for regression
+            # targets that type_of_target misclassifies as "multiclass" (integer dtype).
+            _can_bincount = (
+                not is_regression
+                and np.issubdtype(y_arr.dtype, np.integer)
+                and y_arr.min() >= 0
+            )
+            min_class = np.min(np.bincount(y_arr.astype(int))) if _can_bincount else cv + 1
 
             use_stratified = (not is_regression) and (min_class >= cv)
 
@@ -155,10 +162,15 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
 
         fit_signature = inspect.signature(model_clone.fit)
         if 'eval_set' in fit_signature.parameters:
-            # Suppress eval_set verbose output for XGBoost
             fit_kwargs = model_fit_kwargs.copy()
-            if 'verbose' not in fit_kwargs:
-                fit_kwargs['verbose'] = False
+            if 'verbose' in fit_signature.parameters:
+                fit_kwargs.setdefault('verbose', False)
+            elif 'callbacks' in fit_signature.parameters and 'callbacks' not in fit_kwargs:
+                try:
+                    import lightgbm as lgb
+                    fit_kwargs['callbacks'] = [lgb.log_evaluation(period=0)]
+                except ImportError:
+                    pass
             model_clone.fit(X_train, y_train, eval_set=[(X_val, y_val)], **fit_kwargs)
         else:
             model_clone.fit(X_train, y_train, **model_fit_kwargs)

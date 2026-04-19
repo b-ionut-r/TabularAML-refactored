@@ -60,10 +60,11 @@ def test_openfe_leakage_probe_records_result(tmp_path):
         task="classification", n_classes=2, seed=42,
     )
 
-    # Record outcome; flag if ROC-AUC is materially above chance.
-    flag = float(score) > 0.60
-    flag_path = tmp_path / "openfe_leakage_flag.txt"
-    flag_path.write_text(f"score={score:.4f}\nleakage_suspected={flag}\n")
-    # The probe is informational; we only assert that it ran and the score
-    # is a finite number so the test picks up actual crashes.
     assert np.isfinite(score), "leakage probe produced non-finite score"
+    # Pure-noise data must not yield ROC-AUC > 0.60; a higher value means
+    # upstream transform() is leaking test distribution into training aggregates.
+    assert score < 0.60, (
+        f"OpenFE leakage probe: score={score:.4f} on random-noise data exceeds 0.60. "
+        "Upstream transform() is leaking test rows into training aggregates — "
+        "annotate OpenFE results in the report with a data-leakage caveat."
+    )

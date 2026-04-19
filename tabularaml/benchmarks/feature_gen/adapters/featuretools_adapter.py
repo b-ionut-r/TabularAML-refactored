@@ -1,15 +1,19 @@
 """Adapter wrapping Featuretools in single-table mode.
 
 Uses the modern (1.x) API: ft.EntitySet().add_dataframe + ft.dfs +
-ft.calculate_feature_matrix. 
+ft.calculate_feature_matrix.
 """
 from __future__ import annotations
-from typing import Literal, Optional, Sequence
+from typing import Literal, Optional
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype, is_object_dtype
 
 from .base import FEFrameworkAdapter
+
+
+class _FeaturetoolsUpstreamBugError(RuntimeError):
+    """Raised for known Featuretools upstream bugs (e.g. TypeConversionError Int64)."""
 
 
 class FeaturetoolsAdapter(FEFrameworkAdapter):
@@ -22,7 +26,7 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         time_budget_s: int,
         random_state: int,
         n_jobs: int = -1,
-        max_depth: int = 1,
+        max_depth: int = 2,
         **framework_kwargs,
     ):
         super().__init__(task, time_budget_s, random_state, n_jobs, **framework_kwargs)
@@ -82,12 +86,17 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         self._valid_cols = keep
         frame = self._to_index_frame(X_train[keep])
         ft, es = self._dfs(frame)
-        matrix, feature_defs = ft.dfs(
-            entityset=es,
-            target_dataframe_name="df",
-            max_depth=self.max_depth,
-            verbose=False,
-        )
+        try:
+            matrix, feature_defs = ft.dfs(
+                entityset=es,
+                target_dataframe_name="df",
+                max_depth=self.max_depth,
+                verbose=False,
+            )
+        except Exception as e:
+            if "TypeConversionError" in type(e).__name__ or "TypeConversionError" in str(type(e).__mro__):
+                raise _FeaturetoolsUpstreamBugError(str(e)) from e
+            raise
         self._feature_defs = feature_defs
         matrix = self._postprocess(matrix, fit=True)
         self._train_columns_fe = list(matrix.columns)

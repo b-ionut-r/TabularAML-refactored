@@ -17,7 +17,7 @@ from .base import FEFrameworkAdapter
 class TabularAMLAdapter(FEFrameworkAdapter):
     name = "tabularaml"
     version = "0.2.0"
-    gpu = True
+    gpu = False
 
     def __init__(
         self,
@@ -26,7 +26,7 @@ class TabularAMLAdapter(FEFrameworkAdapter):
         random_state: int,
         n_jobs: int = -1,
         mode: str = "medium",
-        use_gpu: bool = True,
+        use_gpu: bool = False,  # CPU-only for fair comparison; pass use_gpu=True for a separate GPU arm
         **framework_kwargs,
     ):
         super().__init__(task, time_budget_s, random_state, n_jobs, **framework_kwargs)
@@ -73,7 +73,7 @@ class TabularAMLAdapter(FEFrameworkAdapter):
             task=self.task,
             scorer=scorer,
             mode=self.mode,
-            # time_budget=self.time_budget_s,
+            # time_budget=self.time_budget_s,  # Intentionally omitted: mode preset owns the per-run budget
             use_gpu=self.use_gpu,
             log_file=None,
         )

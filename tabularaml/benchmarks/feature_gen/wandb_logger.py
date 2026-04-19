@@ -107,7 +107,7 @@ def wandb_run(
         tags=tags,
         config=config,
         reinit=True,
-        settings=wandb.Settings(start_method="thread"),
+        settings=wandb.Settings(start_method="thread", init_timeout=300),
     )
     if job_type:
         init_kwargs["job_type"] = job_type

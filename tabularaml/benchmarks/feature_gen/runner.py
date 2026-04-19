@@ -42,7 +42,7 @@ class RunSpec:
     task: str
     framework: str
     seed: int
-    time_budget_s: int = 3600
+    time_budget_s: int = 1200
     n_jobs: int = -1
     mode: str = "medium"
     framework_kwargs: dict = field(default_factory=dict)
@@ -85,7 +85,11 @@ def _load_master(csv_path: Path) -> pd.DataFrame:
 def _done_key_set(master: pd.DataFrame, retry_crashes: bool = True) -> set:
     if len(master) == 0:
         return set()
-    terminal = {"ok", "timeout", "oom", "contract_violation", "unsupported_task"}
+    terminal = {
+        "ok", "timeout", "oom", "contract_violation", "unsupported_task",
+        "dataset_fetch_failed", "degenerate_dataset",
+        "autofeat_internal_nan", "autofeat_upstream_bug", "featuretools_upstream_bug",
+    }
     if not retry_crashes:
         terminal.add("crash")
     done = master[master["status"].isin(terminal)]
@@ -107,7 +111,7 @@ class BenchmarkRunner:
         frameworks: Sequence[str],
         seeds: Sequence[int],
         results_dir: Path,
-        time_budget_s: int = 3600,
+        time_budget_s: int = 1200,
         n_workers: int = 1,
         subset: str = "full",
         tabularaml_mode: str = "medium",
@@ -213,7 +217,7 @@ class BenchmarkRunner:
             "--spec", spec.to_json(),
             "--out", out_path,
         ]
-        grace_s = 60
+        grace_s = 180
         hard_cap = spec.time_budget_s + grace_s
         t0 = time.time()
         try:
