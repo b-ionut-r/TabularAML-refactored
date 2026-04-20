@@ -40,12 +40,19 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         """Attach a stable integer index column for ft's EntitySet."""
         frame = X.reset_index(drop=True).copy()
         frame.insert(0, "_bench_idx", np.arange(len(frame)))
-        # Convert categoricals back to object to prevent Pandas comparison TypeErrors
-        # ('Categoricals can only be compared if categories are the same')
-        # Featuretools (Woodwork) still automatically infers them as Categorical.
+        
         for c in frame.columns:
             if isinstance(frame[c].dtype, pd.CategoricalDtype):
                 frame[c] = frame[c].astype(object)
+                
+        # NEW: Ensure boolean-like objects are cast to nullable boolean 
+        # so Woodwork doesn't incorrectly assign them as Categorical.
+        for c in frame.columns:
+            if is_object_dtype(frame[c]):
+                inferred = pd.api.types.infer_dtype(frame[c], skipna=True)
+                if inferred == 'boolean':
+                    frame[c] = frame[c].astype("boolean")
+                    
         return frame
 
     def _dfs(self, frame: pd.DataFrame):
@@ -88,7 +95,8 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         t_primitives = [
             "add_numeric", "subtract_numeric", "multiply_numeric", "divide_numeric",
             "absolute", "modulo_numeric", "square_root", "natural_logarithm",
-            "greater_than", "equal", "and", "not"
+            "greater_than", "equal", 
+            # "and", "not"
         ]
         if any(is_datetime64_any_dtype(frame[c]) for c in frame.columns):
             t_primitives.extend(["year", "month", "weekday", "day", "hour", "is_weekend"])
