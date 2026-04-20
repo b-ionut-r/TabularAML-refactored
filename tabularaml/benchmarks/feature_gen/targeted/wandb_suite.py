@@ -16,10 +16,8 @@ from tabularaml.benchmarks.feature_gen.wandb_logger import (
     _build_per_dataset_frame,
     _build_task_summary_frame,
     _build_scorer_summary_frame,
-    _build_pct_improvement_figure,
-    _build_pareto_figure,
-    _build_failure_rate_figure,
     _to_wandb_table,
+    _safe_fig,
     OrchestratorRun,
 )
 
@@ -230,7 +228,11 @@ class TargetedOrchestratorRun(OrchestratorRun):
 
     def _build_figure_payload(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         payload = super()._build_figure_payload(snapshot)
-        rank_fig = _build_suite_rank_figure(snapshot["suite_summary_df"])
+        rank_fig = _safe_fig(
+            lambda: _build_suite_rank_figure(snapshot["suite_summary_df"]),
+            "Suite Rank",
+            "Rank chart needs at least 2 suites and 2 frameworks with improvement data.",
+        )
         if rank_fig is not None:
             payload["figure_suite_rank"] = rank_fig
         return payload

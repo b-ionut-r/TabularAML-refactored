@@ -473,6 +473,19 @@ def _build_message_figure(title: str, message: str):
             import matplotlib.pyplot as plt
             plt.close(fig)
 
+def _safe_fig(builder, title: str, message: str):
+    """Call builder(); if it returns None or raises, return a labelled placeholder."""
+    try:
+        result = builder()
+        if result is not None:
+            return result
+    except Exception:
+        pass
+    try:
+        return _build_message_figure(title, message)
+    except Exception:
+        return None
+
 def _framework_color_map(frameworks: List[str]) -> Dict[str, Any]:
     import matplotlib.pyplot as plt
     palette = list(plt.get_cmap("Set2").colors) + list(plt.get_cmap("tab10").colors)
@@ -1039,6 +1052,9 @@ class OrchestratorRun:
 
     def _build_snapshot(self, master_csv: Optional[Path]) -> Dict[str, Any]:
         per_run_df = self._load_per_run_frame(master_csv)
+        if not per_run_df.empty and "task" in per_run_df.columns:
+            per_run_df = per_run_df.copy()
+            per_run_df["task"] = per_run_df["task"].replace("multiclass", "classification")
         per_dataset_df = _build_per_dataset_frame(per_run_df)
         task_summary_df = _build_task_summary_frame(per_run_df, per_dataset_df)
         scorer_summary_df = _build_scorer_summary_frame(per_dataset_df)
@@ -1073,39 +1089,28 @@ class OrchestratorRun:
             payload["results_per_run"] = _to_wandb_table(ordered)
         return payload
 
+    def _figure_specs(self, snapshot: Dict[str, Any]) -> List[tuple]:
+        ts = snapshot["task_summary_df"]
+        pd_ = snapshot["per_dataset_df"]
+        _w = "Results will appear here as the benchmark progresses."
+        return [
+            ("figure_pct_improvement",       lambda: _build_pct_improvement_figure(ts),         "% Improvement",          _w),
+            ("figure_win_rate",              lambda: _build_win_rate_figure(ts),                 "Win Rate",               _w),
+            ("figure_runtime_vs_improvement",lambda: _build_pareto_figure(pd_),                  "Runtime vs Improvement", _w),
+            ("figure_failure_rate",          lambda: _build_failure_rate_figure(ts),             "Failure Rate",           _w),
+            ("figure_score_distribution",    lambda: _build_score_distribution_figure(pd_),      "Score Distribution",     _w),
+            ("figure_per_dataset_improvement",lambda: _build_per_dataset_improvement_figure(pd_),"Per-Dataset Improvement",_w),
+            ("figure_features_added",        lambda: _build_features_added_figure(ts),           "Features Added",         _w),
+        ]
+
     def _build_figure_payload(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        # Every key is always logged — either the real chart or a "waiting for data"
+        # placeholder. This prevents media panels from showing "no data" errors.
         payload: Dict[str, Any] = {}
-        task_summary = snapshot["task_summary_df"]
-        per_dataset = snapshot["per_dataset_df"]
-
-        pct_fig = _build_pct_improvement_figure(task_summary)
-        if pct_fig is not None:
-            payload["figure_pct_improvement"] = pct_fig
-
-        win_fig = _build_win_rate_figure(task_summary)
-        if win_fig is not None:
-            payload["figure_win_rate"] = win_fig
-
-        pareto_fig = _build_pareto_figure(per_dataset)
-        if pareto_fig is not None:
-            payload["figure_runtime_vs_improvement"] = pareto_fig
-
-        failure_fig = _build_failure_rate_figure(task_summary)
-        if failure_fig is not None:
-            payload["figure_failure_rate"] = failure_fig
-
-        score_fig = _build_score_distribution_figure(per_dataset)
-        if score_fig is not None:
-            payload["figure_score_distribution"] = score_fig
-
-        per_ds_fig = _build_per_dataset_improvement_figure(per_dataset)
-        if per_ds_fig is not None:
-            payload["figure_per_dataset_improvement"] = per_ds_fig
-
-        features_fig = _build_features_added_figure(task_summary)
-        if features_fig is not None:
-            payload["figure_features_added"] = features_fig
-
+        for key, builder, title, message in self._figure_specs(snapshot):
+            fig = _safe_fig(builder, title, message)
+            if fig is not None:
+                payload[key] = fig
         return payload
 
     def push(self, paths: List[Path], *, force: bool = False, min_interval_s: float = 30.0) -> bool:
