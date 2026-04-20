@@ -21,7 +21,11 @@ _build_task_summary_frame = _MOD._build_task_summary_frame
 _build_failure_rate_figure = _MOD._build_failure_rate_figure
 _build_pareto_figure = _MOD._build_pareto_figure
 _normalize_results_frame = _MOD._normalize_results_frame
+_to_wandb_table = _MOD._to_wandb_table
+OrchestratorRun = _MOD.OrchestratorRun
 log_media_placeholder = _MOD.log_media_placeholder
+
+_TARGETED_MOD_PATH = Path(__file__).resolve().parents[1] / "targeted" / "wandb_suite.py"
 
 
 class _FakeImage:
@@ -30,10 +34,262 @@ class _FakeImage:
         self.caption = caption
 
 
+class _FakeTable:
+    def __init__(self, columns=None, data=None, log_mode=None):
+        self.columns = list(columns or [])
+        self.data = [list(row) for row in (data or [])]
+        self.log_mode = log_mode
+
+    def add_data(self, *row):
+        self.data.append(list(row))
+
+
+class _FakeArtifact:
+    def __init__(self, name, type):
+        self.name = name
+        self.type = type
+        self.files = []
+        self.dirs = []
+
+    def add_file(self, path):
+        self.files.append(path)
+
+    def add_dir(self, path):
+        self.dirs.append(path)
+
+
+class _FakeSummary:
+    def __init__(self):
+        self.updates = []
+
+    def update(self, payload):
+        self.updates.append(dict(payload))
+
+
+class _FakeRun:
+    def __init__(self, init_kwargs):
+        self.init_kwargs = init_kwargs
+        self.logged = []
+        self.summary = _FakeSummary()
+
+    def log(self, payload, step=None):
+        self.logged.append({"payload": dict(payload), "step": step})
+
+
+class _FakeSettings:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _FakeWandb:
+    Image = _FakeImage
+    Table = _FakeTable
+    Artifact = _FakeArtifact
+    Settings = _FakeSettings
+
+    def __init__(self):
+        self.run = None
+        self.runs = []
+        self.logged_artifacts = []
+
+    def init(self, **kwargs):
+        run = _FakeRun(kwargs)
+        self.run = run
+        self.runs.append(run)
+        return run
+
+    def finish(self):
+        self.run = None
+
+    def log_artifact(self, artifact):
+        self.logged_artifacts.append(artifact)
+
+
 def _install_fake_wandb(monkeypatch):
-    fake = types.SimpleNamespace(Image=_FakeImage)
+    fake = _FakeWandb()
     monkeypatch.setitem(sys.modules, "wandb", fake)
     return fake
+
+
+def _load_targeted_suite_module():
+    tabularaml_pkg = sys.modules.setdefault("tabularaml", types.ModuleType("tabularaml"))
+    tabularaml_pkg.__path__ = [str(Path(__file__).resolve().parents[3])]
+
+    benchmarks_pkg = sys.modules.setdefault("tabularaml.benchmarks", types.ModuleType("tabularaml.benchmarks"))
+    benchmarks_pkg.__path__ = [str(Path(__file__).resolve().parents[2])]
+
+    feature_gen_pkg = sys.modules.setdefault(
+        "tabularaml.benchmarks.feature_gen",
+        types.ModuleType("tabularaml.benchmarks.feature_gen"),
+    )
+    feature_gen_pkg.__path__ = [str(Path(__file__).resolve().parents[1])]
+    sys.modules["tabularaml.benchmarks.feature_gen.wandb_logger"] = _MOD
+
+    targeted_pkg = sys.modules.setdefault(
+        "tabularaml.benchmarks.feature_gen.targeted",
+        types.ModuleType("tabularaml.benchmarks.feature_gen.targeted"),
+    )
+    targeted_pkg.__path__ = [str(Path(__file__).resolve().parents[1] / "targeted")]
+
+    spec = importlib.util.spec_from_file_location("targeted_wandb_suite_under_test", _TARGETED_MOD_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _base_rows():
+    return [
+        {
+            "dataset_id": 1,
+            "task": "classification",
+            "framework": "nofe",
+            "seed": 0,
+            "scorer_name": "binary_roc_auc",
+            "score_holdout": 0.70,
+            "score_nofe_same_seed": 0.70,
+            "pct_improvement": 0.0,
+            "n_train": 80,
+            "n_test": 20,
+            "n_features_before": 10,
+            "n_features_after": 10,
+            "n_added": 0,
+            "wall_time_fit": 1.0,
+            "wall_time_transform": 0.1,
+            "wall_time_total": 1.1,
+            "peak_rss_mb": 100.0,
+            "n_boost_rounds": 12,
+            "status": "ok",
+            "error_msg": "",
+        },
+        {
+            "dataset_id": 1,
+            "task": "classification",
+            "framework": "openfe",
+            "seed": 0,
+            "scorer_name": "binary_roc_auc",
+            "score_holdout": 0.77,
+            "score_nofe_same_seed": 0.70,
+            "pct_improvement": 0.1,
+            "n_train": 80,
+            "n_test": 20,
+            "n_features_before": 10,
+            "n_features_after": 18,
+            "n_added": 8,
+            "wall_time_fit": 3.2,
+            "wall_time_transform": 0.5,
+            "wall_time_total": 3.7,
+            "peak_rss_mb": 140.0,
+            "n_boost_rounds": 16,
+            "status": "ok",
+            "error_msg": "",
+        },
+    ]
+
+
+def _targeted_rows():
+    return [
+        {
+            "dataset_id": "adult",
+            "dataset_name": "adult",
+            "dataset_source": "pmlb",
+            "suite": "amlb",
+            "task": "classification",
+            "framework": "nofe",
+            "seed": 0,
+            "scorer_name": "binary_roc_auc",
+            "score_holdout": 0.71,
+            "score_nofe_same_seed": 0.71,
+            "pct_improvement": 0.0,
+            "n_train": 100,
+            "n_test": 25,
+            "n_features_before": 8,
+            "n_features_after": 8,
+            "n_added": 0,
+            "wall_time_fit": 1.0,
+            "wall_time_transform": 0.1,
+            "wall_time_total": 1.1,
+            "peak_rss_mb": 90.0,
+            "n_boost_rounds": 8,
+            "status": "ok",
+            "error_msg": "",
+        },
+        {
+            "dataset_id": "adult",
+            "dataset_name": "adult",
+            "dataset_source": "pmlb",
+            "suite": "amlb",
+            "task": "classification",
+            "framework": "openfe",
+            "seed": 0,
+            "scorer_name": "binary_roc_auc",
+            "score_holdout": 0.77,
+            "score_nofe_same_seed": 0.71,
+            "pct_improvement": 0.0845,
+            "n_train": 100,
+            "n_test": 25,
+            "n_features_before": 8,
+            "n_features_after": 18,
+            "n_added": 10,
+            "wall_time_fit": 3.0,
+            "wall_time_transform": 0.4,
+            "wall_time_total": 3.4,
+            "peak_rss_mb": 120.0,
+            "n_boost_rounds": 10,
+            "status": "ok",
+            "error_msg": "",
+        },
+        {
+            "dataset_id": "credit",
+            "dataset_name": "credit",
+            "dataset_source": "pmlb",
+            "suite": "pmlb",
+            "task": "classification",
+            "framework": "nofe",
+            "seed": 0,
+            "scorer_name": "binary_roc_auc",
+            "score_holdout": 0.73,
+            "score_nofe_same_seed": 0.73,
+            "pct_improvement": 0.0,
+            "n_train": 120,
+            "n_test": 30,
+            "n_features_before": 9,
+            "n_features_after": 9,
+            "n_added": 0,
+            "wall_time_fit": 1.1,
+            "wall_time_transform": 0.1,
+            "wall_time_total": 1.2,
+            "peak_rss_mb": 92.0,
+            "n_boost_rounds": 9,
+            "status": "ok",
+            "error_msg": "",
+        },
+        {
+            "dataset_id": "credit",
+            "dataset_name": "credit",
+            "dataset_source": "pmlb",
+            "suite": "pmlb",
+            "task": "classification",
+            "framework": "openfe",
+            "seed": 0,
+            "scorer_name": "binary_roc_auc",
+            "score_holdout": 0.79,
+            "score_nofe_same_seed": 0.73,
+            "pct_improvement": 0.0822,
+            "n_train": 120,
+            "n_test": 30,
+            "n_features_before": 9,
+            "n_features_after": 19,
+            "n_added": 10,
+            "wall_time_fit": 3.4,
+            "wall_time_transform": 0.5,
+            "wall_time_total": 3.9,
+            "peak_rss_mb": 128.0,
+            "n_boost_rounds": 11,
+            "status": "ok",
+            "error_msg": "",
+        },
+    ]
 
 
 def test_task_summary_uses_per_dataset_means_not_per_run_means():
@@ -216,3 +472,74 @@ def test_log_media_placeholder_logs_runtime_key(monkeypatch):
     image = payload["figure_runtime_vs_improvement"]
     assert isinstance(image, _FakeImage)
     assert image.caption == "Aggregated runtime-vs-improvement media is logged on the orchestrator run."
+
+
+def test_to_wandb_table_preserves_requested_log_mode(monkeypatch):
+    _install_fake_wandb(monkeypatch)
+
+    table = _to_wandb_table(pd.DataFrame([{"a": 1, "b": 2}]), log_mode="MUTABLE")
+
+    assert isinstance(table, _FakeTable)
+    assert table.log_mode == "MUTABLE"
+    assert table.data == [[1, 2]]
+
+
+def test_orchestrator_run_uses_incremental_live_results_and_final_immutable_tables(tmp_path, monkeypatch):
+    fake = _install_fake_wandb(monkeypatch)
+    rows = _base_rows()
+    master_csv = tmp_path / "master.csv"
+
+    pd.DataFrame([rows[0]]).to_csv(master_csv, index=False)
+
+    with OrchestratorRun(project="proj", entity=None, artifact_name="bench-results", enabled=True) as orch:
+        orch.append_result(rows[0])
+        assert orch.push([master_csv], min_interval_s=0)
+
+        pd.DataFrame([rows[1]]).to_csv(master_csv, mode="a", header=False, index=False)
+        orch.append_result(rows[1])
+        assert orch.push([master_csv], min_interval_s=0)
+
+        assert orch.push([master_csv], force=True, min_interval_s=0)
+
+    run = fake.runs[0]
+    assert [entry["step"] for entry in run.logged] == [1, 2, 3]
+
+    first_payload = run.logged[0]["payload"]
+    second_payload = run.logged[1]["payload"]
+    final_payload = run.logged[2]["payload"]
+
+    assert "results_live" in first_payload
+    assert first_payload["results_live"].log_mode == "INCREMENTAL"
+    assert len(first_payload["results_live"].data) == 2
+
+    assert "results_live" in second_payload
+    assert second_payload["results_live"] is first_payload["results_live"]
+    assert len(second_payload["results_live"].data) == 2
+
+    assert final_payload["results"].log_mode == "IMMUTABLE"
+    assert final_payload["results_per_run"].log_mode == "IMMUTABLE"
+    assert final_payload["results_aggregated"].log_mode == "IMMUTABLE"
+    assert final_payload["n_rows_total"] == 2
+    assert final_payload["n_ok_rows"] == 2
+
+
+def test_targeted_orchestrator_logs_suite_summary_and_rank_figure(tmp_path, monkeypatch):
+    fake = _install_fake_wandb(monkeypatch)
+    targeted_mod = _load_targeted_suite_module()
+    rows = _targeted_rows()
+    master_csv = tmp_path / "master.csv"
+    pd.DataFrame(rows).to_csv(master_csv, index=False)
+
+    with targeted_mod.TargetedOrchestratorRun(
+        project="proj",
+        entity=None,
+        artifact_name="targeted-results",
+        suite="all",
+        enabled=True,
+    ) as orch:
+        assert orch.push([master_csv], force=True, min_interval_s=0)
+
+    payload = fake.runs[0].logged[0]["payload"]
+    assert payload["results"].log_mode == "IMMUTABLE"
+    assert payload["results_suite_summary"].log_mode == "IMMUTABLE"
+    assert payload["n_suites_started"] == 2

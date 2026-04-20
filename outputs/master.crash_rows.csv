@@ -1,0 +1,4 @@
+﻿dataset_id,dataset_name,dataset_source,suite,task,framework,seed,time_budget_s,n_train,n_test,n_features_before,n_features_after,n_added,score_holdout,scorer_name,scorer_greater_is_better,score_nofe_same_seed,pct_improvement,wall_time_fit,wall_time_transform,wall_time_total,peak_rss_mb,n_boost_rounds,status,error_msg,adapter_version,internal_log_json
+23,cmc,openml_task,smoke_test,multiclass,tabularaml,3,1200,1178,295,9,,,,,,,,,,62.38754320144653,,,crash,ValueError: Input X contains infinity or a value too large for dtype('float64').,0.2.0,
+23,cmc,openml_task,smoke_test,multiclass,tabularaml,0,1200,1178,295,9,,,,,,,,,,223.50840163230896,,,crash,ValueError: Input X contains infinity or a value too large for dtype('float16').,0.2.0,
+23,cmc,openml_task,smoke_test,multiclass,tabularaml,4,1200,1178,295,9,,,,,,,,,,708.3268394470215,,,crash,ValueError: X does not contain the columns listed in cols,0.2.0,

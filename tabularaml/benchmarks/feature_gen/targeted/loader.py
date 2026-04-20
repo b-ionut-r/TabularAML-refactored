@@ -43,14 +43,27 @@ def load_dataset(spec: DatasetSpec) -> LoadedDataset:
     raise ValueError(f"Unknown dataset source: {spec.source!r}")
 
 
+def _acquire_cache_lock(dataset_id: str):
+    import tempfile
+    try:
+        from filelock import FileLock
+        lock_path = Path(tempfile.gettempdir()) / f"dataset_cache_{dataset_id}.lock"
+        return FileLock(str(lock_path))
+    except ImportError:
+        class _NoLock:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        return _NoLock()
+
 def _load_openml_task(spec: DatasetSpec) -> LoadedDataset:
     import openml
 
     task_id = int(spec.id)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore")
-        task = openml.tasks.get_task(task_id)
-        X, y = task.get_X_and_y(dataset_format="dataframe")
+    with _acquire_cache_lock(f"openml_{task_id}"):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            task = openml.tasks.get_task(task_id)
+            X, y = task.get_X_and_y(dataset_format="dataframe")
 
     X = pd.DataFrame(X)
     y_ser = pd.Series(y).reset_index(drop=True)
@@ -63,7 +76,8 @@ def _load_openml_task(spec: DatasetSpec) -> LoadedDataset:
 def _load_pmlb(spec: DatasetSpec) -> LoadedDataset:
     import pmlb
 
-    df = pmlb.fetch_data(spec.id, local_cache_dir=_pmlb_cache_dir())
+    with _acquire_cache_lock(f"pmlb_{spec.id}"):
+        df = pmlb.fetch_data(spec.id, local_cache_dir=_pmlb_cache_dir())
     if "target" not in df.columns:
         raise RuntimeError(f"PMLB dataset {spec.id!r} has no 'target' column")
 

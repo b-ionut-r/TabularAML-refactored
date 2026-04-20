@@ -94,6 +94,10 @@ def _parse(argv=None) -> argparse.Namespace:
         "--sync-every", type=int, default=5,
         help="Push W&B artifact after every N completed rows (default: 5).",
     )
+    p.add_argument(
+        "--sync-min-interval", type=float, default=30.0,
+        help="Minimum seconds between W&B syncs (default: 30.0).",
+    )
     return p.parse_args(argv)
 
 
@@ -118,6 +122,7 @@ def main(argv=None) -> None:
         retry_crashes=args.retry_crashes,
         artifact_name=args.artifact_name,
         sync_every_rows=args.sync_every,
+        sync_min_interval_s=args.sync_min_interval,
     )
     runner.run()
 

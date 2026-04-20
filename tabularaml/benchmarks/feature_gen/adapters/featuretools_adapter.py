@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Literal, Optional
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_numeric_dtype, is_object_dtype
+from pandas.api.types import is_numeric_dtype, is_object_dtype, is_datetime64_any_dtype
 
 from .base import FEFrameworkAdapter
 
@@ -26,7 +26,7 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         time_budget_s: int,
         random_state: int,
         n_jobs: int = -1,
-        max_depth: int = 2,
+        max_depth: int = 1,
         **framework_kwargs,
     ):
         super().__init__(task, time_budget_s, random_state, n_jobs, **framework_kwargs)
@@ -40,10 +40,12 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         """Attach a stable integer index column for ft's EntitySet."""
         frame = X.reset_index(drop=True).copy()
         frame.insert(0, "_bench_idx", np.arange(len(frame)))
-        # Featuretools needs no-NaN index and numeric/object-consistent dtypes.
+        # Convert categoricals back to object to prevent Pandas comparison TypeErrors
+        # ('Categoricals can only be compared if categories are the same')
+        # Featuretools (Woodwork) still automatically infers them as Categorical.
         for c in frame.columns:
-            if is_object_dtype(frame[c]):
-                frame[c] = frame[c].astype("category")
+            if isinstance(frame[c].dtype, pd.CategoricalDtype):
+                frame[c] = frame[c].astype(object)
         return frame
 
     def _dfs(self, frame: pd.DataFrame):
@@ -82,10 +84,22 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         self._valid_cols = keep
         frame = self._to_index_frame(X_train[keep])
         ft, es = self._dfs(frame)
+        
+        t_primitives = [
+            "add_numeric", "subtract_numeric", "multiply_numeric", "divide_numeric",
+            "absolute", "modulo_numeric", "square_root", "natural_logarithm",
+            "greater_than", "equal", "and", "not"
+        ]
+        if any(is_datetime64_any_dtype(frame[c]) for c in frame.columns):
+            t_primitives.extend(["year", "month", "weekday", "day", "hour", "is_weekend"])
+
         try:
             matrix, feature_defs = ft.dfs(
                 entityset=es,
                 target_dataframe_name="df",
+                ignore_columns={"df": ["_bench_idx"]},
+                trans_primitives=t_primitives,
+                groupby_trans_primitives=["cum_sum", "cum_mean", "cum_min", "cum_max", "cum_count"],
                 max_depth=self.max_depth,
                 verbose=False,
                 n_jobs=self.n_jobs,
@@ -96,6 +110,8 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
             raise
         self._feature_defs = feature_defs
         matrix = self._postprocess(matrix, fit=True)
+        if "_bench_idx" in matrix.columns:
+            matrix = matrix.drop(columns=["_bench_idx"])
         self._train_columns_fe = list(matrix.columns)
         self._n_features_after = matrix.shape[1]
         matrix.index = X_train.index
@@ -115,6 +131,8 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
             n_jobs=self.n_jobs,
         )
         matrix = self._postprocess(matrix, fit=False)
+        if "_bench_idx" in matrix.columns:
+            matrix = matrix.drop(columns=["_bench_idx"])
         # Align columns to training schema; missing columns filled with NaN
         # (XGBoost handles NaN natively via learned split directions).
         for c in self._train_columns_fe:

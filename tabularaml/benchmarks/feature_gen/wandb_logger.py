@@ -30,7 +30,6 @@ import pandas as pd
 # 1. Guard helpers
 # ---------------------------------------------------------------------------
 
-
 def _wandb_available() -> bool:
     try:
         import wandb  # noqa: F401
@@ -38,12 +37,10 @@ def _wandb_available() -> bool:
     except ImportError:
         return False
 
-
 def _wandb_enabled() -> bool:
     if os.environ.get("WANDB_DISABLED", "").lower() in ("1", "true", "yes"):
         return False
     return _wandb_available()
-
 
 def _bucket(n: int, edges=(1_000, 10_000, 50_000)) -> str:
     labels = ["<1k", "<10k", "<50k", ">=50k"]
@@ -52,31 +49,22 @@ def _bucket(n: int, edges=(1_000, 10_000, 50_000)) -> str:
             return label
     return labels[-1]
 
-
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(text).strip().lower()).strip("_") or "unknown"
-
 
 def _task_sort_key(task: Any) -> tuple[int, str]:
     task_str = str(task)
     order = {"classification": 0, "regression": 1}
     return order.get(task_str, 99), task_str
 
-
 def _label_with_task(framework: Any, task: Any) -> str:
     task_str = str(task)
     short = {"classification": "cls", "regression": "reg"}.get(task_str, task_str)
     return f"{framework} [{short}]"
 
-
-def _is_lower_better_scorer(scorer_name: Any) -> bool:
-    return str(scorer_name) in {"rmse", "categorical_crossentropy", "logloss", "mae", "mse"}
-
-
 # ---------------------------------------------------------------------------
 # 2. Per-worker helpers  (called from _worker.py subprocesses)
 # ---------------------------------------------------------------------------
-
 
 @contextmanager
 def wandb_run(
@@ -90,10 +78,6 @@ def wandb_run(
     job_type: Optional[str] = None,
     enabled: bool = True,
 ):
-    """Context manager that yields a wandb.run or None.
-
-    Always closes the run on exit even if the inner block raises.
-    """
     if not enabled or not _wandb_enabled():
         yield None
         return
@@ -120,13 +104,7 @@ def wandb_run(
         except Exception:
             pass
 
-
 def log_row(run, row: Dict[str, Any]) -> None:
-    """Write all result fields to the run summary.
-
-    Uses summary.update() (not wandb.log) so each run appears as a single
-    bar/point in W&B's comparison view rather than a flat line chart.
-    """
     if run is None:
         return
     import wandb
@@ -139,15 +117,13 @@ def log_row(run, row: Dict[str, Any]) -> None:
     except Exception:
         pass
 
-
 def log_artifact(name: str, artifact_type: str, paths: list) -> None:
-    """Attach file/dir paths as a wandb artifact on the active run."""
     if not _wandb_enabled():
         return
     import wandb
-
     if wandb.run is None:
         return
+
     artifact = wandb.Artifact(name=name, type=artifact_type)
     for p in paths:
         p = Path(p)
@@ -157,7 +133,6 @@ def log_artifact(name: str, artifact_type: str, paths: list) -> None:
             artifact.add_file(str(p))
     wandb.log_artifact(artifact)
 
-
 def derive_tags(framework: str, task: str, n_rows: int, n_cols: int) -> list:
     return [
         framework,
@@ -166,24 +141,14 @@ def derive_tags(framework: str, task: str, n_rows: int, n_cols: int) -> list:
         f"ncols_{_bucket(n_cols, edges=(20, 50, 100))}",
     ]
 
-
 # ---------------------------------------------------------------------------
 # 3. Artifact sync  (called by runner at startup)
 # ---------------------------------------------------------------------------
-
 
 def download_results_artifact(
     *, project: str, entity: Optional[str], artifact_name: str,
     out_dir: Path, alias: str = "latest",
 ) -> bool:
-    """Pull `{entity}/{project}/{artifact_name}:{alias}` into `out_dir`.
-
-    Copies every file in the artifact to out_dir (preserving basenames), so a
-    prior master.csv / raw/*.csv snapshot rehydrates on top of an empty dir.
-
-    Returns True if files were copied; False on first run or if wandb is
-    disabled. Never raises - errors are printed and the benchmark runs anyway.
-    """
     if not _wandb_enabled():
         return False
 
@@ -216,11 +181,9 @@ def download_results_artifact(
     print(f"[wandb] pulled {copied} file(s) from {qualified} into {out_dir}")
     return copied > 0
 
-
 # ---------------------------------------------------------------------------
 # 4. Orchestrator visualisation helpers + OrchestratorRun
 # ---------------------------------------------------------------------------
-
 
 _RESULTS_TABLE_COLS: List[str] = [
     "dataset_id", "task", "framework", "seed", "scorer_name",
@@ -264,12 +227,16 @@ _NUMERIC_RESULT_COLS = (
     "peak_rss_mb", "n_boost_rounds",
 )
 
-
 def _py_scalar(value: Any) -> Any:
-    if pd.isna(value):
-        return None
-    return value.item() if hasattr(value, "item") else value
-
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    value = value.item() if hasattr(value, "item") else value
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    return str(value)
 
 def _normalize_results_frame(df: pd.DataFrame) -> pd.DataFrame:
     frame = df.copy() if len(df) else pd.DataFrame(columns=_RESULTS_TABLE_COLS)
@@ -278,14 +245,16 @@ def _normalize_results_frame(df: pd.DataFrame) -> pd.DataFrame:
             frame[col] = None
     for col in _NUMERIC_RESULT_COLS:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    
+    # Safe fallback for object columns
     for col in ("task", "framework", "scorer_name", "status", "error_msg"):
-        frame[col] = frame[col].where(frame[col].notna(), None)
+        frame[col] = frame[col].replace({pd.NA: None})
+        
     return frame[_RESULTS_TABLE_COLS].sort_values(
         by=["dataset_id", "framework", "seed"],
         kind="stable",
         na_position="last",
     ).reset_index(drop=True)
-
 
 def _build_per_dataset_frame(df: pd.DataFrame) -> pd.DataFrame:
     ok = df[df["status"] == "ok"].copy()
@@ -316,7 +285,6 @@ def _build_per_dataset_frame(df: pd.DataFrame) -> pd.DataFrame:
         key=lambda s: s.map(_task_sort_key) if s.name == "task" else s,
         kind="stable",
     ).reset_index(drop=True)
-
 
 def _build_task_summary_frame(df: pd.DataFrame, per_dataset: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -366,7 +334,6 @@ def _build_task_summary_frame(df: pd.DataFrame, per_dataset: pd.DataFrame) -> pd
         na_position="last",
     ).reset_index(drop=True)
 
-
 def _build_scorer_summary_frame(per_dataset: pd.DataFrame) -> pd.DataFrame:
     if per_dataset.empty:
         return pd.DataFrame(columns=_SCORER_SUMMARY_COLS)
@@ -388,7 +355,6 @@ def _build_scorer_summary_frame(per_dataset: pd.DataFrame) -> pd.DataFrame:
         kind="stable",
     ).reset_index(drop=True)
 
-
 def _load_master_frame(master_csv: Optional[Path]) -> pd.DataFrame:
     if master_csv is None or not master_csv.exists():
         return pd.DataFrame(columns=_RESULTS_TABLE_COLS)
@@ -399,7 +365,6 @@ def _load_master_frame(master_csv: Optional[Path]) -> pd.DataFrame:
         return pd.DataFrame(columns=_RESULTS_TABLE_COLS)
     return _normalize_results_frame(raw)
 
-
 def _find_master_csv(paths: List[Path]) -> Optional[Path]:
     for p in paths:
         p = Path(p)
@@ -407,15 +372,31 @@ def _find_master_csv(paths: List[Path]) -> Optional[Path]:
             return p
     return None
 
-
-def _to_wandb_table(df: pd.DataFrame):
+def _to_wandb_table(df: pd.DataFrame, *, log_mode: Optional[str] = None):
     import wandb
-
+    kwargs: Dict[str, Any] = {"columns": list(df.columns)}
     if df.empty:
-        return wandb.Table(columns=list(df.columns))
+        if log_mode is not None:
+            try:
+                return wandb.Table(log_mode=log_mode, **kwargs)
+            except TypeError:
+                pass
+        return wandb.Table(**kwargs)
     data = [[_py_scalar(v) for v in row] for row in df.itertuples(index=False, name=None)]
-    return wandb.Table(columns=list(df.columns), data=data)
+    kwargs["data"] = data
+    if log_mode is not None:
+        try:
+            return wandb.Table(log_mode=log_mode, **kwargs)
+        except TypeError:
+            pass
+    return wandb.Table(**kwargs)
 
+def _ordered_table_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    frame = df.copy() if len(df) else pd.DataFrame(columns=columns)
+    for col in columns:
+        if col not in frame.columns:
+            frame[col] = None
+    return frame[columns].reset_index(drop=True)
 
 def _apply_figure_margins(
     fig,
@@ -426,16 +407,9 @@ def _apply_figure_margins(
     top: float,
     wspace: float = 0.2,
 ) -> None:
-    """Use explicit subplot margins for crowded dashboard figures.
-
-    The benchmark plots combine suptitles, legends, rotated tick labels, and
-    dense annotations; ``tight_layout`` is prone to emitting warnings there.
-    """
     fig.subplots_adjust(left=left, right=right, bottom=bottom, top=top, wspace=wspace)
 
-
 def log_media_placeholder(run, *, key: str, caption: str) -> None:
-    """Log a tiny placeholder image so W&B media panels have a stable key."""
     if run is None:
         return
     try:
@@ -447,180 +421,67 @@ def log_media_placeholder(run, *, key: str, caption: str) -> None:
     except Exception:
         pass
 
-
-def _build_native_plots(per_dataset: pd.DataFrame, task_summary: pd.DataFrame, scorer_summary: pd.DataFrame) -> Dict[str, Any]:
-    import wandb
-
+def _build_native_plots(
+    per_dataset: pd.DataFrame,
+    task_summary: pd.DataFrame,
+    scorer_summary: pd.DataFrame,
+    *,
+    log_mode: Optional[str] = None,
+) -> Dict[str, Any]:
     plots: Dict[str, Any] = {}
 
     if not task_summary.empty:
-        combined_task = task_summary.copy()
-        plots["results_aggregated"] = _to_wandb_table(combined_task)
-        try:
-            plots["chart_pct_improvement"] = wandb.plot.bar(
-                plots["results_aggregated"],
-                "framework_task",
-                "pct_improvement_mean",
-                title="Mean % Improvement vs No-FE by Framework / Task",
-            )
-        except Exception:
-            pass
-        try:
-            plots["chart_fit_time"] = wandb.plot.bar(
-                plots["results_aggregated"],
-                "framework_task",
-                "wall_time_total_mean",
-                title="Mean Total Runtime (s) by Framework / Task",
-            )
-        except Exception:
-            pass
-        try:
-            plots["chart_n_added"] = wandb.plot.bar(
-                plots["results_aggregated"],
-                "framework_task",
-                "n_added_mean",
-                title="Mean Features Added by Framework / Task",
-            )
-        except Exception:
-            pass
-        try:
-            plots["chart_failure_rate"] = wandb.plot.bar(
-                plots["results_aggregated"],
-                "framework_task",
-                "non_ok_rate",
-                title="Non-OK Rate by Framework / Task",
-            )
-        except Exception:
-            pass
-
+        plots["results_aggregated"] = _to_wandb_table(task_summary, log_mode=log_mode)
         for task in sorted(task_summary["task"].dropna().unique(), key=_task_sort_key):
             sub = task_summary[task_summary["task"] == task].reset_index(drop=True)
-            task_key = _slug(task)
-            table_key = f"results_by_framework_{task_key}"
-            plots[table_key] = _to_wandb_table(sub)
-            try:
-                plots[f"chart_pct_improvement_{task_key}"] = wandb.plot.bar(
-                    plots[table_key],
-                    "framework",
-                    "pct_improvement_mean",
-                    title=f"Mean % Improvement vs No-FE ({task})",
-                )
-            except Exception:
-                pass
-            try:
-                plots[f"chart_fit_time_{task_key}"] = wandb.plot.bar(
-                    plots[table_key],
-                    "framework",
-                    "wall_time_total_mean",
-                    title=f"Mean Total Runtime (s) ({task})",
-                )
-            except Exception:
-                pass
-            try:
-                plots[f"chart_n_added_{task_key}"] = wandb.plot.bar(
-                    plots[table_key],
-                    "framework",
-                    "n_added_mean",
-                    title=f"Mean Features Added ({task})",
-                )
-            except Exception:
-                pass
-            try:
-                plots[f"chart_failure_rate_{task_key}"] = wandb.plot.bar(
-                    plots[table_key],
-                    "framework",
-                    "non_ok_rate",
-                    title=f"Non-OK Rate ({task})",
-                )
-            except Exception:
-                pass
+            plots[f"results_by_framework_{_slug(task)}"] = _to_wandb_table(sub, log_mode=log_mode)
 
     if not scorer_summary.empty:
-        combined_scorer = scorer_summary.copy()
-        plots["results_by_scorer"] = _to_wandb_table(combined_scorer)
-        try:
-            plots["chart_score_holdout"] = wandb.plot.bar(
-                plots["results_by_scorer"],
-                "framework_metric",
-                "score_holdout_mean",
-                title="Mean Holdout Score by Framework / Scorer",
-            )
-        except Exception:
-            pass
+        plots["results_by_scorer"] = _to_wandb_table(scorer_summary, log_mode=log_mode)
         for scorer_name in sorted(scorer_summary["scorer_name"].dropna().unique()):
             sub = scorer_summary[scorer_summary["scorer_name"] == scorer_name].reset_index(drop=True)
-            scorer_key = _slug(scorer_name)
-            table_key = f"results_by_scorer_{scorer_key}"
-            plots[table_key] = _to_wandb_table(sub)
-            try:
-                plots[f"chart_score_holdout_{scorer_key}"] = wandb.plot.bar(
-                    plots[table_key],
-                    "framework",
-                    "score_holdout_mean",
-                    title=f"Mean Holdout Score ({scorer_name})",
-                )
-            except Exception:
-                pass
+            plots[f"results_by_scorer_{_slug(scorer_name)}"] = _to_wandb_table(sub, log_mode=log_mode)
 
     if not per_dataset.empty:
-        plots["results_per_dataset"] = _to_wandb_table(per_dataset)
-        try:
-            plots["chart_time_vs_improvement"] = wandb.plot.scatter(
-                plots["results_per_dataset"],
-                "wall_time_total_mean",
-                "pct_improvement_mean",
-                title="Runtime vs % Improvement (per dataset mean)",
-            )
-        except Exception:
-            pass
+        plots["results_per_dataset"] = _to_wandb_table(per_dataset, log_mode=log_mode)
         for task in sorted(per_dataset["task"].dropna().unique(), key=_task_sort_key):
             sub = per_dataset[per_dataset["task"] == task].reset_index(drop=True)
-            task_key = _slug(task)
-            table_key = f"results_per_dataset_{task_key}"
-            plots[table_key] = _to_wandb_table(sub)
-            try:
-                plots[f"chart_time_vs_improvement_{task_key}"] = wandb.plot.scatter(
-                    plots[table_key],
-                    "wall_time_total_mean",
-                    "pct_improvement_mean",
-                    title=f"Runtime vs % Improvement ({task})",
-                )
-            except Exception:
-                pass
+            plots[f"results_per_dataset_{_slug(task)}"] = _to_wandb_table(sub, log_mode=log_mode)
 
     return plots
 
-
 def _build_message_figure(title: str, message: str):
-    import matplotlib
+    fig = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import wandb
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import wandb
-
-    fig, ax = plt.subplots(figsize=(9, 4.5))
-    fig.patch.set_facecolor("#f7f4ef")
-    ax.set_facecolor("#fdfbf8")
-    ax.axis("off")
-    ax.text(0.5, 0.62, title, ha="center", va="center", fontsize=18, fontweight="bold", color="#1f2937")
-    ax.text(0.5, 0.38, message, ha="center", va="center", fontsize=11, color="#4b5563", wrap=True)
-    _apply_figure_margins(fig, left=0.06, right=0.94, bottom=0.08, top=0.92)
-    img = wandb.Image(fig)
-    plt.close(fig)
-    return img
-
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        fig.patch.set_facecolor("#f7f4ef")
+        ax.set_facecolor("#fdfbf8")
+        ax.axis("off")
+        ax.text(0.5, 0.62, title, ha="center", va="center", fontsize=18, fontweight="bold", color="#1f2937")
+        ax.text(0.5, 0.38, message, ha="center", va="center", fontsize=11, color="#4b5563", wrap=True)
+        _apply_figure_margins(fig, left=0.06, right=0.94, bottom=0.08, top=0.92)
+        
+        img = wandb.Image(fig)
+        return img
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
 
 def _framework_color_map(frameworks: List[str]) -> Dict[str, Any]:
     import matplotlib.pyplot as plt
-
     palette = list(plt.get_cmap("Set2").colors) + list(plt.get_cmap("tab10").colors)
     return {fw: palette[i % len(palette)] for i, fw in enumerate(sorted(frameworks))}
 
-
 def _build_pct_improvement_figure(task_summary: pd.DataFrame):
+    fig = None
     try:
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import wandb
@@ -628,8 +489,7 @@ def _build_pct_improvement_figure(task_summary: pd.DataFrame):
         if task_summary.empty or task_summary["pct_improvement_mean"].dropna().empty:
             return _build_message_figure(
                 "Feature Engineering Benchmark",
-                "No completed baseline-comparable runs yet. "
-                "The figure will appear once pct_improvement is available.",
+                "No completed baseline-comparable runs yet. The figure will appear once pct_improvement is available."
             )
 
         tasks = ["classification", "regression"]
@@ -643,6 +503,7 @@ def _build_pct_improvement_figure(task_summary: pd.DataFrame):
             ax.set_facecolor("#fffdfa")
             sub = task_summary[task_summary["task"] == task].copy()
             sub = sub.dropna(subset=["pct_improvement_mean"]).sort_values("pct_improvement_mean", ascending=False)
+            
             if sub.empty:
                 ax.axis("off")
                 ax.text(0.5, 0.5, f"No {task} data", ha="center", va="center", fontsize=13, color="#6b7280")
@@ -653,6 +514,7 @@ def _build_pct_improvement_figure(task_summary: pd.DataFrame):
             errs = sub["pct_improvement_std"].fillna(0.0).tolist()
             labels = sub["framework"].astype(str).tolist()
             bar_colors = [colors[lbl] for lbl in labels]
+            
             ax.barh(y, vals, xerr=errs, color=bar_colors, alpha=0.92, edgecolor="#374151", linewidth=0.6)
             ax.axvline(0, color="#374151", linewidth=1.0, linestyle="--")
             ax.grid(axis="x", linestyle=":", alpha=0.35)
@@ -661,43 +523,39 @@ def _build_pct_improvement_figure(task_summary: pd.DataFrame):
             ax.invert_yaxis()
             ax.set_title(task.title(), fontsize=14, fontweight="bold")
             ax.set_xlabel("Mean % improvement vs no-FE")
+            
             for idx, (_, row) in enumerate(sub.iterrows()):
                 val = float(row["pct_improvement_mean"])
                 pad = max(abs(val) * 0.02, 0.01)
                 x_text = val + pad if val >= 0 else val - pad
                 align = "left" if val >= 0 else "right"
                 ax.text(
-                    x_text,
-                    idx,
-                    f"{val:.3f}  (n={int(row['n_datasets'])})",
-                    va="center",
-                    ha=align,
-                    fontsize=9,
-                    color="#111827",
+                    x_text, idx, f"{val:.3f}  (n={int(row['n_datasets'])})",
+                    va="center", ha=align, fontsize=9, color="#111827"
                 )
 
         fig.suptitle("Feature Engineering Improvement by Task", fontsize=17, fontweight="bold", color="#111827")
         _apply_figure_margins(fig, left=0.16, right=0.98, bottom=0.12, top=0.86, wspace=0.3)
+        
         img = wandb.Image(fig)
-        plt.close(fig)
         return img
     except Exception:
         return None
-
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
 
 def _build_pareto_figure(per_dataset: pd.DataFrame):
+    fig = None
     try:
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import wandb
 
         if per_dataset.empty or per_dataset["pct_improvement_mean"].dropna().empty:
-            return _build_message_figure(
-                "Runtime vs Improvement",
-                "Pareto view will appear after the first completed dataset-level results.",
-            )
+            return _build_message_figure("Runtime vs Improvement", "Pareto view will appear after dataset-level results.")
 
         tasks = ["classification", "regression"]
         frameworks = per_dataset["framework"].dropna().astype(str).unique().tolist()
@@ -710,6 +568,7 @@ def _build_pareto_figure(per_dataset: pd.DataFrame):
             ax.set_facecolor("#fffdfa")
             sub = per_dataset[per_dataset["task"] == task].copy()
             sub = sub.dropna(subset=["wall_time_total_mean", "pct_improvement_mean"])
+            
             if sub.empty:
                 ax.axis("off")
                 ax.text(0.5, 0.5, f"No {task} data", ha="center", va="center", fontsize=13, color="#6b7280")
@@ -717,15 +576,11 @@ def _build_pareto_figure(per_dataset: pd.DataFrame):
 
             for fw, grp in sub.groupby("framework"):
                 ax.scatter(
-                    grp["wall_time_total_mean"],
-                    grp["pct_improvement_mean"],
-                    s=54,
-                    alpha=0.82,
-                    color=colors[str(fw)],
-                    edgecolors="#374151",
-                    linewidths=0.4,
-                    label=str(fw),
+                    grp["wall_time_total_mean"], grp["pct_improvement_mean"],
+                    s=54, alpha=0.82, color=colors[str(fw)],
+                    edgecolors="#374151", linewidths=0.4, label=str(fw),
                 )
+                
             ax.set_xscale("log")
             ax.axhline(0, color="#374151", linewidth=1.0, linestyle="--")
             ax.grid(True, linestyle=":", alpha=0.3)
@@ -736,28 +591,30 @@ def _build_pareto_figure(per_dataset: pd.DataFrame):
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             fig.legend(handles, labels, loc="upper center", ncol=min(5, len(labels)), frameon=False)
+            
         fig.suptitle("Pareto View: Runtime vs Improvement", fontsize=17, fontweight="bold", color="#111827")
         _apply_figure_margins(fig, left=0.08, right=0.98, bottom=0.14, top=0.82, wspace=0.14)
+        
         img = wandb.Image(fig)
-        plt.close(fig)
         return img
-    except Exception:
+    except Exception as e:
+        print(f"[wandb] Error building pareto_figure: {e}")
         return None
-
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
 
 def _build_failure_rate_figure(task_summary: pd.DataFrame):
+    fig = None
     try:
         import matplotlib
-
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import wandb
 
         if task_summary.empty:
-            return _build_message_figure(
-                "Failure and Timeout Rates",
-                "No benchmark attempts have been logged yet.",
-            )
+            return _build_message_figure("Failure and Timeout Rates", "No benchmark attempts logged yet.")
 
         tasks = ["classification", "regression"]
         frameworks = task_summary["framework"].dropna().astype(str).unique().tolist()
@@ -768,8 +625,8 @@ def _build_failure_rate_figure(task_summary: pd.DataFrame):
 
         for ax, task in zip(axes, tasks):
             ax.set_facecolor("#fffdfa")
-            sub = task_summary[task_summary["task"] == task].copy()
-            sub = sub.sort_values("non_ok_rate", ascending=False)
+            sub = task_summary[task_summary["task"] == task].copy().sort_values("non_ok_rate", ascending=False)
+            
             if sub.empty:
                 ax.axis("off")
                 ax.text(0.5, 0.5, f"No {task} data", ha="center", va="center", fontsize=13, color="#6b7280")
@@ -779,6 +636,7 @@ def _build_failure_rate_figure(task_summary: pd.DataFrame):
             vals = sub["non_ok_rate"].fillna(0.0).tolist()
             labels = sub["framework"].astype(str).tolist()
             bar_colors = [colors[lbl] for lbl in labels]
+            
             ax.bar(x, vals, color=bar_colors, alpha=0.92, edgecolor="#374151", linewidth=0.6)
             ax.set_xticks(x)
             ax.set_xticklabels(labels, rotation=20, ha="right")
@@ -786,39 +644,27 @@ def _build_failure_rate_figure(task_summary: pd.DataFrame):
             ax.grid(axis="y", linestyle=":", alpha=0.35)
             ax.set_title(task.title(), fontsize=14, fontweight="bold")
             ax.set_ylabel("Non-OK rate")
+            
             for idx, (_, row) in enumerate(sub.iterrows()):
                 rate = float(row["non_ok_rate"])
                 ax.text(
-                    idx,
-                    rate + 0.01,
-                    f"{rate:.1%}\n{int(row['n_non_ok_runs'])}/{int(row['n_attempts'])}",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8.5,
-                    color="#111827",
+                    idx, rate + 0.01, f"{rate:.1%}\n{int(row['n_non_ok_runs'])}/{int(row['n_attempts'])}",
+                    ha="center", va="bottom", fontsize=8.5, color="#111827",
                 )
 
         fig.suptitle("Crash / Timeout / Unsupported Rate by Task", fontsize=17, fontweight="bold", color="#111827")
         _apply_figure_margins(fig, left=0.08, right=0.98, bottom=0.24, top=0.85, wspace=0.18)
+        
         img = wandb.Image(fig)
-        plt.close(fig)
         return img
     except Exception:
         return None
-
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
 
 class OrchestratorRun:
-    """Long-lived wandb run owned by the benchmark orchestrator.
-
-    Responsibilities:
-    - Upload versioned `{artifact_name}` artifacts (master.csv + raw/*.csv)
-      so results survive ephemeral environments (HF Spaces, Colab, Vast.ai).
-    - Build all benchmark charts from the authoritative `master.csv`, not just
-      rows seen in the current process, so resumed runs stay accurate.
-
-    Per-(dataset, framework, seed) runs are independent and spawned by workers.
-    """
-
     def __init__(
         self,
         *,
@@ -833,23 +679,25 @@ class OrchestratorRun:
         self.enabled = bool(enabled and _wandb_enabled())
         self._run = None
         self._last_push = 0.0
+        self._report_step = 0
+        self._pending_rows: List[Dict[str, Any]] = []
+        self._live_results_table = None
 
     def __enter__(self):
         if not self.enabled:
             return self
         try:
             import wandb
-
             self._run = wandb.init(
                 project=self.project,
                 entity=self.entity,
-                id=self.artifact_name,  # Unified orchestrator ID per artifact
+                id=self.artifact_name,
                 resume="allow",
                 name="orchestrator",
                 job_type="orchestrator",
                 tags=["orchestrator", "benchmark"],
                 reinit=True,
-                settings=wandb.Settings(start_method="thread"),
+                settings=wandb.Settings(start_method="thread", init_timeout=300),
             )
         except Exception as e:
             print(f"[wandb] orchestrator init failed; artifact sync disabled: {e}")
@@ -860,35 +708,99 @@ class OrchestratorRun:
         if self._run is not None:
             try:
                 import wandb
-
                 wandb.finish()
             except Exception:
                 pass
         return False
 
     def append_result(self, row: dict) -> None:
-        """Compatibility no-op.
+        self._pending_rows.append(dict(row))
 
-        Reporting is rebuilt from master.csv on every push so resumed sessions
-        and fresh orchestrator processes show the same benchmark state.
-        """
-        del row
-        return None
+    def _result_columns(self) -> List[str]:
+        return _RESULTS_TABLE_COLS
+
+    def _load_per_run_frame(self, master_csv: Optional[Path]) -> pd.DataFrame:
+        return _load_master_frame(master_csv)
+
+    def _build_extra_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        del snapshot
+        return {}
+
+    def _build_snapshot(self, master_csv: Optional[Path]) -> Dict[str, Any]:
+        per_run_df = self._load_per_run_frame(master_csv)
+        per_dataset_df = _build_per_dataset_frame(per_run_df)
+        task_summary_df = _build_task_summary_frame(per_run_df, per_dataset_df)
+        scorer_summary_df = _build_scorer_summary_frame(per_dataset_df)
+        snapshot: Dict[str, Any] = {
+            "per_run_df": per_run_df,
+            "per_dataset_df": per_dataset_df,
+            "task_summary_df": task_summary_df,
+            "scorer_summary_df": scorer_summary_df,
+        }
+        snapshot.update(self._build_extra_snapshot(snapshot))
+        return snapshot
+
+    def _build_metrics(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        per_run_df = snapshot["per_run_df"]
+        per_dataset_df = snapshot["per_dataset_df"]
+        task_summary_df = snapshot["task_summary_df"]
+        return {
+            "n_rows_total": int(len(per_run_df)),
+            "n_ok_rows": int((per_run_df["status"] == "ok").sum()) if not per_run_df.empty else 0,
+            "n_framework_task_pairs": int(len(task_summary_df)),
+            "n_dataset_framework_rows": int(len(per_dataset_df)),
+        }
+
+    def _build_table_payload(self, snapshot: Dict[str, Any], *, log_mode: Optional[str], include_results: bool) -> Dict[str, Any]:
+        payload = _build_native_plots(
+            snapshot["per_dataset_df"],
+            snapshot["task_summary_df"],
+            snapshot["scorer_summary_df"],
+            log_mode=log_mode,
+        )
+        if include_results:
+            ordered = _ordered_table_frame(snapshot["per_run_df"], self._result_columns())
+            payload["results"] = _to_wandb_table(ordered, log_mode=log_mode)
+            payload["results_per_run"] = _to_wandb_table(ordered, log_mode=log_mode)
+        return payload
+
+    def _build_figure_payload(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        pct_fig = _build_pct_improvement_figure(snapshot["task_summary_df"])
+        if pct_fig is not None:
+            payload["figure_pct_improvement"] = pct_fig
+
+        pareto_fig = _build_pareto_figure(snapshot["per_dataset_df"])
+        if pareto_fig is not None:
+            payload["figure_runtime_vs_improvement"] = pareto_fig
+
+        failure_fig = _build_failure_rate_figure(snapshot["task_summary_df"])
+        if failure_fig is not None:
+            payload["figure_failure_rate"] = failure_fig
+        return payload
+
+    def _refresh_live_results_table(self, snapshot: Dict[str, Any]):
+        ordered = _ordered_table_frame(snapshot["per_run_df"], self._result_columns())
+        if self._live_results_table is None:
+            if ordered.empty:
+                return None
+            self._live_results_table = _to_wandb_table(ordered, log_mode="INCREMENTAL")
+            return self._live_results_table
+
+        for row in self._pending_rows:
+            values = [_py_scalar(row.get(col)) for col in self._result_columns()]
+            self._live_results_table.add_data(*values)
+        return self._live_results_table
 
     def push(self, paths: List[Path], *, force: bool = False, min_interval_s: float = 30.0) -> bool:
-        """Upload a versioned artifact and refresh all charts/tables.
-
-        Debounced - no-ops if the last push was within `min_interval_s`
-        unless `force=True`.
-        """
         if not self.enabled or self._run is None:
             return False
         now = time.time()
         if not force and (now - self._last_push) < min_interval_s:
             return False
+            
         try:
             import wandb
-
             artifact = wandb.Artifact(name=self.artifact_name, type="benchmark_results")
             for p in paths:
                 p = Path(p)
@@ -899,46 +811,30 @@ class OrchestratorRun:
             wandb.log_artifact(artifact)
 
             master_csv = _find_master_csv(paths)
-            per_run_df = _load_master_frame(master_csv)
-            per_dataset_df = _build_per_dataset_frame(per_run_df)
-            task_summary_df = _build_task_summary_frame(per_run_df, per_dataset_df)
-            scorer_summary_df = _build_scorer_summary_frame(per_dataset_df)
+            snapshot = self._build_snapshot(master_csv)
+            log_dict: Dict[str, Any] = {}
+            log_dict.update(self._build_table_payload(snapshot, log_mode="MUTABLE", include_results=False))
+            log_dict.update(self._build_figure_payload(snapshot))
 
-            log_dict: Dict[str, Any] = {
-                "results": _to_wandb_table(per_run_df),
-                "results_per_run": _to_wandb_table(per_run_df),
-                **_build_native_plots(per_dataset_df, task_summary_df, scorer_summary_df),
-            }
+            live_results = self._refresh_live_results_table(snapshot)
+            if live_results is not None:
+                log_dict["results_live"] = live_results
 
-            pct_fig = _build_pct_improvement_figure(task_summary_df)
-            if pct_fig is not None:
-                log_dict["figure_pct_improvement"] = pct_fig
+            if force:
+                log_dict.update(self._build_table_payload(snapshot, log_mode="IMMUTABLE", include_results=True))
 
-            pareto_fig = _build_pareto_figure(per_dataset_df)
-            if pareto_fig is not None:
-                log_dict["figure_runtime_vs_improvement"] = pareto_fig
+            metrics = self._build_metrics(snapshot)
+            log_dict.update(metrics)
 
-            failure_fig = _build_failure_rate_figure(task_summary_df)
-            if failure_fig is not None:
-                log_dict["figure_failure_rate"] = failure_fig
-
-            # Tables, charts, and images must go to summary (not log) so panels
-            # always display the latest value. wandb.run.log() appends history
-            # steps; after ~100 pushes the media panels stop rendering.
-            media_dict = {k: v for k, v in log_dict.items() if not isinstance(v, (int, float))}
-            scalar_dict = {k: v for k, v in log_dict.items() if isinstance(v, (int, float))}
-            self._run.summary.update(media_dict)
-            if scalar_dict:
-                self._run.log(scalar_dict)
-            self._run.summary.update({
-                "n_rows_total": int(len(per_run_df)),
-                "n_ok_rows": int((per_run_df["status"] == "ok").sum()) if not per_run_df.empty else 0,
-                "n_framework_task_pairs": int(len(task_summary_df)),
-                "n_dataset_framework_rows": int(len(per_dataset_df)),
-            })
+            self._report_step += 1
+            self._run.log(log_dict, step=self._report_step)
+            self._run.summary.update(metrics)
 
             self._last_push = now
+            if self._pending_rows:
+                self._pending_rows.clear()
             return True
         except Exception as e:
+            self._live_results_table = None
             print(f"[wandb] artifact push failed: {e}")
             return False
