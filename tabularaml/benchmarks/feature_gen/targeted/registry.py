@@ -268,14 +268,16 @@ CTR23_REGRESSION: list[DatasetSpec] = [
 
 # ---------------------------------------------------------------------------
 # Smoke Test — Tiny datasets for fast cloud pipeline verification.
+# Contains a mix of all task types (classification, regression, multiclass)
+# and sources (openml_task, pmlb) to verify API integrations.
 # ---------------------------------------------------------------------------
 SMOKE_TEST: list[DatasetSpec] = [
     DatasetSpec("breast_cancer", "breast-cancer", "pmlb", "classification", "smoke_test", 
-                rationale="Tiny classification dataset for fast CI/Cloud tests"),
+                rationale="Tests PMLB integration (classification)"),
     DatasetSpec("361618", "forest_fires", "openml_task", "regression", "smoke_test", 
-                rationale="Tiny regression dataset (517 rows)"),
-    DatasetSpec("mfeat_factors", "mfeat-factors", "pmlb", "multiclass", "smoke_test", 
-                rationale="Small multiclass dataset"),
+                rationale="Tests OpenML CTR23 integration (regression)"),
+    DatasetSpec("23", "cmc", "openml_task", "multiclass", "smoke_test", 
+                rationale="Tests OpenML AMLB integration (multiclass)"),
 ]
 
 
