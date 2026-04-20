@@ -220,7 +220,7 @@ _SCORER_SUMMARY_COLS: List[str] = [
 ]
 
 _NUMERIC_RESULT_COLS = (
-    "dataset_id", "seed", "score_holdout", "score_nofe_same_seed", "pct_improvement",
+    "seed", "score_holdout", "score_nofe_same_seed", "pct_improvement",
     "n_train", "n_test",
     "n_features_before", "n_features_after", "n_added",
     "wall_time_fit", "wall_time_transform", "wall_time_total",
@@ -246,6 +246,9 @@ def _normalize_results_frame(df: pd.DataFrame) -> pd.DataFrame:
     for col in _NUMERIC_RESULT_COLS:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
     
+    if "dataset_id" in frame.columns:
+        frame["dataset_id"] = frame["dataset_id"].astype(str)
+        
     # Safe fallback for object columns
     for col in ("task", "framework", "scorer_name", "status", "error_msg"):
         frame[col] = frame[col].replace({pd.NA: None})
@@ -359,7 +362,7 @@ def _load_master_frame(master_csv: Optional[Path]) -> pd.DataFrame:
     if master_csv is None or not master_csv.exists():
         return pd.DataFrame(columns=_RESULTS_TABLE_COLS)
     try:
-        raw = pd.read_csv(master_csv)
+        raw = pd.read_csv(master_csv, dtype={"dataset_id": str})
     except Exception as e:
         print(f"[wandb] failed to read master.csv for reporting: {e}")
         return pd.DataFrame(columns=_RESULTS_TABLE_COLS)

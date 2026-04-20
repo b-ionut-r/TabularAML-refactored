@@ -248,7 +248,7 @@ def _load_master_frame_targeted(master_csv: Optional[Path]) -> pd.DataFrame:
     if master_csv is None or not master_csv.exists():
         return pd.DataFrame(columns=_TARGETED_RESULT_COLUMNS)
     try:
-        df = pd.read_csv(master_csv)
+        df = pd.read_csv(master_csv, dtype={"dataset_id": str})
     except Exception as e:
         print(f"[wandb] failed to read targeted master.csv: {e}")
         return pd.DataFrame(columns=_TARGETED_RESULT_COLUMNS)
@@ -267,6 +267,10 @@ def _load_master_frame_targeted(master_csv: Optional[Path]) -> pd.DataFrame:
     for col in ("dataset_name", "dataset_source", "suite", "task", "framework", "scorer_name", "status", "error_msg"):
         if col in df.columns:
             df[col] = df[col].replace({pd.NA: None})
+            
+    if "dataset_id" in df.columns:
+        df["dataset_id"] = df["dataset_id"].astype(str)
+
     return df[_TARGETED_RESULT_COLUMNS].sort_values(
         by=["suite", "task", "dataset_id", "framework", "seed"],
         kind="stable",
