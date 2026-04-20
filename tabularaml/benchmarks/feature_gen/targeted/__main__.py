@@ -5,7 +5,7 @@ Usage::
     python -m tabularaml.benchmarks.feature_gen.targeted \\
         --suite amlb \\
         --frameworks nofe tabularaml openfe autofeat featuretools \\
-        --seeds 0 1 2 \\
+        --seeds 0 1 2 3 4 \
         --n-workers 4 \\
         --time-budget 600 \\
         --results-dir ./results/targeted/amlb \\
@@ -44,7 +44,7 @@ def _parse(argv=None) -> argparse.Namespace:
         help="Feature engineering frameworks to evaluate.",
     )
     p.add_argument(
-        "--seeds", nargs="+", type=int, default=[0, 1, 2],
+        "--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4],
         metavar="SEED",
         help="Random seeds for train/test splits.",
     )

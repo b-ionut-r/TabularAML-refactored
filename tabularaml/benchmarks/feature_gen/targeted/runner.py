@@ -45,7 +45,7 @@ class TargetedRunSpec:
     rationale: str
     framework: str
     seed: int
-    time_budget_s: int = 600
+    time_budget_s: int = 1200
     n_jobs: int = -1
     mode: str = "medium"
     framework_kwargs: dict = field(default_factory=dict)
@@ -113,7 +113,7 @@ class TargetedBenchmarkRunner:
         frameworks: Sequence[str],
         seeds: Sequence[int],
         results_dir: Path,
-        time_budget_s: int = 600,
+        time_budget_s: int = 1200,
         n_workers: int = 4,
         tabularaml_mode: str = "medium",
         wandb_project: str = "tabularaml-targeted-benchmark",
