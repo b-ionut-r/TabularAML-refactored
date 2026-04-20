@@ -219,14 +219,13 @@ class TargetedOrchestratorRun(OrchestratorRun):
             )
         }
 
-    def _build_table_payload(self, snapshot: Dict[str, Any], *, log_mode: Optional[str], include_results: bool) -> Dict[str, Any]:
-        payload = super()._build_table_payload(snapshot, log_mode=log_mode, include_results=False)
-        payload["results_task_summary"] = _to_wandb_table(snapshot["task_summary_df"], log_mode=log_mode)
-        payload["results_suite_summary"] = _to_wandb_table(snapshot["suite_summary_df"], log_mode=log_mode)
-        if include_results:
+    def _build_table_payload(self, snapshot: Dict[str, Any], *, final: bool = False) -> Dict[str, Any]:
+        payload = super()._build_table_payload(snapshot, final=False)
+        payload["results_task_summary"] = _to_wandb_table(snapshot["task_summary_df"])
+        payload["results_suite_summary"] = _to_wandb_table(snapshot["suite_summary_df"])
+        if final:
             ordered = snapshot["per_run_df"].reindex(columns=self._result_columns())
-            payload["results"] = _to_wandb_table(ordered, log_mode=log_mode)
-            payload["results_per_run"] = _to_wandb_table(ordered, log_mode=log_mode)
+            payload["results_per_run"] = _to_wandb_table(ordered)
         return payload
 
     def _build_figure_payload(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:

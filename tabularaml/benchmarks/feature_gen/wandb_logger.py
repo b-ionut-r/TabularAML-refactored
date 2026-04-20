@@ -207,6 +207,7 @@ _PER_DATASET_TABLE_COLS: List[str] = [
 _TASK_SUMMARY_COLS: List[str] = [
     "framework", "task", "framework_task",
     "n_datasets", "n_attempts", "n_ok_runs", "n_non_ok_runs", "non_ok_rate",
+    "win_rate",
     "pct_improvement_mean", "pct_improvement_median", "pct_improvement_std",
     "wall_time_fit_mean", "wall_time_total_mean",
     "peak_rss_mb_mean", "n_added_mean", "n_seeds_mean",
@@ -316,10 +317,19 @@ def _build_task_summary_frame(df: pd.DataFrame, per_dataset: pd.DataFrame) -> pd
             n_added_mean=("n_added_mean", "mean"),
             n_seeds_mean=("n_seeds", "mean"),
         )
+        win_rate_s = (
+            per_dataset.dropna(subset=["pct_improvement_mean"])
+            .groupby(["framework", "task"])["pct_improvement_mean"]
+            .apply(lambda s: float((s > 0).sum()) / len(s) if len(s) > 0 else float("nan"))
+            .rename("win_rate")
+            .reset_index()
+        )
+        agg = agg.merge(win_rate_s, on=["framework", "task"], how="left")
         summary = summary.merge(agg, on=["framework", "task"], how="left")
     else:
         for col in (
-            "n_datasets", "pct_improvement_mean", "pct_improvement_median",
+            "n_datasets", "win_rate",
+            "pct_improvement_mean", "pct_improvement_median",
             "pct_improvement_std", "wall_time_fit_mean", "wall_time_total_mean",
             "peak_rss_mb_mean", "n_added_mean", "n_seeds_mean",
         ):
@@ -375,24 +385,13 @@ def _find_master_csv(paths: List[Path]) -> Optional[Path]:
             return p
     return None
 
-def _to_wandb_table(df: pd.DataFrame, *, log_mode: Optional[str] = None):
+def _to_wandb_table(df: pd.DataFrame):
     import wandb
-    kwargs: Dict[str, Any] = {"columns": list(df.columns)}
+    columns = list(df.columns)
     if df.empty:
-        if log_mode is not None:
-            try:
-                return wandb.Table(log_mode=log_mode, **kwargs)
-            except TypeError:
-                pass
-        return wandb.Table(**kwargs)
+        return wandb.Table(columns=columns)
     data = [[_py_scalar(v) for v in row] for row in df.itertuples(index=False, name=None)]
-    kwargs["data"] = data
-    if log_mode is not None:
-        try:
-            return wandb.Table(log_mode=log_mode, **kwargs)
-        except TypeError:
-            pass
-    return wandb.Table(**kwargs)
+    return wandb.Table(columns=columns, data=data)
 
 def _ordered_table_frame(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     frame = df.copy() if len(df) else pd.DataFrame(columns=columns)
@@ -428,28 +427,26 @@ def _build_native_plots(
     per_dataset: pd.DataFrame,
     task_summary: pd.DataFrame,
     scorer_summary: pd.DataFrame,
-    *,
-    log_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     plots: Dict[str, Any] = {}
 
     if not task_summary.empty:
-        plots["results_aggregated"] = _to_wandb_table(task_summary, log_mode=log_mode)
+        plots["results_aggregated"] = _to_wandb_table(task_summary)
         for task in sorted(task_summary["task"].dropna().unique(), key=_task_sort_key):
             sub = task_summary[task_summary["task"] == task].reset_index(drop=True)
-            plots[f"results_by_framework_{_slug(task)}"] = _to_wandb_table(sub, log_mode=log_mode)
+            plots[f"results_by_framework_{_slug(task)}"] = _to_wandb_table(sub)
 
     if not scorer_summary.empty:
-        plots["results_by_scorer"] = _to_wandb_table(scorer_summary, log_mode=log_mode)
+        plots["results_by_scorer"] = _to_wandb_table(scorer_summary)
         for scorer_name in sorted(scorer_summary["scorer_name"].dropna().unique()):
             sub = scorer_summary[scorer_summary["scorer_name"] == scorer_name].reset_index(drop=True)
-            plots[f"results_by_scorer_{_slug(scorer_name)}"] = _to_wandb_table(sub, log_mode=log_mode)
+            plots[f"results_by_scorer_{_slug(scorer_name)}"] = _to_wandb_table(sub)
 
     if not per_dataset.empty:
-        plots["results_per_dataset"] = _to_wandb_table(per_dataset, log_mode=log_mode)
+        plots["results_per_dataset"] = _to_wandb_table(per_dataset)
         for task in sorted(per_dataset["task"].dropna().unique(), key=_task_sort_key):
             sub = per_dataset[per_dataset["task"] == task].reset_index(drop=True)
-            plots[f"results_per_dataset_{_slug(task)}"] = _to_wandb_table(sub, log_mode=log_mode)
+            plots[f"results_per_dataset_{_slug(task)}"] = _to_wandb_table(sub)
 
     return plots
 
@@ -657,7 +654,7 @@ def _build_failure_rate_figure(task_summary: pd.DataFrame):
 
         fig.suptitle("Crash / Timeout / Unsupported Rate by Task", fontsize=17, fontweight="bold", color="#111827")
         _apply_figure_margins(fig, left=0.08, right=0.98, bottom=0.24, top=0.85, wspace=0.18)
-        
+
         img = wandb.Image(fig)
         return img
     except Exception:
@@ -666,6 +663,318 @@ def _build_failure_rate_figure(task_summary: pd.DataFrame):
         if fig is not None:
             import matplotlib.pyplot as plt
             plt.close(fig)
+
+def _build_win_rate_figure(task_summary: pd.DataFrame):
+    """Bar chart: fraction of datasets where FE beat no-FE, per framework and task."""
+    fig = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import wandb
+
+        if task_summary.empty or "win_rate" not in task_summary.columns or task_summary["win_rate"].dropna().empty:
+            return None
+
+        tasks = ["classification", "regression"]
+        frameworks = task_summary["framework"].dropna().astype(str).unique().tolist()
+        colors = _framework_color_map(frameworks)
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.8), sharey=True)
+        fig.patch.set_facecolor("#fbf8f3")
+
+        for ax, task in zip(axes, tasks):
+            ax.set_facecolor("#fffdfa")
+            sub = task_summary[task_summary["task"] == task].copy()
+            sub = sub.dropna(subset=["win_rate"]).sort_values("win_rate", ascending=False)
+
+            if sub.empty:
+                ax.axis("off")
+                ax.text(0.5, 0.5, f"No {task} data", ha="center", va="center", fontsize=13, color="#6b7280")
+                continue
+
+            y = list(range(len(sub)))
+            vals = (sub["win_rate"] * 100).tolist()
+            labels = sub["framework"].astype(str).tolist()
+            bar_colors = [colors[lbl] for lbl in labels]
+
+            ax.barh(y, vals, color=bar_colors, alpha=0.92, edgecolor="#374151", linewidth=0.6)
+            ax.axvline(50, color="#374151", linewidth=1.0, linestyle="--")
+            ax.set_xlim(0, 110)
+            ax.grid(axis="x", linestyle=":", alpha=0.35)
+            ax.set_yticks(y)
+            ax.set_yticklabels(labels)
+            ax.invert_yaxis()
+            ax.set_title(task.title(), fontsize=14, fontweight="bold")
+            ax.set_xlabel("Win rate (% datasets FE > no-FE)")
+
+            for idx, (_, row) in enumerate(sub.iterrows()):
+                val = float(row["win_rate"]) * 100
+                n = int(row["n_datasets"]) if pd.notna(row.get("n_datasets")) else "?"
+                ax.text(
+                    min(val + 1.5, 108), idx, f"{val:.0f}%  (n={n})",
+                    va="center", ha="left", fontsize=9, color="#111827",
+                )
+
+        fig.suptitle("Win Rate: Datasets Where Feature Engineering Helped", fontsize=16, fontweight="bold", color="#111827")
+        _apply_figure_margins(fig, left=0.16, right=0.98, bottom=0.12, top=0.86, wspace=0.3)
+
+        img = wandb.Image(fig)
+        return img
+    except Exception:
+        return None
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+
+
+def _build_score_distribution_figure(per_dataset: pd.DataFrame):
+    """Box plot of holdout scores per framework, using only the dominant scorer per task.
+
+    Scores are only comparable within the same scorer, so we filter to the
+    most-common scorer_name per task before plotting.
+    """
+    fig = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import wandb
+
+        if per_dataset.empty or per_dataset["score_holdout_mean"].dropna().empty:
+            return _build_message_figure("Score Distribution", "No score data available yet.")
+
+        tasks = ["classification", "regression"]
+        frameworks = per_dataset["framework"].dropna().astype(str).unique().tolist()
+        colors = _framework_color_map(frameworks)
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.8))
+        fig.patch.set_facecolor("#fbf8f3")
+
+        for ax, task in zip(axes, tasks):
+            ax.set_facecolor("#fffdfa")
+            task_sub = per_dataset[per_dataset["task"] == task].dropna(subset=["score_holdout_mean"])
+
+            if task_sub.empty:
+                ax.axis("off")
+                ax.text(0.5, 0.5, f"No {task} data", ha="center", va="center", fontsize=13, color="#6b7280")
+                continue
+
+            # Find the dominant scorer so absolute values are comparable
+            dominant_scorer = (
+                task_sub["scorer_name"].value_counts().idxmax()
+                if "scorer_name" in task_sub.columns else None
+            )
+            if dominant_scorer:
+                sub = task_sub[task_sub["scorer_name"] == dominant_scorer]
+            else:
+                sub = task_sub
+
+            fw_order = (
+                sub.groupby("framework")["score_holdout_mean"]
+                .median()
+                .sort_values(ascending=False)
+                .index.tolist()
+            )
+            box_data = [sub[sub["framework"] == fw]["score_holdout_mean"].dropna().tolist() for fw in fw_order]
+
+            bp = ax.boxplot(box_data, patch_artist=True, notch=False, vert=True)
+            for patch, fw in zip(bp["boxes"], fw_order):
+                patch.set_facecolor(colors.get(str(fw), "#4b5563"))
+                patch.set_alpha(0.85)
+            for element in bp["whiskers"] + bp["caps"]:
+                element.set_color("#374151")
+                element.set_linewidth(1.2)
+            for median in bp["medians"]:
+                median.set_color("#111827")
+                median.set_linewidth(2.0)
+            for flier in bp["fliers"]:
+                flier.set(marker=".", markerfacecolor="#374151", alpha=0.5, markersize=5)
+
+            ax.set_xticks(range(1, len(fw_order) + 1))
+            ax.set_xticklabels(fw_order, rotation=20, ha="right")
+            ax.grid(axis="y", linestyle=":", alpha=0.35)
+            scorer_label = f" ({dominant_scorer})" if dominant_scorer else ""
+            ax.set_title(f"{task.title()}{scorer_label}", fontsize=13, fontweight="bold")
+            ax.set_ylabel("Holdout score")
+
+        fig.suptitle("Score Distribution by Framework (dominant scorer per task)", fontsize=15, fontweight="bold", color="#111827")
+        _apply_figure_margins(fig, left=0.08, right=0.98, bottom=0.22, top=0.86, wspace=0.25)
+
+        img = wandb.Image(fig)
+        return img
+    except Exception as e:
+        print(f"[wandb] Error building score_distribution_figure: {e}")
+        return None
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+
+
+def _build_per_dataset_improvement_figure(per_dataset: pd.DataFrame, *, top_n: int = 40):
+    """Strip chart of per-dataset pct_improvement per framework.
+
+    The single most informative benchmark plot: shows exactly which datasets
+    each framework helps or hurts, with all frameworks overlaid as colored dots.
+    Datasets are sorted by mean improvement across frameworks (ascending),
+    capped at top_n most-affected datasets to keep the figure readable.
+    """
+    fig = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import wandb
+
+        # Exclude nofe — it's 0 by definition and clutters the chart
+        sub_all = per_dataset[per_dataset["framework"] != "nofe"].copy()
+        sub_all = sub_all.dropna(subset=["pct_improvement_mean"])
+        if sub_all.empty:
+            return None
+
+        tasks = [t for t in ["classification", "regression"] if t in sub_all["task"].values]
+        if not tasks:
+            return None
+
+        frameworks = sorted(sub_all["framework"].dropna().astype(str).unique())
+        colors = _framework_color_map(frameworks)
+        n_tasks = len(tasks)
+
+        fig, axes = plt.subplots(1, n_tasks, figsize=(8 * n_tasks, max(6, top_n * 0.22)))
+        if n_tasks == 1:
+            axes = [axes]
+        fig.patch.set_facecolor("#fbf8f3")
+
+        for ax, task in zip(axes, tasks):
+            ax.set_facecolor("#fffdfa")
+            sub = sub_all[sub_all["task"] == task].copy()
+
+            # Rank datasets by mean pct_improvement across frameworks
+            ds_means = (
+                sub.groupby("dataset_id")["pct_improvement_mean"].mean().sort_values(ascending=True)
+            )
+            if len(ds_means) > top_n:
+                keep = ds_means.abs().nlargest(top_n).index
+                ds_means = ds_means[keep].sort_values(ascending=True)
+
+            ds_ids = ds_means.index.tolist()
+            ds_y = {ds: i for i, ds in enumerate(ds_ids)}
+
+            for fw in frameworks:
+                fw_sub = sub[sub["framework"] == fw].set_index("dataset_id")
+                xs, ys = [], []
+                for ds in ds_ids:
+                    if ds in fw_sub.index:
+                        xs.append(float(fw_sub.loc[ds, "pct_improvement_mean"]))
+                        ys.append(ds_y[ds])
+                if xs:
+                    ax.scatter(xs, ys, s=40, alpha=0.85, color=colors.get(fw, "#6b7280"),
+                               edgecolors="#374151", linewidths=0.3, label=fw, zorder=3)
+
+            ax.axvline(0, color="#374151", linewidth=1.2, linestyle="--", alpha=0.7)
+            ax.grid(axis="x", linestyle=":", alpha=0.3)
+
+            # Show dataset IDs on y-axis (truncated to keep compact)
+            ax.set_yticks(range(len(ds_ids)))
+            ax.set_yticklabels([str(d)[:22] for d in ds_ids], fontsize=7.5)
+            ax.set_xlabel("Mean % improvement vs no-FE")
+            ax.set_title(task.title(), fontsize=14, fontweight="bold")
+
+            handles, lbls = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(handles, lbls, loc="lower right", fontsize=9, frameon=True, framealpha=0.85)
+
+        n_total = sub_all["dataset_id"].nunique()
+        shown = len(ds_means)
+        note = f"top {shown} by |improvement|" if n_total > top_n else f"all {n_total} datasets"
+        fig.suptitle(f"Per-Dataset Improvement by Framework ({note})", fontsize=15, fontweight="bold", color="#111827")
+        fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+        img = wandb.Image(fig)
+        return img
+    except Exception as e:
+        print(f"[wandb] Error building per_dataset_improvement_figure: {e}")
+        return None
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+
+
+def _build_features_added_figure(task_summary: pd.DataFrame):
+    """Bar chart: mean features added per framework, annotated with mean % improvement."""
+    fig = None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import wandb
+
+        if task_summary.empty or "n_added_mean" not in task_summary.columns:
+            return None
+        ts = task_summary.dropna(subset=["n_added_mean"])
+        if ts[ts["framework"] != "nofe"].empty:
+            return None
+
+        tasks = ["classification", "regression"]
+        frameworks = ts["framework"].dropna().astype(str).unique().tolist()
+        colors = _framework_color_map(frameworks)
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.2))
+        fig.patch.set_facecolor("#fbf8f3")
+
+        for ax, task in zip(axes, tasks):
+            ax.set_facecolor("#fffdfa")
+            sub = (
+                ts[(ts["task"] == task) & (ts["framework"] != "nofe")]
+                .dropna(subset=["n_added_mean"])
+                .sort_values("n_added_mean", ascending=False)
+            )
+            if sub.empty:
+                ax.axis("off")
+                ax.text(0.5, 0.5, f"No {task} data", ha="center", va="center", fontsize=13, color="#6b7280")
+                continue
+
+            x = list(range(len(sub)))
+            vals = sub["n_added_mean"].tolist()
+            labels = sub["framework"].astype(str).tolist()
+            bar_colors = [colors.get(lbl, "#6b7280") for lbl in labels]
+
+            bars = ax.bar(x, vals, color=bar_colors, alpha=0.88, edgecolor="#374151", linewidth=0.6)
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=20, ha="right")
+            ax.grid(axis="y", linestyle=":", alpha=0.35)
+            ax.set_ylabel("Mean features added")
+            ax.set_title(task.title(), fontsize=14, fontweight="bold")
+
+            for bar, (_, row) in zip(bars, sub.iterrows()):
+                h = bar.get_height()
+                pct = row.get("pct_improvement_mean")
+                label = f"{h:.1f}"
+                if pd.notna(pct):
+                    sign = "+" if pct >= 0 else ""
+                    label += f"\n({sign}{pct:.3f}%)"
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    h + max(h * 0.02, 0.3),
+                    label, ha="center", va="bottom", fontsize=8.5, color="#111827",
+                )
+
+        fig.suptitle("Mean Features Added per Framework (with mean % improvement)", fontsize=15, fontweight="bold", color="#111827")
+        _apply_figure_margins(fig, left=0.08, right=0.98, bottom=0.22, top=0.86, wspace=0.28)
+
+        img = wandb.Image(fig)
+        return img
+    except Exception as e:
+        print(f"[wandb] Error building features_added_figure: {e}")
+        return None
+    finally:
+        if fig is not None:
+            import matplotlib.pyplot as plt
+            plt.close(fig)
+
 
 class OrchestratorRun:
     def __init__(
@@ -684,7 +993,6 @@ class OrchestratorRun:
         self._last_push = 0.0
         self._report_step = 0
         self._pending_rows: List[Dict[str, Any]] = []
-        self._live_results_table = None
 
     def __enter__(self):
         if not self.enabled:
@@ -754,46 +1062,51 @@ class OrchestratorRun:
             "n_dataset_framework_rows": int(len(per_dataset_df)),
         }
 
-    def _build_table_payload(self, snapshot: Dict[str, Any], *, log_mode: Optional[str], include_results: bool) -> Dict[str, Any]:
+    def _build_table_payload(self, snapshot: Dict[str, Any], *, final: bool = False) -> Dict[str, Any]:
         payload = _build_native_plots(
             snapshot["per_dataset_df"],
             snapshot["task_summary_df"],
             snapshot["scorer_summary_df"],
-            log_mode=log_mode,
         )
-        if include_results:
+        if final:
             ordered = _ordered_table_frame(snapshot["per_run_df"], self._result_columns())
-            payload["results"] = _to_wandb_table(ordered, log_mode=log_mode)
-            payload["results_per_run"] = _to_wandb_table(ordered, log_mode=log_mode)
+            payload["results_per_run"] = _to_wandb_table(ordered)
         return payload
 
     def _build_figure_payload(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
-        pct_fig = _build_pct_improvement_figure(snapshot["task_summary_df"])
+        task_summary = snapshot["task_summary_df"]
+        per_dataset = snapshot["per_dataset_df"]
+
+        pct_fig = _build_pct_improvement_figure(task_summary)
         if pct_fig is not None:
             payload["figure_pct_improvement"] = pct_fig
 
-        pareto_fig = _build_pareto_figure(snapshot["per_dataset_df"])
+        win_fig = _build_win_rate_figure(task_summary)
+        if win_fig is not None:
+            payload["figure_win_rate"] = win_fig
+
+        pareto_fig = _build_pareto_figure(per_dataset)
         if pareto_fig is not None:
             payload["figure_runtime_vs_improvement"] = pareto_fig
 
-        failure_fig = _build_failure_rate_figure(snapshot["task_summary_df"])
+        failure_fig = _build_failure_rate_figure(task_summary)
         if failure_fig is not None:
             payload["figure_failure_rate"] = failure_fig
+
+        score_fig = _build_score_distribution_figure(per_dataset)
+        if score_fig is not None:
+            payload["figure_score_distribution"] = score_fig
+
+        per_ds_fig = _build_per_dataset_improvement_figure(per_dataset)
+        if per_ds_fig is not None:
+            payload["figure_per_dataset_improvement"] = per_ds_fig
+
+        features_fig = _build_features_added_figure(task_summary)
+        if features_fig is not None:
+            payload["figure_features_added"] = features_fig
+
         return payload
-
-    def _refresh_live_results_table(self, snapshot: Dict[str, Any]):
-        ordered = _ordered_table_frame(snapshot["per_run_df"], self._result_columns())
-        if self._live_results_table is None:
-            if ordered.empty:
-                return None
-            self._live_results_table = _to_wandb_table(ordered, log_mode="INCREMENTAL")
-            return self._live_results_table
-
-        for row in self._pending_rows:
-            values = [_py_scalar(row.get(col)) for col in self._result_columns()]
-            self._live_results_table.add_data(*values)
-        return self._live_results_table
 
     def push(self, paths: List[Path], *, force: bool = False, min_interval_s: float = 30.0) -> bool:
         if not self.enabled or self._run is None:
@@ -801,7 +1114,7 @@ class OrchestratorRun:
         now = time.time()
         if not force and (now - self._last_push) < min_interval_s:
             return False
-            
+
         try:
             import wandb
             artifact = wandb.Artifact(name=self.artifact_name, type="benchmark_results")
@@ -815,29 +1128,23 @@ class OrchestratorRun:
 
             master_csv = _find_master_csv(paths)
             snapshot = self._build_snapshot(master_csv)
-            log_dict: Dict[str, Any] = {}
-            log_dict.update(self._build_table_payload(snapshot, log_mode="MUTABLE", include_results=False))
-            log_dict.update(self._build_figure_payload(snapshot))
 
-            live_results = self._refresh_live_results_table(snapshot)
-            if live_results is not None:
-                log_dict["results_live"] = live_results
-
-            if force:
-                log_dict.update(self._build_table_payload(snapshot, log_mode="IMMUTABLE", include_results=True))
-
+            # Scalar metrics → logged with step so they appear as charts over time
             metrics = self._build_metrics(snapshot)
-            log_dict.update(metrics)
-
             self._report_step += 1
-            self._run.log(log_dict, step=self._report_step)
-            self._run.summary.update(metrics)
+            self._run.log(metrics, step=self._report_step)
+
+            # Tables & figures → persisted in summary so they always show the latest
+            # state without step-based confusion (tables are not time-series data)
+            summary_update: Dict[str, Any] = {}
+            summary_update.update(metrics)
+            summary_update.update(self._build_table_payload(snapshot, final=force))
+            summary_update.update(self._build_figure_payload(snapshot))
+            self._run.summary.update(summary_update)
 
             self._last_push = now
-            if self._pending_rows:
-                self._pending_rows.clear()
+            self._pending_rows.clear()
             return True
         except Exception as e:
-            self._live_results_table = None
             print(f"[wandb] artifact push failed: {e}")
             return False

@@ -474,17 +474,17 @@ def test_log_media_placeholder_logs_runtime_key(monkeypatch):
     assert image.caption == "Aggregated runtime-vs-improvement media is logged on the orchestrator run."
 
 
-def test_to_wandb_table_preserves_requested_log_mode(monkeypatch):
+def test_to_wandb_table_creates_correct_table(monkeypatch):
     _install_fake_wandb(monkeypatch)
 
-    table = _to_wandb_table(pd.DataFrame([{"a": 1, "b": 2}]), log_mode="MUTABLE")
+    table = _to_wandb_table(pd.DataFrame([{"a": 1, "b": 2}]))
 
     assert isinstance(table, _FakeTable)
-    assert table.log_mode == "MUTABLE"
+    assert table.columns == ["a", "b"]
     assert table.data == [[1, 2]]
 
 
-def test_orchestrator_run_uses_incremental_live_results_and_final_immutable_tables(tmp_path, monkeypatch):
+def test_orchestrator_run_logs_scalars_with_step_and_tables_to_summary(tmp_path, monkeypatch):
     fake = _install_fake_wandb(monkeypatch)
     rows = _base_rows()
     master_csv = tmp_path / "master.csv"
@@ -502,25 +502,28 @@ def test_orchestrator_run_uses_incremental_live_results_and_final_immutable_tabl
         assert orch.push([master_csv], force=True, min_interval_s=0)
 
     run = fake.runs[0]
+
+    # Scalars are logged with monotonically-increasing step for chart tracking
     assert [entry["step"] for entry in run.logged] == [1, 2, 3]
+    for entry in run.logged:
+        payload = entry["payload"]
+        assert "n_rows_total" in payload
+        assert "n_ok_rows" in payload
+        # No tables in the step-logged payload — tables go to summary
+        assert not any(isinstance(v, _FakeTable) for v in payload.values())
 
-    first_payload = run.logged[0]["payload"]
-    second_payload = run.logged[1]["payload"]
-    final_payload = run.logged[2]["payload"]
+    # Tables and figures land in summary (always shows latest, no step confusion)
+    assert len(run.summary.updates) == 3
+    final_summary = run.summary.updates[2]
+    assert isinstance(final_summary.get("results_aggregated"), _FakeTable)
+    assert isinstance(final_summary.get("results_per_run"), _FakeTable)  # only on final push
+    assert final_summary["n_rows_total"] == 2
+    assert final_summary["n_ok_rows"] == 2
 
-    assert "results_live" in first_payload
-    assert first_payload["results_live"].log_mode == "INCREMENTAL"
-    assert len(first_payload["results_live"].data) == 2
-
-    assert "results_live" in second_payload
-    assert second_payload["results_live"] is first_payload["results_live"]
-    assert len(second_payload["results_live"].data) == 2
-
-    assert final_payload["results"].log_mode == "IMMUTABLE"
-    assert final_payload["results_per_run"].log_mode == "IMMUTABLE"
-    assert final_payload["results_aggregated"].log_mode == "IMMUTABLE"
-    assert final_payload["n_rows_total"] == 2
-    assert final_payload["n_ok_rows"] == 2
+    # Intermediate pushes have aggregated tables but not the full per-run table
+    first_summary = run.summary.updates[0]
+    assert isinstance(first_summary.get("results_aggregated"), _FakeTable)
+    assert "results_per_run" not in first_summary
 
 
 def test_targeted_orchestrator_logs_suite_summary_and_rank_figure(tmp_path, monkeypatch):
@@ -539,7 +542,11 @@ def test_targeted_orchestrator_logs_suite_summary_and_rank_figure(tmp_path, monk
     ) as orch:
         assert orch.push([master_csv], force=True, min_interval_s=0)
 
-    payload = fake.runs[0].logged[0]["payload"]
-    assert payload["results"].log_mode == "IMMUTABLE"
-    assert payload["results_suite_summary"].log_mode == "IMMUTABLE"
-    assert payload["n_suites_started"] == 2
+    run = fake.runs[0]
+
+    # Tables live in summary, not in logged history
+    assert len(run.summary.updates) == 1
+    summary = run.summary.updates[0]
+    assert isinstance(summary.get("results_per_run"), _FakeTable)
+    assert isinstance(summary.get("results_suite_summary"), _FakeTable)
+    assert summary["n_suites_started"] == 2
