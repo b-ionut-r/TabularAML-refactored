@@ -106,9 +106,12 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
             if n_classes is None or n_classes <= 2:
                 self._planned_target_output_cols = [f"{col}_target" for col in self.target_enc_cols]
             else:
+                # PolynomialWrapper drops the first-seen class (drop_invariant=True on OHE),
+                # producing K-1 columns. Skip labels[0] to match n_new_feats = n_classes - 1.
+                planned_labels = labels[1:]
                 self._planned_target_output_cols = [
                     f"{col}_target_{class_label}"
-                    for class_label in labels
+                    for class_label in planned_labels
                     for col in self.target_enc_cols
                 ]
         else:

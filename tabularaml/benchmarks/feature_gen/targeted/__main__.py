@@ -13,10 +13,10 @@ Usage::
 
     # Dry run (no W&B, single seed, stress-test suite)
     python -m tabularaml.benchmarks.feature_gen.targeted \\
-        --suite stress_test --frameworks nofe tabularaml \\
+        --suite smoke_test --frameworks nofe tabularaml \
         --seeds 0 --n-workers 1 --no-wandb
 
-Available suites: amlb, pmlb, stress_test, all
+Available suites: amlb, pmlb, stress_test, ctr23, smoke_test, all
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def _parse(argv=None) -> argparse.Namespace:
     )
     p.add_argument(
         "--suite", required=True,
-        choices=["amlb", "pmlb", "stress_test", "all"],
+        choices=["amlb", "pmlb", "stress_test", "ctr23", "smoke_test", "all"],
         help="Dataset suite to run.",
     )
     p.add_argument(
