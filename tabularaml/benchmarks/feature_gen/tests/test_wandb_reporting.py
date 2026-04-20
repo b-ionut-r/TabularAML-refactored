@@ -449,7 +449,9 @@ def test_crowded_media_figures_avoid_tight_layout_warnings(monkeypatch):
     assert not any("Tight layout not applied" in str(w.message) for w in caught)
 
 
-def test_log_media_placeholder_logs_runtime_key(monkeypatch):
+def test_log_media_placeholder_still_works_when_called(monkeypatch):
+    # log_media_placeholder is kept for API compatibility but workers no longer call it.
+    # Verify the function itself still behaves correctly if invoked externally.
     _install_fake_wandb(monkeypatch)
 
     class FakeRun:
@@ -460,18 +462,11 @@ def test_log_media_placeholder_logs_runtime_key(monkeypatch):
             self.logged.append(payload)
 
     run = FakeRun()
-    log_media_placeholder(
-        run,
-        key="figure_runtime_vs_improvement",
-        caption="Aggregated runtime-vs-improvement media is logged on the orchestrator run.",
-    )
+    log_media_placeholder(run, key="some_key", caption="test caption")
 
     assert len(run.logged) == 1
-    payload = run.logged[0]
-    assert "figure_runtime_vs_improvement" in payload
-    image = payload["figure_runtime_vs_improvement"]
-    assert isinstance(image, _FakeImage)
-    assert image.caption == "Aggregated runtime-vs-improvement media is logged on the orchestrator run."
+    assert "some_key" in run.logged[0]
+    assert isinstance(run.logged[0]["some_key"], _FakeImage)
 
 
 def test_to_wandb_table_creates_correct_table(monkeypatch):
@@ -484,7 +479,7 @@ def test_to_wandb_table_creates_correct_table(monkeypatch):
     assert table.data == [[1, 2]]
 
 
-def test_orchestrator_run_logs_scalars_with_step_and_tables_to_summary(tmp_path, monkeypatch):
+def test_orchestrator_run_logs_scalars_tables_figures_with_step(tmp_path, monkeypatch):
     fake = _install_fake_wandb(monkeypatch)
     rows = _base_rows()
     master_csv = tmp_path / "master.csv"
@@ -503,24 +498,26 @@ def test_orchestrator_run_logs_scalars_with_step_and_tables_to_summary(tmp_path,
 
     run = fake.runs[0]
 
-    # Scalars are logged with monotonically-increasing step for chart tracking
+    # Three pushes → three step-based log entries
     assert [entry["step"] for entry in run.logged] == [1, 2, 3]
+
+    # Each step-log has scalars + lightweight tables (no heavy per-run table)
     for entry in run.logged:
         payload = entry["payload"]
         assert "n_rows_total" in payload
         assert "n_ok_rows" in payload
-        # No tables in the step-logged payload — tables go to summary
-        assert not any(isinstance(v, _FakeTable) for v in payload.values())
+        assert isinstance(payload.get("results_aggregated"), _FakeTable)
+        assert "results_per_run" not in payload  # only in summary, not history
 
-    # Tables and figures land in summary (always shows latest, no step confusion)
+    # Summary persists latest state including the heavy per-run table (final push only)
     assert len(run.summary.updates) == 3
     final_summary = run.summary.updates[2]
     assert isinstance(final_summary.get("results_aggregated"), _FakeTable)
-    assert isinstance(final_summary.get("results_per_run"), _FakeTable)  # only on final push
+    assert isinstance(final_summary.get("results_per_run"), _FakeTable)
     assert final_summary["n_rows_total"] == 2
     assert final_summary["n_ok_rows"] == 2
 
-    # Intermediate pushes have aggregated tables but not the full per-run table
+    # Intermediate push summaries do not include the per-run table
     first_summary = run.summary.updates[0]
     assert isinstance(first_summary.get("results_aggregated"), _FakeTable)
     assert "results_per_run" not in first_summary
@@ -544,8 +541,12 @@ def test_targeted_orchestrator_logs_suite_summary_and_rank_figure(tmp_path, monk
 
     run = fake.runs[0]
 
-    # Tables live in summary, not in logged history
-    assert len(run.summary.updates) == 1
+    # Step-logged payload has suite summary table (lightweight → goes to workspace panel)
+    step_payload = run.logged[0]["payload"]
+    assert isinstance(step_payload.get("results_suite_summary"), _FakeTable)
+    assert step_payload["n_suites_started"] == 2
+
+    # Summary also has the heavy per-run table
     summary = run.summary.updates[0]
     assert isinstance(summary.get("results_per_run"), _FakeTable)
     assert isinstance(summary.get("results_suite_summary"), _FakeTable)

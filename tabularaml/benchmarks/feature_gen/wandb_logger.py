@@ -1131,16 +1131,22 @@ class OrchestratorRun:
 
             # Scalar metrics → logged with step so they appear as charts over time
             metrics = self._build_metrics(snapshot)
-            self._report_step += 1
-            self._run.log(metrics, step=self._report_step)
+            tables = self._build_table_payload(snapshot, final=force)
+            figures = self._build_figure_payload(snapshot)
 
-            # Tables & figures → persisted in summary so they always show the latest
-            # state without step-based confusion (tables are not time-series data)
-            summary_update: Dict[str, Any] = {}
-            summary_update.update(metrics)
-            summary_update.update(self._build_table_payload(snapshot, final=force))
-            summary_update.update(self._build_figure_payload(snapshot))
-            self._run.summary.update(summary_update)
+            self._report_step += 1
+
+            # One run.log() call per step: scalars → line charts, figures → media panels,
+            # lightweight tables → workspace table panels.
+            # Heavy per-run table is only logged to summary (too large for every sync).
+            log_dict: Dict[str, Any] = {}
+            log_dict.update(metrics)
+            log_dict.update(figures)
+            log_dict.update({k: v for k, v in tables.items() if k != "results_per_run"})
+            self._run.log(log_dict, step=self._report_step)
+
+            # Summary: all tables + metrics always reflect the latest state
+            self._run.summary.update({**metrics, **tables})
 
             self._last_push = now
             self._pending_rows.clear()

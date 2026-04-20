@@ -115,7 +115,7 @@ def run(spec: dict) -> dict:
         split_early_stopping_validation,
     )
     from tabularaml.benchmarks.feature_gen.wandb_logger import (
-        wandb_run, derive_tags, log_media_placeholder, log_row,
+        wandb_run, derive_tags, log_row,
     )
 
     row = _make_row(spec)
@@ -173,11 +173,6 @@ def run(spec: dict) -> dict:
             job_type="worker",
             enabled=wb_enabled,
         ) as wb:
-            log_media_placeholder(
-                wb,
-                key="figure_runtime_vs_improvement",
-                caption="Aggregated runtime-vs-improvement media is logged on the orchestrator run.",
-            )
             adapter_cls = get_adapter_cls(spec["framework"])
 
             adapter_kwargs = dict(spec.get("framework_kwargs") or {})
