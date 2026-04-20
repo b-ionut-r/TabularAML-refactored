@@ -58,6 +58,10 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
 
     def _postprocess(self, matrix: pd.DataFrame, fit: bool) -> pd.DataFrame:
         matrix = matrix.copy()
+        # Replace inf with NaN — XGBoost handles NaN natively, so do NOT fill.
+        for c in matrix.columns:
+            if is_numeric_dtype(matrix[c]):
+                matrix[c] = matrix[c].replace([np.inf, -np.inf], np.nan)
         # Drop constant / all-NaN columns (train time only — decide which to keep).
         if fit:
             keep = [
@@ -66,17 +70,9 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
                 and (matrix[c].dropna().nunique() > 1 if is_numeric_dtype(matrix[c]) else True)
             ]
             matrix = matrix[keep]
-            # Compute medians for later NaN filling + remember schema.
-            self._num_medians = {
-                c: float(np.nanmedian(matrix[c].astype(float).values))
-                for c in matrix.columns if is_numeric_dtype(matrix[c])
-            }
-        # Ensure numeric NaN filled; cast object → category.
+        # Cast object → category.
         for c in matrix.columns:
-            if is_numeric_dtype(matrix[c]):
-                fill = self._num_medians.get(c, 0.0)
-                matrix[c] = matrix[c].astype(float).fillna(fill if not np.isnan(fill) else 0.0)
-            elif is_object_dtype(matrix[c]):
+            if is_object_dtype(matrix[c]):
                 matrix[c] = matrix[c].astype("category")
         return matrix
 
@@ -119,10 +115,11 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
             n_jobs=self.n_jobs,
         )
         matrix = self._postprocess(matrix, fit=False)
-        # Align columns to training schema; missing columns filled with medians.
+        # Align columns to training schema; missing columns filled with NaN
+        # (XGBoost handles NaN natively via learned split directions).
         for c in self._train_columns_fe:
             if c not in matrix.columns:
-                matrix[c] = self._num_medians.get(c, 0.0)
+                matrix[c] = np.nan
         matrix = matrix[self._train_columns_fe]
         matrix.index = X_test.index
         return matrix

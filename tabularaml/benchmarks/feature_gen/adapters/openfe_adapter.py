@@ -167,15 +167,15 @@ class OpenFEAdapter(FEFrameworkAdapter):
         _compat_mse._openfe_patched = True
         sm.mean_squared_error = _compat_mse
 
-        # Patch openfe's own module-level reference and swap its executor.
-        try:
-            import openfe.openfe as _ofe
-            _ofe.mean_squared_error = _compat_mse
-            if not getattr(_ofe, "_executor_patched", False):
-                _ofe.ProcessPoolExecutor = ThreadPoolExecutor
-                _ofe._executor_patched = True
-        except (ImportError, AttributeError):
-            pass
+        # # Patch openfe's own module-level reference and swap its executor. (performance hit)
+        # try:
+        #     import openfe.openfe as _ofe
+        #     _ofe.mean_squared_error = _compat_mse
+        #     if not getattr(_ofe, "_executor_patched", False):
+        #         _ofe.ProcessPoolExecutor = ThreadPoolExecutor
+        #         _ofe._executor_patched = True
+        # except (ImportError, AttributeError):
+        #     pass
 
     def _safe_column_names(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         """Replace column names with safe alphanumeric identifiers (col_0, col_1, ...)."""
