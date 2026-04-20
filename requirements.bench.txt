@@ -4,7 +4,7 @@
 # Competitor FE frameworks
 openfe>=0.0.12
 autofeat>=2.1.3
-featuretools>=1.31.0
+featuretools[dask]>=1.31.0
 
 # Stats + plotting
 scikit-posthocs>=0.9.0
