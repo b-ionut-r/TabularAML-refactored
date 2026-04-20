@@ -24,6 +24,7 @@ lightgbm
 
 # Datasets
 openml
+pmlb>=1.0.0
 
 # Others
 category_encoders

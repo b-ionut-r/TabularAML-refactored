@@ -97,6 +97,12 @@ PMLB_STANDARD: list[DatasetSpec] = [
     DatasetSpec("vehicle",        "vehicle",         "pmlb", "multiclass",     "pmlb"),
     DatasetSpec("mfeat_factors",  "mfeat-factors",   "pmlb", "multiclass",     "pmlb"),
     DatasetSpec("monk1",          "monk1",           "pmlb", "classification", "pmlb"),
+    # --- Regression ---
+    DatasetSpec("529_pollen",       "pollen",        "pmlb", "regression", "pmlb"),
+    DatasetSpec("503_wind",         "wind",          "pmlb", "regression", "pmlb"),
+    DatasetSpec("1193_BNG_lowbwt",  "BNG-lowbwt",   "pmlb", "regression", "pmlb"),
+    DatasetSpec("581_fri_c3_500_25","Friedman-c3",  "pmlb", "regression", "pmlb"),
+    DatasetSpec("1028_SWD",         "SWD",           "pmlb", "regression", "pmlb"),
 ]
 
 
