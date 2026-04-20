@@ -922,7 +922,14 @@ class OrchestratorRun:
             if failure_fig is not None:
                 log_dict["figure_failure_rate"] = failure_fig
 
-            self._run.log(log_dict)
+            # Tables, charts, and images must go to summary (not log) so panels
+            # always display the latest value. wandb.run.log() appends history
+            # steps; after ~100 pushes the media panels stop rendering.
+            media_dict = {k: v for k, v in log_dict.items() if not isinstance(v, (int, float))}
+            scalar_dict = {k: v for k, v in log_dict.items() if isinstance(v, (int, float))}
+            self._run.summary.update(media_dict)
+            if scalar_dict:
+                self._run.log(scalar_dict)
             self._run.summary.update({
                 "n_rows_total": int(len(per_run_df)),
                 "n_ok_rows": int((per_run_df["status"] == "ok").sum()) if not per_run_df.empty else 0,

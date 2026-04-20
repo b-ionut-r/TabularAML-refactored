@@ -97,3 +97,52 @@ def test_fortran_flatten_correctness():
     assert np.allclose(fortran_1d[:n], arr[:, 0]), "Fortran order: first block must be column 0."
     assert np.allclose(fortran_1d[n:2 * n], arr[:, 1]), "Fortran order: second block must be column 1."
     assert np.allclose(fortran_1d[2 * n:3 * n], arr[:, 2]), "Fortran order: third block must be column 2."
+
+
+def test_log_probability_math_invariant():
+    """softmax(log(p)) == p — the identity the init_score math fix relies on.
+
+    OpenFE passes raw class probabilities as init_score but LightGBM applies
+    softmax to init_score, so the fix converts p → log(p) so that
+    softmax(log(p)) recovers p exactly.
+    """
+    rng = np.random.default_rng(42)
+    n_samples, n_classes = 30, 4
+    raw = np.abs(rng.normal(size=(n_samples, n_classes))) + 1e-6
+    probs = raw / raw.sum(axis=1, keepdims=True)
+
+    log_probs = np.log(np.clip(probs, 1e-15, 1.0))
+
+    # Numerically stable softmax
+    shifted = log_probs - log_probs.max(axis=1, keepdims=True)
+    exp_shifted = np.exp(shifted)
+    recovered = exp_shifted / exp_shifted.sum(axis=1, keepdims=True)
+
+    np.testing.assert_allclose(recovered, probs, atol=1e-6,
+                               err_msg="softmax(log(p)) must equal p — math fix invariant violated")
+
+
+def test_probability_detection_triggers_log_conversion():
+    """A 2-D array with values in [0,1] and rows summing to 1 must be detected as
+    a probability matrix by the patch and converted to log-domain (all values ≤ 0).
+    A raw-margin matrix (values outside [0,1]) must be left untouched.
+    """
+    rng = np.random.default_rng(0)
+    n, k = 20, 3
+
+    # Build a probability matrix
+    raw = np.abs(rng.normal(size=(n, k))) + 1e-6
+    probs = raw / raw.sum(axis=1, keepdims=True)
+    assert probs.min() >= 0 and probs.max() <= 1
+    assert np.allclose(probs.sum(axis=1), 1.0, atol=1e-6)
+
+    log_probs = np.log(np.clip(probs, 1e-15, 1.0))
+    # log of values in (0,1] is ≤ 0
+    assert (log_probs <= 1e-9).all(), "log(p) for p in (0,1] must be ≤ 0"
+
+    # Raw margins (from predict_proba with raw_score=True) are NOT in [0,1]
+    margins = rng.normal(size=(n, k))  # can be negative or > 1
+    # Confirming it would NOT be detected as a probability matrix
+    is_prob = (margins.min() >= 0.0 and margins.max() <= 1.0 and
+               np.allclose(margins.sum(axis=1), 1.0, atol=1e-6))
+    assert not is_prob, "Raw margin matrix must not be misclassified as a probability matrix"

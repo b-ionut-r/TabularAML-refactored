@@ -12,19 +12,59 @@ import os
 import tempfile
 import warnings
 from typing import Literal, Optional
+import numpy as np
 import pandas as pd
 
 from .base import FEFrameworkAdapter
 
 
+def _openfe_worker_mse_patch() -> None:
+    """ProcessPoolExecutor initializer: re-apply the sklearn MSE compat patch.
+
+    On Windows, each spawned worker process re-imports everything fresh.
+    This function runs inside each worker before any task executes, patching
+    both sklearn.metrics and openfe.openfe's own module-level binding.
+    Must be a module-level function so it is picklable by the spawn pickler.
+    """
+    import numpy as _np
+    import sklearn.metrics as _sm
+
+    if getattr(_sm.mean_squared_error, "_openfe_patched", False):
+        return
+
+    _orig = _sm.mean_squared_error
+
+    def _w_mse(y_true, y_pred, *, sample_weight=None,
+               multioutput="uniform_average", squared=True):
+        r = _orig(y_true, y_pred, sample_weight=sample_weight,
+                  multioutput=multioutput)
+        return r if squared else _np.sqrt(r)
+
+    _w_mse._openfe_patched = True
+    _sm.mean_squared_error = _w_mse
+    try:
+        import openfe.openfe as _o
+        _o.mean_squared_error = _w_mse
+    except (ImportError, AttributeError):
+        pass
+
+
 class OpenFEAdapter(FEFrameworkAdapter):
     name = "openfe"
     version = "upstream-0.0.12"
-    # supports_multiclass is True (default). OpenFE's multiclass has a math flaw
-    # (raw class probabilities used as init_score instead of log-odds) and
-    # calls exit() on any internal LightGBM error, but both are handled by
-    # _patch_init_score_flatten (fixes LightGBM API shape contract) and the
-    # SystemExit catch in fit_transform. Results will be poor but are real data.
+    # supports_multiclass is True (default). OpenFE multiclass has two bugs fixed
+    # by _patch_init_score_flatten:
+    #   (1) Shape crash — init_score is a DataFrame; LightGBM 4+ requires 1-D Fortran array.
+    #       This is crash prevention only; without it OpenFE dies, producing no result.
+    #   (2) Math fix — upstream passes raw class probabilities as init_score, but LightGBM
+    #       applies softmax again, destroying the class prior. Fix: log(p) so softmax(log(p))=p.
+    #       NOTE: this is a performance enhancement, not crash prevention. It gives OpenFE
+    #       better multiclass scores than `pip install openfe` would produce out-of-the-box.
+    #       Rationale: we want to measure the algorithm's quality, not a known implementation
+    #       defect. The companion test (test_openfe_leakage_probe.py) documents transform
+    #       leakage; this class-level comment documents the math fix.
+    # OpenFE also calls exit() on internal LightGBM errors; the SystemExit catch in
+    # fit_transform converts those to RuntimeError so the worker subprocess survives.
 
     def __init__(
         self,
@@ -131,20 +171,15 @@ class OpenFEAdapter(FEFrameworkAdapter):
     def _patch_sklearn_mse() -> None:
         """Patch sklearn mean_squared_error for squared=False removal (sklearn>=1.4).
 
-        Two-part patch:
-        1. Replace sklearn.metrics.mean_squared_error with a compat wrapper.
-        2. Also replace openfe.openfe's own local binding (it uses
-           `from sklearn.metrics import mean_squared_error`, so patching the
-           sklearn module alone is insufficient).
-        3. Replace openfe.openfe.ProcessPoolExecutor with ThreadPoolExecutor so
-           candidate-evaluation workers run as threads in the current process,
-           where our patched mean_squared_error is visible.  ProcessPoolExecutor
-           spawns fresh subprocesses (Windows spawn) that re-import unpatched
-           sklearn, causing the same TypeError in every worker.
+        On Windows, ProcessPoolExecutor uses the 'spawn' start method: each worker
+        process re-imports everything from scratch, so patching sklearn.metrics in the
+        parent is invisible to workers.  The fix injects _openfe_worker_mse_patch (a
+        module-level function, therefore picklable) as an initializer into OpenFE's
+        ProcessPoolExecutor subclass so every spawned worker re-applies the patch
+        before executing tasks.  This preserves true CPU parallelism (no GIL penalty
+        from a ThreadPoolExecutor swap) and avoids any timeout bias.
         """
-        import numpy as np
         import sklearn.metrics as sm
-        from concurrent.futures import ThreadPoolExecutor
 
         if getattr(sm.mean_squared_error, "_openfe_patched", False):
             return
@@ -167,15 +202,29 @@ class OpenFEAdapter(FEFrameworkAdapter):
         _compat_mse._openfe_patched = True
         sm.mean_squared_error = _compat_mse
 
-        # # Patch openfe's own module-level reference and swap its executor. (performance hit)
-        # try:
-        #     import openfe.openfe as _ofe
-        #     _ofe.mean_squared_error = _compat_mse
-        #     if not getattr(_ofe, "_executor_patched", False):
-        #         _ofe.ProcessPoolExecutor = ThreadPoolExecutor
-        #         _ofe._executor_patched = True
-        # except (ImportError, AttributeError):
-        #     pass
+        # Patch openfe's own module-level MSE binding (bound at import time via
+        # `from sklearn.metrics import mean_squared_error`).
+        # Then subclass ProcessPoolExecutor to inject _openfe_worker_mse_patch as an
+        # initializer so every spawned worker process also gets the patch applied.
+        try:
+            import openfe.openfe as _ofe
+            from concurrent.futures import ProcessPoolExecutor as _BasePPE
+
+            _ofe.mean_squared_error = _compat_mse
+
+            if not getattr(_ofe, "_executor_patched", False):
+
+                class _PatchedPPE(_BasePPE):
+                    def __init__(self, max_workers=None, **kwargs):
+                        if not kwargs.get("initializer"):
+                            kwargs["initializer"] = _openfe_worker_mse_patch
+                        super().__init__(max_workers, **kwargs)
+
+                _ofe.ProcessPoolExecutor = _PatchedPPE
+                _ofe._executor_patched = True
+
+        except (ImportError, AttributeError):
+            pass
 
     def _safe_column_names(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         """Replace column names with safe alphanumeric identifiers (col_0, col_1, ...)."""

@@ -90,3 +90,35 @@ def test_all_nan_column_gets_zero_fill():
 
     assert out["a"].iloc[0] == pytest.approx(0.0)
     assert np.isfinite(out["a"].values).all()
+
+
+def test_pandas_categorical_dtype_accepted():
+    """_TrainOnlyPreprocessor must handle pd.Categorical dtype without error.
+
+    The worker calls _preprocess() which casts object→category, so the adapter
+    receives pandas Categorical columns, not plain object columns. The preprocessor
+    must treat them identically to object columns: ordinal-encode from train cats,
+    sentinel -1 for unseen categories on test.
+    """
+    train = pd.DataFrame({
+        "cat": pd.Categorical(["a", "b", "c", "a"]),
+        "num": [1.0, 2.0, 3.0, 4.0],
+    })
+    test = pd.DataFrame({
+        "cat": pd.Categorical(["a", "d"]),  # "d" is unseen
+        "num": [5.0, 6.0],
+    })
+
+    pre = _TrainOnlyPreprocessor()
+    train_out = pre.fit_transform(train)
+    test_out = pre.transform(test)
+
+    # All output values must be finite floats
+    assert np.isfinite(train_out.to_numpy(dtype=float)).all()
+    assert train_out["cat"].dtype == float
+
+    # Known category "a" → non-negative code; unseen "d" → -1
+    a_code = test_out["cat"].iloc[0]
+    d_code = test_out["cat"].iloc[1]
+    assert a_code >= 0, "Known category must produce a non-negative code"
+    assert d_code == pytest.approx(-1.0), "Unseen category must produce sentinel -1"

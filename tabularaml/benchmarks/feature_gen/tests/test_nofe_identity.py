@@ -64,3 +64,38 @@ def test_nofe_matches_direct_xgb(toy_cls):
     assert np.isclose(score, direct_score, atol=1e-10), (
         f"NoFE adapter diverges from direct XGBoost: {score} vs {direct_score}"
     )
+
+
+def test_nofe_matches_direct_xgb_regression(toy_reg):
+    X, y = toy_reg
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.25, random_state=7)
+    y_tr = y_tr.values
+    y_te = y_te.values
+
+    adapter = get_adapter_cls("nofe")(
+        task="regression", time_budget_s=60, random_state=7, n_jobs=1,
+    )
+    X_tr_fit, X_tr_val, y_tr_fit, y_tr_val = split_early_stopping_validation(
+        X_tr, y_tr, task="regression", seed=7,
+    )
+    X_tr_fe = adapter.fit_transform(X_tr_fit, y_tr_fit)
+    X_val_fe = adapter.transform(X_tr_val)
+    X_te_fe = adapter.transform(X_te)
+
+    score, _ = score_on_holdout(
+        X_tr_fe, y_tr_fit, X_val_fe, y_tr_val, X_te_fe, y_te,
+        task="regression", n_classes=0, seed=7,
+    )
+
+    params = dict(BASE_LEARNER_PARAMS)
+    params["random_state"] = 7
+    params["seed"] = 7
+    direct = xgb.XGBRegressor(**params)
+    direct.fit(X_tr_fit, y_tr_fit, eval_set=[(X_tr_val, y_tr_val)], verbose=False)
+    y_pred = direct.predict(X_te)
+    scorer = select_scorer("regression", 0)
+    direct_score = float(scorer.score(y_te, y_pred))
+
+    assert np.isclose(score, direct_score, atol=1e-10), (
+        f"NoFE regression adapter diverges from direct XGBoost: {score} vs {direct_score}"
+    )
