@@ -1140,16 +1140,15 @@ class OrchestratorRun:
             tables = self._build_table_payload(snapshot, final=force)
             figures = self._build_figure_payload(snapshot)
 
-            self._report_step += 1
-
             # One run.log() call per step: scalars → line charts, figures → media panels,
             # lightweight tables → workspace table panels.
             # Heavy per-run table is only logged to summary (too large for every sync).
+            # No explicit step= so wandb auto-increments from where resumed runs left off.
             log_dict: Dict[str, Any] = {}
             log_dict.update(metrics)
             log_dict.update(figures)
             log_dict.update({k: v for k, v in tables.items() if k != "results_per_run"})
-            self._run.log(log_dict, step=self._report_step)
+            self._run.log(log_dict)
 
             # Summary: all tables + metrics always reflect the latest state
             self._run.summary.update({**metrics, **tables})
