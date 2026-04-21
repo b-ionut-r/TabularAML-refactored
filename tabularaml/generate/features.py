@@ -2331,7 +2331,9 @@ class FeatureGenerator:
 
         # Calculate and store metrics
         n_init_feats = len(self.initial_features)
-        n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats
+        n_groupby = len(getattr(self.pipeline, "groupby_encoders", []))
+        n_temporal = len(getattr(self.pipeline, "temporal_encoders", []))
+        n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal
 
         self.initial_train_metric, self.initial_val_metric = self._eval_baseline(X[self.initial_features], y, self.pipeline)
         self.final_metric = self.state['best']['val_score']
@@ -2358,11 +2360,17 @@ class FeatureGenerator:
             self.pipeline.encoder.freq_enc_cols
         )
         all_generated = set(X.columns) - set(self.initial_features)
+        
+        gb_names = [gb.output_col for gb in getattr(self.pipeline, "groupby_encoders", [])]
+        te_names = [te.output_col for te in getattr(self.pipeline, "temporal_encoders", [])]
+        
         new_features = {
             "generated": all_generated - encoder_feats_final,
             "target encoded": self.pipeline.encoder.target_enc_cols,
             "count encoded": self.pipeline.encoder.count_enc_cols,
             "freq encoded": self.pipeline.encoder.freq_enc_cols,
+            "groupby": gb_names,
+            "temporal": te_names
         }
         for feat_type, features in new_features.items():
             if features: self._log(f"New {feat_type}: {features}")
