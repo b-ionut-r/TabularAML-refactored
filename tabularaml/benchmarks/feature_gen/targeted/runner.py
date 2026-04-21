@@ -356,15 +356,33 @@ class TargetedBenchmarkRunner:
                                           min_interval_s=self.sync_min_interval_s)
                     else:
                         with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
-                            futures = [pool.submit(_dispatch, (self, s)) for s in specs]
-                            for fut in as_completed(futures):
-                                _, row = fut.result()
-                                self._finalize_row(row, nofe_lookup, orch)
-                                n_done += 1
-                                pbar.update(1)
-                                if n_done % self.sync_every_rows == 0:
-                                    orch.push(self._sync_paths(),
-                                              min_interval_s=self.sync_min_interval_s)
+                            # Split into two phases: nofe first, then the rest
+                            nofe_specs = [s for s in specs if s.framework == "nofe"]
+                            other_specs = [s for s in specs if s.framework != "nofe"]
+                            
+                            # Phase 1: nofe
+                            if nofe_specs:
+                                futures = [pool.submit(_dispatch, (self, s)) for s in nofe_specs]
+                                for fut in as_completed(futures):
+                                    _, row = fut.result()
+                                    self._finalize_row(row, nofe_lookup, orch)
+                                    n_done += 1
+                                    pbar.update(1)
+                                    if n_done % self.sync_every_rows == 0:
+                                        orch.push(self._sync_paths(),
+                                                  min_interval_s=self.sync_min_interval_s)
+                                                  
+                            # Phase 2: others
+                            if other_specs:
+                                futures = [pool.submit(_dispatch, (self, s)) for s in other_specs]
+                                for fut in as_completed(futures):
+                                    _, row = fut.result()
+                                    self._finalize_row(row, nofe_lookup, orch)
+                                    n_done += 1
+                                    pbar.update(1)
+                                    if n_done % self.sync_every_rows == 0:
+                                        orch.push(self._sync_paths(),
+                                                  min_interval_s=self.sync_min_interval_s)
             finally:
                 if self.master_csv.exists():
                     orch.push(self._sync_paths(), force=True)
