@@ -320,12 +320,14 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
         stripped_message = message.strip()
         feature_prefixes = {
             "Simple:": "simple",
+            "Pipeline:": "pipeline",
             "Target encoded:": "_target_enc",
             "Count encoded:": "_count_enc",
             "Freq encoded:": "_freq_enc",
             "Groupby:": "_groupby",
             "Temporal:": "_temporal",
             "New simple:": "simple",
+            "New pipeline:": "pipeline",
             "New target encoded:": "_target_enc",
             "New count encoded:": "_count_enc",
             "New freq encoded:": "_freq_enc",
