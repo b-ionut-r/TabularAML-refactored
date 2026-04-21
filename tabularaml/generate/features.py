@@ -2190,7 +2190,10 @@ class FeatureGenerator:
                 # Enhanced logging
                 improvement = "No improvement." if delta <= 0 else f"Score improved by {delta:.5f}."
                 adaptive_status = self.adaptive_controller.get_status_summary()
-                n_encoded = self.pipeline.encoder.n_new_feats if hasattr(self.pipeline, 'encoder') else 0
+                
+                n_groupby = len(getattr(self.pipeline, "groupby_encoders", []))
+                n_temporal = len(getattr(self.pipeline, "temporal_encoders", []))
+                n_encoded = (self.pipeline.encoder.n_new_feats if hasattr(self.pipeline, 'encoder') else 0) + n_groupby + n_temporal
 
                 gen_log = f"Gen {N+1}: Added {features_added} features, {X.shape[1] + n_encoded} total ({self.state['counters']['total_new_features'] + n_encoded} new)."
                 gen_log += f" Train {self.scorer.name}={new_train_score:.5f}, Val {self.scorer.name}={new_val_score:.5f}. {improvement}"
