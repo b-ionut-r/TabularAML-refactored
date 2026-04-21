@@ -323,15 +323,26 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
             "Target encoded:": "_target_enc",
             "Count encoded:": "_count_enc",
             "Freq encoded:": "_freq_enc",
+            "Groupby:": "_groupby",
+            "Temporal:": "_temporal",
             "New simple:": "simple",
-            "New target:": "_target_enc",
-            "New count:": "_count_enc",
-            "New freq:": "_freq_enc",
+            "New target encoded:": "_target_enc",
+            "New count encoded:": "_count_enc",
+            "New freq encoded:": "_freq_enc",
+            "New groupby:": "_groupby",
+            "New temporal:": "_temporal",
         }
         for prefix, encoding_type in feature_prefixes.items():
             if stripped_message.startswith(prefix):
                 try:
-                    parsed = ast.literal_eval(stripped_message.split(":", 1)[1].strip())
+                    # Handle both "Prefix: ['feat1', 'feat2']" and "Prefix: feat1"
+                    content = stripped_message.split(":", 1)[1].strip()
+                    try:
+                        parsed = ast.literal_eval(content)
+                    except (SyntaxError, ValueError):
+                        # Fallback for non-Python-literal strings (like single feature names without quotes)
+                        parsed = content
+
                     if isinstance(parsed, str):
                         parsed = [parsed]
                     elif isinstance(parsed, set):
@@ -344,8 +355,12 @@ class ComprehensiveFeatureGenerator(FeatureGenerator):
                         if isinstance(feature_name, str):
                             # Add encoding type suffix to categorical encoded features (except simple)
                             annotated_name = feature_name
+                            # Don't double-suffix if it already has it
                             if encoding_type != "simple" and not feature_name.endswith(encoding_type):
-                                annotated_name = f"{feature_name}{encoding_type}"
+                                # For groupby and temporal, they usually already have descriptive names, 
+                                # but we can still annotate them if desired. 
+                                # Based on current generator, groupby_mean_... is the name.
+                                pass
                                 
                             if annotated_name not in generated_features:
                                 generated_features.append(annotated_name)

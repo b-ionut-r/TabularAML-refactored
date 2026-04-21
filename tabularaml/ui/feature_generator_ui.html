@@ -458,6 +458,12 @@
             border-left-color: #43e97b;
             animation: fadeIn 0.5s ease-in;
         }
+
+        .feature-item.target-enc { border-left-color: #f5576c; }
+        .feature-item.count-enc { border-left-color: #4facfe; }
+        .feature-item.freq-enc { border-left-color: #f6d365; }
+        .feature-item.groupby-enc { border-left-color: #764ba2; }
+        .feature-item.temporal-enc { border-left-color: #43e97b; }
         
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(10px); }
@@ -1581,6 +1587,14 @@
             generationState.features.forEach(function(featureName) {
                 const featureItem = document.createElement('div');
                 featureItem.className = 'feature-item new';
+                
+                // Apply type-specific classes
+                if (featureName.includes('_target_enc')) featureItem.classList.add('target-enc');
+                else if (featureName.includes('_count_enc')) featureItem.classList.add('count-enc');
+                else if (featureName.includes('_freq_enc')) featureItem.classList.add('freq-enc');
+                else if (featureName.startsWith('groupby_')) featureItem.classList.add('groupby-enc');
+                else if (featureName.startsWith('temporal_')) featureItem.classList.add('temporal-enc');
+                
                 featureItem.textContent = featureName;
                 featureGrid.appendChild(featureItem);
             });
