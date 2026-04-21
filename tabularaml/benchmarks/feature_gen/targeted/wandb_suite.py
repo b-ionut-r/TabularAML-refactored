@@ -198,6 +198,7 @@ class TargetedOrchestratorRun(OrchestratorRun):
                 reinit=True,
                 settings=wandb.Settings(start_method="thread", init_timeout=300),
             )
+            self._report_step = self._run.step
         except Exception as e:
             print(f"[wandb] targeted orchestrator init failed: {e}")
             self.enabled = False

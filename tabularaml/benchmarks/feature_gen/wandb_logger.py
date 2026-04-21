@@ -1023,6 +1023,7 @@ class OrchestratorRun:
                 reinit=True,
                 settings=wandb.Settings(start_method="thread", init_timeout=300),
             )
+            self._report_step = self._run.step
         except Exception as e:
             print(f"[wandb] orchestrator init failed; artifact sync disabled: {e}")
             self.enabled = False
