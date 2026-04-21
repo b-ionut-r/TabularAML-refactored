@@ -117,7 +117,7 @@ class Interaction:
             self.depth = feature_1.depth + 1
             self.weight = feature_1.weight
             self.require_pipeline = True  # Must go through pipeline
-            self.name = f"{op}({feature_1.name})"
+            self.name = f"{op}_{feature_1.name}"
         elif self.is_agg:
             # Aggregation: feature_1 is categorical key, feature_2 is numeric column
             self.type = "binary"
@@ -126,7 +126,7 @@ class Interaction:
             self.weight = (feature_1.weight + feature_2.weight) / 2 if feature_2 else feature_1.weight
             self.require_pipeline = True  # Must go through pipeline to prevent leakage
             agg_name = op.replace("groupby_", "")
-            self.name = f"groupby_{agg_name}({feature_1.name}, {feature_2.name})" if feature_2 else f"groupby_{agg_name}({feature_1.name})"
+            self.name = f"groupby_{agg_name}_{feature_1.name}_{feature_2.name}" if feature_2 else f"groupby_{agg_name}_{feature_1.name}"
         else:
             self.type = "unary" if feature_2 is None else "binary"
             self.dtype = (feature_1.dtype if feature_2 is None else 
@@ -2417,6 +2417,16 @@ class FeatureGenerator:
                            consecutive_no_improvement_iters=0, current_gen=0),
             "seen_feats": set(),
         }
+
+        # Align X and y index if needed
+        if not X.index.equals(y.index):
+            if len(X) == len(y):
+                # If lengths match, we just reset both safely
+                X.reset_index(drop=True, inplace=True)
+                if hasattr(y, "reset_index"):
+                    y.reset_index(drop=True, inplace=True)
+            else:
+                self._log(f"Warning: X length ({len(X)}) != y length ({len(y)}).")
 
         # Keep these attributes available even when no generated feature
         # is accepted before replay/transform paths run.

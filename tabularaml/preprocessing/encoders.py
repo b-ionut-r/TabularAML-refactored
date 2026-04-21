@@ -358,7 +358,7 @@ class GroupByEncoder(BaseEstimator, TransformerMixin):
         self.cat_col = cat_col
         self.num_col = num_col
         self.agg_func = agg_func
-        self.output_col = output_col or f"groupby_{agg_func}({cat_col}, {num_col})"
+        self.output_col = output_col or f"groupby_{agg_func}_{cat_col}_{num_col}"
         self.mapping_ = None
         self.global_fallback_ = None
         self.rank_values_by_group_ = None
@@ -483,7 +483,7 @@ class TemporalEncoder(BaseEstimator, TransformerMixin):
         self.id_col = id_col
         self.time_col = time_col
         self.op_name = op_name
-        self.output_col = output_col or f"{op_name}({col})"
+        self.output_col = output_col or f"{op_name}_{col}"
         self.strict_no_leakage = bool(strict_no_leakage)
         self.global_fallback_ = None
         self.id_history_ = {}
