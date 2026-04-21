@@ -2338,7 +2338,9 @@ class FeatureGenerator:
         n_temporal = len(getattr(self.pipeline, "temporal_encoders", []))
         n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal
 
-        self.initial_train_metric, self.initial_val_metric = self._eval_baseline(X[self.initial_features], y, self.pipeline)
+        # Use a clean pipeline for baseline evaluation to get true initial performance
+        baseline_pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+        self.initial_train_metric, self.initial_val_metric = self._eval_baseline(X[self.initial_features], y, baseline_pipeline)
         self.final_metric = self.state['best']['val_score']
         self.gain = self.final_metric - self.initial_val_metric if self.scorer.greater_is_better else self.initial_val_metric - self.final_metric
         self.pct_gain = self.gain / (abs(self.initial_val_metric) + 1e-8)

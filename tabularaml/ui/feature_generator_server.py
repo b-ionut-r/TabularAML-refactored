@@ -799,7 +799,7 @@ def start_generation():
                 results = {
                     'total_time': round(end_time - start_time, 2),
                     'completed_gens': generator.current_generation,
-                    'features_added': len(X_result.columns) - len(X.columns),
+                    'features_added': getattr(generator, 'n_added_feats', 0),
                     'initial_score': getattr(generator, 'initial_val_metric', 0.0),
                     'final_score': getattr(generator, 'final_metric', 0.0),
                     'improvement': getattr(generator, 'gain', 0.0),
