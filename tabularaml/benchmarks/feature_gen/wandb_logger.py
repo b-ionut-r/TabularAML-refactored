@@ -188,6 +188,7 @@ def download_results_artifact(
 _RESULTS_TABLE_COLS: List[str] = [
     "dataset_id", "task", "framework", "seed", "scorer_name",
     "score_holdout", "score_nofe_same_seed", "pct_improvement",
+    "all_metrics_json", "metric_gains_json",
     "n_train", "n_test",
     "n_features_before", "n_features_after", "n_added",
     "wall_time_fit", "wall_time_transform", "wall_time_total",
@@ -251,7 +252,10 @@ def _normalize_results_frame(df: pd.DataFrame) -> pd.DataFrame:
         frame["dataset_id"] = frame["dataset_id"].astype(str)
         
     # Safe fallback for object columns
-    for col in ("task", "framework", "scorer_name", "status", "error_msg"):
+    for col in (
+        "task", "framework", "scorer_name", "status", "error_msg",
+        "all_metrics_json", "metric_gains_json",
+    ):
         frame[col] = frame[col].replace({pd.NA: None})
         
     return frame[_RESULTS_TABLE_COLS].sort_values(
@@ -1023,7 +1027,7 @@ class OrchestratorRun:
                 reinit=True,
                 settings=wandb.Settings(start_method="thread", init_timeout=300),
             )
-            self._report_step = self._run.step
+            self._report_step = int(getattr(self._run, "step", 0) or 0)
         except Exception as e:
             print(f"[wandb] orchestrator init failed; artifact sync disabled: {e}")
             self.enabled = False
@@ -1143,12 +1147,12 @@ class OrchestratorRun:
             # One run.log() call per step: scalars → line charts, figures → media panels,
             # lightweight tables → workspace table panels.
             # Heavy per-run table is only logged to summary (too large for every sync).
-            # No explicit step= so wandb auto-increments from where resumed runs left off.
             log_dict: Dict[str, Any] = {}
             log_dict.update(metrics)
             log_dict.update(figures)
             log_dict.update({k: v for k, v in tables.items() if k != "results_per_run"})
-            self._run.log(log_dict)
+            self._report_step += 1
+            self._run.log(log_dict, step=self._report_step)
 
             # Summary: all tables + metrics always reflect the latest state
             self._run.summary.update({**metrics, **tables})

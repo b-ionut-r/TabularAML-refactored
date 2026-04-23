@@ -35,6 +35,8 @@ def _make_row(spec: dict, **overrides) -> dict:
         "n_features_after": None,
         "n_added": None,
         "score_holdout": None,
+        "all_metrics_json": "",
+        "metric_gains_json": "",
         "wall_time_fit": None,
         "wall_time_transform": None,
         "wall_time_total": None,
@@ -226,7 +228,7 @@ def run(spec: dict) -> dict:
             row["n_features_after"] = int(X_train_fe.shape[1])
             row["n_added"] = int(adapter.get_feature_count_added())
 
-            score, n_rounds = score_on_holdout(
+            score, n_rounds, all_metrics = score_on_holdout(
                 X_train_fe,
                 y_train_fit,
                 X_es_fe,
@@ -235,9 +237,11 @@ def run(spec: dict) -> dict:
                 y_test,
                 task=task, n_classes=n_classes, seed=int(spec["seed"]),
                 n_jobs=int(spec.get("n_jobs", 1)),
+                return_all_metrics=True,
             )
             scorer = select_scorer(task, n_classes)
             row["score_holdout"] = float(score)
+            row["all_metrics_json"] = json.dumps(all_metrics, sort_keys=True)
             row["n_boost_rounds"] = int(n_rounds)
             row["status"] = "ok"
             row["peak_rss_mb"] = _peak_rss_mb()

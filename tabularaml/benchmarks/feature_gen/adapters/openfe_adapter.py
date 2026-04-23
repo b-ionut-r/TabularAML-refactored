@@ -56,17 +56,12 @@ def _openfe_worker_mse_patch() -> None:
 class OpenFEAdapter(FEFrameworkAdapter):
     name = "openfe"
     version = "upstream-0.0.12"
-    # supports_multiclass is True (default). OpenFE multiclass has two bugs fixed
-    # by _patch_init_score_flatten:
-    #   (1) Shape crash — init_score is a DataFrame; LightGBM 4+ requires 1-D Fortran array.
-    #       This is crash prevention only; without it OpenFE dies, producing no result.
-    #   (2) Math fix — upstream passes raw class probabilities as init_score, but LightGBM
-    #       applies softmax again, destroying the class prior. Fix: log(p) so softmax(log(p))=p.
-    #       NOTE: this is a performance enhancement, not crash prevention. It gives OpenFE
-    #       better multiclass scores than `pip install openfe` would produce out-of-the-box.
-    #       Rationale: we want to measure the algorithm's quality, not a known implementation
-    #       defect. The companion test (test_openfe_leakage_probe.py) documents transform
-    #       leakage; this class-level comment documents the math fix.
+    # supports_multiclass is True (default). _patch_init_score_flatten keeps only
+    # the crash-prevention fix for init_score shape:
+    #   (1) Shape crash — init_score is a DataFrame; LightGBM 4+ requires a 1-D
+    #       Fortran-order array. Without this, OpenFE dies and produces no result.
+    # The probability -> log-margin correction is intentionally disabled so the
+    # benchmark measures upstream OpenFE behavior as shipped.
     # OpenFE also calls exit() on internal LightGBM errors; the SystemExit catch in
     # fit_transform converts those to RuntimeError so the worker subprocess survives.
 
@@ -97,20 +92,18 @@ class OpenFEAdapter(FEFrameworkAdapter):
 
     @staticmethod
     def _patch_init_score_flatten() -> None:
-        """Patch LightGBM.fit to fix two init_score issues from OpenFE multiclass.
+        """Patch LightGBM.fit to fix only the init_score shape crash from OpenFE multiclass.
 
         Issue 1 — shape: OpenFE passes init_score as a pandas DataFrame of shape
         (n_samples, n_classes).  LightGBM 4.0+ requires a 1-D Fortran-order array
         of length n_samples * n_classes.  len(DataFrame) == n_samples, not n*k,
         so LightGBM raises 'Length of init_score != n_samples * n_classes'.
 
-        Issue 2 — math: OpenFE's default multiclass path passes raw class
-        probabilities [p0, p1, …] as init_score.  LightGBM applies softmax to
-        init_score, so softmax([0.3, 0.5, 0.2]) ≈ uniform — the prior is lost.
-        The fix (log(p)) restores the correct prior: softmax(log(p)) == p exactly.
-        OpenFE's own check_init_scores() warns about this very problem.
-        The feature_boosting path uses predict_proba(raw_score=True) which already
-        returns raw margins, so it is left untouched.
+        OpenFE's default multiclass path also passes raw class probabilities as
+        init_score even though LightGBM expects raw margins.  That probability ->
+        log-margin correction is intentionally disabled here so the benchmark tests
+        upstream OpenFE behavior as-is; only the crash-prevention shape repair
+        remains active.
         """
         import numpy as np
         import lightgbm as lgb
@@ -121,16 +114,7 @@ class OpenFEAdapter(FEFrameworkAdapter):
         _orig_fit = lgb.LGBMModel.fit
 
         def _to_fortran_1d(score):
-            """Convert a 2-D score array/DataFrame to Fortran-order 1-D; leave 1-D alone.
-
-            Also fixes OpenFE's multiclass math flaw: its default (no feature_boosting)
-            path passes raw class probabilities as init_score, but LightGBM expects raw
-            margins.  OpenFE's own check_init_scores() warns about this yet its default
-            code violates it.  Detection: 2-D array with all values in [0,1] and rows
-            summing to 1.  Fix: log(p), so softmax(log(p)) == p — same prior, correct
-            representation.  The feature_boosting path already uses predict_proba with
-            raw_score=True, so its scores are outside [0,1] and are left untouched.
-            """
+            """Convert a 2-D score array/DataFrame to Fortran-order 1-D; leave 1-D alone."""
             if isinstance(score, (list, tuple)):
                 try:
                     score = np.column_stack(score)
@@ -141,10 +125,14 @@ class OpenFEAdapter(FEFrameworkAdapter):
             else:
                 score = np.asarray(score, dtype=float)
             if score.ndim == 2:
-                # Detect probability matrix: values in [0,1], rows sum to ~1
-                if (score.min() >= 0.0 and score.max() <= 1.0 and
-                        np.allclose(score.sum(axis=1), 1.0, atol=1e-6)):
-                    score = np.log(np.clip(score, 1e-15, 1.0))
+                # Intentionally keep upstream OpenFE probability semantics here.
+                # We only repair the LightGBM shape/ordering requirement so the
+                # framework can run without crashing.
+                #
+                # Probability -> log-margin correction intentionally disabled:
+                # if (score.min() >= 0.0 and score.max() <= 1.0 and
+                #         np.allclose(score.sum(axis=1), 1.0, atol=1e-6)):
+                #     score = np.log(np.clip(score, 1e-15, 1.0))
                 return score.ravel(order='F')
             if score.ndim == 1:
                 return score

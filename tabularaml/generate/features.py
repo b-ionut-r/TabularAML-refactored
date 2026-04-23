@@ -76,7 +76,11 @@ def _compatible_pickle_loads(payload: bytes):
     return _compatible_pickle_load(io.BytesIO(payload))
 
 
-def _restore_missing_pipeline_columns(X: pd.DataFrame, pipeline) -> pd.DataFrame:
+def _restore_missing_pipeline_columns(
+    X: pd.DataFrame,
+    pipeline,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> pd.DataFrame:
     """Backfill columns expected by a fitted sklearn pipeline.
 
     Some generated features only materialize on the training fold. When the
@@ -110,6 +114,14 @@ def _restore_missing_pipeline_columns(X: pd.DataFrame, pipeline) -> pd.DataFrame
             )
         else:
             restored[col] = np.nan
+
+    if log_fn is not None:
+        preview = ", ".join(map(str, missing[:10]))
+        suffix = " ..." if len(missing) > 10 else ""
+        log_fn(
+            f"Warning: restoring {len(missing)} missing pipeline column(s) at transform time "
+            f"as missing-value placeholders: {preview}{suffix}"
+        )
 
     return restored
 
@@ -2554,7 +2566,11 @@ class FeatureGenerator:
                 pipeline = pipeline.get_pipeline(X_transformed)
                 self.pipeline = pipeline
             try:
-                X_transformed = _restore_missing_pipeline_columns(X_transformed, pipeline)
+                X_transformed = _restore_missing_pipeline_columns(
+                    X_transformed,
+                    pipeline,
+                    log_fn=self._log,
+                )
                 X_transformed = pipeline.transform(X_transformed)
             except Exception as e:
                 self._log(f"Error applying pipeline: {str(e)}")

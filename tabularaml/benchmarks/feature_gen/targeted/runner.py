@@ -13,6 +13,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import math
 import multiprocessing
 import os
 import subprocess
@@ -70,18 +71,68 @@ def _acquire_lock(path: Path):
 
 def _append_row(csv_path: Path, row: dict, columns: Sequence[str]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    ordered = {c: row.get(c) for c in columns}
-    df = pd.DataFrame([ordered])
     lock = _acquire_lock(csv_path)
     with lock:
-        header = not csv_path.exists()
-        df.to_csv(csv_path, mode="a", header=header, index=False)
+        if not csv_path.exists():
+            ordered = {c: row.get(c) for c in columns}
+            pd.DataFrame([ordered], columns=list(columns)).to_csv(csv_path, index=False)
+            return
+
+        try:
+            existing_cols = list(pd.read_csv(csv_path, nrows=0).columns)
+        except Exception:
+            existing_cols = []
+
+        full_columns = list(existing_cols)
+        for c in columns:
+            if c not in full_columns:
+                full_columns.append(c)
+
+        if full_columns != existing_cols:
+            existing = pd.read_csv(csv_path)
+            for c in full_columns:
+                if c not in existing.columns:
+                    existing[c] = None
+            existing = existing[full_columns]
+            existing.to_csv(csv_path, index=False)
+
+        ordered = {c: row.get(c) for c in full_columns}
+        pd.DataFrame([ordered], columns=full_columns).to_csv(
+            csv_path, mode="a", header=False, index=False
+        )
 
 
 def _load_master(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         return pd.DataFrame(columns=RESULT_COLUMNS)
     return pd.read_csv(csv_path)
+
+
+def _parse_metrics_json(raw, *, scorer_name=None, score_holdout=None) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {}
+        if isinstance(parsed, dict):
+            for key, value in parsed.items():
+                if value is None:
+                    metrics[str(key)] = None
+                elif isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    metrics[str(key)] = float(value)
+    if scorer_name and score_holdout is not None and scorer_name not in metrics:
+        try:
+            score = float(score_holdout)
+        except (TypeError, ValueError):
+            score = None
+        if score is not None and math.isfinite(score):
+            metrics[str(scorer_name)] = score
+    return metrics
+
+
+def _dump_metrics_json(metrics: dict[str, float | None]) -> str:
+    return json.dumps(metrics, sort_keys=True) if metrics else ""
 
 
 def _done_key_set(master: pd.DataFrame, retry_crashes: bool = False) -> set:
@@ -275,8 +326,15 @@ class TargetedBenchmarkRunner:
         return row
 
     def _attach_pct_improvement(self, row: dict, nofe_lookup: dict) -> dict:
+        from tabularaml.benchmarks.feature_gen.evaluator import compute_metric_gains
+
         key = (str(row["dataset_id"]), int(row["seed"]))
         nofe_score = nofe_lookup.get(key)
+        row_metrics = _parse_metrics_json(
+            row.get("all_metrics_json"),
+            scorer_name=row.get("scorer_name"),
+            score_holdout=row.get("score_holdout"),
+        )
         if nofe_score is not None and row.get("score_holdout") is not None:
             row["score_nofe_same_seed"] = float(nofe_score["score_holdout"])
             denom = abs(row["score_nofe_same_seed"])
@@ -286,9 +344,15 @@ class TargetedBenchmarkRunner:
                 row["pct_improvement"] = float(raw if gib else -raw)
             else:
                 row["pct_improvement"] = 0.0
+            row["metric_gains_json"] = _dump_metrics_json(
+                compute_metric_gains(row_metrics, nofe_score.get("all_metrics", {}))
+            )
         else:
             row["score_nofe_same_seed"] = None
             row["pct_improvement"] = None
+            row["metric_gains_json"] = _dump_metrics_json(
+                {metric_name: None for metric_name in row_metrics}
+            )
         return row
 
     def _sync_paths(self) -> list[Path]:
@@ -304,6 +368,11 @@ class TargetedBenchmarkRunner:
             nofe_lookup[(str(row["dataset_id"]), int(row["seed"]))] = {
                 "score_holdout":            float(row["score_holdout"]),
                 "scorer_greater_is_better": bool(row.get("scorer_greater_is_better", True)),
+                "all_metrics": _parse_metrics_json(
+                    row.get("all_metrics_json"),
+                    scorer_name=row.get("scorer_name"),
+                    score_holdout=row.get("score_holdout"),
+                ),
             }
         row = self._attach_pct_improvement(row, nofe_lookup)
         _append_row(self.master_csv, row, RESULT_COLUMNS)
@@ -341,6 +410,11 @@ class TargetedBenchmarkRunner:
                     nofe_lookup[(str(r.dataset_id), int(r.seed))] = {
                         "score_holdout":            float(r.score_holdout),
                         "scorer_greater_is_better": bool(getattr(r, "scorer_greater_is_better", True)),
+                        "all_metrics": _parse_metrics_json(
+                            getattr(r, "all_metrics_json", ""),
+                            scorer_name=getattr(r, "scorer_name", None),
+                            score_holdout=getattr(r, "score_holdout", None),
+                        ),
                     }
 
             n_done = 0

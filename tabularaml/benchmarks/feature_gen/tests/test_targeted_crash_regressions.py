@@ -100,6 +100,32 @@ def test_restore_missing_pipeline_columns_adds_numeric_and_categorical_inputs():
     assert str(restored["cat"].dtype) == "category"
 
 
+def test_restore_missing_pipeline_columns_logs_restoration():
+    class _FakeScaling:
+        feature_names_in_ = np.array(["num", "cat", "generated"])
+
+    class _FakeImputer:
+        numerical_columns_ = ["num", "generated"]
+        categorical_columns_ = ["cat"]
+
+    class _FakePipeline:
+        named_steps = {
+            "scaling_encoding": _FakeScaling(),
+            "imputing": _FakeImputer(),
+        }
+
+    logs = []
+    _restore_missing_pipeline_columns(
+        pd.DataFrame({"num": [1.0]}),
+        _FakePipeline(),
+        log_fn=logs.append,
+    )
+
+    assert len(logs) == 1
+    assert "restoring 2 missing pipeline column(s)" in logs[0]
+    assert "cat, generated" in logs[0]
+
+
 def test_featuretools_adapter_maps_boolean_na_bug_to_upstream_status():
     adapter = FeaturetoolsAdapter(
         task="classification",

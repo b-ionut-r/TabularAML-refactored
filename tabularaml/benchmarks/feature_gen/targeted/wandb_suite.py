@@ -37,6 +37,7 @@ _TARGETED_RESULT_COLUMNS = [
     "n_features_before", "n_features_after", "n_added",
     "score_holdout", "scorer_name", "scorer_greater_is_better",
     "score_nofe_same_seed", "pct_improvement",
+    "all_metrics_json", "metric_gains_json",
     "wall_time_fit", "wall_time_transform", "wall_time_total",
     "peak_rss_mb", "n_boost_rounds",
     "status", "error_msg", "adapter_version", "internal_log_json",
@@ -198,7 +199,7 @@ class TargetedOrchestratorRun(OrchestratorRun):
                 reinit=True,
                 settings=wandb.Settings(start_method="thread", init_timeout=300),
             )
-            self._report_step = self._run.step
+            self._report_step = int(getattr(self._run, "step", 0) or 0)
         except Exception as e:
             print(f"[wandb] targeted orchestrator init failed: {e}")
             self.enabled = False
@@ -266,7 +267,10 @@ def _load_master_frame_targeted(master_csv: Optional[Path]) -> pd.DataFrame:
     for col in _TARGETED_RESULT_COLUMNS:
         if col not in df.columns:
             df[col] = None
-    for col in ("dataset_name", "dataset_source", "suite", "task", "framework", "scorer_name", "status", "error_msg"):
+    for col in (
+        "dataset_name", "dataset_source", "suite", "task", "framework",
+        "scorer_name", "status", "error_msg", "all_metrics_json", "metric_gains_json",
+    ):
         if col in df.columns:
             df[col] = df[col].replace({pd.NA: None})
             

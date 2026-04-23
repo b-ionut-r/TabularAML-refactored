@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 from tabularaml.benchmarks.feature_gen.evaluator import (
+    compute_holdout_metrics,
+    compute_metric_gains,
     sanitize_features,
     split_early_stopping_validation,
     pct_improvement,
@@ -99,3 +101,46 @@ def test_split_regression_is_unstratified():
     )
     assert len(X_val) == 20
     assert len(X_tr) == 80
+
+
+def test_compute_holdout_metrics_returns_multiple_metrics():
+    y_true = np.array([0, 1, 0, 1, 1, 0])
+    y_pred = np.array([0.1, 0.8, 0.3, 0.9, 0.7, 0.2])
+
+    metrics = compute_holdout_metrics(y_true, y_pred, task="classification", n_classes=2)
+
+    assert metrics["binary_roc_auc"] is not None
+    assert metrics["binary_crossentropy"] is not None
+    assert metrics["accuracy"] is not None
+    assert metrics["precision"] is not None
+    assert metrics["recall"] is not None
+    assert metrics["f1"] is not None
+
+
+def test_compute_holdout_metrics_swallows_aux_metric_failures(monkeypatch):
+    y_true = np.array([1.0, 2.0, 3.0])
+    y_pred = np.array([1.1, 1.9, 3.2])
+
+    def _boom(y_true, y_pred):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(
+        "tabularaml.benchmarks.feature_gen.evaluator.rmsle.score",
+        _boom,
+    )
+
+    metrics = compute_holdout_metrics(y_true, y_pred, task="regression", n_classes=0)
+
+    assert metrics["rmse"] is not None
+    assert metrics["rmsle"] is None
+
+
+def test_compute_metric_gains_uses_metric_direction():
+    gains = compute_metric_gains(
+        metric_scores={"rmse": 0.5, "accuracy": 0.8, "f1": None},
+        baseline_metric_scores={"rmse": 0.8, "accuracy": 0.7, "f1": 0.6},
+    )
+
+    assert gains["rmse"] > 0
+    assert gains["accuracy"] > 0
+    assert gains["f1"] is None
