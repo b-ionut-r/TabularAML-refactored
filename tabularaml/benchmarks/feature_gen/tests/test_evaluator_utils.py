@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.model_selection import KFold
+
 from tabularaml.benchmarks.feature_gen.evaluator import (
     compute_holdout_metrics,
     compute_metric_gains,
@@ -10,11 +12,13 @@ from tabularaml.benchmarks.feature_gen.evaluator import (
     split_early_stopping_validation,
     pct_improvement,
 )
+from tabularaml.eval.cv import cross_val_score
+from tabularaml.eval.scorers import accuracy
 from tabularaml.eval.scorers import binary_roc_auc, rmse
 
 def test_sanitize_features_handles_inf_and_extremes():
     df = pd.DataFrame({
-        "a": [1.0, np.inf, -np.inf, 2.0],
+        "a": [1.0, np.inf, -np.inf, np.nan],
         "b": [1e10, -1e10, 0.0, 5.0],
         "c": pd.Series(["x", "y", "x", "y"], dtype="category")
     })
@@ -22,15 +26,66 @@ def test_sanitize_features_handles_inf_and_extremes():
     sanitized = sanitize_features(df)
     
     # Inf should be replaced with NaN
-    assert sanitized["a"].isna().sum() == 2
+    assert sanitized["a"].isna().sum() == 3
     assert np.isfinite(sanitized["a"].dropna()).all()
-    
-    # Large values should be clipped
-    assert sanitized["b"].max() <= 1e6
-    assert sanitized["b"].min() >= -1e6
+    assert not np.isinf(sanitized["b"].to_numpy()).any()
     
     # Categories should be preserved
     assert isinstance(sanitized["c"].dtype, pd.CategoricalDtype)
+
+
+class _RareClassEvalGuardModel:
+    fit_calls = 0
+
+    def fit(self, X, y, eval_set=None, **kwargs):
+        type(self).fit_calls += 1
+        train_labels = set(np.unique(np.asarray(y)))
+        if eval_set is not None:
+            _, y_val = eval_set[0]
+            unseen = set(np.unique(np.asarray(y_val))) - train_labels
+            assert not unseen
+        self._default_pred = min(train_labels)
+        return self
+
+    def predict(self, X):
+        return np.full(len(X), self._default_pred)
+
+    def get_params(self, deep=True):
+        return {}
+
+
+def test_cross_val_score_reduces_classification_folds_for_rare_classes():
+    _RareClassEvalGuardModel.fit_calls = 0
+    X = pd.DataFrame({"feat": np.arange(42)})
+    y = pd.Series([0] * 20 + [1] * 20 + [2] * 2)
+
+    score = cross_val_score(
+        _RareClassEvalGuardModel(),
+        X,
+        y,
+        scorer=accuracy,
+        cv=5,
+    )
+
+    assert np.isfinite(score)
+    assert _RareClassEvalGuardModel.fit_calls == 2
+
+
+def test_cross_val_score_skips_eval_set_when_splitter_hides_a_class():
+    _RareClassEvalGuardModel.fit_calls = 0
+    X = pd.DataFrame({"feat": np.arange(42)})
+    y = pd.Series([0] * 20 + [1] * 20 + [2] * 2)
+
+    score = cross_val_score(
+        _RareClassEvalGuardModel(),
+        X,
+        y,
+        scorer=accuracy,
+        cv=KFold(n_splits=5, shuffle=False),
+    )
+
+    assert np.isfinite(score)
+    assert _RareClassEvalGuardModel.fit_calls == 5
 
 def test_split_early_stopping_validation_stratifies():
     X = pd.DataFrame({"feat": np.arange(100)})

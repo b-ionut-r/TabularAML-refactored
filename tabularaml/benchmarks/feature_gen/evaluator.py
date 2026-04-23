@@ -13,6 +13,7 @@ if not hasattr(np, "NaN"):
 import xgboost as xgb
 from sklearn.model_selection import train_test_split
 
+from tabularaml.eval.cv import sanitize_model_features
 from tabularaml.eval.scorers import (
     PREDEFINED_SCORERS,
     Scorer,
@@ -166,27 +167,8 @@ def split_early_stopping_validation(
 
 
 def sanitize_features(X: pd.DataFrame) -> pd.DataFrame:
-    """Sanitizes generated features to avoid breaking XGBoost."""
-    X = X.copy()
-    
-    # 1. Replace inf/-inf with NaN
-    X = X.replace([np.inf, -np.inf], np.nan)
-    
-    # 2. Clip numerical columns to avoid extreme values
-    num_cols = X.select_dtypes(include=[np.number]).columns
-    if len(num_cols) > 0:
-        # Cast to float32 or float64 if not already to prevent overflow/dtype issues
-        X[num_cols] = X[num_cols].astype(float).clip(lower=-1e6, upper=1e6)
-        
-    # 3. Fix category indices ending up as floats
-    cat_cols = X.select_dtypes(include=['category']).columns
-    for c in cat_cols:
-        cat_dtype = X[c].cat.categories.dtype
-        if cat_dtype.kind in ('f', 'i', 'c'): # floats, ints, complex
-            # Convert internal categories to string so XGB is happy
-            X[c] = X[c].cat.rename_categories(X[c].cat.categories.astype(str))
-            
-    return X
+    """Replace infinities before model handoff while preserving NaNs."""
+    return sanitize_model_features(X)
 
 
 def score_on_holdout(

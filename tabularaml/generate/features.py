@@ -18,7 +18,7 @@ from sklearn.model_selection import BaseCrossValidator
 from sklearn.utils.multiclass import type_of_target
 from tqdm.auto import tqdm
 
-from tabularaml.eval.cv import cross_val_score
+from tabularaml.eval.cv import cross_val_score, make_cv_splitter, sanitize_model_features
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, PREDEFINED_SCORERS, Scorer
 from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, build_temporal_ops
 from tabularaml.inspect.importance import FeatureImportanceAnalyzer
@@ -926,8 +926,8 @@ class FeatureGenerator:
             oof_preds = np.zeros((len(y), n_classes))
 
         for train_idx, val_idx in cv.split(X, y, groups=self._groups_active):
-            X_train = X.iloc[train_idx].copy()
-            X_val = X.iloc[val_idx].copy()
+            X_train = sanitize_model_features(X.iloc[train_idx].copy())
+            X_val = sanitize_model_features(X.iloc[val_idx].copy())
             for col in X_train.select_dtypes(include=['object']).columns:
                 X_train[col] = X_train[col].astype('category')
                 X_val[col] = pd.Categorical(X_val[col], categories=X_train[col].cat.categories)
@@ -1090,14 +1090,16 @@ class FeatureGenerator:
     def _get_cv_splitter(self):
         """Get the CV splitter object from self.cv (handles int and splitter)."""
         if isinstance(self.cv, int):
-            if self._groups_active is not None:
-                from sklearn.model_selection import GroupKFold
-                return GroupKFold(n_splits=self.cv)
-            from sklearn.model_selection import StratifiedKFold, KFold
-            if self.task == "regression":
-                return KFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
-            else:
-                return StratifiedKFold(n_splits=self.cv, shuffle=True, random_state=self.random_state)
+            y = getattr(self, "_current_y", None)
+            if y is None:
+                return self.cv
+            return make_cv_splitter(
+                self.cv,
+                y,
+                shuffle=True,
+                random_state=self.random_state,
+                groups=self._groups_active,
+            )
         return self.cv
 
     def _final_regularized_selection(self, X, y):
@@ -2008,15 +2010,13 @@ class FeatureGenerator:
                 # CV fold rotation (CV bias fix)
                 if self.rotate_cv_folds and N > 0 and N % self.fold_rotation_period == 0:
                     n_splits = self.cv if isinstance(self.cv, int) else getattr(self.cv, 'n_splits', 5)
-                    if self._groups_active is not None:
-                        from sklearn.model_selection import GroupKFold
-                        self.cv = GroupKFold(n_splits=n_splits)
-                    else:
-                        from sklearn.model_selection import StratifiedKFold, KFold
-                        if self.task == "regression":
-                            self.cv = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_state + N)
-                        else:
-                            self.cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state + N)
+                    self.cv = make_cv_splitter(
+                        n_splits,
+                        y,
+                        shuffle=True,
+                        random_state=self.random_state + N,
+                        groups=self._groups_active,
+                    )
                     self._oof_preds_stale = True
                 
                 # Check for restart conditions

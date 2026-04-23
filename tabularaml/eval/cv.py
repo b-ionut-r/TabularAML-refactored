@@ -16,6 +16,65 @@ if not hasattr(pd.Series, 'numpy'):
         return self.values
     pd.Series.numpy = _numpy
 
+
+def sanitize_model_features(X):
+    """Replace +/-inf with NaN without dropping or filling missing values."""
+    if isinstance(X, np.ndarray):
+        if not np.issubdtype(X.dtype, np.number):
+            return X
+        X = X.astype(float, copy=True)
+        X[np.isinf(X)] = np.nan
+        return X
+
+    if not isinstance(X, pd.DataFrame):
+        return X
+
+    X = X.copy()
+
+    for col in X.columns:
+        if X[col].dtype == 'object' or X[col].dtype == 'string':
+            X[col] = pd.Categorical(X[col])
+
+    num_cols = X.select_dtypes(include=[np.number]).columns
+    if len(num_cols):
+        numeric_block = X[num_cols].apply(pd.to_numeric, errors="coerce")
+        numeric_block = numeric_block.replace([np.inf, -np.inf], np.nan)
+        X.loc[:, num_cols] = numeric_block
+
+    for col in X.select_dtypes(include=['category']).columns:
+        cat_dtype = X[col].cat.categories.dtype
+        if getattr(cat_dtype, "kind", None) in ("f", "i", "u", "c"):
+            X[col] = X[col].cat.rename_categories(X[col].cat.categories.astype(str))
+
+    return X
+
+
+def make_cv_splitter(cv, y, shuffle=True, random_state=42, groups=None):
+    """Build a safer default splitter for classification with rare classes."""
+    if not isinstance(cv, int):
+        return cv
+
+    if groups is not None:
+        from sklearn.model_selection import GroupKFold
+        return GroupKFold(n_splits=cv)
+
+    y_arr = np.asarray(y)
+    is_regression = type_of_target(y_arr) in ("continuous", "continuous-multioutput")
+    n_samples = len(y_arr)
+    if n_samples < 2:
+        raise ValueError("cross_val_score requires at least 2 samples")
+
+    requested_splits = max(2, min(int(cv), n_samples))
+    if is_regression:
+        return KFold(n_splits=requested_splits, shuffle=shuffle, random_state=random_state)
+
+    class_counts = pd.Series(y_arr).value_counts(dropna=False)
+    safe_splits = min(requested_splits, int(class_counts.min())) if not class_counts.empty else requested_splits
+    if safe_splits >= 2:
+        return StratifiedKFold(n_splits=safe_splits, shuffle=shuffle, random_state=random_state)
+
+    return KFold(n_splits=requested_splits, shuffle=shuffle, random_state=random_state)
+
 def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_state = 42,
                     pipeline: Union[Pipeline, PipelineWrapper] = None, return_dict = False,
                     model_fit_kwargs = {}, folds_weights = None, groups = None):
@@ -72,9 +131,7 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
 
     X = X.copy()
     y = y.copy()
-    for col in X.columns:
-        if X[col].dtype == 'object' or X[col].dtype == 'string':
-            X[col] = pd.Categorical(X[col])
+    X = sanitize_model_features(X)
 
     assert hasattr(model, "fit"), "Model must have a .fit() method."
     assert hasattr(model, "predict"), "Model must have a .predict() method."
@@ -85,28 +142,7 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
     is_dataframe = isinstance(X, pd.DataFrame)
     
     if isinstance(cv, int):
-        if groups is not None:
-            from sklearn.model_selection import GroupKFold
-            cv = GroupKFold(n_splits=cv)
-        else:
-            is_regression = type_of_target(y) in ("continuous", "continuous-multioutput")
-
-            y_arr = np.asarray(y)
-            # Guard: np.bincount requires non-negative integers; fall back for regression
-            # targets that type_of_target misclassifies as "multiclass" (integer dtype).
-            _can_bincount = (
-                not is_regression
-                and np.issubdtype(y_arr.dtype, np.integer)
-                and y_arr.min() >= 0
-            )
-            min_class = np.min(np.bincount(y_arr.astype(int))) if _can_bincount else cv + 1
-
-            use_stratified = (not is_regression) and (min_class >= cv)
-
-            if use_stratified:
-                cv = StratifiedKFold(n_splits=cv, shuffle=shuffle, random_state=random_state)
-            else:
-                cv = KFold(n_splits=cv, shuffle=shuffle, random_state=random_state)
+        cv = make_cv_splitter(cv, y, shuffle=shuffle, random_state=random_state, groups=groups)
     
     # Validate folds_weights if provided
     if folds_weights is not None:
@@ -160,6 +196,9 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
         else:
             X_train, X_val = X_train_raw, X_val_raw
 
+        X_train = sanitize_model_features(X_train)
+        X_val = sanitize_model_features(X_val)
+
         fit_signature = inspect.signature(model_clone.fit)
         if 'eval_set' in fit_signature.parameters:
             fit_kwargs = model_fit_kwargs.copy()
@@ -171,7 +210,13 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
                     fit_kwargs['callbacks'] = [lgb.log_evaluation(period=0)]
                 except ImportError:
                     pass
-            model_clone.fit(X_train, y_train, eval_set=[(X_val, y_val)], **fit_kwargs)
+            train_labels = np.unique(np.asarray(y_train))
+            val_labels = np.unique(np.asarray(y_val))
+            has_unseen_eval_labels = np.setdiff1d(val_labels, train_labels).size > 0
+            if has_unseen_eval_labels:
+                model_clone.fit(X_train, y_train, **fit_kwargs)
+            else:
+                model_clone.fit(X_train, y_train, eval_set=[(X_val, y_val)], **fit_kwargs)
         else:
             model_clone.fit(X_train, y_train, **model_fit_kwargs)
 
