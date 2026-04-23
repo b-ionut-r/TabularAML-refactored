@@ -44,6 +44,23 @@ def test_split_early_stopping_validation_stratifies():
     assert (y_val == 0).sum() == 10
     assert (y_val == 1).sum() == 10
 
+
+def test_split_early_stopping_validation_stratifies_multiclass():
+    X = pd.DataFrame({"feat": np.arange(90)})
+    y = np.array([0] * 30 + [1] * 30 + [2] * 30)
+
+    X_tr, X_val, y_tr, y_val = split_early_stopping_validation(
+        X, y, task="multiclass", seed=42, validation_fraction=0.2
+    )
+
+    assert len(X_val) == 18
+    assert len(X_tr) == 72
+    assert set(np.unique(y_tr)) == {0, 1, 2}
+    assert set(np.unique(y_val)) == {0, 1, 2}
+    assert (y_val == 0).sum() == 6
+    assert (y_val == 1).sum() == 6
+    assert (y_val == 2).sum() == 6
+
 def test_split_early_stopping_validation_falls_back_on_tiny_data():
     X = pd.DataFrame({"feat": np.arange(5)})
     y = np.array([0, 0, 0, 0, 1])  # Only one member of class 1

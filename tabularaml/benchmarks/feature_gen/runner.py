@@ -89,6 +89,7 @@ def _done_key_set(master: pd.DataFrame, retry_crashes: bool = True) -> set:
         "ok", "timeout", "oom", "contract_violation", "unsupported_task",
         "dataset_fetch_failed", "degenerate_dataset",
         "autofeat_internal_nan", "autofeat_upstream_bug", "featuretools_upstream_bug",
+        "openfe_upstream_bug",
     }
     if not retry_crashes:
         terminal.add("crash")

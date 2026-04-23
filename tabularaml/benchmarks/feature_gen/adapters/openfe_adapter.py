@@ -18,6 +18,10 @@ import pandas as pd
 from .base import FEFrameworkAdapter
 
 
+class _OpenFEUpstreamBugError(RuntimeError):
+    """Raised for known upstream OpenFE failures that should not kill the worker."""
+
+
 def _openfe_worker_mse_patch() -> None:
     """ProcessPoolExecutor initializer: re-apply the sklearn MSE compat patch.
 
@@ -241,9 +245,9 @@ class OpenFEAdapter(FEFrameworkAdapter):
             return self._fit_transform_inner(X_train, y_train)
         except SystemExit as exc:
             # OpenFE's _evaluate() calls exit() on any internal LightGBM error.
-            # Catch it so the worker subprocess survives and records a crash row
-            # rather than dying silently.
-            raise RuntimeError(
+            # Catch it so the worker subprocess survives and can classify the
+            # failure as an upstream framework bug instead of a generic crash.
+            raise _OpenFEUpstreamBugError(
                 f"OpenFE called exit() internally (multiclass LightGBM error): {exc}"
             ) from exc
 
@@ -314,12 +318,17 @@ class OpenFEAdapter(FEFrameworkAdapter):
             # Apply the same column renaming to test data
             X_test_safe = X_test.rename(columns=self._col_mapping)
 
-            _, X_test_fe_safe = transform(
-                self._x_train_cache.rename(columns=self._col_mapping),
-                X_test_safe,
-                self._features,
-                n_jobs=self.n_jobs,
-            )
+            try:
+                _, X_test_fe_safe = transform(
+                    self._x_train_cache.rename(columns=self._col_mapping),
+                    X_test_safe,
+                    self._features,
+                    n_jobs=self.n_jobs,
+                )
+            except SystemExit as exc:
+                raise _OpenFEUpstreamBugError(
+                    f"OpenFE called exit() internally (multiclass LightGBM error): {exc}"
+                ) from exc
 
             reverse_mapping = {v: k for k, v in self._col_mapping.items()}
             new_cols = []

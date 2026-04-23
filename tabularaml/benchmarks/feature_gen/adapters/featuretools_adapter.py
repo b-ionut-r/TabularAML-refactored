@@ -44,16 +44,26 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         for c in frame.columns:
             if isinstance(frame[c].dtype, pd.CategoricalDtype):
                 frame[c] = frame[c].astype(object)
-                
-        # NEW: Ensure boolean-like objects are cast to nullable boolean 
-        # so Woodwork doesn't incorrectly assign them as Categorical.
+
+        # Avoid propagating pandas.NA into Featuretools/Woodwork paths that
+        # evaluate truthiness internally and crash on ambiguous NA scalars.
         for c in frame.columns:
-            if is_object_dtype(frame[c]):
-                inferred = pd.api.types.infer_dtype(frame[c], skipna=True)
-                if inferred == 'boolean':
-                    frame[c] = frame[c].astype("boolean")
-                    
+            if c == "_bench_idx":
+                continue
+            if is_object_dtype(frame[c]) or str(frame[c].dtype) == "boolean":
+                ser = frame[c].astype(object)
+                frame[c] = ser.where(~pd.isna(ser), np.nan)
+
         return frame
+
+    @staticmethod
+    def _raise_known_upstream_error(exc: Exception):
+        text = str(exc)
+        if "TypeConversionError" in type(exc).__name__ or "TypeConversionError" in text:
+            raise _FeaturetoolsUpstreamBugError(text) from exc
+        if "boolean value of NA is ambiguous" in text:
+            raise _FeaturetoolsUpstreamBugError(text) from exc
+        raise exc
 
     def _dfs(self, frame: pd.DataFrame):
         import featuretools as ft
@@ -113,9 +123,7 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
                 n_jobs=self.n_jobs,
             )
         except Exception as e:
-            if "TypeConversionError" in type(e).__name__ or "TypeConversionError" in str(type(e).__mro__):
-                raise _FeaturetoolsUpstreamBugError(str(e)) from e
-            raise
+            self._raise_known_upstream_error(e)
         self._feature_defs = feature_defs
         matrix = self._postprocess(matrix, fit=True)
         if "_bench_idx" in matrix.columns:
@@ -132,12 +140,15 @@ class FeaturetoolsAdapter(FEFrameworkAdapter):
         valid_cols = getattr(self, '_valid_cols', X_test.columns.tolist())
         frame = self._to_index_frame(X_test[[c for c in valid_cols if c in X_test.columns]])
         _, es = self._dfs(frame)
-        matrix = ft.calculate_feature_matrix(
-            features=self._feature_defs,
-            entityset=es,
-            verbose=False,
-            n_jobs=self.n_jobs,
-        )
+        try:
+            matrix = ft.calculate_feature_matrix(
+                features=self._feature_defs,
+                entityset=es,
+                verbose=False,
+                n_jobs=self.n_jobs,
+            )
+        except Exception as e:
+            self._raise_known_upstream_error(e)
         matrix = self._postprocess(matrix, fit=False)
         if "_bench_idx" in matrix.columns:
             matrix = matrix.drop(columns=["_bench_idx"])

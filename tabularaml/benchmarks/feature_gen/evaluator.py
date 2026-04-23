@@ -68,7 +68,7 @@ def _predict_for_scorer(model, X, task: str, n_classes: int) -> np.ndarray:
 
 def _safe_stratify_for_classification(y: np.ndarray, task: str):
     """Return stratification labels only when it is safe to use them."""
-    if task != "classification":
+    if task not in ("classification", "multiclass"):
         return None
     y = np.asarray(y)
     classes, counts = np.unique(y, return_counts=True)

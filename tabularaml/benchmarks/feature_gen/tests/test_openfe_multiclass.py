@@ -12,6 +12,8 @@ import importlib
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.datasets import load_wine, make_classification
+from sklearn.metrics import log_loss
 from sklearn.model_selection import train_test_split
 
 
@@ -31,6 +33,32 @@ def toy_multiclass():
     })
     y = pd.Series(rng.integers(0, 4, size=n))
     return X, y
+
+
+def _make_openfe_for_init_checks(X: pd.DataFrame, y: pd.Series):
+    from openfe import OpenFE
+
+    ofe = OpenFE()
+    ofe.data = X.reset_index(drop=True)
+    ofe.label = pd.DataFrame({"label": pd.Series(y).reset_index(drop=True)})
+    ofe.task = "classification"
+    ofe.feature_boosting = False
+    ofe.metric = "multi_logloss"
+    ofe.seed = 0
+    ofe.n_jobs = 1
+    ofe.verbose = False
+    ofe.categorical_features = []
+    return ofe
+
+
+def _is_probability_matrix(arr: np.ndarray) -> bool:
+    arr = np.asarray(arr, dtype=float)
+    return bool(
+        arr.ndim == 2
+        and arr.min() >= 0.0
+        and arr.max() <= 1.0
+        and np.allclose(arr.sum(axis=1), 1.0, atol=1e-6)
+    )
 
 
 @pytest.mark.skipif(not openfe_available, reason="openfe not installed")
@@ -146,3 +174,81 @@ def test_probability_detection_triggers_log_conversion():
     is_prob = (margins.min() >= 0.0 and margins.max() <= 1.0 and
                np.allclose(margins.sum(axis=1), 1.0, atol=1e-6))
     assert not is_prob, "Raw margin matrix must not be misclassified as a probability matrix"
+
+
+@pytest.mark.skipif(not openfe_available, reason="openfe not installed")
+def test_openfe_upstream_default_multiclass_init_score_is_probability_matrix():
+    """Upstream OpenFE default multiclass init_score really is a probability matrix."""
+    X, y = load_wine(return_X_y=True, as_frame=True)
+    ofe = _make_openfe_for_init_checks(X, y)
+
+    init_scores = ofe.get_init_score(None).to_numpy(dtype=float)
+
+    assert _is_probability_matrix(init_scores), (
+        "Upstream OpenFE default multiclass init_score is expected to be a row-normalized "
+        "probability matrix. If this stops being true, the adapter log(p) fix and its "
+        "rationale need to be revisited."
+    )
+
+
+@pytest.mark.skipif(not openfe_available, reason="openfe not installed")
+def test_openfe_multiclass_metric_matches_true_log_loss_only_after_log_conversion():
+    """OpenFE.get_init_metric() is correct for multiclass only after p -> log(p).
+
+    This checks a real imbalanced multiclass setting where softmax(p) noticeably differs
+    from p, so the bug is not hidden by a uniform class prior.
+    """
+    X, y = make_classification(
+        n_samples=300,
+        n_features=8,
+        n_informative=6,
+        n_redundant=0,
+        n_classes=4,
+        weights=[0.70, 0.15, 0.10, 0.05],
+        random_state=0,
+    )
+    X = pd.DataFrame(X)
+    y = pd.Series(y)
+
+    ofe = _make_openfe_for_init_checks(X, y)
+    probs = ofe.get_init_score(None).to_numpy(dtype=float)
+    labels = ofe.label.values.ravel()
+    log_probs = np.log(np.clip(probs, 1e-15, 1.0))
+
+    metric_with_probs = ofe.get_init_metric(probs, labels)
+    metric_with_log_probs = ofe.get_init_metric(log_probs, labels)
+    true_logloss = log_loss(labels, probs, labels=list(range(probs.shape[1])))
+
+    assert metric_with_log_probs == pytest.approx(true_logloss, abs=1e-12), (
+        "OpenFE.get_init_metric(log(p), y) must equal the true multiclass log loss of p."
+    )
+    assert metric_with_probs > true_logloss + 1e-3, (
+        "Using raw probabilities as multiclass init_score should measurably distort the "
+        "baseline metric on an imbalanced problem."
+    )
+
+
+@pytest.mark.skipif(not openfe_available, reason="openfe not installed")
+def test_probability_detector_negative_control_on_real_raw_margins():
+    """Real LightGBM multiclass raw margins should not look like probabilities."""
+    import lightgbm as lgb
+
+    X, y = load_wine(return_X_y=True, as_frame=True)
+    X_tr, X_te, y_tr, _ = train_test_split(X, y, test_size=0.25, random_state=0, stratify=y)
+
+    clf = lgb.LGBMClassifier(
+        objective="multiclass",
+        num_class=int(pd.Series(y_tr).nunique()),
+        n_estimators=50,
+        learning_rate=0.1,
+        random_state=0,
+        n_jobs=1,
+        verbosity=-1,
+    )
+    clf.fit(X_tr, y_tr)
+    raw_scores = clf.predict_proba(X_te, raw_score=True)
+
+    assert not _is_probability_matrix(raw_scores), (
+        "A real raw_score=True multiclass output from LightGBM should not satisfy the "
+        "probability-matrix detector used by the adapter."
+    )

@@ -10,9 +10,9 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class DatasetSpec:
-    id: str                  # OpenML task ID (str of int) or PMLB dataset name
+    id: str                  # OpenML task/dataset ID (str of int) or PMLB dataset name
     name: str                # Human-readable label
-    source: str              # "openml_task" | "pmlb"
+    source: str              # "openml_task" | "openml_dataset" | "pmlb"
     task: str                # "classification" | "regression" | "multiclass"
     suite: str               # "amlb" | "pmlb" | "stress_test" | "ctr23"
     rationale: str = ""      # Why this dataset is in the suite
@@ -142,27 +142,27 @@ PMLB_STANDARD: list[DatasetSpec] = [
 # ---------------------------------------------------------------------------
 STRESS_TEST: list[DatasetSpec] = [
     DatasetSpec(
-        "1169", "Airlines", "openml_task", "classification", "stress_test",
+        "1169", "Airlines", "openml_dataset", "classification", "stress_test",
         rationale="100k+ rows, high-cardinality categoricals: tests scale & encoding robustness",
     ),
     DatasetSpec(
-        "42712", "Bike-Sharing", "openml_task", "regression", "stress_test",
+        "42712", "Bike-Sharing", "openml_dataset", "regression", "stress_test",
         rationale="Temporal structure: tests whether tools extract day_of_week / lag features",
     ),
     DatasetSpec(
-        "1113", "KDD-Cup-98", "openml_task", "regression", "stress_test",
+        "1113", "KDD-Cup-98", "openml_dataset", "regression", "stress_test",
         rationale="Multi-table relational structure: primary test of Featuretools DFS",
     ),
     DatasetSpec(
-        "23380", "Mercedes-Greener", "openml_task", "regression", "stress_test",
+        "23380", "Mercedes-Greener", "openml_dataset", "regression", "stress_test",
         rationale="Anonymous feature names (X1, X2, ...): tests tools that rely on column names",
     ),
     DatasetSpec(
-        "41207", "Allstate-Claims", "openml_task", "regression", "stress_test",
+        "41207", "Allstate-Claims", "openml_dataset", "regression", "stress_test",
         rationale="Highly skewed regression target: tests overfitting risk with FE",
     ),
     DatasetSpec(
-        "40927", "Sleep", "openml_task", "classification", "stress_test",
+        "40927", "Sleep", "openml_dataset", "classification", "stress_test",
         rationale="Wide table (small n, many features): tests regularisation under high-dim FE",
     ),
     DatasetSpec(

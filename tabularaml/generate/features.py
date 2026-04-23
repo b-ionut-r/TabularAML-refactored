@@ -75,6 +75,44 @@ def _compatible_pickle_loads(payload: bytes):
     """Load pickled bytes using compatibility module remapping."""
     return _compatible_pickle_load(io.BytesIO(payload))
 
+
+def _restore_missing_pipeline_columns(X: pd.DataFrame, pipeline) -> pd.DataFrame:
+    """Backfill columns expected by a fitted sklearn pipeline.
+
+    Some generated features only materialize on the training fold. When the
+    held-out fold is missing those inputs, restore them as NaN so the fitted
+    imputer/encoder stack can handle them instead of crashing on a schema
+    mismatch.
+    """
+    if not isinstance(X, pd.DataFrame) or pipeline is None or not hasattr(pipeline, "named_steps"):
+        return X
+
+    scaler_step = pipeline.named_steps.get("scaling_encoding")
+    required_cols = list(getattr(scaler_step, "feature_names_in_", []))
+    if not required_cols:
+        return X
+
+    missing = [col for col in required_cols if col not in X.columns]
+    if not missing:
+        return X
+
+    restored = X.copy()
+    imputer = pipeline.named_steps.get("imputing")
+    numeric_cols = set(getattr(imputer, "numerical_columns_", [])) if imputer is not None else set()
+    categorical_cols = set(getattr(imputer, "categorical_columns_", [])) if imputer is not None else set()
+
+    for col in missing:
+        if col in categorical_cols and col not in numeric_cols:
+            restored[col] = pd.Series(
+                [pd.NA] * len(restored),
+                index=restored.index,
+                dtype="category",
+            )
+        else:
+            restored[col] = np.nan
+
+    return restored
+
 class Feature:
     """Feature with name, dtype, weight, depth, and pipeline requirements."""
     def __init__(self, name: str, dtype: Literal["num", "cat"], weight: float, 
@@ -2516,6 +2554,7 @@ class FeatureGenerator:
                 pipeline = pipeline.get_pipeline(X_transformed)
                 self.pipeline = pipeline
             try:
+                X_transformed = _restore_missing_pipeline_columns(X_transformed, pipeline)
                 X_transformed = pipeline.transform(X_transformed)
             except Exception as e:
                 self._log(f"Error applying pipeline: {str(e)}")

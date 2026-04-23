@@ -2,6 +2,7 @@
 
 Supports two sources:
   - "openml_task": fetch by OpenML task ID via the openml Python package.
+  - "openml_dataset": fetch by OpenML dataset ID via the openml Python package.
   - "pmlb":        fetch by PMLB dataset name via the pmlb Python package.
 
 Both paths return a LoadedDataset with a consistent interface.
@@ -17,6 +18,10 @@ import numpy as np
 import pandas as pd
 
 from .registry import DatasetSpec
+
+
+class DatasetLoadError(RuntimeError):
+    """Raised when a configured dataset cannot be fetched or decoded."""
 
 
 def _pmlb_cache_dir() -> str:
@@ -38,6 +43,8 @@ class LoadedDataset:
 def load_dataset(spec: DatasetSpec) -> LoadedDataset:
     if spec.source == "pmlb":
         return _load_pmlb(spec)
+    if spec.source == "openml_dataset":
+        return _load_openml_dataset(spec)
     if spec.source == "openml_task":
         return _load_openml_task(spec)
     raise ValueError(f"Unknown dataset source: {spec.source!r}")
@@ -62,8 +69,74 @@ def _load_openml_task(spec: DatasetSpec) -> LoadedDataset:
     with _acquire_cache_lock(f"openml_{task_id}"):
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
-            task = openml.tasks.get_task(task_id)
-            X, y = task.get_X_and_y(dataset_format="dataframe")
+            try:
+                task = openml.tasks.get_task(task_id)
+                X, y = task.get_X_and_y(dataset_format="dataframe")
+            except Exception as exc:
+                if _looks_like_unknown_openml_task(exc):
+                    return _load_openml_dataset(spec)
+                raise DatasetLoadError(
+                    f"OpenML task {task_id} could not be loaded: {exc}"
+                ) from exc
+
+    X = pd.DataFrame(X)
+    y_ser = pd.Series(y).reset_index(drop=True)
+    X = X.reset_index(drop=True)
+
+    task_type, n_classes = _infer_task(y_ser, spec.task)
+    return LoadedDataset(X=X, y=y_ser, task=task_type, name=spec.name, n_classes=n_classes)
+
+
+def _looks_like_unknown_openml_task(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "unknown task" in text or ("returned code 151" in text and "/task/" in text)
+
+
+def _default_openml_target(dataset) -> str | None:
+    target = getattr(dataset, "default_target_attribute", None)
+    if target is None:
+        return None
+    if isinstance(target, (list, tuple)):
+        values = [str(v).strip() for v in target if str(v).strip()]
+    else:
+        values = [part.strip() for part in str(target).split(",") if part.strip()]
+    if not values:
+        return None
+    return values[0]
+
+
+def _load_openml_dataset(spec: DatasetSpec) -> LoadedDataset:
+    import openml
+
+    dataset_id = int(spec.id)
+    with _acquire_cache_lock(f"openml_dataset_{dataset_id}"):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            try:
+                dataset = openml.datasets.get_dataset(
+                    dataset_id,
+                    download_data=True,
+                    download_qualities=False,
+                    download_features_meta_data=False,
+                )
+                target = _default_openml_target(dataset)
+                if not target:
+                    raise DatasetLoadError(
+                        f"OpenML dataset {dataset_id} has no default target attribute"
+                    )
+                X, y, _, _ = dataset.get_data(
+                    dataset_format="dataframe",
+                    target=target,
+                )
+            except DatasetLoadError:
+                raise
+            except Exception as exc:
+                raise DatasetLoadError(
+                    f"OpenML dataset {dataset_id} could not be loaded: {exc}"
+                ) from exc
+
+    if y is None:
+        raise DatasetLoadError(f"OpenML dataset {dataset_id} returned no target column")
 
     X = pd.DataFrame(X)
     y_ser = pd.Series(y).reset_index(drop=True)

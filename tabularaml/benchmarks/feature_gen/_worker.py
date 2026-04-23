@@ -72,6 +72,9 @@ def _preprocess(X: pd.DataFrame, y, task: str):
     for c in X.columns:
         if hasattr(X[c], "sparse"):
             X[c] = X[c].sparse.to_dense()
+    for c in X.columns:
+        if pd.api.types.is_numeric_dtype(X[c]):
+            X[c] = pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
     # Cast object → category.
     for c in X.columns:
@@ -263,6 +266,8 @@ def run(spec: dict) -> dict:
             row["status"] = "autofeat_upstream_bug"
         elif cls_name == "_FeaturetoolsUpstreamBugError":
             row["status"] = "featuretools_upstream_bug"
+        elif cls_name == "_OpenFEUpstreamBugError":
+            row["status"] = "openfe_upstream_bug"
         else:
             row["status"] = "crash"
         row["error_msg"] = f"{cls_name}: {str(e)[:400]}"
