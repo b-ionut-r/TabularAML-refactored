@@ -2018,6 +2018,22 @@ class FeatureGenerator:
                         groups=self._groups_active,
                     )
                     self._oof_preds_stale = True
+                    if self.state['best']['X'] is not None:
+                        try:
+                            old_best = self.state['best']['val_score']
+                            best_train, best_val = self._eval_baseline(
+                                self.state['best']['X'],
+                                y,
+                                self.state['best']['pipeline'],
+                            )
+                            self.state['best']['train_score'] = best_train
+                            self.state['best']['val_score'] = best_val
+                            self._log(
+                                f"  CV fold rotation: refreshed best {self.scorer.name} "
+                                f"{old_best:.5f} -> {best_val:.5f}"
+                            )
+                        except Exception as e:
+                            self._log(f"  CV fold rotation: failed to refresh best score ({e})")
                 
                 # Check for restart conditions
                 if self.adaptive_controller.should_restart(N):
@@ -2238,7 +2254,12 @@ class FeatureGenerator:
                         stagnation_counter += 1
                 
                 # Enhanced logging
-                improvement = "No improvement." if delta <= 0 else f"Score improved by {delta:.5f}."
+                if delta <= 0:
+                    improvement = "No improvement."
+                elif delta < 0.5e-5:
+                    improvement = "Score improved by <0.00001."
+                else:
+                    improvement = f"Score improved by {delta:.5f}."
                 adaptive_status = self.adaptive_controller.get_status_summary()
                 
                 n_groupby = len(getattr(self.pipeline, "groupby_encoders", []))
