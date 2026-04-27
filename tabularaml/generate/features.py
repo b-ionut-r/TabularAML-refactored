@@ -2044,22 +2044,7 @@ class FeatureGenerator:
                         self._log(f"  CV fold rotation skipped for {type(self.cv).__name__}")
                     else:
                         self._oof_preds_stale = True
-                    if cv_rotated and self.state['best']['X'] is not None:
-                        try:
-                            old_best = self.state['best']['val_score']
-                            best_train, best_val = self._eval_baseline(
-                                self.state['best']['X'],
-                                y,
-                                self.state['best']['pipeline'],
-                            )
-                            self.state['best']['train_score'] = best_train
-                            self.state['best']['val_score'] = best_val
-                            self._log(
-                                f"  CV fold rotation: refreshed best {self.scorer.name} "
-                                f"{old_best:.5f} -> {best_val:.5f}"
-                            )
-                        except Exception as e:
-                            self._log(f"  CV fold rotation: failed to refresh best score ({e})")
+                        self._log(f"  CV fold rotation: rotated to {type(self.cv).__name__}")
                 
                 # Check for restart conditions
                 if self.adaptive_controller.should_restart(N):
