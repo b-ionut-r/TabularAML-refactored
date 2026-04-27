@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 
 from tabularaml.eval.cv import cross_val_score, make_cv_splitter, sanitize_model_features
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, PREDEFINED_SCORERS, Scorer
+from tabularaml.eval.splitters import RotatedGroupKFold, normalize_rotatable_splitter
 from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, build_temporal_ops
 from tabularaml.inspect.importance import FeatureImportanceAnalyzer
 from tabularaml.preprocessing.encoders import CategoricalEncoder, GroupByEncoder, TemporalEncoder
@@ -1901,6 +1902,7 @@ class FeatureGenerator:
         start_time = time.time()
         X = self._drop_id_columns(X)
         self._set_defaults(X, y)
+        self.cv = normalize_rotatable_splitter(self.cv)
         self.initial_features = list(X.columns)
         num_cols, cat_cols = self._get_num_cat_cols(X)
         self.max_gen_new_feats = (int(self.max_new_feats * len(self.initial_features)) if isinstance(self.max_new_feats, float)
@@ -1941,7 +1943,16 @@ class FeatureGenerator:
         X_meta, y_meta = None, None
         if self.meta_validation_frac > 0 and len(X) > 2000:
             try:
-                if self._groups_active is not None:
+                split_meta = getattr(self.cv, "split_meta", None)
+                if callable(split_meta):
+                    search_idx, meta_idx = split_meta(
+                        X,
+                        y=y,
+                        groups=self._groups_active,
+                        frac=self.meta_validation_frac,
+                        random_state=self.random_state,
+                    )
+                elif self._groups_active is not None:
                     from sklearn.model_selection import GroupShuffleSplit
                     gss = GroupShuffleSplit(n_splits=1, test_size=self.meta_validation_frac, random_state=self.random_state)
                     search_idx, meta_idx = next(gss.split(X, y, groups=self._groups_active))
@@ -1986,6 +1997,7 @@ class FeatureGenerator:
         # Main loop
         stagnation_counter = 0
         hopeful_monster_consecutive_fails = 0
+        cv_rotation_splits = self.cv if isinstance(self.cv, int) else None
         
         with tqdm(total=self.n_generations, desc="Generations") as pbar:
             for N in range(self.n_generations):
@@ -2009,16 +2021,30 @@ class FeatureGenerator:
                 
                 # CV fold rotation (CV bias fix)
                 if self.rotate_cv_folds and N > 0 and N % self.fold_rotation_period == 0:
-                    n_splits = self.cv if isinstance(self.cv, int) else getattr(self.cv, 'n_splits', 5)
-                    self.cv = make_cv_splitter(
-                        n_splits,
-                        y,
-                        shuffle=True,
-                        random_state=self.random_state + N,
-                        groups=self._groups_active,
-                    )
-                    self._oof_preds_stale = True
-                    if self.state['best']['X'] is not None:
+                    cv_rotated = False
+                    if cv_rotation_splits is not None:
+                        if self._groups_active is not None:
+                            self.cv = RotatedGroupKFold(cv_rotation_splits, rotation=self.random_state + N)
+                        else:
+                            self.cv = make_cv_splitter(
+                                cv_rotation_splits,
+                                y,
+                                shuffle=True,
+                                random_state=self.random_state + N,
+                                groups=self._groups_active,
+                            )
+                        cv_rotated = True
+                    else:
+                        rotate_cv = getattr(self.cv, "rotated", None)
+                        if callable(rotate_cv):
+                            self.cv = rotate_cv(N)
+                            cv_rotated = True
+
+                    if not cv_rotated:
+                        self._log(f"  CV fold rotation skipped for {type(self.cv).__name__}")
+                    else:
+                        self._oof_preds_stale = True
+                    if cv_rotated and self.state['best']['X'] is not None:
                         try:
                             old_best = self.state['best']['val_score']
                             best_train, best_val = self._eval_baseline(

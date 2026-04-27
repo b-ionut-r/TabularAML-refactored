@@ -34,6 +34,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 from tabularaml.generate.features import FeatureGenerator
 from tabularaml.configs.feature_gen import PRESET_PARAMS
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS
+from tabularaml.eval.splitters import PurgedTimeSeriesSplit
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'tabularaml_feature_gen_complete'
@@ -654,27 +655,7 @@ def start_generation():
             unique_periods = np.sort(np.unique(groups))
             tss = TimeSeriesSplit(n_splits=cv_folds, gap=cv_gap)
 
-            class _PurgedTimeSeriesSplit:
-                """Wraps TimeSeriesSplit to work on period-level then mask rows."""
-                def __init__(self, tss, unique_periods, groups):
-                    self._tss = tss
-                    self._periods = unique_periods
-                    self._groups = groups
-                    self.n_splits = tss.n_splits
-                def split(self, X, y=None, groups=None):
-                    # Use groups passed at split-time (may be subsampled), else fall back
-                    g = groups if groups is not None else self._groups
-                    unique_periods = np.sort(np.unique(g))
-                    for tr_p_idx, val_p_idx in self._tss.split(unique_periods):
-                        tr_periods  = unique_periods[tr_p_idx]
-                        val_periods = unique_periods[val_p_idx]
-                        tr_mask  = np.isin(g, tr_periods)
-                        val_mask = np.isin(g, val_periods)
-                        yield np.where(tr_mask)[0], np.where(val_mask)[0]
-                def get_n_splits(self, X=None, y=None, groups=None):
-                    return self._tss.get_n_splits()
-
-            cv_obj = _PurgedTimeSeriesSplit(tss, unique_periods, groups)
+            cv_obj = PurgedTimeSeriesSplit(tss, unique_periods, groups)
             print(f"📊 TimeSeriesSplit: {cv_folds} splits, gap={cv_gap} on column '{group_col}' ({len(unique_periods)} unique periods)")
 
         elif cv_type == 'custom':
