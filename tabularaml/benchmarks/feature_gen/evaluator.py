@@ -54,14 +54,14 @@ EARLY_STOP_VALIDATION_FRACTION = 0.1
 def select_scorer(task: str, n_classes: int) -> Scorer:
     if task == "regression":
         return rmse
-    return binary_roc_auc if n_classes == 2 else categorical_crossentropy
+    return binary_crossentropy if n_classes == 2 else categorical_crossentropy
 
 
 def select_logging_scorers(task: str, n_classes: int) -> Tuple[Scorer, ...]:
     if task == "regression":
         return (rmse, mae, mse, r2, pearson, rmsle)
     if n_classes == 2:
-        return (binary_roc_auc, binary_crossentropy, accuracy, precision, recall, f1)
+        return (binary_crossentropy, binary_roc_auc, accuracy, precision, recall, f1)
     return (categorical_crossentropy, categorical_roc_auc, accuracy, precision, recall, f1)
 
 

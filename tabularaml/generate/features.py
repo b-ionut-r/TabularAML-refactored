@@ -858,12 +858,13 @@ class FeatureGenerator:
         imp_df.sort_values(by="weighted_importance", axis=0, ascending=False, inplace=True)
         return imp_df if k == -1 else imp_df[:k]
 
-    def _eval_baseline(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> tuple[float, float]:
+    def _eval_baseline(self, X: pd.DataFrame, y: pd.Series, pipeline=None, groups=None) -> tuple[float, float]:
         """Evaluate baseline model performance."""
         pipeline = pipeline.get_pipeline(X, y) if pipeline is not None else pipeline
+        eval_groups = self._groups_active if groups is None else groups
         cv_dict = cross_val_score(self.baseline_model, X, y, self.scorer, cv=self.cv,
                                  return_dict=True, pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs,
-                                 groups=self._groups_active)
+                                 groups=eval_groups)
         return cv_dict["mean_train_score"], cv_dict["mean_val_score"]
 
     def _eval_logging_scorers(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> Dict[str, Tuple[float, float]]:
@@ -1940,7 +1941,7 @@ class FeatureGenerator:
         self._current_y = y  # Reference for proxy eval objective detection
 
         # Meta-validation split (CV bias fix)
-        X_meta, y_meta = None, None
+        X_meta, y_meta, groups_meta = None, None, None
         if self.meta_validation_frac > 0 and len(X) > 2000:
             try:
                 split_meta = getattr(self.cv, "split_meta", None)
@@ -1964,6 +1965,9 @@ class FeatureGenerator:
                         stratify=stratify, random_state=self.random_state
                     )
                 X_meta, y_meta = X.iloc[meta_idx].copy(), y.iloc[meta_idx].copy()
+                if self._groups_active is not None:
+                    groups_arr = np.asarray(self._groups_active)
+                    groups_meta = groups_arr[meta_idx]
                 X, y = X.iloc[search_idx].copy(), y.iloc[search_idx].copy()
                 if self._groups_active is not None:
                     self._groups_active = np.asarray(self._groups_active)[search_idx]
@@ -1972,7 +1976,7 @@ class FeatureGenerator:
                 self._log(f"Meta-validation split: {len(X)} search + {len(X_meta)} meta-validation rows")
             except Exception as e:
                 self._log(f"Meta-validation split failed: {e}")
-                X_meta, y_meta = None, None  # Fallback: no meta split
+                X_meta, y_meta, groups_meta = None, None, None  # Fallback: no meta split
 
         self._log(f"Starting {self.task} on {self.device} - {X.shape[0]} samples, {X.shape[1]} features")
         self._log(f"Params: gen={self.n_generations}, parents={self.n_parents}, children={self.n_children}, limit={self.max_gen_new_feats}, time_budget={self.time_budget}s.")
@@ -2385,7 +2389,7 @@ class FeatureGenerator:
                     X_meta_transformed = X_meta_transformed.drop(
                         columns=[c for c in self.pruned_features if c in X_meta_transformed.columns], errors='ignore')
                 
-                meta_train, meta_val = self._eval_baseline(X_meta_transformed, y_meta, self.pipeline)
+                meta_train, meta_val = self._eval_baseline(X_meta_transformed, y_meta, self.pipeline, groups=groups_meta)
                 search_val = self.state['best']['val_score']
                 
                 if self.scorer.greater_is_better:

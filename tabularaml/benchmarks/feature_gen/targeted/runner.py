@@ -168,6 +168,7 @@ class TargetedBenchmarkRunner:
         time_budget_s: int = 1200,
         n_workers: int = 4,
         tabularaml_mode: str = "medium",
+        tasks: Optional[Sequence[str]] = None,
         wandb_project: str = "tabularaml-targeted-benchmark",
         wandb_entity: Optional[str] = None,
         wandb_enabled: bool = True,
@@ -188,6 +189,7 @@ class TargetedBenchmarkRunner:
         self.time_budget_s = int(time_budget_s)
         self.n_workers = max(1, int(n_workers))
         self.tabularaml_mode = tabularaml_mode
+        self.tasks = set(tasks) if tasks else None
         self.wandb_project = wandb_project
         self.wandb_entity = wandb_entity
         self.wandb_enabled = bool(wandb_enabled)
@@ -211,6 +213,8 @@ class TargetedBenchmarkRunner:
 
     def build_run_plan(self) -> list[TargetedRunSpec]:
         specs_registry = get_suite(self.suite)
+        if self.tasks is not None:
+            specs_registry = [s for s in specs_registry if s.task in self.tasks]
 
         fws = list(self.frameworks)
         if self.nofe_first and "nofe" in fws:

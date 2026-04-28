@@ -9,7 +9,11 @@ from typing import Literal, Optional
 import pandas as pd
 
 from tabularaml.generate.features import FeatureGenerator
-from tabularaml.eval.scorers import rmse, binary_roc_auc, categorical_crossentropy
+from tabularaml.eval.scorers import (
+    rmse,
+    binary_crossentropy,
+    categorical_crossentropy,
+)
 
 from .base import FEFrameworkAdapter
 
@@ -39,7 +43,7 @@ class TabularAMLAdapter(FEFrameworkAdapter):
         if self.task == "regression":
             return rmse
         n_classes = int(pd.Series(y).nunique())
-        return binary_roc_auc if n_classes == 2 else categorical_crossentropy
+        return binary_crossentropy if n_classes == 2 else categorical_crossentropy
 
     @staticmethod
     def _decategorise(X: pd.DataFrame) -> pd.DataFrame:

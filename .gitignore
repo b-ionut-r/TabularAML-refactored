@@ -46,6 +46,8 @@ htmlcov/
 .ipynb_checkpoints/
 
 # Local artifacts and outputs
+*.docx
+*.pdf
 *.log
 *.out
 *.err

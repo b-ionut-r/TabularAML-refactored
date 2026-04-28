@@ -67,6 +67,12 @@ def _parse(argv=None) -> argparse.Namespace:
         help="TabularAML preset (default: medium).",
     )
     p.add_argument(
+        "--tasks", nargs="+",
+        choices=["classification", "multiclass", "regression"],
+        default=None,
+        help="Optional task filter. Use '--tasks classification' for binary-only runs.",
+    )
+    p.add_argument(
         "--wandb-project", default="tabularaml-targeted-benchmark",
         help="W&B project name.",
     )
@@ -115,6 +121,7 @@ def main(argv=None) -> None:
         time_budget_s=args.time_budget,
         n_workers=args.n_workers,
         tabularaml_mode=args.tabularaml_mode,
+        tasks=args.tasks,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_enabled=not args.no_wandb,

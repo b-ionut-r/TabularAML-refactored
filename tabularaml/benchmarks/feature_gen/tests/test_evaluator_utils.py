@@ -14,7 +14,7 @@ from tabularaml.benchmarks.feature_gen.evaluator import (
 )
 from tabularaml.eval.cv import cross_val_score
 from tabularaml.eval.scorers import accuracy
-from tabularaml.eval.scorers import binary_roc_auc, rmse
+from tabularaml.eval.scorers import binary_crossentropy, rmse
 
 def test_sanitize_features_handles_inf_and_extremes():
     df = pd.DataFrame({
@@ -132,10 +132,10 @@ def test_split_early_stopping_validation_falls_back_on_tiny_data():
 
 def test_pct_improvement_sign_normalization():
     """positive = framework beats no-FE, for both greater-is-better and lower-is-better scorers."""
-    # ROC-AUC (greater_is_better=True): framework 0.8 > nofe 0.7 → positive
-    assert pct_improvement(0.8, 0.7, binary_roc_auc) > 0
-    # ROC-AUC: framework 0.6 < nofe 0.7 → negative
-    assert pct_improvement(0.6, 0.7, binary_roc_auc) < 0
+    # Binary crossentropy (greater_is_better=False): lower is better.
+    assert pct_improvement(0.6, 0.7, binary_crossentropy) > 0
+    # Binary crossentropy: higher is worse.
+    assert pct_improvement(0.8, 0.7, binary_crossentropy) < 0
 
     # RMSE (greater_is_better=False): framework 0.5 < nofe 0.8 → positive (lower RMSE is better)
     assert pct_improvement(0.5, 0.8, rmse) > 0
@@ -143,7 +143,7 @@ def test_pct_improvement_sign_normalization():
     assert pct_improvement(0.9, 0.8, rmse) < 0
 
     # Zero denominator should not raise
-    assert pct_improvement(0.5, 0.0, binary_roc_auc) == 0.0
+    assert pct_improvement(0.5, 0.0, binary_crossentropy) == 0.0
 
 
 def test_split_regression_is_unstratified():
@@ -164,8 +164,8 @@ def test_compute_holdout_metrics_returns_multiple_metrics():
 
     metrics = compute_holdout_metrics(y_true, y_pred, task="classification", n_classes=2)
 
-    assert metrics["binary_roc_auc"] is not None
     assert metrics["binary_crossentropy"] is not None
+    assert metrics["binary_roc_auc"] is not None
     assert metrics["accuracy"] is not None
     assert metrics["precision"] is not None
     assert metrics["recall"] is not None
