@@ -50,6 +50,7 @@ class TargetedRunSpec:
     n_jobs: int = -1
     mode: str = "medium"
     framework_kwargs: dict = field(default_factory=dict)
+    task_filter: Optional[list[str]] = None
     wandb_enabled: bool = True
     wandb_project: str = "tabularaml-targeted-benchmark"
     wandb_entity: Optional[str] = None
@@ -108,6 +109,32 @@ def _load_master(csv_path: Path) -> pd.DataFrame:
     return pd.read_csv(csv_path)
 
 
+def _finite_float(value) -> float | None:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None
+
+
+def _row_value(row, name: str, default=None):
+    if isinstance(row, dict):
+        return row.get(name, default)
+    return getattr(row, name, default)
+
+
+def _result_key(row, *, framework: str | None = None) -> tuple:
+    key = (
+        str(_row_value(row, "dataset_source", "") or ""),
+        str(_row_value(row, "dataset_id")),
+        str(_row_value(row, "suite", "") or ""),
+        int(_row_value(row, "seed")),
+    )
+    if framework is None:
+        return key
+    return (*key, str(framework))
+
+
 def _parse_metrics_json(raw, *, scorer_name=None, score_holdout=None) -> dict[str, float | None]:
     metrics: dict[str, float | None] = {}
     if isinstance(raw, str) and raw.strip():
@@ -119,14 +146,11 @@ def _parse_metrics_json(raw, *, scorer_name=None, score_holdout=None) -> dict[st
             for key, value in parsed.items():
                 if value is None:
                     metrics[str(key)] = None
-                elif isinstance(value, (int, float)) and math.isfinite(float(value)):
-                    metrics[str(key)] = float(value)
+                else:
+                    metrics[str(key)] = _finite_float(value)
     if scorer_name and score_holdout is not None and scorer_name not in metrics:
-        try:
-            score = float(score_holdout)
-        except (TypeError, ValueError):
-            score = None
-        if score is not None and math.isfinite(score):
+        score = _finite_float(score_holdout)
+        if score is not None:
             metrics[str(scorer_name)] = score
     return metrics
 
@@ -148,7 +172,7 @@ def _done_key_set(master: pd.DataFrame, retry_crashes: bool = False) -> set:
         terminal.add("crash")
     done = master[master["status"].isin(terminal)]
     return {
-        (str(r.dataset_id), str(r.framework), int(r.seed))
+        _result_key(r, framework=str(r.framework))
         for r in done.itertuples(index=False)
     }
 
@@ -230,7 +254,13 @@ class TargetedBenchmarkRunner:
         for ds_spec in specs_registry:
             for seed in self.seeds:
                 for fw in fws:
-                    key = (str(ds_spec.id), fw, int(seed))
+                    key = (
+                        str(ds_spec.source),
+                        str(ds_spec.id),
+                        str(ds_spec.suite),
+                        int(seed),
+                        str(fw),
+                    )
                     if key in done:
                         continue
                     run_specs.append(TargetedRunSpec(
@@ -245,6 +275,7 @@ class TargetedBenchmarkRunner:
                         time_budget_s=self.time_budget_s,
                         n_jobs=n_jobs_per_worker,
                         mode=self.tabularaml_mode if fw == "tabularaml" else "medium",
+                        task_filter=sorted(self.tasks) if self.tasks else None,
                         wandb_enabled=self.wandb_enabled,
                         wandb_project=self.wandb_project,
                         wandb_entity=self.wandb_entity,
@@ -330,26 +361,37 @@ class TargetedBenchmarkRunner:
         return row
 
     def _attach_pct_improvement(self, row: dict, nofe_lookup: dict) -> dict:
-        from tabularaml.benchmarks.feature_gen.evaluator import compute_metric_gains
+        from tabularaml.benchmarks.feature_gen.evaluator import (
+            compute_metric_gains,
+            pct_improvement,
+        )
+        from tabularaml.eval.scorers import PREDEFINED_SCORERS
 
-        key = (str(row["dataset_id"]), int(row["seed"]))
+        key = _result_key(row)
         nofe_score = nofe_lookup.get(key)
         row_metrics = _parse_metrics_json(
             row.get("all_metrics_json"),
             scorer_name=row.get("scorer_name"),
             score_holdout=row.get("score_holdout"),
         )
-        if nofe_score is not None and row.get("score_holdout") is not None:
-            row["score_nofe_same_seed"] = float(nofe_score["score_holdout"])
-            denom = abs(row["score_nofe_same_seed"])
-            if denom > 0:
-                raw = (float(row["score_holdout"]) - row["score_nofe_same_seed"]) / denom
-                gib = bool(nofe_score.get("scorer_greater_is_better", True))
-                row["pct_improvement"] = float(raw if gib else -raw)
+        if nofe_score is not None:
+            baseline_metrics = nofe_score.get("all_metrics", {})
+            scorer_name = row.get("scorer_name")
+            row_score = row_metrics.get(scorer_name) if scorer_name else None
+            if row_score is None:
+                row_score = _finite_float(row.get("score_holdout"))
+            baseline_score = baseline_metrics.get(scorer_name) if scorer_name else None
+            if baseline_score is None and scorer_name == nofe_score.get("scorer_name"):
+                baseline_score = _finite_float(nofe_score.get("score_holdout"))
+
+            row["score_nofe_same_seed"] = baseline_score
+            scorer = PREDEFINED_SCORERS.get(str(scorer_name)) if scorer_name else None
+            if row_score is not None and baseline_score is not None and scorer is not None:
+                row["pct_improvement"] = float(pct_improvement(row_score, baseline_score, scorer))
             else:
-                row["pct_improvement"] = 0.0
+                row["pct_improvement"] = None
             row["metric_gains_json"] = _dump_metrics_json(
-                compute_metric_gains(row_metrics, nofe_score.get("all_metrics", {}))
+                compute_metric_gains(row_metrics, baseline_metrics)
             )
         else:
             row["score_nofe_same_seed"] = None
@@ -369,8 +411,9 @@ class TargetedBenchmarkRunner:
 
     def _finalize_row(self, row: dict, nofe_lookup: dict, orch=None) -> None:
         if row.get("framework") == "nofe" and row.get("status") == "ok":
-            nofe_lookup[(str(row["dataset_id"]), int(row["seed"]))] = {
-                "score_holdout":            float(row["score_holdout"]),
+            nofe_lookup[_result_key(row)] = {
+                "score_holdout":            _finite_float(row.get("score_holdout")),
+                "scorer_name":              row.get("scorer_name"),
                 "scorer_greater_is_better": bool(row.get("scorer_greater_is_better", True)),
                 "all_metrics": _parse_metrics_json(
                     row.get("all_metrics_json"),
@@ -411,8 +454,9 @@ class TargetedBenchmarkRunner:
             if len(master):
                 nofe_rows = master[(master["framework"] == "nofe") & (master["status"] == "ok")]
                 for r in nofe_rows.itertuples(index=False):
-                    nofe_lookup[(str(r.dataset_id), int(r.seed))] = {
-                        "score_holdout":            float(r.score_holdout),
+                    nofe_lookup[_result_key(r)] = {
+                        "score_holdout":            _finite_float(getattr(r, "score_holdout", None)),
+                        "scorer_name":              getattr(r, "scorer_name", None),
                         "scorer_greater_is_better": bool(getattr(r, "scorer_greater_is_better", True)),
                         "all_metrics": _parse_metrics_json(
                             getattr(r, "all_metrics_json", ""),

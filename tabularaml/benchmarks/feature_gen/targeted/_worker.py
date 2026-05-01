@@ -140,6 +140,16 @@ def run(spec: dict) -> dict:
             row["error_msg"] = str(e)
             return row
 
+        task_filter = set(spec.get("task_filter") or [])
+        if task_filter and task not in task_filter:
+            row["status"] = "unsupported_task"
+            row["error_msg"] = (
+                f"loaded task {task!r} is excluded by task filter "
+                f"{sorted(task_filter)!r}"
+            )
+            return row
+
+        row["task"] = task
         X, y, n_classes = _preprocess(X_raw, y_raw, task, n_classes_loaded)
         row["n_features_before"] = int(X.shape[1])
         if X.shape[1] == 0:

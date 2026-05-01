@@ -2,6 +2,7 @@
 .vscode/
 .idea/
 .claude/
+.codex_node/
 tabularaml/.github/
 
 # OS files
