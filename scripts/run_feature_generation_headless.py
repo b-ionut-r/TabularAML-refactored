@@ -84,6 +84,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to save the generated feature matrix plus target. Format follows extension.",
     )
     parser.add_argument("--summary-json", default=None, help="Optional path to write run summary JSON.")
+    parser.add_argument("--meta-validation-frac", type=float, default=0.15,
+                        help="Fraction of data held out for meta-validation overfitting check. Set to 0 to disable.")
 
     return parser.parse_args()
 
@@ -256,6 +258,7 @@ def main() -> int:
         "log_file": str(log_path) if log_path else None,
         "random_state": args.random_state,
         "n_jobs": args.n_jobs,
+        "meta_validation_frac": args.meta_validation_frac,
     }
 
     log_message("Starting headless FeatureGenerator search with parameters:", log_path)
