@@ -728,7 +728,9 @@ class FeatureGenerator:
                  expand_datetime: bool = True,
                  expand_row_stats: bool = True,
                  era_col: Optional[str] = None,
-                 era_acceptance_frac: float = 0.55):
+                 era_acceptance_frac: float = 0.55,
+                 adversarial_auc_warn: float = 0.75,
+                 adversarial_drop: bool = False):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -750,6 +752,22 @@ class FeatureGenerator:
         self.early_stopping_child_eval = early_stopping_child_eval
         self.time_budget = time_budget
         self.search_sample_size = search_sample_size
+
+        # Competition-grade knobs that presets may override: must be assigned
+        # BEFORE the mode override so presets can change them
+        self.acceptance = acceptance
+        self.acceptance_folds_frac = acceptance_folds_frac
+        self.confirmation_seeds = confirmation_seeds
+        self.null_importance_selection = null_importance_selection
+        self.null_importance_n_perm = null_importance_n_perm
+        self.null_importance_pct = null_importance_pct
+        self.expand_datetime = expand_datetime
+        self.expand_row_stats = expand_row_stats
+        self.use_proxy_evaluation = use_proxy_evaluation
+        self.proxy_mode = proxy_mode if use_proxy_evaluation else "none"
+        self.proxy_ram_budget_mb = proxy_ram_budget_mb
+        self.proxy_halving = proxy_halving
+        self.proxy_top_pct = proxy_top_pct
 
         # Mode overrides only params still at their constructor defaults
         if mode:
@@ -789,12 +807,7 @@ class FeatureGenerator:
         # Feature value cache
         self._feature_cache = FeatureCache(max_size_mb=cache_size_mb)
         
-        # Proxy evaluation settings
-        self.use_proxy_evaluation = use_proxy_evaluation
-        self.proxy_mode = proxy_mode if use_proxy_evaluation else "none"
-        self.proxy_ram_budget_mb = proxy_ram_budget_mb
-        self.proxy_halving = proxy_halving
-        self.proxy_top_pct = proxy_top_pct
+        # Proxy evaluation settings (preset-overridable values assigned above)
         self._lgb_available = None  # Lazy check
         
         # CV bias fix settings
@@ -831,27 +844,22 @@ class FeatureGenerator:
         self.interactions: list = []
         self.generation: list = []
 
-        # Paired-fold evaluation state (statistical acceptance)
-        self.acceptance = acceptance
-        self.acceptance_folds_frac = acceptance_folds_frac
+        # Paired-fold evaluation state (statistical acceptance; knobs assigned above)
         self._cv_epoch = 0
         self._best_fold_state = FoldEvalState()
 
-        # Generation-level confirmation + post-search null-importance gate
-        self.confirmation_seeds = confirmation_seeds
-        self.null_importance_selection = null_importance_selection
-        self.null_importance_n_perm = null_importance_n_perm
-        self.null_importance_pct = null_importance_pct
-
-        # Base-table expansion (datetime decomposition, row stats)
-        self.expand_datetime = expand_datetime
-        self.expand_row_stats = expand_row_stats
+        # Base-table expansion runtime state
         self.base_expander = None
         self._priority_candidates = []
 
         # Era mode (CrunchDAO/Numerai-style grouped time-series data)
         self.era_col = era_col
         self.era_acceptance_frac = era_acceptance_frac
+
+        # Adversarial validation (active only when X_test is passed to search)
+        self.adversarial_auc_warn = adversarial_auc_warn
+        self.adversarial_drop = adversarial_drop
+        self.adversarial_report = None
 
     def _ensure_no_duplicates(self, X: pd.DataFrame, context: str = "") -> pd.DataFrame:
         """Ensure DataFrame has no duplicate columns."""
@@ -1533,6 +1541,82 @@ class FeatureGenerator:
         except Exception as e:
             self._log(f"  Null-importance selection failed: {e}")
             return []
+
+    def _adversarial_validation_report(self, X_final: pd.DataFrame, X_test: pd.DataFrame):
+        """Train-vs-test discriminability of the final feature set.
+
+        Applies the base expander and non-pipeline interactions to X_test,
+        fits a LightGBM to distinguish train rows from test rows, and reports
+        3-fold AUC plus the features driving the shift. High AUC means the
+        feature set encodes train-specific structure that will not transfer.
+        Drops shift-driving generated features only when adversarial_drop=True.
+        """
+        from lightgbm import LGBMClassifier
+        from sklearn.model_selection import StratifiedKFold
+        from sklearn.metrics import roc_auc_score
+
+        X_t = X_test.copy()
+        if getattr(self, 'base_expander', None) is not None:
+            X_t = self.base_expander.transform(X_t)
+        for interaction in getattr(self, 'interactions', []):
+            if interaction.name not in X_t.columns and not interaction.require_pipeline:
+                try:
+                    X_t[interaction.name] = interaction.generate(X_t)
+                except Exception:
+                    pass
+
+        common = [c for c in X_final.columns if c in X_t.columns]
+        if len(common) < 2:
+            self._log("Adversarial validation skipped: no common columns")
+            return None
+
+        cap = 50_000
+        rng = np.random.RandomState(self.random_state)
+        A = X_final[common]
+        B = X_t[common]
+        if len(A) > cap:
+            A = A.iloc[np.sort(rng.choice(len(A), cap, replace=False))]
+        if len(B) > cap:
+            B = B.iloc[np.sort(rng.choice(len(B), cap, replace=False))]
+
+        XX = sanitize_model_features(pd.concat([A, B], axis=0, ignore_index=True))
+        yy = np.r_[np.zeros(len(A)), np.ones(len(B))]
+
+        clf = LGBMClassifier(n_estimators=200, num_leaves=31, n_jobs=self.n_jobs,
+                             verbose=-1, random_state=self.random_state,
+                             importance_type="gain")
+        skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=self.random_state)
+        aucs = []
+        for tr, va in skf.split(XX, yy):
+            m = deepcopy(clf)
+            m.fit(XX.iloc[tr], yy[tr])
+            aucs.append(roc_auc_score(yy[va], m.predict_proba(XX.iloc[va])[:, 1]))
+        auc = float(np.mean(aucs))
+
+        clf.fit(XX, yy)
+        imp = pd.Series(clf.feature_importances_, index=common).astype(float)
+        share = imp / max(imp.sum(), 1e-9)
+        top = share.sort_values(ascending=False).head(10)
+        generated = set(X_final.columns) - set(self.initial_features)
+        self.adversarial_report = {
+            "auc": auc,
+            "top_shift_features": [(name, float(s), name in generated) for name, s in top.items()],
+        }
+
+        warn_thr = getattr(self, 'adversarial_auc_warn', 0.75)
+        self._log(f"Adversarial validation: train-vs-test AUC={auc:.3f}"
+                  + (f" (> {warn_thr}: feature set encodes train-specific structure!)" if auc > warn_thr else ""))
+        if auc > warn_thr:
+            for name, s, is_gen in self.adversarial_report["top_shift_features"][:5]:
+                self._log(f"  shift driver: {name} ({s:.1%}{', generated' if is_gen else ''})")
+
+        drop = []
+        if getattr(self, 'adversarial_drop', False) and auc > warn_thr:
+            drop = [name for name, s, is_gen in self.adversarial_report["top_shift_features"]
+                    if is_gen and s > 0.10]
+            if drop:
+                self._log(f"  Adversarial drop: removing {drop}")
+        return drop
 
     def _era_feature_corr_report(self):
         """Future work: per-era correlation of generated features with the span
@@ -2476,8 +2560,14 @@ class FeatureGenerator:
             return X.drop(columns=cols_to_drop)
         return X
 
-    def search(self, X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, PipelineWrapper, list[Feature], list[Interaction]]:
-        """Enhanced genetic algorithm with better stagnation handling."""
+    def search(self, X: pd.DataFrame, y: pd.Series,
+               X_test: Optional[pd.DataFrame] = None) -> tuple[pd.DataFrame, PipelineWrapper, list[Feature], list[Interaction]]:
+        """Enhanced genetic algorithm with better stagnation handling.
+
+        X_test (optional, unlabeled): enables post-search adversarial
+        validation — a train-vs-test report flagging generated features that
+        encode train-specific structure.
+        """
         random.seed(self.random_state)
         np.random.seed(self.random_state)
         start_time = time.time()
@@ -3109,6 +3199,20 @@ class FeatureGenerator:
                 self.state['best']['train_score'] = train_score
                 self._log(f"Post-selection validation: {self.scorer.name}={val_score:.5f}")
 
+        # Adversarial validation against unlabeled test features (optional)
+        if X_test is not None:
+            try:
+                adv_drop = self._adversarial_validation_report(X, X_test)
+                if adv_drop:
+                    X = X.drop(columns=[c for c in adv_drop if c in X.columns], errors='ignore')
+                    self.pruned_features.update(adv_drop)
+                    self._sync_state_components(X, self.pipeline, generation, preserve_pruned=True)
+                    train_score, val_score = self._eval_baseline(X, y, self.pipeline, update_fold_cache=True)
+                    self.state['best']['val_score'], self.state['best']['train_score'] = val_score, train_score
+                    self._log(f"Post-adversarial validation: {self.scorer.name}={val_score:.5f}")
+            except Exception as e:
+                self._log(f"Adversarial validation failed: {e}")
+
         # Calculate and store metrics
         n_init_feats = len(self.initial_features)
         n_groupby = len(getattr(self.pipeline, "groupby_encoders", []))
@@ -3574,6 +3678,12 @@ class FeatureGenerator:
             self.era_col = None
         if not hasattr(self, 'era_acceptance_frac'):
             self.era_acceptance_frac = 0.55
+        if not hasattr(self, 'adversarial_auc_warn'):
+            self.adversarial_auc_warn = 0.75
+        if not hasattr(self, 'adversarial_drop'):
+            self.adversarial_drop = False
+        if not hasattr(self, 'adversarial_report'):
+            self.adversarial_report = None
         if not hasattr(self, 'cv_n_jobs'):
             self.cv_n_jobs = "auto"
         if not hasattr(self, '_cv_n_jobs_resolved'):
@@ -3596,6 +3706,6 @@ class FeatureGenerator:
             if 'fold_cv_epoch' not in self.state['best']:
                 self.state['best']['fold_cv_epoch'] = -1
 
-    def generate(self, X: pd.DataFrame, y: pd.Series):
+    def generate(self, X: pd.DataFrame, y: pd.Series, X_test: Optional[pd.DataFrame] = None):
         """Main entry point for feature generation."""
-        return self.search(X, y)
+        return self.search(X, y, X_test=X_test)
