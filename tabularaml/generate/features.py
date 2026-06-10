@@ -902,8 +902,12 @@ class FeatureGenerator:
                 f.write(f"{formatted_message}\n")
 
     def _get_num_cat_cols(self, X: pd.DataFrame) -> tuple[list, list]:
-        return (X.select_dtypes(include=['number']).columns.tolist(),
-                X.select_dtypes(include=['object', 'category']).columns.tolist())
+        num_cols = X.select_dtypes(include=['number']).columns.tolist()
+        cat_cols = [c for c in X.columns
+                    if c not in num_cols
+                    and (X[c].dtype == object or isinstance(X[c].dtype, pd.CategoricalDtype)
+                         or pd.api.types.is_string_dtype(X[c]))]
+        return num_cols, cat_cols
 
     def _create_search_subsample(self, X: pd.DataFrame, y: pd.Series, sample_size: int, groups=None) -> tuple:
         """Create a stratified subsample for the search phase, respecting groups/time if provided."""

@@ -146,8 +146,9 @@ class PipelineWrapper:
         
         # Process each column to determine data type and perform conversions
         for col in X.columns:
-            # Handle object or categorical types
-            if X[col].dtype == np.dtype('O') or isinstance(X[col].dtype, pd.CategoricalDtype):
+            # Handle object, string (pandas >= 3 default for text) or categorical types
+            if (X[col].dtype == np.dtype('O') or isinstance(X[col].dtype, pd.CategoricalDtype)
+                    or pd.api.types.is_string_dtype(X[col])):
                 # Determine if column is likely categorical based on unique value ratio
                 is_likely_categorical = X[col].nunique() / len(X[col]) < 0.1
                 
@@ -168,10 +169,10 @@ class PipelineWrapper:
                             X[col] = self._convert_to_category(X[col])
                             dtypes_dict[col] = "cat"
             
-            # Handle numeric types directly
-            elif np.issubdtype(X[col].dtype, np.integer):
+            # Handle numeric types directly (pandas-native checks cover extension dtypes)
+            elif pd.api.types.is_integer_dtype(X[col]):
                 dtypes_dict[col] = "int"
-            elif np.issubdtype(X[col].dtype, np.floating):
+            elif pd.api.types.is_float_dtype(X[col]):
                 dtypes_dict[col] = "float"
             elif isinstance(X[col].dtype, pd.CategoricalDtype):
                 dtypes_dict[col] = "cat"

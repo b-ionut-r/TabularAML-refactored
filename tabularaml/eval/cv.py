@@ -34,7 +34,7 @@ def sanitize_model_features(X):
     X = X.copy()
 
     for col in X.columns:
-        if X[col].dtype == 'object' or X[col].dtype == 'string':
+        if X[col].dtype == 'object' or pd.api.types.is_string_dtype(X[col]):
             X[col] = pd.Categorical(X[col])
 
     num_cols = X.select_dtypes(include=[np.number]).columns
