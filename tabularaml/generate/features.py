@@ -570,8 +570,11 @@ class ImprovedAdaptiveController:
             # Pattern similarity score - boost if similar to successful patterns
             pattern_score = self._get_pattern_similarity_score(interaction)
             
-            # Complexity penalty
-            complexity_penalty = (interaction.depth / 5.0) ** 2 if interaction.depth > 3 else 0
+            # Complexity penalty: linear term acts as a tiebreaker at every depth
+            # (prefer simpler, more robust features at equal promise), quadratic
+            # term kicks in past depth 3
+            complexity_penalty = 0.1 * interaction.depth + (
+                (interaction.depth / 5.0) ** 2 if interaction.depth > 3 else 0)
             
             # Adaptive weighting based on stagnation
             if self.state.stagnation_level.value >= StagnationLevel.SEVERE.value:
@@ -693,7 +696,9 @@ class FeatureGenerator:
                  temporal_windows: Optional[list] = None,
                  random_state: int = 42,
                  n_jobs: int = -1,
-                 cv_n_jobs: Union[int, str] = "auto"):
+                 cv_n_jobs: Union[int, str] = "auto",
+                 acceptance: Literal["statistical", "mean"] = "statistical",
+                 acceptance_folds_frac: float = 0.7):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -794,6 +799,8 @@ class FeatureGenerator:
         self.generation: list = []
 
         # Paired-fold evaluation state (statistical acceptance)
+        self.acceptance = acceptance
+        self.acceptance_folds_frac = acceptance_folds_frac
         self._cv_epoch = 0
         self._best_fold_state = FoldEvalState()
 
@@ -943,6 +950,30 @@ class FeatureGenerator:
     def _bump_cv_epoch(self, reason: str = "") -> None:
         """Invalidate cached fold vectors after any change to splitter state or data."""
         self._cv_epoch += 1
+
+    def _acceptance_gate(self, gain: float, fold_deltas: Optional[np.ndarray]) -> bool:
+        """Decide candidate acceptance.
+
+        "statistical" (default): the mean relative gain must clear the adaptive
+        threshold AND the paired per-fold deltas must be positive in at least
+        k_req of K folds (sign-test gate), so a candidate cannot be accepted on
+        the strength of a single lucky fold. k_req relaxes by one step (floored
+        at a simple majority) when stagnation reaches SEVERE. Falls back to the
+        mean-only rule when paired vectors are unavailable (mismatched splitter
+        state) or K < 3 (no statistical power).
+        """
+        if gain < self.adaptive_controller.get_adaptive_min_gain():
+            return False
+        if getattr(self, "acceptance", "statistical") != "statistical":
+            return True
+        if fold_deltas is None or len(fold_deltas) < 3:
+            return True
+        K = len(fold_deltas)
+        frac = getattr(self, "acceptance_folds_frac", 0.7)
+        k_req = min(K, max(2, int(np.ceil(frac * K))))
+        if self.adaptive_controller.state.stagnation_level.value >= StagnationLevel.SEVERE.value:
+            k_req = max(K // 2 + 1, k_req - 1)
+        return int(np.sum(fold_deltas > 0)) >= k_req
 
     def _eval_logging_scorers(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> Dict[str, Tuple[float, float]]:
         """Evaluate all logging scorers and return dict of {scorer_name: (train_score, val_score)}."""
@@ -1672,8 +1703,11 @@ class FeatureGenerator:
         # Use memory-aware ranking
         ranked = self.adaptive_controller.rank_candidates_with_memory(valid_batch, X, y)
 
-        # Selection loop with adaptive threshold
-        _, best_val = self._eval_baseline(X, y, self.pipeline)
+        # Selection loop with adaptive threshold and paired per-fold acceptance.
+        # Baseline fold vector comes from the cache when the splitter state and
+        # feature set are unchanged (saves one full CV per generation).
+        base_res = self._get_baseline_fold_scores(X, y)
+        best_val, best_folds = base_res.mean_val, base_res.fold_scores
         selected, X_base = [], X.copy()
         evals = consec_no_gain = 0
         
@@ -1719,26 +1753,30 @@ class FeatureGenerator:
                 continue
                 
             pipe_iter = self._extend_pipeline(self.pipeline, self._prepare_pipeline([inter] + selected))
-            
+
             try:
-                _, new_val = self._eval_baseline(X_try, y, pipe_iter)
+                res = self._eval_cv_light(X_try, y, pipe_iter)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 self._log(f"Error evaluating {inter.name}: {str(e)}")
                 continue
-            
-            delta = (new_val - best_val) if self.scorer.greater_is_better else (best_val - new_val)
+
+            sign = 1.0 if self.scorer.greater_is_better else -1.0
+            new_val = res.mean_val
+            delta = sign * (new_val - best_val)
             gain = delta / (abs(best_val) + 1e-8)
-            
-            # Use adaptive threshold
-            success = gain >= self.adaptive_controller.get_adaptive_min_gain()
-            
+            fold_deltas = None
+            if best_folds is not None and len(res.fold_scores) == len(best_folds):
+                fold_deltas = sign * (res.fold_scores - best_folds)
+
+            success = self._acceptance_gate(gain, fold_deltas)
+
             self.adaptive_controller.update_operation_stats(inter, success=success, gain=gain)
-            
+
             if success:
                 selected.append(inter)
-                X_base, best_val, consec_no_gain = X_try, new_val, 0
+                X_base, best_val, best_folds, consec_no_gain = X_try, new_val, res.fold_scores, 0
             else:
                 consec_no_gain += 1
 
@@ -1841,6 +1879,7 @@ class FeatureGenerator:
                         keep_top_n: int = 10) -> tuple[pd.DataFrame, list]:
         """Perform a partial restart keeping only the best features."""
         self._log(f"  Performing partial restart (restart #{self.adaptive_controller.state.total_restarts + 1})")
+        self._bump_cv_epoch("partial restart")
         
         # Get the best features to keep from generation
         best_features = self.adaptive_controller.get_restart_features(
@@ -1905,16 +1944,21 @@ class FeatureGenerator:
     def _save_current_as_best(self):
         """Save current state as the best state and auto-save if path is provided."""
         if hasattr(self, 'state') and 'best' in self.state:
+            fold_state = getattr(self, '_best_fold_state', None)
             self.state['best'].update(
                 X=self.X.copy(),
                 pipeline=deepcopy(self.pipeline),  # Deep copy to prevent mutation
                 generation=deepcopy(self.generation),  # Deep copy to preserve interaction refs
                 pruned_features=getattr(self, 'pruned_features', set()).copy(),
-                interactions=deepcopy(getattr(self, 'interactions', []))  # Save interactions too
+                interactions=deepcopy(getattr(self, 'interactions', [])),  # Save interactions too
+                val_fold_scores=(fold_state.fold_scores.copy()
+                                 if fold_state is not None and fold_state.fold_scores is not None else None),
+                fold_cv_epoch=(fold_state.cv_epoch if fold_state is not None else -1),
+                val_fold_per_era=(fold_state.per_era if fold_state is not None else None),
             )
             if hasattr(self, 'save_path') and self.save_path:
                 self.save(self.save_path)
-    
+
     def _revert_to_best(self):
         """Revert to best saved state."""
         if hasattr(self, 'state') and 'best' in self.state and self.state['best']['X'] is not None:
@@ -1929,6 +1973,19 @@ class FeatureGenerator:
                 # Fallback: rebuild from generation
                 self.interactions = [feat.generating_interaction for feat in self.generation
                                    if hasattr(feat, 'generating_interaction') and feat.generating_interaction]
+            # Restore the paired-fold baseline vector of the best state; a stale
+            # epoch (e.g. rotation since the save) fails matches() and triggers
+            # a lazy recompute rather than a corrupted pairing.
+            saved_scores = self.state['best'].get('val_fold_scores')
+            if saved_scores is not None:
+                self._best_fold_state = FoldEvalState(
+                    fold_scores=np.asarray(saved_scores, dtype=float),
+                    cv_epoch=self.state['best'].get('fold_cv_epoch', -1),
+                    n_rows=len(self.X),
+                    cols_hash=FoldEvalState.hash_cols(self.X),
+                    per_era=self.state['best'].get('val_fold_per_era'))
+            else:
+                self._best_fold_state = FoldEvalState()
             return True
         return False
 
@@ -2059,7 +2116,9 @@ class FeatureGenerator:
         self._log(f"Params: gen={self.n_generations}, parents={self.n_parents}, children={self.n_children}, limit={self.max_gen_new_feats}, time_budget={self.time_budget}s.")
         self.adaptive_controller.initialize_operations(self.ops)
         self.adaptive_controller.reset_for_new_run()
-        self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(X, y, self.pipeline)
+        self._bump_cv_epoch("search init")  # final data shape known only now (subsample/meta split)
+        self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(
+            X, y, self.pipeline, update_fold_cache=True)
         gen0_log = f"Gen 0: Train {self.scorer.name}={self.state['best']['train_score']:.5f}, Val {self.scorer.name}={self.state['best']['val_score']:.5f}"
         if self.logging_scorers:
             logging_scores = self._eval_logging_scorers(X, y, self.pipeline)
@@ -2125,6 +2184,7 @@ class FeatureGenerator:
                         self._log(f"  CV fold rotation skipped for {type(self.cv).__name__}")
                     else:
                         self._oof_preds_stale = True
+                        self._bump_cv_epoch("fold rotation")
                         self._log(f"  CV fold rotation: rotated to {type(self.cv).__name__}")
                 
                 # Check for restart conditions
@@ -2190,7 +2250,8 @@ class FeatureGenerator:
                             # Update counters and state
                             self.state['counters']['total_new_features'] = X.shape[1] - len(self.initial_features)
                             self.state['counters']['no_feature_gens_count'] = 0
-                            new_train_score, new_val_score = self._eval_baseline(X, y, self.pipeline)
+                            new_train_score, new_val_score = self._eval_baseline(
+                                X, y, self.pipeline, update_fold_cache=True)
                             delta = new_val_score - self.state['best']['val_score'] if self.scorer.greater_is_better else self.state['best']['val_score'] - new_val_score
                             self.state['best'].update(gen_num=N+1, val_score=new_val_score)
                             self.state['counters']['consecutive_no_improvement_iters'] = 0
@@ -2319,7 +2380,8 @@ class FeatureGenerator:
                     self.state['counters']['total_new_features'] = X.shape[1] - len(self.initial_features)
                     self.state['counters']['no_feature_gens_count'] = 0 if features_added > 0 else self.state['counters']['no_feature_gens_count'] + 1
                     
-                    new_train_score, new_val_score = self._eval_baseline(X, y, self.pipeline)
+                    new_train_score, new_val_score = self._eval_baseline(
+                        X, y, self.pipeline, update_fold_cache=True)
                     delta = new_val_score - self.state['best']['val_score'] if self.scorer.greater_is_better else self.state['best']['val_score'] - new_val_score
                     
                     # Revert if no improvement
@@ -2436,7 +2498,8 @@ class FeatureGenerator:
             self._save_current_as_best()
 
             # Re-evaluate on full data for accurate metrics
-            train_score, val_score = self._eval_baseline(X, y, self.pipeline)
+            self._bump_cv_epoch("full-data replay")
+            train_score, val_score = self._eval_baseline(X, y, self.pipeline, update_fold_cache=True)
             self.state['best']['train_score'], self.state['best']['val_score'] = train_score, val_score
             self._log(f"Full-data validation: {self.scorer.name}={val_score:.5f}")
         else:
@@ -2490,7 +2553,7 @@ class FeatureGenerator:
                 self.pruned_features.update(features_to_drop)
                 self._sync_state_components(X, self.pipeline, generation, preserve_pruned=True)
                 # Re-evaluate after pruning
-                train_score, val_score = self._eval_baseline(X, y, self.pipeline)
+                train_score, val_score = self._eval_baseline(X, y, self.pipeline, update_fold_cache=True)
                 self.state['best']['val_score'] = val_score
                 self.state['best']['train_score'] = train_score
                 self._log(f"Post-selection validation: {self.scorer.name}={val_score:.5f}")
@@ -2916,6 +2979,10 @@ class FeatureGenerator:
             self.id_col = None
 
         # Competition-grade additions (paired-fold acceptance, parallel CV)
+        if not hasattr(self, 'acceptance'):
+            self.acceptance = "statistical"
+        if not hasattr(self, 'acceptance_folds_frac'):
+            self.acceptance_folds_frac = 0.7
         if not hasattr(self, 'cv_n_jobs'):
             self.cv_n_jobs = "auto"
         if not hasattr(self, '_cv_n_jobs_resolved'):
