@@ -168,8 +168,16 @@ def _run_single_fold(fold_idx, train_idx, val_idx, model, X, y, scorer, pipeline
 
     if model_threads is not None and hasattr(model_clone, "set_params"):
         try:
-            if "n_jobs" in model_clone.get_params():
-                model_clone.set_params(n_jobs=model_threads)
+            params = model_clone.get_params()
+            if "n_jobs" in params:
+                current = params.get("n_jobs")
+                # Only ever LOWER the model's thread count: raising an explicit
+                # small n_jobs (e.g. 1 in a multi-process harness) above what
+                # the caller budgeted causes OpenMP spin-wait thrash.
+                if isinstance(current, int) and current > 0:
+                    model_clone.set_params(n_jobs=min(current, model_threads))
+                else:
+                    model_clone.set_params(n_jobs=model_threads)
         except Exception:
             pass
 

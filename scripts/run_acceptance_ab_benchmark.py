@@ -133,6 +133,9 @@ def holdout_score(model, scorer, X_tr, y_tr, X_te, y_te):
 
 def run_one(spec):
     name, seed, config_name, time_budget, n_jobs = spec
+    # Cap OpenMP before any lightgbm/xgboost load: multiple worker processes
+    # with unconstrained OpenMP pools spin-wait each other to a standstill.
+    os.environ.setdefault("OMP_NUM_THREADS", str(max(1, n_jobs)))
     from sklearn.model_selection import train_test_split
     from tabularaml.generate.features import FeatureGenerator
 
