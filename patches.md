@@ -174,3 +174,21 @@ What is established from source is:
 
 - the patch aligns OpenFE with LightGBM's intended multiclass handling
 - the patch did not invent an invalid multiclass `init_score` interpretation
+
+---
+
+# Note: cross_val_score eval_set policy (2026-06)
+
+`tabularaml.eval.cv.cross_val_score` historically passed the validation fold
+as `eval_set` whenever the model's `fit` accepted one. For models configured
+with early stopping this optimistically biases CV scores (the fold being
+scored steers training). The default is now `eval_set_policy="auto"`: an
+eval_set is passed only when early stopping is actually configured, and it is
+carved out of the TRAIN fold (stratified / group-aware), so the validation
+fold is never seen during fit. For continuous targets the legacy unseen-label
+guard effectively never passed an eval_set, so regression behavior only
+changes for ES-configured models (which previously early-stopped on the
+scored fold).
+
+`eval_set_policy="legacy"` reproduces the previous behavior bit-for-bit;
+`"none"` never passes an eval_set.
