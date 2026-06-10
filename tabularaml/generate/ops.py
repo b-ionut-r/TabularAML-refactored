@@ -38,15 +38,23 @@ OPS = {
     },
     "temporal": {
         "unary": [
-            f"{op}_{w}" 
-            for w in DEFAULT_TEMPORAL_WINDOWS 
+            f"{op}_{w}"
+            for w in DEFAULT_TEMPORAL_WINDOWS
             for op in (
-                ["lag", "pct_change"] if w < 2 else 
+                ["lag", "pct_change"] if w < 2 else
                 ["lag", "rolling_mean", "rolling_std", "momentum", "pct_change"]
             )
         ],
     },
+    # Global (whole-column) transforms: fitted on the train fold inside the
+    # pipeline (rank maps / bin edges / winsor bounds), applied leakage-free
+    # to validation and test rows.
+    "global": {
+        "unary": ["rank_pct", "qbin", "zscore_winsor", "log_rank"],
+    },
 }
+
+GLOBAL_OPS = set(OPS["global"]["unary"])
 
 # --- Helpers ---
 

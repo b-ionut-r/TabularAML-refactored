@@ -87,4 +87,5 @@ def test_failed_confirmation_reverts_everything():
     gen._confirm_generation = lambda *a, **k: False
     X_out, _, _, interactions = gen.search(X, y)
     assert len(interactions) == 0
-    assert list(X_out.columns) == ["a", "b", "c"]
+    # nothing beyond the (base-expanded) initial table survives
+    assert list(X_out.columns) == gen.initial_features

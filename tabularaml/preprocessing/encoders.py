@@ -639,3 +639,94 @@ class TemporalEncoder(BaseEstimator, TransformerMixin):
 
     def get_feature_names_out(self, input_features=None):
         return np.array([self.output_col])
+
+
+class GlobalTransformEncoder(BaseEstimator, TransformerMixin):
+    """Fit-transform global (whole-column) statistics within CV folds.
+
+    Learns rank distributions / quantile bin edges / winsorization bounds from
+    the training fold only and applies them to any fold, so rank- and
+    bin-style features stay leakage-free and batch-independent at transform
+    time (test rows are scored against the train distribution).
+
+    Kinds:
+      - rank_pct:      empirical percentile of the value in the train distribution
+      - log_rank:      log of rank_pct (offset by 1/(2N)) — spreads the low tail
+      - qbin:          ordinal code of the train-quantile bin (float codes)
+      - zscore_winsor: z-score after clipping to the train [p1, p99] range
+    """
+
+    def __init__(self, col, kind, n_bins=10, output_col=None):
+        self.col = col
+        self.kind = kind
+        self.n_bins = n_bins
+        self.output_col = output_col or f"{kind}_{col}"
+        self.sorted_vals_ = None
+        self.edges_ = None
+        self.median_bin_ = 0.0
+        self.p1_ = self.p99_ = self.mean_ = 0.0
+        self.std_ = 1.0
+
+    def fit(self, X, y=None):
+        if self.col not in X.columns:
+            self.sorted_vals_ = np.array([], dtype=float)
+            self.edges_ = np.array([0.0])
+            return self
+        vals = pd.to_numeric(X[self.col], errors="coerce").dropna().to_numpy(dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if self.kind in ("rank_pct", "log_rank"):
+            self.sorted_vals_ = np.sort(vals)
+        elif self.kind == "qbin":
+            if len(vals):
+                qs = np.linspace(0.0, 1.0, self.n_bins + 1)
+                self.edges_ = np.unique(np.quantile(vals, qs))
+                median_val = float(np.median(vals))
+                self.median_bin_ = float(np.searchsorted(self.edges_[1:-1], median_val, side="right"))
+            else:
+                self.edges_ = np.array([0.0])
+                self.median_bin_ = 0.0
+        elif self.kind == "zscore_winsor":
+            if len(vals):
+                self.p1_, self.p99_ = np.percentile(vals, [1, 99])
+                clipped = np.clip(vals, self.p1_, self.p99_)
+                self.mean_ = float(clipped.mean())
+                self.std_ = float(max(clipped.std(), 1e-8))
+            else:
+                self.p1_ = self.p99_ = self.mean_ = 0.0
+                self.std_ = 1.0
+        return self
+
+    def transform(self, X):
+        if self.col not in X.columns:
+            fallback = 0.5 if self.kind in ("rank_pct",) else 0.0
+            return pd.DataFrame({self.output_col: np.full(len(X), fallback)}, index=X.index)
+
+        s = pd.to_numeric(X[self.col], errors="coerce").to_numpy(dtype=float)
+
+        if self.kind in ("rank_pct", "log_rank"):
+            n = max(1, len(self.sorted_vals_) if self.sorted_vals_ is not None else 0)
+            if self.sorted_vals_ is not None and len(self.sorted_vals_):
+                pct = np.searchsorted(self.sorted_vals_, s, side="right") / float(n)
+            else:
+                pct = np.full(len(s), 0.5)
+            pct = np.where(np.isfinite(s), pct, 0.5)
+            if self.kind == "rank_pct":
+                out = pct
+            else:
+                out = np.log(pct + 1.0 / (2.0 * n))
+        elif self.kind == "qbin":
+            edges = self.edges_ if self.edges_ is not None else np.array([0.0])
+            inner = edges[1:-1] if len(edges) > 2 else np.array([], dtype=float)
+            codes = np.searchsorted(inner, s, side="right").astype(float)
+            out = np.where(np.isfinite(s), codes, self.median_bin_)
+        elif self.kind == "zscore_winsor":
+            clipped = np.clip(s, self.p1_, self.p99_)
+            out = (clipped - self.mean_) / (self.std_ + 1e-8)
+            out = np.where(np.isfinite(s), out, 0.0)
+        else:
+            out = np.zeros(len(s))
+
+        return pd.DataFrame({self.output_col: out}, index=X.index)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array([self.output_col])

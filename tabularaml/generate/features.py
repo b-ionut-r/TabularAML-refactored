@@ -22,9 +22,11 @@ from tabularaml.eval.cv import (cross_val_score, cross_val_fold_scores, make_cv_
                                 sanitize_model_features, FoldScores)
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, PREDEFINED_SCORERS, Scorer
 from tabularaml.eval.splitters import RotatedGroupKFold, normalize_rotatable_splitter
-from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, build_temporal_ops
+from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, GLOBAL_OPS, build_temporal_ops
+from tabularaml.generate.expanders import BaselineFeatureExpander
 from tabularaml.inspect.importance import FeatureImportanceAnalyzer
-from tabularaml.preprocessing.encoders import CategoricalEncoder, GroupByEncoder, TemporalEncoder
+from tabularaml.preprocessing.encoders import (CategoricalEncoder, GroupByEncoder, TemporalEncoder,
+                                               GlobalTransformEncoder)
 from tabularaml.preprocessing.imputers import SimpleImputer
 from tabularaml.preprocessing.pipeline import PipelineWrapper
 from tabularaml.configs.feature_gen import PRESET_PARAMS
@@ -161,7 +163,8 @@ class Interaction:
         # Determine if this is an aggregation operation
         self.is_agg = op in AGG_OPS
         self.is_temporal = op in TEMPORAL_OPS
-        
+        self.is_global = op in GLOBAL_OPS
+
         if self.is_temporal:
             # Temporal: feature_1 is the numeric column, feature_2 unused (unary-style)
             self.type = "unary"
@@ -169,6 +172,14 @@ class Interaction:
             self.depth = feature_1.depth + 1
             self.weight = feature_1.weight
             self.require_pipeline = True  # Must go through pipeline
+            self.name = f"{op}_{feature_1.name}"
+        elif self.is_global:
+            # Global transform: rank/bin/winsor maps fitted on the train fold
+            self.type = "unary"
+            self.dtype = "num"
+            self.depth = feature_1.depth + 1
+            self.weight = feature_1.weight
+            self.require_pipeline = True  # Fit-state must come from train folds only
             self.name = f"{op}_{feature_1.name}"
         elif self.is_agg:
             # Aggregation: feature_1 is categorical key, feature_2 is numeric column
@@ -270,6 +281,10 @@ class FoldEvalState:
                 and self.cols_hash == self.hash_cols(X))
 
 
+# Initial priority overrides for specific operations (see initialize_operations)
+_OP_PRIORS = {"concat": 0.8}
+
+
 class StagnationLevel(Enum):
     NONE, MILD, MODERATE, SEVERE, CRITICAL = 0, 1, 2, 3, 4
 
@@ -328,8 +343,10 @@ class ImprovedAdaptiveController:
                     self.op_stats[dtype][op_type] = {}
                 for op in ops[dtype][op_type]:
                     if op not in self.op_stats[dtype][op_type]:
-                        # Start with higher scores for rarely used operations
-                        initial_score = 0.7 if self.op_usage[op] < 5 else 0.5
+                        # Start with higher scores for rarely used operations;
+                        # explicit priors boost ops that unlock follow-up moves
+                        # (concat keys enable multi-key group-bys next round)
+                        initial_score = _OP_PRIORS.get(op, 0.7 if self.op_usage[op] < 5 else 0.5)
                         self.op_stats[dtype][op_type][op] = {
                             "success_rate": initial_score, 
                             "avg_gain": 0.0, 
@@ -393,6 +410,8 @@ class ImprovedAdaptiveController:
             dtype, op_type = "agg", "binary"
         elif getattr(interaction, 'is_temporal', False):
             dtype, op_type = "temporal", "unary"
+        elif getattr(interaction, 'is_global', False):
+            dtype, op_type = "global", "unary"
         else:
             dtype = interaction.dtype
             op_type = interaction.type
@@ -705,7 +724,9 @@ class FeatureGenerator:
                  confirmation_seeds: int = 1,
                  null_importance_selection: bool = True,
                  null_importance_n_perm: int = 4,
-                 null_importance_pct: float = 75.0):
+                 null_importance_pct: float = 75.0,
+                 expand_datetime: bool = True,
+                 expand_row_stats: bool = True):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -819,6 +840,12 @@ class FeatureGenerator:
         self.null_importance_selection = null_importance_selection
         self.null_importance_n_perm = null_importance_n_perm
         self.null_importance_pct = null_importance_pct
+
+        # Base-table expansion (datetime decomposition, row stats)
+        self.expand_datetime = expand_datetime
+        self.expand_row_stats = expand_row_stats
+        self.base_expander = None
+        self._priority_candidates = []
 
     def _ensure_no_duplicates(self, X: pd.DataFrame, context: str = "") -> pd.DataFrame:
         """Ensure DataFrame has no duplicate columns."""
@@ -1899,7 +1926,7 @@ class FeatureGenerator:
         pipeline = PipelineWrapper(imputer=None, scaler=None,
                                    encoder=CategoricalEncoder(target_enc_cols, count_enc_cols, freq_enc_cols))
         pipeline.groupby_encoders = groupby_encoders
-        
+
         # Collect Temporal encoders for temporal interactions
         temporal_encoders = []
         for i in interactions:
@@ -1909,6 +1936,15 @@ class FeatureGenerator:
                                    time_col=self.time_col, op_name=i.op, output_col=i.name)
                 )
         pipeline.temporal_encoders = temporal_encoders
+
+        # Collect Global transform encoders (rank/bin/winsor fitted on train fold)
+        global_encoders = []
+        for i in interactions:
+            if getattr(i, 'is_global', False):
+                global_encoders.append(
+                    GlobalTransformEncoder(col=i.feature_1.name, kind=i.op, output_col=i.name)
+                )
+        pipeline.global_encoders = global_encoders
         return pipeline
 
     def _extend_pipeline(self, pipeline: PipelineWrapper, new_pipeline: PipelineWrapper) -> PipelineWrapper:
@@ -1941,6 +1977,17 @@ class FeatureGenerator:
                 merged_te.append(te)
                 seen_te.add(te.output_col)
         result.temporal_encoders = merged_te
+
+        # Merge global transform encoders
+        existing_g = getattr(pipeline, 'global_encoders', [])
+        new_g = getattr(new_pipeline, 'global_encoders', [])
+        seen_g = {g.output_col for g in existing_g}
+        merged_g = list(existing_g)
+        for g in new_g:
+            if g.output_col not in seen_g:
+                merged_g.append(g)
+                seen_g.add(g.output_col)
+        result.global_encoders = merged_g
         return result
         
     def _apply_interactions(self, X: pd.DataFrame, interactions: List[Interaction]) -> tuple[pd.DataFrame, PipelineWrapper]:
@@ -2361,7 +2408,11 @@ class FeatureGenerator:
             
             col_str = str(col).lower()
             is_id_name = col_str in ["id", "index"] or col_str.endswith("_id")
-            
+
+            # Datetime columns are never IDs (the base expander decomposes them)
+            if pd.api.types.is_datetime64_any_dtype(X[col]) and not is_id_name:
+                continue
+
             # If it's explicitly named like an ID, or acts like a perfect ID (all uniquely categorical)
             if is_id_name or (X[col].nunique() == len(X) and not pd.api.types.is_float_dtype(X[col])):
                 cols_to_drop.append(col)
@@ -2379,11 +2430,32 @@ class FeatureGenerator:
         random.seed(self.random_state)
         np.random.seed(self.random_state)
         start_time = time.time()
+
+        # Base-table expansion: datetime decomposition + row stats become part
+        # of the base table (parent-eligible, protected from pruning). Runs
+        # BEFORE ID dropping so unique-valued datetime columns are decomposed
+        # rather than mistaken for IDs.
+        self.base_expander = None
+        if getattr(self, 'expand_datetime', True) or getattr(self, 'expand_row_stats', True):
+            try:
+                expander = BaselineFeatureExpander(
+                    datetime_features=getattr(self, 'expand_datetime', True),
+                    row_stats=getattr(self, 'expand_row_stats', True),
+                    exclude_cols=tuple(c for c in (self.time_col, self.id_col) if c))
+                X_expanded = expander.fit(X).transform(X)
+                if expander.added_cols_:
+                    self.base_expander = expander
+                    X = X_expanded
+                    self._log(f"Base expansion: {expander.summary()}")
+            except Exception as e:
+                self._log(f"Base expansion failed: {e}")
+
         X = self._drop_id_columns(X)
         self._set_defaults(X, y)
         self._cv_int_hint = self.cv if isinstance(self.cv, int) else None
         self.cv = normalize_rotatable_splitter(self.cv)
         self.initial_features = list(X.columns)
+        self._priority_candidates = []
         num_cols, cat_cols = self._get_num_cat_cols(X)
         self.max_gen_new_feats = (int(self.max_new_feats * len(self.initial_features)) if isinstance(self.max_new_feats, float)
                                  else self.max_new_feats if isinstance(self.max_new_feats, int) else float('inf'))
@@ -2659,7 +2731,7 @@ class FeatureGenerator:
 
                     # Generate Temporal candidates (when time_col is specified)
                     if self.time_col and self.id_col and "temporal" in self.ops:
-                        num_parents_temporal = [f for f in valid_unary if f.dtype == "num" 
+                        num_parents_temporal = [f for f in valid_unary if f.dtype == "num"
                                                 and f.name != self.time_col and f.name != self.id_col]
                         if num_parents_temporal:
                             # Sample a reasonable number of temporal candidates
@@ -2669,11 +2741,40 @@ class FeatureGenerator:
                                 for temp_op in self.ops["temporal"]["unary"]:
                                     candidates_pool.append(Interaction(feat, temp_op))
 
+                    # Generate Global transform candidates (rank/bin/winsor via pipeline);
+                    # shallow parents only, and never re-rank a rank
+                    if "global" in self.ops:
+                        global_op_names = self.ops["global"]["unary"]
+                        global_parents = [f for f in valid_unary if f.dtype == "num"
+                                          and (f.depth or 0) < 2
+                                          and not any(f.name.startswith(g + "_") for g in global_op_names)]
+                        for feat in global_parents:
+                            for gop in global_op_names:
+                                candidates_pool.append(Interaction(feat, gop))
+
                     # Enhanced child sampling (budget-aware sizing)
                     n_children_eff, early_thr_eff = self._budget_scaled_sizes(start_time, N)
                     if n_children_eff < self.n_children:
                         self._log(f"  Budget-aware sizing: children {self.n_children} -> {n_children_eff}")
                     batch = self._sample_children_with_creativity(candidates_pool, n_children_eff, tau=tau)
+
+                    # Guaranteed evaluation of queued follow-up candidates
+                    # (e.g. group-bys over a just-accepted concat key)
+                    if getattr(self, '_priority_candidates', None):
+                        batch_names = {b.name for b in batch}
+                        queued, seen_q = [], set()
+                        for c in self._priority_candidates:
+                            if (c.name in batch_names or c.name in seen_q or c.name in X.columns
+                                    or c.feature_1.name not in X.columns
+                                    or (c.feature_2 is not None and c.feature_2.name not in X.columns)):
+                                continue
+                            queued.append(c)
+                            seen_q.add(c.name)
+                        queued = queued[:max(1, n_children_eff // 4)]
+                        if queued:
+                            self._log(f"  Priority queue: injecting {len(queued)} follow-up candidates")
+                            batch = queued + batch
+                        self._priority_candidates = []
 
                     # Phase 1: Proxy screening (fast FeatureBoost pre-filter)
                     n_before_proxy = len(batch)
@@ -2715,7 +2816,18 @@ class FeatureGenerator:
                         feat = interaction.get_new_feature_instance()
                         feat.set_generating_interaction(interaction)
                         new_generation.append(feat)
-                    
+
+                        # Accepted concat keys unlock multi-key group-bys: queue
+                        # them for guaranteed evaluation next generation
+                        if interaction.op == "concat" and "agg" in self.ops:
+                            num_parents_q = sorted(
+                                [f for f in generation if f.dtype == "num" and f.name in X.columns
+                                 and not f.require_pipeline],
+                                key=lambda f: f.weight, reverse=True)[:5]
+                            for np_feat in num_parents_q:
+                                for agg_op in self.ops["agg"]["binary"]:
+                                    self._priority_candidates.append(Interaction(feat, agg_op, np_feat))
+
                     # Update weights if changes made
                     if new_feature_names or elites:
                         weights = self._get_top_k_features(X, y, k=-1, pipeline=self.pipeline)
@@ -2783,7 +2895,8 @@ class FeatureGenerator:
                 
                 n_groupby = len(getattr(self.pipeline, "groupby_encoders", []))
                 n_temporal = len(getattr(self.pipeline, "temporal_encoders", []))
-                n_encoded = (self.pipeline.encoder.n_new_feats if hasattr(self.pipeline, 'encoder') else 0) + n_groupby + n_temporal
+                n_global = len(getattr(self.pipeline, "global_encoders", []))
+                n_encoded = (self.pipeline.encoder.n_new_feats if hasattr(self.pipeline, 'encoder') else 0) + n_groupby + n_temporal + n_global
 
                 gen_log = f"Gen {N+1}: Added {features_added} features, {X.shape[1] + n_encoded} total ({self.state['counters']['total_new_features'] + n_encoded} new)."
                 gen_log += f" Train {self.scorer.name}={new_train_score:.5f}, Val {self.scorer.name}={new_val_score:.5f}. {improvement}"
@@ -2843,6 +2956,8 @@ class FeatureGenerator:
             # Replay discovered features on full dataset
             self._log("Replaying discovered features on full dataset...")
             X = X_full.copy()
+            if getattr(self, 'base_expander', None) is not None:
+                X = self.base_expander.transform(X)
             for interaction in getattr(self, 'interactions', []):
                 if interaction.name not in X.columns and not interaction.require_pipeline:
                     try:
@@ -2881,6 +2996,8 @@ class FeatureGenerator:
             try:
                 # Replay features on meta split
                 X_meta_transformed = X_meta.copy()
+                if getattr(self, 'base_expander', None) is not None:
+                    X_meta_transformed = self.base_expander.transform(X_meta_transformed)
                 for interaction in getattr(self, 'interactions', []):
                     if interaction.name not in X_meta_transformed.columns and not interaction.require_pipeline:
                         try:
@@ -2931,7 +3048,8 @@ class FeatureGenerator:
         n_init_feats = len(self.initial_features)
         n_groupby = len(getattr(self.pipeline, "groupby_encoders", []))
         n_temporal = len(getattr(self.pipeline, "temporal_encoders", []))
-        n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal
+        n_global = len(getattr(self.pipeline, "global_encoders", []))
+        n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal + n_global
 
         # Use a clean pipeline for baseline evaluation to get true initial performance
         baseline_pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
@@ -2963,14 +3081,16 @@ class FeatureGenerator:
         
         gb_names = [gb.output_col for gb in getattr(self.pipeline, "groupby_encoders", [])]
         te_names = [te.output_col for te in getattr(self.pipeline, "temporal_encoders", [])]
-        
+        g_names = [g.output_col for g in getattr(self.pipeline, "global_encoders", [])]
+
         new_features = {
             "generated": all_generated - encoder_feats_final,
             "target encoded": self.pipeline.encoder.target_enc_cols,
             "count encoded": self.pipeline.encoder.count_enc_cols,
             "freq encoded": self.pipeline.encoder.freq_enc_cols,
             "groupby": gb_names,
-            "temporal": te_names
+            "temporal": te_names,
+            "global": g_names
         }
         for feat_type, features in new_features.items():
             if features: self._log(f"New {feat_type}: {features}")
@@ -3069,9 +3189,13 @@ class FeatureGenerator:
             unique_vals = np.unique(y)
             if not np.array_equal(unique_vals, np.arange(len(unique_vals))):
                 y_encoded, _ = y.factorize(sort=True)
-                y = pd.Series(y_encoded, index=y.index, name=y.name)      
+                y = pd.Series(y_encoded, index=y.index, name=y.name)
         X_transformed = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
-        
+
+        # Re-apply base expansion (datetime parts, row stats)
+        if getattr(self, 'base_expander', None) is not None:
+            X_transformed = self.base_expander.transform(X_transformed)
+
         # Generate non-pipeline features
         for interaction in self.interactions:
             if interaction.name not in X_transformed.columns and not interaction.require_pipeline:
@@ -3093,12 +3217,17 @@ class FeatureGenerator:
 
     def transform(self, X: pd.DataFrame):
         """Transform data by applying interactions and pipeline."""
-        if not getattr(self, 'interactions', None):
-            self._log("Warning: No interactions. Returning unchanged.")
-            return X
-            
         X_transformed = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
-            
+
+        # Re-apply base expansion (datetime parts, row stats) — also when no
+        # interactions were accepted, so the output schema matches search()
+        if getattr(self, 'base_expander', None) is not None:
+            X_transformed = self.base_expander.transform(X_transformed)
+
+        if not getattr(self, 'interactions', None):
+            self._log("Warning: No interactions. Returning base-expanded data.")
+            return X_transformed
+
         # Generate features
         for interaction in self.interactions:
             if interaction.name not in X_transformed.columns and not interaction.require_pipeline:
@@ -3368,6 +3497,14 @@ class FeatureGenerator:
             self.null_importance_pct = 75.0
         if not hasattr(self, '_cv_int_hint'):
             self._cv_int_hint = None
+        if not hasattr(self, 'expand_datetime'):
+            self.expand_datetime = True
+        if not hasattr(self, 'expand_row_stats'):
+            self.expand_row_stats = True
+        if not hasattr(self, 'base_expander'):
+            self.base_expander = None
+        if not hasattr(self, '_priority_candidates'):
+            self._priority_candidates = []
         if not hasattr(self, 'cv_n_jobs'):
             self.cv_n_jobs = "auto"
         if not hasattr(self, '_cv_n_jobs_resolved'):

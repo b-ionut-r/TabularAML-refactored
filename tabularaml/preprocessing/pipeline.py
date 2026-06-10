@@ -67,10 +67,13 @@ class PipelineWrapper:
             if hasattr(self.encoder, 'freq_enc_cols'):
                 encoder_output_cols.update(f"{col}_freq" for col in self.encoder.freq_enc_cols)
 
-        # Also track GroupBy encoder output cols
+        # Also track GroupBy / Temporal / Global encoder output cols
         groupby_encoders = getattr(self, 'groupby_encoders', [])
         for gb_enc in groupby_encoders:
             encoder_output_cols.add(gb_enc.output_col)
+        global_encoders = getattr(self, 'global_encoders', [])
+        for g_enc in global_encoders:
+            encoder_output_cols.add(g_enc.output_col)
 
         # Filter out columns that will be created by encoder from numerical columns
         # This prevents duplicate feature name errors in ColumnTransformer
@@ -99,6 +102,11 @@ class PipelineWrapper:
             te_cols_present = [c for c in te_cols if c in X.columns]
             if len(te_cols_present) == len(te_cols):
                 transformers.append((f"temporal_{i}", te_enc, te_cols_present))
+
+        # Add Global transform encoder transformers (rank/bin/winsor fitted on train fold)
+        for i, g_enc in enumerate(global_encoders):
+            if g_enc.col in X.columns:
+                transformers.append((f"global_{i}", g_enc, [g_enc.col]))
         
         # ColumnTransformer
         ct = ColumnTransformer(
