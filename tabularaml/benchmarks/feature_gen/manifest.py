@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Optional
 import pandas as pd
 from tqdm.auto import tqdm
-import openml
+try:
+    # Optional: only needed when (re)building the manifest from OpenML.
+    import openml
+except ImportError:
+    openml = None
 import warnings
 
 
@@ -31,6 +35,8 @@ def _load_id_pools() -> pd.DataFrame:
 
 def _probe_one(tid: int, task: str):
     """Return a dict describing the dataset or None if it should be skipped."""
+    if openml is None:
+        return None, "openml_not_installed"
     try:
         task_obj = openml.tasks.get_task(tid, download_data=False, download_qualities=True)
     except Exception as e:

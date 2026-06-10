@@ -1,8 +1,13 @@
 import numpy as np
 import pandas as pd
 import random
-import openml
-from openml.tasks import TaskType
+try:
+    # Optional: only needed for OpenML-based dataset fetching helpers.
+    import openml
+    from openml.tasks import TaskType
+except ImportError:
+    openml = None
+    TaskType = None
 from sklearn.datasets import fetch_openml
 from sklearn.utils import Bunch
 import os
@@ -47,6 +52,9 @@ def fetch_random_openml_dataset(task_type=None, return_X_y=True, as_frame=True, 
     
     try:
         # 1. First get task list with proper task type
+        if openml is None:
+            raise ImportError("The 'openml' package is required for OpenML dataset fetching. "
+                              "Install it with: pip install openml")
         if task_type in ['classification', 'regression']:
             # Set the appropriate TaskType
             if task_type == 'classification':
@@ -260,7 +268,10 @@ if __name__ == "__main__":
 
 import pandas as pd
 from typing import Optional
-import openml
+try:
+    import openml
+except ImportError:
+    openml = None
 import random
 import warnings
 import os
@@ -299,6 +310,9 @@ class Dataset:
 
     @classmethod
     def fetch_by_id(cls, id):
+        if openml is None:
+            raise ImportError("The 'openml' package is required for OpenML dataset fetching. "
+                              "Install it with: pip install openml")
         with warnings.catch_warnings():
             # Ignore all warnings
             warnings.filterwarnings("ignore")

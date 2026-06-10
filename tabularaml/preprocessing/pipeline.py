@@ -144,20 +144,20 @@ class PipelineWrapper:
                 is_likely_categorical = X[col].nunique() / len(X[col]) < 0.1
                 
                 if is_likely_categorical:
-                    X.loc[:, col] = self._convert_to_category(X[col])
+                    X[col] = self._convert_to_category(X[col])
                     dtypes_dict[col] = "cat"
                 else:
                     # Try numeric conversion
                     numeric_result = self._try_numeric_conversion(X[col])
                     if numeric_result is not None:
-                        X.loc[:, col] = numeric_result
+                        X[col] = numeric_result
                         dtypes_dict[col] = "float" if X[col].dtype == np.float64 else "int"
                     else:
                         # Handle non-categorical text
                         if hasattr(self, 'drop_non_categorical_text') and self.drop_non_categorical_text:
                             dropped_columns.append(col)
                         else:
-                            X.loc[:, col] = self._convert_to_category(X[col])
+                            X[col] = self._convert_to_category(X[col])
                             dtypes_dict[col] = "cat"
             
             # Handle numeric types directly

@@ -18,7 +18,8 @@ from sklearn.model_selection import BaseCrossValidator
 from sklearn.utils.multiclass import type_of_target
 from tqdm.auto import tqdm
 
-from tabularaml.eval.cv import cross_val_score, make_cv_splitter, sanitize_model_features
+from tabularaml.eval.cv import (cross_val_score, cross_val_fold_scores, make_cv_splitter,
+                                sanitize_model_features, FoldScores)
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, PREDEFINED_SCORERS, Scorer
 from tabularaml.eval.splitters import RotatedGroupKFold, normalize_rotatable_splitter
 from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, build_temporal_ops
@@ -242,6 +243,31 @@ class FeatureCache:
     def hit_rate(self):
         total = self.hits + self.misses
         return self.hits / total if total > 0 else 0.0
+
+
+@dataclass
+class FoldEvalState:
+    """Cached per-fold CV scores of the current baseline feature set.
+
+    Valid only while the CV splitter state (cv_epoch), row count and column set
+    are unchanged; any mismatch forces a recompute so paired per-fold deltas are
+    never taken against a stale baseline vector.
+    """
+    fold_scores: Optional[np.ndarray] = None
+    cv_epoch: int = -1
+    n_rows: int = -1
+    cols_hash: int = 0
+    per_era: Optional[dict] = None
+
+    @staticmethod
+    def hash_cols(X: pd.DataFrame) -> int:
+        return hash(tuple(sorted(map(str, X.columns))))
+
+    def matches(self, cv_epoch: int, X: pd.DataFrame) -> bool:
+        return (self.fold_scores is not None
+                and self.cv_epoch == cv_epoch
+                and self.n_rows == len(X)
+                and self.cols_hash == self.hash_cols(X))
 
 
 class StagnationLevel(Enum):
@@ -666,7 +692,8 @@ class FeatureGenerator:
                  id_col: Optional[str] = None,
                  temporal_windows: Optional[list] = None,
                  random_state: int = 42,
-                 n_jobs: int = -1):
+                 n_jobs: int = -1,
+                 cv_n_jobs: Union[int, str] = "auto"):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -675,6 +702,8 @@ class FeatureGenerator:
         self.mode = mode
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.cv_n_jobs = cv_n_jobs
+        self._cv_n_jobs_resolved = 1
 
         # Always set params from constructor args first (preserves explicit UI overrides)
         self.n_generations = n_generations
@@ -763,6 +792,10 @@ class FeatureGenerator:
         # early-exit paths (e.g. fit/transform without generate) never hit AttributeError.
         self.interactions: list = []
         self.generation: list = []
+
+        # Paired-fold evaluation state (statistical acceptance)
+        self._cv_epoch = 0
+        self._best_fold_state = FoldEvalState()
 
     def _ensure_no_duplicates(self, X: pd.DataFrame, context: str = "") -> pd.DataFrame:
         """Ensure DataFrame has no duplicate columns."""
@@ -858,14 +891,58 @@ class FeatureGenerator:
         imp_df.sort_values(by="weighted_importance", axis=0, ascending=False, inplace=True)
         return imp_df if k == -1 else imp_df[:k]
 
-    def _eval_baseline(self, X: pd.DataFrame, y: pd.Series, pipeline=None, groups=None) -> tuple[float, float]:
+    def _eval_baseline(self, X: pd.DataFrame, y: pd.Series, pipeline=None, groups=None,
+                       update_fold_cache: bool = False) -> tuple[float, float]:
         """Evaluate baseline model performance."""
         pipeline = pipeline.get_pipeline(X, y) if pipeline is not None else pipeline
         eval_groups = self._groups_active if groups is None else groups
         cv_dict = cross_val_score(self.baseline_model, X, y, self.scorer, cv=self.cv,
                                  return_dict=True, pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs,
-                                 groups=eval_groups)
+                                 groups=eval_groups, n_jobs_folds=self._cv_n_jobs_resolved)
+        if update_fold_cache:
+            self._store_baseline_fold_scores(
+                X, FoldScores(mean_val=cv_dict["mean_val_score"],
+                              fold_scores=np.asarray(cv_dict["fold_val_scores"], dtype=float),
+                              per_group=cv_dict.get("val_group_scores")))
         return cv_dict["mean_train_score"], cv_dict["mean_val_score"]
+
+    def _eval_cv_light(self, X: pd.DataFrame, y: pd.Series, pipeline=None, groups=None) -> FoldScores:
+        """Light CV evaluation for the candidate hot loop: per-fold val scores only
+        (no train-side predictions, no fold-model retention)."""
+        pipeline = pipeline.get_pipeline(X, y) if pipeline is not None else pipeline
+        eval_groups = self._groups_active if groups is None else groups
+        return cross_val_fold_scores(self.baseline_model, X, y, self.scorer, cv=self.cv,
+                                     pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs,
+                                     groups=eval_groups, n_jobs_folds=self._cv_n_jobs_resolved)
+
+    def _store_baseline_fold_scores(self, X: pd.DataFrame, res: FoldScores) -> None:
+        """Cache the baseline per-fold vector for paired candidate comparisons."""
+        self._best_fold_state = FoldEvalState(
+            fold_scores=np.asarray(res.fold_scores, dtype=float),
+            cv_epoch=self._cv_epoch,
+            n_rows=len(X),
+            cols_hash=FoldEvalState.hash_cols(X),
+            per_era=res.per_group)
+
+    def _get_baseline_fold_scores(self, X: pd.DataFrame, y: pd.Series,
+                                  pipeline=None) -> FoldScores:
+        """Baseline per-fold scores for X, from cache when still valid.
+
+        The cache key (cv_epoch, n_rows, cols_hash) guarantees paired deltas are
+        only ever computed against a vector produced under the same splitter
+        state and feature set.
+        """
+        if self._best_fold_state.matches(self._cv_epoch, X):
+            return FoldScores(mean_val=float(np.mean(self._best_fold_state.fold_scores)),
+                              fold_scores=self._best_fold_state.fold_scores,
+                              per_group=self._best_fold_state.per_era)
+        res = self._eval_cv_light(X, y, pipeline if pipeline is not None else self.pipeline)
+        self._store_baseline_fold_scores(X, res)
+        return res
+
+    def _bump_cv_epoch(self, reason: str = "") -> None:
+        """Invalidate cached fold vectors after any change to splitter state or data."""
+        self._cv_epoch += 1
 
     def _eval_logging_scorers(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> Dict[str, Tuple[float, float]]:
         """Evaluate all logging scorers and return dict of {scorer_name: (train_score, val_score)}."""
@@ -2502,6 +2579,14 @@ class FeatureGenerator:
                           if len(np.unique(y)) == 2 else 
                           PREDEFINED_CLS_SCORERS["categorical_crossentropy"])
 
+        # Parallel fold fitting: conservative default to avoid oversubscription
+        # (model n_jobs is clamped per fold inside cross_val_score).
+        cv_n_jobs = getattr(self, "cv_n_jobs", "auto")
+        if cv_n_jobs == "auto":
+            self._cv_n_jobs_resolved = 1 if self.device == "cuda" else 2
+        else:
+            self._cv_n_jobs_resolved = max(1, int(cv_n_jobs))
+
         # Pipeline & adaptive controller
         self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
         self.adaptive_controller.reset_for_new_run()
@@ -2830,6 +2915,16 @@ class FeatureGenerator:
         if not hasattr(self, 'id_col'):
             self.id_col = None
 
+        # Competition-grade additions (paired-fold acceptance, parallel CV)
+        if not hasattr(self, 'cv_n_jobs'):
+            self.cv_n_jobs = "auto"
+        if not hasattr(self, '_cv_n_jobs_resolved'):
+            self._cv_n_jobs_resolved = 1
+        if not hasattr(self, '_cv_epoch'):
+            self._cv_epoch = 0
+        if not hasattr(self, '_best_fold_state'):
+            self._best_fold_state = FoldEvalState()
+
         # Ensure state dict has interactions in best (for future reverts)
         if hasattr(self, 'state') and 'best' in self.state:
             if 'X' not in self.state['best']:
@@ -2838,6 +2933,10 @@ class FeatureGenerator:
                 self.state['best']['interactions'] = deepcopy(self.interactions)
             if 'pruned_features' not in self.state['best']:
                 self.state['best']['pruned_features'] = set()
+            if 'val_fold_scores' not in self.state['best']:
+                self.state['best']['val_fold_scores'] = None
+            if 'fold_cv_epoch' not in self.state['best']:
+                self.state['best']['fold_cv_epoch'] = -1
 
     def generate(self, X: pd.DataFrame, y: pd.Series):
         """Main entry point for feature generation."""

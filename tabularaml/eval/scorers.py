@@ -62,6 +62,11 @@ def _prepare_metric_inputs(name: str, from_probs: bool,
 
 class CatScorer:
 
+    # Class attribute (not instance) so old pickled scorer instances resolve it.
+    # Group-aware scorers (e.g. per-era metrics) override this with True and
+    # accept a `groups` kwarg in score().
+    needs_groups = False
+
     def __init__(self,
                  name: str,
                  scorer: callable,
@@ -182,6 +187,11 @@ class CatScorer:
 
 
 class Scorer:
+
+    # Class attribute (not instance) so old pickled scorer instances resolve it.
+    # Group-aware scorers (e.g. per-era metrics) override this with True and
+    # accept a `groups` kwarg in score().
+    needs_groups = False
 
     def __new__(cls, *args, **kwargs):
         """

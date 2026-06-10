@@ -1,5 +1,7 @@
+import os
 import pandas as pd
 import numpy as np
+from dataclasses import dataclass
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.utils.multiclass import type_of_target
@@ -7,7 +9,7 @@ from sklearn.preprocessing import OneHotEncoder
 from tabularaml.eval.scorers import Scorer
 from tabularaml.preprocessing.pipeline import PipelineWrapper
 from copy import deepcopy
-from typing import Union
+from typing import Optional, Union
 import inspect
 
 # --- FIX: Add numpy() method to pandas Series if it doesn't exist ---
@@ -75,61 +77,309 @@ def make_cv_splitter(cv, y, shuffle=True, random_state=42, groups=None):
 
     return KFold(n_splits=requested_splits, shuffle=shuffle, random_state=random_state)
 
+
+@dataclass
+class FoldScores:
+    """Lightweight per-fold CV result used by the feature search hot loop."""
+    mean_val: float
+    fold_scores: np.ndarray
+    per_group: Optional[dict] = None  # group/era id -> score, when scorer is group-aware
+
+
+def _early_stopping_requested(model, model_fit_kwargs) -> bool:
+    """Detect whether the model/fit-kwargs configure early stopping on an eval_set.
+
+    Covers XGBoost / LightGBM / CatBoost sklearn wrappers. False for models whose
+    early stopping is internal (e.g. sklearn HistGB's n_iter_no_change, which does
+    not consume eval_set).
+    """
+    if getattr(model, "early_stopping_rounds", None):
+        return True
+    try:
+        params = model.get_params()
+    except Exception:
+        params = {}
+    for key in ("early_stopping_rounds", "early_stopping_round", "early_stopping",
+                "od_wait", "od_type"):
+        if params.get(key):
+            return True
+    if model_fit_kwargs:
+        for key in ("early_stopping_rounds", "early_stopping_round"):
+            if model_fit_kwargs.get(key):
+                return True
+        for cb in model_fit_kwargs.get("callbacks", []) or []:
+            if hasattr(cb, "stopping_rounds") or "earlystop" in type(cb).__name__.lower().replace("_", ""):
+                return True
+    return False
+
+
+def _carve_es_split(train_idx, y, groups, es_split_frac, random_state):
+    """Split positional train indices into (reduced_train_idx, es_idx) for early stopping.
+
+    The early-stopping eval set is carved out of the TRAIN fold so the validation
+    fold is never seen during fit. Stratifies for classification when possible and
+    respects groups when provided.
+    """
+    from sklearn.model_selection import train_test_split, GroupShuffleSplit
+
+    n_es = max(1, int(round(len(train_idx) * es_split_frac)))
+    if len(train_idx) - n_es < 2:
+        return train_idx, None
+
+    if groups is not None:
+        groups_train = np.asarray(groups)[train_idx]
+        if len(np.unique(groups_train)) >= 2:
+            gss = GroupShuffleSplit(n_splits=1, test_size=es_split_frac, random_state=random_state)
+            tr_pos, es_pos = next(gss.split(train_idx.reshape(-1, 1), groups=groups_train))
+            return train_idx[tr_pos], train_idx[es_pos]
+
+    y_train = np.asarray(y)[train_idx]
+    stratify = None
+    if type_of_target(y_train) not in ("continuous", "continuous-multioutput"):
+        counts = pd.Series(y_train).value_counts(dropna=False)
+        if counts.min() >= 2 and len(counts) <= n_es:
+            stratify = y_train
+    try:
+        tr, es = train_test_split(train_idx, test_size=es_split_frac,
+                                  random_state=random_state, stratify=stratify)
+    except ValueError:
+        tr, es = train_test_split(train_idx, test_size=es_split_frac,
+                                  random_state=random_state, stratify=None)
+    return tr, es
+
+
+def _slice_xy(X, y, idx, is_dataframe):
+    if is_dataframe:
+        return X.iloc[idx], y.iloc[idx] if hasattr(y, "iloc") else np.asarray(y)[idx]
+    return X[idx], y.iloc[idx] if hasattr(y, "iloc") else np.asarray(y)[idx]
+
+
+def _run_single_fold(fold_idx, train_idx, val_idx, model, X, y, scorer, pipeline,
+                     model_fit_kwargs, groups, compute_train, keep_model,
+                     eval_set_policy, es_split_frac, random_state, model_threads,
+                     y_is_classification=True):
+    """Fit and score a single CV fold. Thread-safe: clones model/pipeline internally."""
+    is_dataframe = isinstance(X, pd.DataFrame)
+
+    try:
+        model_clone = deepcopy(model)
+    except Exception:
+        model_clone = type(model)(**model.get_params())
+
+    if model_threads is not None and hasattr(model_clone, "set_params"):
+        try:
+            if "n_jobs" in model_clone.get_params():
+                model_clone.set_params(n_jobs=model_threads)
+        except Exception:
+            pass
+
+    fit_signature = inspect.signature(model_clone.fit)
+    supports_eval_set = 'eval_set' in fit_signature.parameters
+    es_requested = (eval_set_policy != "none" and supports_eval_set and
+                    (eval_set_policy == "legacy" or
+                     _early_stopping_requested(model_clone, model_fit_kwargs)))
+
+    es_idx = None
+    if es_requested and eval_set_policy == "auto":
+        train_idx, es_idx = _carve_es_split(np.asarray(train_idx), y, groups,
+                                            es_split_frac, random_state)
+        if es_idx is None:
+            es_requested = False
+
+    X_train_raw, y_train = _slice_xy(X, y, train_idx, is_dataframe)
+    X_val_raw, y_val = _slice_xy(X, y, val_idx, is_dataframe)
+    if is_dataframe:
+        X_train_raw, X_val_raw = X_train_raw.copy(), X_val_raw.copy()
+
+    pipeline_clone = None
+    if pipeline is not None:
+        try:
+            pipeline_clone = deepcopy(pipeline)
+        except Exception:
+            if hasattr(pipeline, "get_params"):
+                pipeline_clone = type(pipeline)(**pipeline.get_params())
+            else:
+                raise ValueError("Cannot clone pipeline. Make sure it has a get_params method.")
+        X_train = pipeline_clone.fit_transform(X_train_raw, y_train)
+        X_val = pipeline_clone.transform(X_val_raw)
+        X_train = sanitize_model_features(X_train)
+        X_val = sanitize_model_features(X_val)
+    else:
+        # X was sanitized once at entry; fold slices need no re-sanitization
+        X_train, X_val = X_train_raw, X_val_raw
+
+    # Build eval_set according to policy
+    fit_kwargs = model_fit_kwargs.copy() if model_fit_kwargs else {}
+    eval_set = None
+    if es_requested:
+        if eval_set_policy == "legacy":
+            # Bit-for-bit legacy guard (it also suppresses eval_set for
+            # continuous targets, since unique float values always differ).
+            train_labels = np.unique(np.asarray(y_train))
+            val_labels = np.unique(np.asarray(y_val))
+            if np.setdiff1d(val_labels, train_labels).size == 0:
+                eval_set = [(X_val, y_val)]
+        else:  # auto: carved from train
+            X_es_raw, y_es = _slice_xy(X, y, es_idx, is_dataframe)
+            if is_dataframe:
+                X_es_raw = X_es_raw.copy()
+            X_es = pipeline_clone.transform(X_es_raw) if pipeline_clone is not None else X_es_raw
+            if pipeline_clone is not None:
+                X_es = sanitize_model_features(X_es)
+            if y_is_classification:
+                train_labels = np.unique(np.asarray(y_train))
+                es_labels = np.unique(np.asarray(y_es))
+                if np.setdiff1d(es_labels, train_labels).size == 0:
+                    eval_set = [(X_es, y_es)]
+            else:
+                eval_set = [(X_es, y_es)]
+
+    if supports_eval_set and eval_set is not None:
+        if 'verbose' in fit_signature.parameters:
+            fit_kwargs.setdefault('verbose', False)
+        elif 'callbacks' in fit_signature.parameters and 'callbacks' not in fit_kwargs:
+            try:
+                import lightgbm as lgb
+                fit_kwargs['callbacks'] = [lgb.log_evaluation(period=0)]
+            except ImportError:
+                pass
+        try:
+            model_clone.fit(X_train, y_train, eval_set=eval_set, **fit_kwargs)
+        except (ValueError, TypeError):
+            model_clone.fit(X_train, y_train, **fit_kwargs)
+    else:
+        try:
+            model_clone.fit(X_train, y_train, **fit_kwargs)
+        except (ValueError, TypeError) as e:
+            # Model demands an eval_set for its configured early stopping but
+            # detection missed it: carve an ES split now and retrain on the rest.
+            if supports_eval_set and "stopping" in str(e).lower():
+                train_idx2, es_idx2 = _carve_es_split(np.asarray(train_idx), y, groups,
+                                                      es_split_frac, random_state)
+                if es_idx2 is not None:
+                    X_tr_raw, y_train = _slice_xy(X, y, train_idx2, is_dataframe)
+                    X_es_raw, y_es = _slice_xy(X, y, es_idx2, is_dataframe)
+                    if pipeline_clone is not None:
+                        X_train = sanitize_model_features(pipeline_clone.transform(
+                            X_tr_raw.copy() if is_dataframe else X_tr_raw))
+                        X_es = sanitize_model_features(pipeline_clone.transform(
+                            X_es_raw.copy() if is_dataframe else X_es_raw))
+                    else:
+                        X_train, X_es = X_tr_raw, X_es_raw
+                    model_clone.fit(X_train, y_train, eval_set=[(X_es, y_es)], **fit_kwargs)
+                else:
+                    raise
+            else:
+                raise
+
+    val_preds = model_clone.predict_proba(X_val) if scorer.from_probs else model_clone.predict(X_val)
+
+    requires_onehot = scorer.name == "categorical_crossentropy"
+    one_hot = None
+    if requires_onehot:
+        one_hot = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+        one_hot.fit(np.asarray(y_train).reshape(-1, 1))
+
+    groups_val = np.asarray(groups)[val_idx] if groups is not None else None
+    scorer_kwargs = {}
+    if getattr(scorer, "needs_groups", False) and groups_val is not None:
+        scorer_kwargs["groups"] = groups_val
+
+    y_val_for_score = one_hot.transform(np.asarray(y_val).reshape(-1, 1)) if requires_onehot else y_val
+    val_score = scorer.score(y_true=y_val_for_score, y_pred=val_preds, **scorer_kwargs)
+
+    result = {"val_score": val_score}
+
+    if getattr(scorer, "needs_groups", False) and groups_val is not None and hasattr(scorer, "score_per_group"):
+        try:
+            result["val_group_scores"] = scorer.score_per_group(y_val, val_preds, groups_val)
+        except Exception:
+            pass
+
+    if compute_train:
+        train_preds = model_clone.predict_proba(X_train) if scorer.from_probs else model_clone.predict(X_train)
+        y_train_for_score = one_hot.transform(np.asarray(y_train).reshape(-1, 1)) if requires_onehot else y_train
+        train_kwargs = {}
+        if getattr(scorer, "needs_groups", False) and groups is not None:
+            train_kwargs["groups"] = np.asarray(groups)[train_idx]
+        result["train_score"] = scorer.score(y_true=y_train_for_score, y_pred=train_preds, **train_kwargs)
+
+    if keep_model:
+        result["model"] = model_clone
+        if pipeline_clone is not None:
+            result["pipeline"] = pipeline_clone
+        if hasattr(model_clone, "feature_importances_"):
+            if is_dataframe and hasattr(X_train, "columns"):
+                result["feature_importance"] = dict(zip(X_train.columns, model_clone.feature_importances_))
+            elif hasattr(model_clone, "feature_names_in_"):
+                result["feature_importance"] = dict(zip(model_clone.feature_names_in_, model_clone.feature_importances_))
+
+    return result
+
+
 def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_state = 42,
                     pipeline: Union[Pipeline, PipelineWrapper] = None, return_dict = False,
-                    model_fit_kwargs = {}, folds_weights = None, groups = None):
+                    model_fit_kwargs = {}, folds_weights = None, groups = None,
+                    compute_train_scores: Optional[bool] = None,
+                    keep_fold_models: Optional[bool] = None,
+                    eval_set_policy: str = "auto",
+                    es_split_frac: float = 0.10,
+                    n_jobs_folds: int = 1):
     """
     Perform cross-validation evaluation of a model.
-    This function evaluates a machine learning model using cross-validation,
-    providing scores for each fold and optionally returning detailed results.
+
     Parameters
     ----------
     model : object
         The model to evaluate. Must implement fit() and predict() methods.
     X : array-like or DataFrame
-        Feature dataset. Can be a pandas DataFrame or a numpy array.
+        Feature dataset.
     y : array-like
         Target values.
     scorer : Scorer
         Object that implements a score() method for model evaluation.
-    cv : int or cross-validation generator, defaault=5
-        Cross-validation strategy. If an integer is provided, KFold or StratifiedKFold 
-        (for continuous or categorical targets respectively) will be used.
+    cv : int or cross-validation generator, default=5
+        Cross-validation strategy.
     shuffle : bool, default=True
         Whether to shuffle the data before splitting.
     random_state : int, default=42
         Random seed for reproducibility.
     pipeline: sklearn Pipeline or custom PipelineWrapper, default=None
-        Preprocessing pipeline to be applied before training the model during cv loop.
-        If provided, fit_transform will be called on training data and transform on validation data.
+        Preprocessing pipeline applied per fold (fit on train, transform on val).
     return_dict : bool, default=False
         If True, returns a dictionary with detailed results for each fold.
-        If False, returns only the mean validation score.
     model_fit_kwargs: dict, default={}
-        If provided, these extra params will be used when fitting the model.
+        Extra params used when fitting the model.
     folds_weights : array-like, default=None
-        If provided, these weights will be used to compute a weighted average instead of
-        a simple mean. The weights will be normalized by their sum automatically.
-        Must have the same length as the number of folds.
+        Weighted average of fold scores instead of simple mean.
+    groups : array-like, default=None
+        Group labels (passed to the splitter and, for group-aware scorers, sliced
+        per fold and forwarded to scorer.score).
+    compute_train_scores : bool, default=None
+        Whether to score the model on training folds. None preserves legacy
+        behavior (computed when return_dict=True). Pass False to skip the
+        train-side predict/score entirely (large speedup in hot loops).
+    keep_fold_models : bool, default=None
+        Whether to keep fitted fold models/pipelines/importances in the result
+        dict. None preserves legacy behavior (kept when return_dict=True).
+    eval_set_policy : {"auto", "legacy", "none"}, default="auto"
+        "auto": pass an eval_set only when the model has early stopping
+        configured, carved out of the TRAIN fold (the validation fold is never
+        seen during fit — no optimistic bias). "legacy": pass the validation
+        fold as eval_set whenever the model supports it (pre-existing behavior).
+        "none": never pass an eval_set.
+    es_split_frac : float, default=0.10
+        Fraction of the train fold carved out for early stopping under "auto".
+    n_jobs_folds : int, default=1
+        Number of folds fitted in parallel (threads). Model n_jobs is clamped
+        per fold to avoid oversubscription.
+
     Returns
     -------
     float or dict
-        If return_dict=False, returns the mean validation score across folds.
-        If return_dict=True, returns a dictionary containing:
-        - Model, train score, and validation score for each fold
-        - Feature importances (if the model has them)
-        - Mean train and validation scores
-    Examples
-    --------
-    >>> from sklearn.ensemble import RandomForestClassifier
-    >>> from tabularaml.eval.metrics import accuracy_scorer
-    >>> X, y = load_data()
-    >>> model = RandomForestClassifier()
-    >>> score = cross_val_score(model, X, y, scorer=accuracy_scorer)
-    >>> print(f"Cross-validation score: {score:.4f}")
+        Mean validation score, or a detailed dict when return_dict=True
+        (includes "fold_val_scores": list of per-fold validation scores).
     """
-
-    X = X.copy()
     y = y.copy()
     X = sanitize_model_features(X)
 
@@ -137,137 +387,104 @@ def cross_val_score(model, X, y, scorer: Scorer, cv = 5, shuffle = True, random_
     assert hasattr(model, "predict"), "Model must have a .predict() method."
     if scorer.from_probs:
         assert hasattr(model, "predict_proba"), "Model must have a .predict_proba() method."
-    
-    # Convert X to DataFrame if it's not already one
-    is_dataframe = isinstance(X, pd.DataFrame)
-    
+
+    if compute_train_scores is None:
+        compute_train_scores = return_dict
+    if keep_fold_models is None:
+        keep_fold_models = return_dict
+
     if isinstance(cv, int):
         cv = make_cv_splitter(cv, y, shuffle=shuffle, random_state=random_state, groups=groups)
-    
-    # Validate folds_weights if provided
+
+    splits = list(cv.split(X, y, groups))
+    n_splits = len(splits)
+
     if folds_weights is not None:
         folds_weights = np.array(folds_weights)
-        # FIXED: Don't exhaust the CV generator by calling split()
-        if hasattr(cv, 'get_n_splits'):
-            n_splits = cv.get_n_splits(X, y)
-        elif hasattr(cv, 'n_splits'):
-            n_splits = cv.n_splits
-        else:
-            # Skip validation if we can't determine n_splits without exhausting generator
-            n_splits = len(folds_weights)
-            
         if len(folds_weights) != n_splits:
             raise ValueError(f"folds_weights length ({len(folds_weights)}) must match number of folds ({n_splits})")
-        # Normalize weights by sum
         folds_weights = folds_weights / np.sum(folds_weights)
-                                  
-    all_results = {}
-    train_results = []
-    val_results = []
-    
-    for idx, (train_idx, val_idx) in enumerate(cv.split(X, y, groups)):
-        # Always create a fresh copy of the model for each fold
-        try:
-            model_clone = deepcopy(model)
-        except:
-            # Fallback if deepcopy fails
-            model_clone = type(model)(**model.get_params())
-            
-        # Handle both DataFrame and numpy array inputs
-        if is_dataframe:
-            X_train_raw, y_train = X.iloc[train_idx].copy(), y.iloc[train_idx].copy() if hasattr(y, 'copy') else y.iloc[train_idx]
-            X_val_raw, y_val = X.iloc[val_idx].copy(), y.iloc[val_idx].copy() if hasattr(y, 'copy') else y.iloc[val_idx]
-        else:
-            X_train_raw, y_train = X[train_idx].copy(), y[train_idx].copy() if hasattr(y, 'copy') else y[train_idx]
-            X_val_raw, y_val = X[val_idx].copy(), y[val_idx].copy() if hasattr(y, 'copy') else y[val_idx]
-          # Apply pipeline if provided
-        if pipeline is not None:
-            try:
-                pipeline_clone = deepcopy(pipeline)
-            except:
-                # Fallback if deepcopy fails
-                if hasattr(pipeline, "get_params"):
-                    pipeline_clone = type(pipeline)(**pipeline.get_params())
-                else:
-                    raise ValueError("Cannot clone pipeline. Make sure it has a get_params method.")
-            
-            X_train = pipeline_clone.fit_transform(X_train_raw, y_train)
-            X_val = pipeline_clone.transform(X_val_raw)
-        else:
-            X_train, X_val = X_train_raw, X_val_raw
 
-        X_train = sanitize_model_features(X_train)
-        X_val = sanitize_model_features(X_val)
+    model_threads = None
+    if n_jobs_folds and n_jobs_folds > 1:
+        model_threads = max(1, (os.cpu_count() or 4) // n_jobs_folds)
 
-        fit_signature = inspect.signature(model_clone.fit)
-        if 'eval_set' in fit_signature.parameters:
-            fit_kwargs = model_fit_kwargs.copy()
-            if 'verbose' in fit_signature.parameters:
-                fit_kwargs.setdefault('verbose', False)
-            elif 'callbacks' in fit_signature.parameters and 'callbacks' not in fit_kwargs:
-                try:
-                    import lightgbm as lgb
-                    fit_kwargs['callbacks'] = [lgb.log_evaluation(period=0)]
-                except ImportError:
-                    pass
-            train_labels = np.unique(np.asarray(y_train))
-            val_labels = np.unique(np.asarray(y_val))
-            has_unseen_eval_labels = np.setdiff1d(val_labels, train_labels).size > 0
-            if has_unseen_eval_labels:
-                model_clone.fit(X_train, y_train, **fit_kwargs)
-            else:
-                model_clone.fit(X_train, y_train, eval_set=[(X_val, y_val)], **fit_kwargs)
-        else:
-            model_clone.fit(X_train, y_train, **model_fit_kwargs)
+    y_is_classification = type_of_target(np.asarray(y)) not in (
+        "continuous", "continuous-multioutput")
 
-        val_preds = model_clone.predict_proba(X_val) if scorer.from_probs else model_clone.predict(X_val)
+    def _run(fold_idx, tr, va):
+        return _run_single_fold(fold_idx, tr, va, model, X, y, scorer, pipeline,
+                                model_fit_kwargs, groups, compute_train_scores,
+                                keep_fold_models, eval_set_policy, es_split_frac,
+                                random_state, model_threads, y_is_classification)
 
-        requires_onehot = False
-        if scorer.name == "categorical_crossentropy":
-            requires_onehot = True
-            one_hot = OneHotEncoder(sparse_output=False, handle_unknown = "ignore")
-            one_hot.fit(y_train.to_numpy().reshape(-1, 1))
-            # one_hot.fit(y_train.reshape(-1, 1))
-        val_score = scorer.score(y_true = y_val if not requires_onehot else one_hot.transform(y_val.numpy().reshape(-1, 1)), 
-                                 y_pred = val_preds)        
-        val_results.append(val_score)
-        
-        if return_dict:
-            train_preds = model_clone.predict_proba(X_train) if scorer.from_probs else model_clone.predict(X_train)
-            train_score = scorer.score(y_true = y_train if not requires_onehot else one_hot.transform(y_train.numpy().reshape(-1, 1)), 
-                                       y_pred = train_preds)
-            train_results.append(train_score)
-            fold_result = {
-                "model": model_clone,
-                "train_score": train_score,
-                "val_score": val_score,
-            }
-            
-            if pipeline is not None:
-                fold_result["pipeline"] = pipeline_clone
-                
-            all_results[f"fold_{idx}"] = fold_result
-            
-            if hasattr(model_clone, "feature_importances_"):
-                # Handle feature importances with proper column names
-                if is_dataframe and hasattr(X_train, "columns"):
-                    all_results[f"fold_{idx}"]["feature_importance"] = dict(zip(X_train.columns, model_clone.feature_importances_))
-                elif hasattr(model_clone, "feature_names_in_"):
-                    all_results[f"fold_{idx}"]["feature_importance"] = dict(zip(model_clone.feature_names_in_, model_clone.feature_importances_))
-            
-    # Compute weighted or simple average
+    if n_jobs_folds and n_jobs_folds > 1 and n_splits > 1:
+        from joblib import Parallel, delayed
+        fold_results = Parallel(n_jobs=min(n_jobs_folds, n_splits), prefer="threads")(
+            delayed(_run)(i, tr, va) for i, (tr, va) in enumerate(splits))
+    else:
+        fold_results = [_run(i, tr, va) for i, (tr, va) in enumerate(splits)]
+
+    val_results = [r["val_score"] for r in fold_results]
+    train_results = [r["train_score"] for r in fold_results if "train_score" in r]
+
     if folds_weights is not None:
         val = np.sum(np.array(val_results) * folds_weights)
-        if return_dict:
-            train_weighted_avg = np.sum(np.array(train_results) * folds_weights)
     else:
         val = np.mean(val_results)
-        if return_dict:
-            train_weighted_avg = np.mean(train_results)
-    
-    if return_dict:
-        all_results["mean_train_score"] = train_weighted_avg
-        all_results["mean_val_score"] = val
-        return all_results
-        
-    return val
+
+    if not return_dict:
+        return val
+
+    all_results = {}
+    for idx, r in enumerate(fold_results):
+        fold_result = {"val_score": r["val_score"]}
+        if "train_score" in r:
+            fold_result["train_score"] = r["train_score"]
+        if "model" in r:
+            fold_result["model"] = r["model"]
+        if "pipeline" in r:
+            fold_result["pipeline"] = r["pipeline"]
+        if "feature_importance" in r:
+            fold_result["feature_importance"] = r["feature_importance"]
+        all_results[f"fold_{idx}"] = fold_result
+
+    all_results["fold_val_scores"] = list(val_results)
+    group_dicts = [r["val_group_scores"] for r in fold_results if "val_group_scores" in r]
+    if group_dicts:
+        merged = {}
+        for d in group_dicts:
+            merged.update(d)
+        all_results["fold_val_groups_scores"] = group_dicts
+        all_results["val_group_scores"] = merged
+
+    if train_results:
+        if folds_weights is not None and len(train_results) == n_splits:
+            all_results["mean_train_score"] = np.sum(np.array(train_results) * folds_weights)
+        else:
+            all_results["mean_train_score"] = np.mean(train_results)
+    else:
+        all_results["mean_train_score"] = None
+    all_results["mean_val_score"] = val
+    return all_results
+
+
+def cross_val_fold_scores(model, X, y, scorer: Scorer, cv=5, *, pipeline=None,
+                          model_fit_kwargs={}, groups=None, shuffle=True,
+                          random_state=42, eval_set_policy="auto",
+                          n_jobs_folds: int = 1) -> FoldScores:
+    """Light CV path for hot loops: per-fold validation scores only.
+
+    Skips train-side predictions and fold-model retention. Fold order is
+    deterministic for a fixed splitter, so two calls under the same splitter
+    state produce pairable per-fold vectors.
+    """
+    res = cross_val_score(model, X, y, scorer, cv=cv, shuffle=shuffle,
+                          random_state=random_state, pipeline=pipeline,
+                          return_dict=True, model_fit_kwargs=model_fit_kwargs,
+                          groups=groups, compute_train_scores=False,
+                          keep_fold_models=False, eval_set_policy=eval_set_policy,
+                          n_jobs_folds=n_jobs_folds)
+    return FoldScores(mean_val=res["mean_val_score"],
+                      fold_scores=np.asarray(res["fold_val_scores"], dtype=float),
+                      per_group=res.get("val_group_scores"))
