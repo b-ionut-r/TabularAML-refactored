@@ -686,6 +686,9 @@ class FeatureGenerator:
                  save_each_trial: bool = False,
                  cache_size_mb: int = 2000,
                  use_proxy_evaluation: bool = True,
+                 proxy_mode: Literal["batched", "featureboost", "none"] = "batched",
+                 proxy_ram_budget_mb: int = 512,
+                 proxy_halving: bool = False,
                  proxy_top_pct: float = 0.15,
                  meta_validation_frac: float = 0.15,
                  rotate_cv_folds: bool = True,
@@ -761,6 +764,9 @@ class FeatureGenerator:
         
         # Proxy evaluation settings
         self.use_proxy_evaluation = use_proxy_evaluation
+        self.proxy_mode = proxy_mode if use_proxy_evaluation else "none"
+        self.proxy_ram_budget_mb = proxy_ram_budget_mb
+        self.proxy_halving = proxy_halving
         self.proxy_top_pct = proxy_top_pct
         self._lgb_available = None  # Lazy check
         
@@ -1135,67 +1141,227 @@ class FeatureGenerator:
         return np.mean(scores) if scores else -np.inf
 
     def _proxy_screen_candidates(self, batch, X, y):
-        """Pre-filter candidates using FeatureBoost proxy scoring.
-        
-        Returns the top proxy_top_pct fraction of non-pipeline candidates,
-        plus all pipeline-required candidates (which skip proxy).
+        """Pre-filter candidates with the configured proxy strategy.
+
+        proxy_mode="batched" (default): one LightGBM over ALL candidate columns
+        at once with init_score = base-model OOF margins, ranked by gain
+        importance. Falls back to the per-candidate FeatureBoost screen on any
+        failure. proxy_mode="featureboost": the original per-candidate screen.
+        proxy_mode="none": pass everything through.
+
+        Returns kept scorable candidates plus pipeline-required candidates,
+        the latter capped so they cannot flood elite selection (they carry no
+        proxy score).
         """
-        if not self.use_proxy_evaluation or not self._check_lgb_available():
+        proxy_mode = getattr(self, 'proxy_mode', 'batched' if self.use_proxy_evaluation else 'none')
+        if proxy_mode == "none" or not self.use_proxy_evaluation or not self._check_lgb_available():
             return batch
-        
-        # Separate pipeline-required (skip proxy) from scorable candidates
+
         pipeline_candidates = [i for i in batch if i.require_pipeline]
         scorable_candidates = [i for i in batch if not i.require_pipeline]
-        
+
         if len(scorable_candidates) <= 5:
             return batch  # Not enough to filter
-        
+
         try:
-            # Get CV splitter
             cv = self._get_cv_splitter()
-            
+
             # Train base model and get OOF predictions (once per generation)
             if not hasattr(self, '_current_oof_preds') or self._oof_preds_stale:
                 self._current_oof_preds = self._train_base_model_and_get_residuals(X, y, cv)
                 self._oof_preds_stale = False
-            
-            # Score each scorable candidate
-            fb_scores = {}
-            for interaction in scorable_candidates:
+
+            top_candidates = None
+            n_final = max(3, int(len(scorable_candidates) * self.proxy_top_pct))
+            if proxy_mode == "batched":
+                # Two-stage screen: one joint residual-boosting model coarsely
+                # filters the batch (cheap), then per-candidate FeatureBoost
+                # ranks the survivors (gain importance in a joint model splits
+                # credit among correlated candidates, so the final ranking
+                # must measure individual marginal value).
                 try:
-                    # Generate candidate values
-                    parent_names = [interaction.feature_1.name]
-                    if interaction.feature_2 is not None:
-                        parent_names.append(interaction.feature_2.name)
-                    
-                    if not all(p in X.columns for p in parent_names):
-                        continue
-                    
-                    name, vals = self._feature_cache.get_or_compute(
-                        parent_names, interaction.op,
-                        lambda inter=interaction: (inter.name, inter.generate(X))
-                    )
-                    
-                    score = self._featureboost_score(
-                        vals, y, self._current_oof_preds, cv
-                    )
-                    fb_scores[id(interaction)] = (interaction, score)
-                except Exception:
-                    pass  # Skip failed candidates
-            
-            if not fb_scores:
+                    coarse = self._batched_proxy_rank(scorable_candidates, X, y, cv)
+                    if coarse is not None:
+                        if len(coarse) > n_final:
+                            top_candidates = self._featureboost_screen(
+                                coarse, X, y, cv, n_keep=n_final)
+                        else:
+                            top_candidates = coarse
+                except (Exception, MemoryError) as e:
+                    self._log(f"  Batched proxy failed ({e}), falling back to FeatureBoost")
+            if top_candidates is None:
+                top_candidates = self._featureboost_screen(scorable_candidates, X, y, cv,
+                                                           n_keep=n_final)
+            if top_candidates is None:
                 return batch
-            
-            # Keep top proxy_top_pct
-            n_keep = max(3, int(len(fb_scores) * self.proxy_top_pct))
-            sorted_candidates = sorted(fb_scores.values(), key=lambda x: x[1], reverse=True)
-            top_candidates = [interaction for interaction, _ in sorted_candidates[:n_keep]]
-            
+
+            # Cap pipeline-required candidates (they skipped proxy and carry no
+            # score): keep the best-ranked ones up to half the scored survivors.
+            if pipeline_candidates:
+                cap = max(10, len(top_candidates) // 2)
+                if len(pipeline_candidates) > cap:
+                    ranked_pipe = self.adaptive_controller.rank_candidates_with_memory(
+                        pipeline_candidates, X, y)
+                    self._log(f"  Pipeline candidates capped: {cap}/{len(pipeline_candidates)} kept")
+                    pipeline_candidates = ranked_pipe[:cap]
+
             return top_candidates + pipeline_candidates
-            
+
         except Exception as e:
             self._log(f"  Proxy screening failed ({e}), falling back to full evaluation")
             return batch
+
+    def _featureboost_screen(self, scorable_candidates, X, y, cv, n_keep=None):
+        """Per-candidate FeatureBoost screen (refinement and fallback path)."""
+        fb_scores = {}
+        for interaction in scorable_candidates:
+            try:
+                parent_names = [interaction.feature_1.name]
+                if interaction.feature_2 is not None:
+                    parent_names.append(interaction.feature_2.name)
+
+                if not all(p in X.columns for p in parent_names):
+                    continue
+
+                name, vals = self._feature_cache.get_or_compute(
+                    parent_names, interaction.op,
+                    lambda inter=interaction: (inter.name, inter.generate(X))
+                )
+
+                score = self._featureboost_score(
+                    vals, y, self._current_oof_preds, cv
+                )
+                fb_scores[id(interaction)] = (interaction, score)
+            except Exception:
+                pass  # Skip failed candidates
+
+        if not fb_scores:
+            return None
+
+        if n_keep is None:
+            n_keep = max(3, int(len(fb_scores) * self.proxy_top_pct))
+        sorted_candidates = sorted(fb_scores.values(), key=lambda x: x[1], reverse=True)
+        return [interaction for interaction, _ in sorted_candidates[:n_keep]]
+
+    def _materialize_candidate_matrix(self, scorable_candidates, X):
+        """Build a float32/category frame of candidate columns via the feature cache.
+
+        Returns (C, kept_interactions); candidates that fail to generate, are
+        mostly non-finite, or duplicate an earlier name are dropped.
+        """
+        cols, kept = {}, []
+        for interaction in scorable_candidates:
+            parent_names = [interaction.feature_1.name]
+            if interaction.feature_2 is not None:
+                parent_names.append(interaction.feature_2.name)
+            if not all(p in X.columns for p in parent_names):
+                continue
+            if interaction.name in cols:
+                continue
+            try:
+                _, vals = self._feature_cache.get_or_compute(
+                    parent_names, interaction.op,
+                    lambda inter=interaction: (inter.name, inter.generate(X))
+                )
+                vals = pd.Series(np.asarray(vals).ravel() if not isinstance(vals, pd.Series) else vals.values,
+                                 index=X.index)
+                if vals.dtype == object or isinstance(vals.dtype, pd.CategoricalDtype):
+                    vals = pd.Series(pd.Categorical(vals.astype(str)), index=X.index)
+                else:
+                    vals = pd.to_numeric(vals, errors="coerce").astype(np.float32)
+                    finite_frac = np.isfinite(vals.values).mean()
+                    if finite_frac < 0.5:
+                        continue
+                    vals = vals.replace([np.inf, -np.inf], np.nan)
+                cols[interaction.name] = vals
+                kept.append(interaction)
+            except Exception:
+                continue
+        if not kept:
+            return None, []
+        return pd.DataFrame(cols, index=X.index), kept
+
+    def _batched_proxy_rank(self, scorable_candidates, X, y, cv):
+        """Rank all candidates with ONE residual-boosting LightGBM per fold.
+
+        Trains on the full candidate matrix with init_score = base-model OOF
+        margins, so gain importance measures each candidate's contribution to
+        explaining what the current feature set cannot. Orders of magnitude
+        fewer model fits than per-candidate FeatureBoost.
+        """
+        import lightgbm as lgb
+
+        C, kept = self._materialize_candidate_matrix(scorable_candidates, X)
+        if C is None or len(kept) < 5:
+            return None
+
+        oof = self._current_oof_preds
+        groups = self._groups_active
+
+        # RAM guard: row-subsample to fit the configured budget
+        ram_budget = getattr(self, 'proxy_ram_budget_mb', 512)
+        est_mb = len(C) * C.shape[1] * 4 / 2**20
+        row_idx = None
+        if est_mb > ram_budget:
+            n_rows = max(5000, int(len(C) * ram_budget / est_mb))
+            if n_rows < len(C):
+                rng = np.random.RandomState(self.random_state)
+                row_idx = np.sort(rng.choice(len(C), n_rows, replace=False))
+
+        def _gain_for(C_sub, y_sub, oof_sub, groups_sub, max_folds=2):
+            objective = self._get_lgb_objective()
+            params = {"objective": objective, "num_leaves": 31, "verbosity": -1,
+                      "n_jobs": self.n_jobs, "learning_rate": 0.1,
+                      "feature_fraction": 0.8, "random_state": self.random_state}
+            if objective == "multiclass":
+                params["num_class"] = len(np.unique(y))
+            gain = np.zeros(C_sub.shape[1])
+            cv_local = self._get_cv_splitter()
+            for fold_i, (tr, va) in enumerate(cv_local.split(C_sub, y_sub, groups=groups_sub)):
+                if fold_i >= max_folds:
+                    break
+                dtrain = lgb.Dataset(C_sub.iloc[tr], y_sub.iloc[tr], init_score=oof_sub[tr])
+                dval = lgb.Dataset(C_sub.iloc[va], y_sub.iloc[va], init_score=oof_sub[va],
+                                   reference=dtrain)
+                booster = lgb.train(params, dtrain, num_boost_round=300,
+                                    valid_sets=[dval],
+                                    callbacks=[lgb.early_stopping(30, verbose=False),
+                                               lgb.log_evaluation(period=0)])
+                gain += booster.feature_importance("gain")
+            return gain
+
+        def _subset(idx):
+            C_s = C.iloc[idx]
+            y_s = y.iloc[idx]
+            oof_s = oof[idx]
+            g_s = np.asarray(groups)[idx] if groups is not None else None
+            return C_s, y_s, oof_s, g_s
+
+        if getattr(self, 'proxy_halving', False) and len(C) > 8000:
+            # Stage A: cheap screen on a small sample keeps the top half
+            rng = np.random.RandomState(self.random_state)
+            idx_a = np.sort(rng.choice(len(C), 8000, replace=False))
+            gain_a = _gain_for(*_subset(idx_a), max_folds=1)
+            order_a = np.argsort(-gain_a)
+            survivors = order_a[:max(5, len(kept) // 2)]
+            C = C.iloc[:, survivors]
+            kept = [kept[i] for i in survivors]
+
+        if row_idx is not None:
+            gain = _gain_for(*_subset(row_idx))
+        else:
+            g_all = np.asarray(groups) if groups is not None else None
+            gain = _gain_for(C, y, oof, g_all)
+
+        # Coarse keep: ~3x the final quota; the FeatureBoost refinement stage
+        # makes the final per-candidate call among these survivors.
+        n_final = max(3, int(len(kept) * self.proxy_top_pct))
+        n_coarse = min(len(kept), max(15, 3 * n_final))
+        order = np.argsort(-gain)
+        top = [kept[i] for i in order[:n_coarse] if gain[i] > 0]
+        if not top:  # all-zero gain: nothing distinguishable, keep best-ranked few
+            top = [kept[i] for i in order[:3]]
+        return top
 
     def _get_cv_splitter(self):
         """Get the CV splitter object from self.cv (handles int and splitter)."""
@@ -1672,7 +1838,8 @@ class FeatureGenerator:
         return X_copy, self._prepare_pipeline(interactions)
 
     def _select_elites(self, batch: list[Interaction], n: int, X: pd.DataFrame, y: pd.Series,
-                      callback: Optional[Callable] = None) -> tuple[list[Interaction], pd.DataFrame, PipelineWrapper]:
+                      callback: Optional[Callable] = None,
+                      early_thr_override: Optional[int] = None) -> tuple[list[Interaction], pd.DataFrame, PipelineWrapper]:
         """Greedy forward-selection with adaptive thresholds."""
         if not batch:
             if callback: callback(0, 0, force_complete=True)
@@ -1722,12 +1889,16 @@ class FeatureGenerator:
         #                 if isinstance(self.early_stopping_child_eval, int) 
         #                 else len(ranked))
         
-        # Respect user's early stopping parameter
-        early_thr = (int(len(ranked) * self.early_stopping_child_eval) 
-                    if isinstance(self.early_stopping_child_eval, float) 
-                    else self.early_stopping_child_eval 
-                    if isinstance(self.early_stopping_child_eval, int) 
-                    else len(ranked))
+        # Respect user's early stopping parameter (overridable by the
+        # time-budget-aware sizing policy)
+        if early_thr_override is not None:
+            early_thr = early_thr_override
+        else:
+            early_thr = (int(len(ranked) * self.early_stopping_child_eval)
+                        if isinstance(self.early_stopping_child_eval, float)
+                        else self.early_stopping_child_eval
+                        if isinstance(self.early_stopping_child_eval, int)
+                        else len(ranked))
         
         min_evals = max(5, int(0.05 * len(ranked)))
 
@@ -1742,11 +1913,14 @@ class FeatureGenerator:
             if len(selected) >= n or not all(feat in X_base.columns for feat in ([inter.feature_1.name] + ([inter.feature_2.name] if inter.feature_2 else []))):
                 continue
 
-            # Evaluate interaction
-            X_try = X_base.copy()
+            # Compose candidate frame without copying X_base: pandas CoW makes
+            # this lazy, and cross_val_score sanitizes (copies) internally.
             if not inter.require_pipeline and inter.name in X_copy.columns:
-                X_try[inter.name] = X_copy[inter.name].values
-            
+                X_try = pd.concat([X_base, X_copy[[inter.name]]], axis=1)
+            else:
+                X_try = X_base
+
+
             # Check for duplicates before evaluation
             if X_try.columns.duplicated().any():
                 self._log(f"Warning: Duplicate columns in X_try for {inter.name}, skipping")
@@ -1776,7 +1950,8 @@ class FeatureGenerator:
 
             if success:
                 selected.append(inter)
-                X_base, best_val, best_folds, consec_no_gain = X_try, new_val, res.fold_scores, 0
+                # Consolidate once per accepted feature (rare), not per candidate
+                X_base, best_val, best_folds, consec_no_gain = X_try.copy(), new_val, res.fold_scores, 0
             else:
                 consec_no_gain += 1
 
@@ -1988,6 +2163,32 @@ class FeatureGenerator:
                 self._best_fold_state = FoldEvalState()
             return True
         return False
+
+    def _budget_scaled_sizes(self, start_time: float, N: int) -> tuple[int, Optional[int]]:
+        """Shrink per-generation work when wall-clock burn outpaces generation progress.
+
+        Returns (n_children_eff, early_thr_override). scale < 1 when the
+        remaining-time fraction lags the remaining-generation fraction; floors
+        keep every generation meaningful (>= 20 children, >= 8 evals).
+        """
+        if not self.time_budget:
+            return self.n_children, None
+        elapsed = time.time() - start_time
+        remaining_frac = max(0.0, 1.0 - elapsed / self.time_budget)
+        gen_frac = max(1e-6, 1.0 - (N + 1) / max(1, self.n_generations))
+        scale = float(np.clip(remaining_frac / gen_frac, 0.3, 1.0))
+        if scale >= 1.0:
+            return self.n_children, None
+        n_children_eff = max(20, int(self.n_children * scale))
+        if isinstance(self.early_stopping_child_eval, float):
+            proxy_active = getattr(self, 'proxy_mode', 'none') != 'none' and self.use_proxy_evaluation
+            approx_ranked = max(1, int(n_children_eff * (self.proxy_top_pct if proxy_active else 1.0)))
+            base_thr = int(self.early_stopping_child_eval * approx_ranked)
+        elif isinstance(self.early_stopping_child_eval, int):
+            base_thr = self.early_stopping_child_eval
+        else:
+            return n_children_eff, None
+        return n_children_eff, max(8, int(base_thr * scale))
 
     def _get_search_parameters(self, progress: float, generation_num: int) -> tuple[float, float, float, float]:
         """Get search parameters with more aggressive exploration during stagnation."""
@@ -2320,9 +2521,12 @@ class FeatureGenerator:
                                 for temp_op in self.ops["temporal"]["unary"]:
                                     candidates_pool.append(Interaction(feat, temp_op))
 
-                    # Enhanced child sampling
-                    batch = self._sample_children_with_creativity(candidates_pool, self.n_children, tau=tau)
-                    
+                    # Enhanced child sampling (budget-aware sizing)
+                    n_children_eff, early_thr_eff = self._budget_scaled_sizes(start_time, N)
+                    if n_children_eff < self.n_children:
+                        self._log(f"  Budget-aware sizing: children {self.n_children} -> {n_children_eff}")
+                    batch = self._sample_children_with_creativity(candidates_pool, n_children_eff, tau=tau)
+
                     # Phase 1: Proxy screening (fast FeatureBoost pre-filter)
                     n_before_proxy = len(batch)
                     batch = self._proxy_screen_candidates(batch, X, y)
@@ -2342,7 +2546,9 @@ class FeatureGenerator:
                             inner_pbar.set_description(f"Evaluating features - Selected: {sc}")
                             return self.time_budget and (time.time() - start_time) > self.time_budget
 
-                        elites, X, self.pipeline = self._select_elites(batch, features_per_gen, X, y, update_callback)
+                        elites, X, self.pipeline = self._select_elites(
+                            batch, features_per_gen, X, y, update_callback,
+                            early_thr_override=early_thr_eff)
                         self._oof_preds_stale = True  # Mark OOF preds as stale after features change
 
                     if elites:
@@ -2959,6 +3165,12 @@ class FeatureGenerator:
             self.proxy_top_pct = 0.15
         if not hasattr(self, '_lgb_available'):
             self._lgb_available = None
+        if not hasattr(self, 'proxy_mode'):
+            self.proxy_mode = "batched" if self.use_proxy_evaluation else "none"
+        if not hasattr(self, 'proxy_ram_budget_mb'):
+            self.proxy_ram_budget_mb = 512
+        if not hasattr(self, 'proxy_halving'):
+            self.proxy_halving = False
 
         # Enhancement 4: CV bias fix
         if not hasattr(self, 'meta_validation_frac'):
