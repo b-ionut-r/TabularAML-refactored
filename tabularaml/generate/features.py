@@ -701,7 +701,11 @@ class FeatureGenerator:
                  n_jobs: int = -1,
                  cv_n_jobs: Union[int, str] = "auto",
                  acceptance: Literal["statistical", "mean"] = "statistical",
-                 acceptance_folds_frac: float = 0.7):
+                 acceptance_folds_frac: float = 0.7,
+                 confirmation_seeds: int = 1,
+                 null_importance_selection: bool = True,
+                 null_importance_n_perm: int = 4,
+                 null_importance_pct: float = 75.0):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -809,6 +813,12 @@ class FeatureGenerator:
         self.acceptance_folds_frac = acceptance_folds_frac
         self._cv_epoch = 0
         self._best_fold_state = FoldEvalState()
+
+        # Generation-level confirmation + post-search null-importance gate
+        self.confirmation_seeds = confirmation_seeds
+        self.null_importance_selection = null_importance_selection
+        self.null_importance_n_perm = null_importance_n_perm
+        self.null_importance_pct = null_importance_pct
 
     def _ensure_no_duplicates(self, X: pd.DataFrame, context: str = "") -> pd.DataFrame:
         """Ensure DataFrame has no duplicate columns."""
@@ -1378,9 +1388,153 @@ class FeatureGenerator:
             )
         return self.cv
 
+    def _make_selection_tree_model(self, random_state=None):
+        """Tree model used by post-search selection (L1 companion and null importance)."""
+        rs = self.random_state if random_state is None else random_state
+        if self.device == "cuda":
+            from xgboost import XGBRegressor, XGBClassifier
+            cls = XGBRegressor if self.task == "regression" else XGBClassifier
+            return cls(n_estimators=300, max_depth=6, verbosity=0, n_jobs=self.n_jobs,
+                       device="cuda", enable_categorical=True, random_state=rs)
+        from lightgbm import LGBMRegressor, LGBMClassifier
+        cls = LGBMRegressor if self.task == "regression" else LGBMClassifier
+        return cls(n_estimators=300, max_depth=6, n_jobs=self.n_jobs, verbose=-1,
+                   random_state=rs)
+
+    def _null_importance_selection(self, X, y, era_groups=None):
+        """Drop generated features whose importance does not beat a target-permutation null.
+
+        Olivier-style null importances: fit the selection tree on the real
+        target for actual gains, then n_perm times on a permuted target; a
+        generated feature survives only if its actual importance exceeds the
+        configured percentile of its own null distribution. Original (and
+        expander) features are never dropped here. When era_groups is given,
+        the target is permuted within eras so era-level structure is preserved
+        in the null.
+        """
+        if not getattr(self, 'null_importance_selection', True):
+            return []
+        generated = [c for c in X.columns if c not in self.initial_features]
+        if len(generated) < 10:
+            return []
+        n_perm = int(getattr(self, 'null_importance_n_perm', 4))
+        pct = float(getattr(self, 'null_importance_pct', 75.0))
+        self._log(f"Null-importance selection: {len(generated)} generated features, {n_perm} permutations...")
+        try:
+            X_fit = sanitize_model_features(X)
+            y_fit = y
+            groups_fit = np.asarray(era_groups) if era_groups is not None else None
+            if len(X_fit) > 200_000:
+                rng = np.random.RandomState(self.random_state)
+                idx = np.sort(rng.choice(len(X_fit), 100_000, replace=False))
+                X_fit, y_fit = X_fit.iloc[idx], y.iloc[idx]
+                if groups_fit is not None:
+                    groups_fit = groups_fit[idx]
+
+            def _importances(target, seed):
+                model = self._make_selection_tree_model(random_state=seed)
+                model.fit(X_fit, target)
+                names = getattr(model, 'feature_names_in_', X_fit.columns)
+                return dict(zip(names, model.feature_importances_))
+
+            actual = _importances(y_fit, self.random_state)
+
+            nulls = {f: [] for f in generated}
+            y_arr = np.asarray(y_fit)
+            for s in range(n_perm):
+                rng = np.random.RandomState(self.random_state + 1000 + s)
+                if groups_fit is not None:
+                    y_perm = y_arr.copy()
+                    for g in np.unique(groups_fit):
+                        mask = groups_fit == g
+                        y_perm[mask] = rng.permutation(y_perm[mask])
+                else:
+                    y_perm = rng.permutation(y_arr)
+                null_imp = _importances(pd.Series(y_perm, index=X_fit.index), self.random_state + 1000 + s)
+                for f in generated:
+                    nulls[f].append(null_imp.get(f, 0.0))
+
+            drop = []
+            for f in generated:
+                act = actual.get(f, 0.0)
+                if act <= 0 or act <= np.percentile(nulls[f], pct):
+                    drop.append(f)
+            if drop:
+                self._log(f"  Null importance: dropping {len(drop)} features not beating the null")
+                self._log(f"  Dropped: {drop}")
+            else:
+                self._log("  Null importance: all generated features beat the null")
+            return drop
+        except Exception as e:
+            self._log(f"  Null-importance selection failed: {e}")
+            return []
+
+    def _make_alternate_splitter(self, s: int, y):
+        """Fresh CV splitter with an alternate seed for confirmation runs.
+
+        Deterministic per s, so calling twice yields identical folds and the
+        new-vs-best fold vectors pair correctly. Returns None when the user's
+        splitter cannot be reseeded safely.
+        """
+        hint = getattr(self, '_cv_int_hint', None)
+        seed = self.random_state + 10_000 + 7919 * s
+        if hint:
+            if self._groups_active is not None:
+                return RotatedGroupKFold(hint, rotation=seed)
+            return make_cv_splitter(hint, y, shuffle=True, random_state=seed,
+                                    groups=self._groups_active)
+        rotated = getattr(self.cv, 'rotated', None)
+        if callable(rotated):
+            return rotated(1_000_000 + s)
+        return None
+
+    def _confirm_generation(self, X_new: pd.DataFrame, y: pd.Series, pipe_new) -> bool:
+        """Re-test an improving feature set against the previous best under
+        alternate CV seeds before committing it.
+
+        Both states are evaluated under the SAME alternate splitter (paired
+        fold deltas); the improvement is confirmed iff the pooled mean delta
+        over all alternate folds is positive. Costs 2*confirmation_seeds light
+        CVs, paid only on improving generations.
+        """
+        seeds = int(getattr(self, 'confirmation_seeds', 0) or 0)
+        if seeds <= 0:
+            return True
+        best_X = self.state['best'].get('X')
+        best_pipe = self.state['best'].get('pipeline')
+        if best_X is None or len(best_X) != len(X_new):
+            return True
+        sign = 1.0 if self.scorer.greater_is_better else -1.0
+        deltas = []
+        for s in range(seeds):
+            alt_a = self._make_alternate_splitter(s, y)
+            alt_b = self._make_alternate_splitter(s, y)  # fresh twin, identical folds
+            if alt_a is None:
+                self._log("  Confirmation skipped: splitter cannot be reseeded")
+                return True
+            try:
+                res_new = cross_val_fold_scores(
+                    self.baseline_model, X_new, y, self.scorer, cv=alt_a,
+                    pipeline=pipe_new.get_pipeline(X_new, y) if pipe_new is not None else None,
+                    model_fit_kwargs=self.model_fit_kwargs, groups=self._groups_active,
+                    n_jobs_folds=self._cv_n_jobs_resolved)
+                res_best = cross_val_fold_scores(
+                    self.baseline_model, best_X, y, self.scorer, cv=alt_b,
+                    pipeline=best_pipe.get_pipeline(best_X, y) if best_pipe is not None else None,
+                    model_fit_kwargs=self.model_fit_kwargs, groups=self._groups_active,
+                    n_jobs_folds=self._cv_n_jobs_resolved)
+                if len(res_new.fold_scores) == len(res_best.fold_scores):
+                    deltas.extend((sign * (res_new.fold_scores - res_best.fold_scores)).tolist())
+            except Exception as e:
+                self._log(f"  Confirmation eval failed ({e}); accepting unconfirmed")
+                return True
+        if not deltas:
+            return True
+        return float(np.mean(deltas)) > 0
+
     def _final_regularized_selection(self, X, y):
         """After search, use L1 regularization + tree importance to jointly select the best feature subset.
-        
+
         Only applies when ≥10 generated features exist. Original features are always kept.
         Returns a list of features to drop (generated features that didn't survive selection).
         """
@@ -1434,18 +1588,7 @@ class FeatureGenerator:
             # Phase 2: Tree-based importance
             tree_selected = set()
             try:
-                if self.device == "cuda":
-                    from xgboost import XGBRegressor, XGBClassifier
-                    if self.task == "regression":
-                        tree_model = XGBRegressor(n_estimators=300, max_depth=6, verbosity=0, n_jobs=self.n_jobs, device="cuda", enable_categorical=True)
-                    else:
-                        tree_model = XGBClassifier(n_estimators=300, max_depth=6, verbosity=0, n_jobs=self.n_jobs, device="cuda", enable_categorical=True)
-                else:
-                    from lightgbm import LGBMRegressor, LGBMClassifier
-                    if self.task == "regression":
-                        tree_model = LGBMRegressor(n_estimators=300, max_depth=6, n_jobs=self.n_jobs, verbose=-1)
-                    else:
-                        tree_model = LGBMClassifier(n_estimators=300, max_depth=6, n_jobs=self.n_jobs, verbose=-1)
+                tree_model = self._make_selection_tree_model()
                 tree_model.fit(X_numeric, y)
                 importances = pd.Series(tree_model.feature_importances_, index=numeric_cols)
                 # Keep top-K where K = number of L1-selected features (or at least initial features count)
@@ -2238,6 +2381,7 @@ class FeatureGenerator:
         start_time = time.time()
         X = self._drop_id_columns(X)
         self._set_defaults(X, y)
+        self._cv_int_hint = self.cv if isinstance(self.cv, int) else None
         self.cv = normalize_rotatable_splitter(self.cv)
         self.initial_features = list(X.columns)
         num_cols, cat_cols = self._get_num_cat_cols(X)
@@ -2432,7 +2576,11 @@ class FeatureGenerator:
                         _, monster_score = self._eval_baseline(X_monster, y, pipe_monster)
                         best_score = self.state['best']['val_score']
                         is_better = (monster_score > best_score) == self.scorer.greater_is_better
-                        
+
+                        if is_better and not self._confirm_generation(X_monster, y, pipe_monster):
+                            self._log("  Creative HM improvement not confirmed on alternate folds; discarded.")
+                            is_better = False
+
                         if is_better:
                             X, self.pipeline, elites = X_monster, pipe_monster, monster_elites
                             hopeful_monster_success = True
@@ -2599,6 +2747,17 @@ class FeatureGenerator:
                             self.state['counters']['total_new_features'] = X.shape[1] - len(self.initial_features)
                             elites = []
                 
+                # Multi-seed confirmation before committing an improvement
+                if not hopeful_monster_success and delta > 0 and features_added > 0:
+                    if not self._confirm_generation(X, y, self.pipeline):
+                        self._log(f"  Gen {N+1} improvement not confirmed on alternate folds; reverting.")
+                        if self._revert_to_best():
+                            X, self.pipeline, generation = self.X, self.pipeline, self.generation
+                            new_val_score, delta = self.state['best']['val_score'], 0
+                            self.state['counters']['total_new_features'] = X.shape[1] - len(self.initial_features)
+                            elites = []
+                            features_added = 0
+
                 # Update best state
                 if not hopeful_monster_success:
                     if delta > 0:
@@ -2749,9 +2908,13 @@ class FeatureGenerator:
             except Exception as e:
                 self._log(f"Meta-validation evaluation failed: {e}")
 
-        # Regularized post-selection (Enhancement 5)
+        # Regularized post-selection (Enhancement 5) + null-importance gate
         if self.final_selection and hasattr(self, 'interactions') and self.interactions:
-            features_to_drop = self._final_regularized_selection(X, y)
+            features_to_drop = set(self._final_regularized_selection(X, y))
+            X_survivors = (X.drop(columns=[c for c in features_to_drop if c in X.columns], errors='ignore')
+                           if features_to_drop else X)
+            features_to_drop.update(self._null_importance_selection(X_survivors, y))
+            features_to_drop = sorted(features_to_drop)
             if features_to_drop:
                 X = X.drop(columns=[c for c in features_to_drop if c in X.columns], errors='ignore')
                 if not hasattr(self, 'pruned_features'):
@@ -3195,6 +3358,16 @@ class FeatureGenerator:
             self.acceptance = "statistical"
         if not hasattr(self, 'acceptance_folds_frac'):
             self.acceptance_folds_frac = 0.7
+        if not hasattr(self, 'confirmation_seeds'):
+            self.confirmation_seeds = 1
+        if not hasattr(self, 'null_importance_selection'):
+            self.null_importance_selection = True
+        if not hasattr(self, 'null_importance_n_perm'):
+            self.null_importance_n_perm = 4
+        if not hasattr(self, 'null_importance_pct'):
+            self.null_importance_pct = 75.0
+        if not hasattr(self, '_cv_int_hint'):
+            self._cv_int_hint = None
         if not hasattr(self, 'cv_n_jobs'):
             self.cv_n_jobs = "auto"
         if not hasattr(self, '_cv_n_jobs_resolved'):
