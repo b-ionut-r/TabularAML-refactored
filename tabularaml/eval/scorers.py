@@ -12,9 +12,10 @@ The module adapts metric functions from metrics.regression and metrics.classific
 to work with any of the supported gradient boosting frameworks' early stopping implementation.
 """
 
+import warnings as _warnings
 import numpy as np
 import pandas as pd
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
 from .metrics.regression import (
     root_mean_squared_error,
     root_mean_squared_log_error,
@@ -322,6 +323,66 @@ class Scorer:
 
 
 
+class GroupAwareScorer(Scorer):
+    """Scorer aggregating a base metric per group/era (CrunchDAO/Numerai-style).
+
+    score() computes the base metric within each group of the validation rows
+    and aggregates across groups: "mean" = average per-era score, "sharpe" =
+    mean/std of per-era scores (rewards stability across eras, not just the
+    pooled fit). Groups with fewer than min_group_size rows are skipped.
+    Without groups it falls back to the global metric with a one-time warning.
+    """
+
+    needs_groups = True
+
+    def __init__(self, name, scorer, greater_is_better, extra_params,
+                 type=None, from_probs=False, aggregation="mean", min_group_size=3):
+        super().__init__(name=name, scorer=scorer, greater_is_better=greater_is_better,
+                         extra_params=extra_params, type=type, from_probs=from_probs)
+        self.aggregation = aggregation
+        self.min_group_size = min_group_size
+        self._warned_no_groups = False
+
+    def score(self, y_true, y_pred, groups=None) -> float:
+        if groups is None:
+            if not self._warned_no_groups:
+                _warnings.warn(f"{self.name}: no groups provided; computing the global metric instead "
+                               f"of per-era aggregation")
+                self._warned_no_groups = True
+            y_true, y_pred = _prepare_metric_inputs(self.name, self.from_probs, y_true, y_pred)
+            return self.scorer(y_true, y_pred, **self.extra_params)
+        per = self.score_per_group(y_true, y_pred, groups)
+        if not per:
+            return 0.0
+        vals = np.asarray(list(per.values()), dtype=float)
+        if self.aggregation == "sharpe":
+            return float(vals.mean() / (vals.std() + 1e-9))
+        return float(vals.mean())
+
+    def score_per_group(self, y_true, y_pred, groups) -> dict:
+        y_true, y_pred = _prepare_metric_inputs(self.name, self.from_probs, y_true, y_pred)
+        groups = np.asarray(groups)
+        out = {}
+        for g in pd.unique(groups):
+            mask = groups == g
+            if mask.sum() < self.min_group_size:
+                continue
+            try:
+                out[g] = float(self.scorer(y_true[mask], y_pred[mask], **self.extra_params))
+            except Exception:
+                continue
+        return out
+
+
+def _spearman_correlation_score(y_true, y_pred):
+    y_true_arr = np.asarray(y_true, dtype=float).ravel()
+    y_pred_arr = np.asarray(y_pred, dtype=float).ravel()
+    if np.std(y_pred_arr) < 1e-12 or np.std(y_true_arr) < 1e-12:
+        return 0.0
+    corr = spearmanr(y_true_arr, y_pred_arr)[0]
+    return float(corr) if np.isfinite(corr) else 0.0
+
+
 # Predefined scorers (regression)
 rmse = Scorer(name = "rmse",
               scorer = root_mean_squared_error,
@@ -361,13 +422,31 @@ pearson = Scorer(name = "pearson",
                  greater_is_better = True,
                  extra_params = {},
                  type = None)  # Set type when using with specific model
+spearman = Scorer(name = "spearman",
+                  scorer = _spearman_correlation_score,
+                  greater_is_better = True,
+                  extra_params = {},
+                  type = None)
+era_spearman = GroupAwareScorer(name = "era_spearman",
+                                scorer = _spearman_correlation_score,
+                                greater_is_better = True,
+                                extra_params = {},
+                                aggregation = "mean")
+era_spearman_sharpe = GroupAwareScorer(name = "era_spearman_sharpe",
+                                       scorer = _spearman_correlation_score,
+                                       greater_is_better = True,
+                                       extra_params = {},
+                                       aggregation = "sharpe")
 PREDEFINED_REG_SCORERS = {
     "rmse": rmse,
     "rmsle": rmsle,
     "mae": mae,
     "mse": mse,
     "r2": r2,
-    "pearson": pearson
+    "pearson": pearson,
+    "spearman": spearman,
+    "era_spearman": era_spearman,
+    "era_spearman_sharpe": era_spearman_sharpe
 }
 
 

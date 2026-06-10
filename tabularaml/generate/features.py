@@ -726,7 +726,9 @@ class FeatureGenerator:
                  null_importance_n_perm: int = 4,
                  null_importance_pct: float = 75.0,
                  expand_datetime: bool = True,
-                 expand_row_stats: bool = True):
+                 expand_row_stats: bool = True,
+                 era_col: Optional[str] = None,
+                 era_acceptance_frac: float = 0.55):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -847,6 +849,10 @@ class FeatureGenerator:
         self.base_expander = None
         self._priority_candidates = []
 
+        # Era mode (CrunchDAO/Numerai-style grouped time-series data)
+        self.era_col = era_col
+        self.era_acceptance_frac = era_acceptance_frac
+
     def _ensure_no_duplicates(self, X: pd.DataFrame, context: str = "") -> pd.DataFrame:
         """Ensure DataFrame has no duplicate columns."""
         if X.columns.duplicated().any():
@@ -900,7 +906,25 @@ class FeatureGenerator:
         groups_arr = np.asarray(groups) if groups is not None else None
 
         try:
-            if groups_arr is not None:
+            if groups_arr is not None and getattr(self, 'era_col', None):
+                # Era mode: sample WHOLE eras (never split one) until the row
+                # budget is met, preserving within-era structure for per-era
+                # metrics and grouped CV.
+                rng = np.random.RandomState(self.random_state)
+                eras = rng.permutation(pd.unique(groups_arr))
+                take, count = [], 0
+                for e in eras:
+                    idx_e = np.where(groups_arr == e)[0]
+                    take.append(idx_e)
+                    count += len(idx_e)
+                    if count >= sample_size:
+                        break
+                indices = np.sort(np.concatenate(take))
+                n_splits_hint = getattr(self.cv, 'n_splits', self.cv if isinstance(self.cv, int) else 5)
+                if len(take) < 2 * n_splits_hint:
+                    self._log(f"Warning: era subsample keeps only {len(take)} eras for "
+                              f"{n_splits_hint}-fold grouped CV — consider a larger search_sample_size")
+            elif groups_arr is not None:
                 frac = sample_size / len(X)
                 df_temp = pd.DataFrame({'idx': np.arange(len(X)), 'g': groups_arr})
                 sampled = df_temp.groupby('g', group_keys=False).sample(frac=frac, random_state=self.random_state)
@@ -994,7 +1018,8 @@ class FeatureGenerator:
         """Invalidate cached fold vectors after any change to splitter state or data."""
         self._cv_epoch += 1
 
-    def _acceptance_gate(self, gain: float, fold_deltas: Optional[np.ndarray]) -> bool:
+    def _acceptance_gate(self, gain: float, fold_deltas: Optional[np.ndarray],
+                         era_deltas: Optional[np.ndarray] = None) -> bool:
         """Decide candidate acceptance.
 
         "statistical" (default): the mean relative gain must clear the adaptive
@@ -1004,11 +1029,19 @@ class FeatureGenerator:
         at a simple majority) when stagnation reaches SEVERE. Falls back to the
         mean-only rule when paired vectors are unavailable (mismatched splitter
         state) or K < 3 (no statistical power).
+
+        In era mode, era_deltas (paired per-era deltas) additionally require the
+        candidate to help in at least era_acceptance_frac of shared eras — a
+        feature that wins on a few eras but loses broadly is rejected.
         """
         if gain < self.adaptive_controller.get_adaptive_min_gain():
             return False
         if getattr(self, "acceptance", "statistical") != "statistical":
             return True
+        if era_deltas is not None and len(era_deltas) >= 4:
+            frac_pos = float(np.mean(era_deltas > 0))
+            if frac_pos < getattr(self, "era_acceptance_frac", 0.55):
+                return False
         if fold_deltas is None or len(fold_deltas) < 3:
             return True
         K = len(fold_deltas)
@@ -1165,8 +1198,11 @@ class FeatureGenerator:
                     base_preds = init_val
                     new_preds = new_preds_margin
 
-                base_score = self.scorer.score(y.iloc[val_idx], base_preds)
-                new_score = self.scorer.score(y.iloc[val_idx], new_preds)
+                score_kwargs = {}
+                if getattr(self.scorer, 'needs_groups', False) and self._groups_active is not None:
+                    score_kwargs['groups'] = np.asarray(self._groups_active)[val_idx]
+                base_score = self.scorer.score(y.iloc[val_idx], base_preds, **score_kwargs)
+                new_score = self.scorer.score(y.iloc[val_idx], new_preds, **score_kwargs)
                 
                 if self.scorer.greater_is_better:
                     scores.append(new_score - base_score)
@@ -1447,6 +1483,8 @@ class FeatureGenerator:
         n_perm = int(getattr(self, 'null_importance_n_perm', 4))
         pct = float(getattr(self, 'null_importance_pct', 75.0))
         self._log(f"Null-importance selection: {len(generated)} generated features, {n_perm} permutations...")
+        if era_groups is not None and len(era_groups) != len(X):
+            era_groups = None  # row mismatch (e.g. after replay) — plain permutation
         try:
             X_fit = sanitize_model_features(X)
             y_fit = y
@@ -1495,6 +1533,12 @@ class FeatureGenerator:
         except Exception as e:
             self._log(f"  Null-importance selection failed: {e}")
             return []
+
+    def _era_feature_corr_report(self):
+        """Future work: per-era correlation of generated features with the span
+        of existing features, to flag candidates for neutralization
+        (CrunchDAO/Numerai feature-exposure analysis). Currently a no-op."""
+        return None
 
     def _make_alternate_splitter(self, s: int, y):
         """Fresh CV splitter with an alternate seed for confirmation runs.
@@ -2065,6 +2109,7 @@ class FeatureGenerator:
         # feature set are unchanged (saves one full CV per generation).
         base_res = self._get_baseline_fold_scores(X, y)
         best_val, best_folds = base_res.mean_val, base_res.fold_scores
+        best_eras = base_res.per_group
         selected, X_base = [], X.copy()
         evals = consec_no_gain = 0
         
@@ -2133,8 +2178,13 @@ class FeatureGenerator:
             fold_deltas = None
             if best_folds is not None and len(res.fold_scores) == len(best_folds):
                 fold_deltas = sign * (res.fold_scores - best_folds)
+            era_deltas = None
+            if best_eras and res.per_group:
+                shared = [e for e in res.per_group if e in best_eras]
+                if len(shared) >= 4:
+                    era_deltas = sign * np.array([res.per_group[e] - best_eras[e] for e in shared])
 
-            success = self._acceptance_gate(gain, fold_deltas)
+            success = self._acceptance_gate(gain, fold_deltas, era_deltas)
 
             self.adaptive_controller.update_operation_stats(inter, success=success, gain=gain)
 
@@ -2142,6 +2192,7 @@ class FeatureGenerator:
                 selected.append(inter)
                 # Consolidate once per accepted feature (rare), not per candidate
                 X_base, best_val, best_folds, consec_no_gain = X_try.copy(), new_val, res.fold_scores, 0
+                best_eras = res.per_group
             else:
                 consec_no_gain += 1
 
@@ -2430,6 +2481,18 @@ class FeatureGenerator:
         random.seed(self.random_state)
         np.random.seed(self.random_state)
         start_time = time.time()
+
+        # Era mode: the era column becomes the CV grouping (never a feature),
+        # and an int cv is upgraded to era-grouped folds.
+        if getattr(self, 'era_col', None) and self.era_col in X.columns:
+            era_series = X[self.era_col]
+            if self.groups is None:
+                self.groups = np.asarray(era_series)
+            X = X.drop(columns=[self.era_col])
+            if isinstance(self.cv, int):
+                self.cv = RotatedGroupKFold(self.cv, rotation=self.random_state)
+            self._log(f"Era mode: {pd.Series(self.groups).nunique()} eras drive grouped CV "
+                      f"and era-stability acceptance")
 
         # Base-table expansion: datetime decomposition + row stats become part
         # of the base table (parent-eligible, protected from pruning). Runs
@@ -3030,7 +3093,9 @@ class FeatureGenerator:
             features_to_drop = set(self._final_regularized_selection(X, y))
             X_survivors = (X.drop(columns=[c for c in features_to_drop if c in X.columns], errors='ignore')
                            if features_to_drop else X)
-            features_to_drop.update(self._null_importance_selection(X_survivors, y))
+            null_era_groups = self._groups_active if getattr(self, 'era_col', None) else None
+            features_to_drop.update(self._null_importance_selection(X_survivors, y,
+                                                                    era_groups=null_era_groups))
             features_to_drop = sorted(features_to_drop)
             if features_to_drop:
                 X = X.drop(columns=[c for c in features_to_drop if c in X.columns], errors='ignore')
@@ -3505,6 +3570,10 @@ class FeatureGenerator:
             self.base_expander = None
         if not hasattr(self, '_priority_candidates'):
             self._priority_candidates = []
+        if not hasattr(self, 'era_col'):
+            self.era_col = None
+        if not hasattr(self, 'era_acceptance_frac'):
+            self.era_acceptance_frac = 0.55
         if not hasattr(self, 'cv_n_jobs'):
             self.cv_n_jobs = "auto"
         if not hasattr(self, '_cv_n_jobs_resolved'):
