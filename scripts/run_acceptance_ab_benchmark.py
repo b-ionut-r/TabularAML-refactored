@@ -317,8 +317,11 @@ def summarize(df, out_md):
         print(msg)
         return
 
-    # The challenger is whichever non-"old" config is present
-    configs = [c for c in ok["config"].unique() if c != "old"]
+    # Baseline: the literal pre-session code when present, else the flag arm.
+    # Challenger: whichever non-baseline config is present.
+    present = list(ok["config"].unique())
+    base = "gitold" if "gitold" in present else "old"
+    configs = [c for c in present if c != base]
     ch = configs[0] if configs else "new"
 
     # Era showcase rows use ABSOLUTE Spearman deltas — summarized separately
@@ -334,26 +337,26 @@ def summarize(df, out_md):
         print("\n".join(verdict))
         return
 
-    d = piv[("test_gain", ch)] - piv[("test_gain", "old")]
+    d = piv[("test_gain", ch)] - piv[("test_gain", base)]
     wins = int((d > 1e-12).sum()); losses = int((d < -1e-12).sum()); ties = len(d) - wins - losses
     win_rate = wins / max(1, wins + losses)
     try:
-        stat, pval = wilcoxon(piv[("test_gain", ch)], piv[("test_gain", "old")],
+        stat, pval = wilcoxon(piv[("test_gain", ch)], piv[("test_gain", base)],
                               alternative="greater", zero_method="zsplit")
     except ValueError:
         stat, pval = np.nan, 1.0
 
-    gap_old = piv[("overfit_gap", "old")].mean()
+    gap_old = piv[("overfit_gap", base)].mean()
     gap_new = piv[("overfit_gap", ch)].mean()
-    epm_ratio = (piv[("evals_per_min", ch)] / piv[("evals_per_min", "old")]).mean()
+    epm_ratio = (piv[("evals_per_min", ch)] / piv[("evals_per_min", base)]).mean()
 
     # criterion (c): per-dataset regression check vs old's seed noise
     per_ds = ok.pivot_table(index="dataset", columns="config", values="test_gain", aggfunc=["mean", "std"])
     regressions = []
     for ds in per_ds.index:
-        mean_old = per_ds.loc[ds, ("mean", "old")]
+        mean_old = per_ds.loc[ds, ("mean", base)]
         mean_ch = per_ds.loc[ds, ("mean", ch)]
-        noise = per_ds.loc[ds, ("std", "old")]
+        noise = per_ds.loc[ds, ("std", base)]
         noise = noise if np.isfinite(noise) and noise > 0 else 0.0
         if mean_ch < mean_old - max(noise, 1e-9):
             regressions.append((ds, float(mean_old), float(mean_ch), float(noise)))
@@ -364,19 +367,19 @@ def summarize(df, out_md):
     crit_d = epm_ratio >= 1.5
 
     lines = []
-    lines.append(f"# A/B benchmark — old vs {ch} genetic search\n")
+    lines.append(f"# A/B benchmark — {base} vs {ch} genetic search\n")
     lines.append(f"Paired runs: {len(piv)} (dataset x seed)\n")
     lines.append("## Pre-registered criteria\n")
     lines.append(f"- (a) test-gain superiority: win/tie/loss = {wins}/{ties}/{losses}, "
                  f"win-rate={win_rate:.0%}, Wilcoxon one-sided p={pval:.4f} -> "
                  f"{'PASS' if crit_a else 'FAIL'}")
-    lines.append(f"- (b) overfit gap reduced: old={gap_old:.4f}, {ch}={gap_new:.4f} -> "
+    lines.append(f"- (b) overfit gap reduced: {base}={gap_old:.4f}, {ch}={gap_new:.4f} -> "
                  f"{'PASS' if crit_b else 'FAIL'}")
-    lines.append(f"- (c) no dataset regression beyond old's seed noise: "
+    lines.append(f"- (c) no dataset regression beyond the baseline's seed noise: "
                  f"{'PASS' if crit_c else 'FAIL ' + str(regressions)}")
     lines.append(f"- (d) throughput >= 1.5x: mean evals/min ratio = {epm_ratio:.2f}x -> "
                  f"{'PASS' if crit_d else 'FAIL'}")
-    lines.append(f"\n- mean test gain: old={piv[('test_gain', 'old')].mean():.4f}, "
+    lines.append(f"\n- mean test gain: {base}={piv[('test_gain', base)].mean():.4f}, "
                  f"{ch}={piv[('test_gain', ch)].mean():.4f}")
     if "gens_completed" in ok.columns:
         gens = ok.groupby("config")["gens_completed"].mean()

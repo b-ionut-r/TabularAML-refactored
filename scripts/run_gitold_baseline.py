@@ -20,21 +20,28 @@ OLD_REPO = "/tmp/old_tree"
 CACHE_DIR = str(REPO_ROOT / "cache" / "pmlb")
 WORKER = str(REPO_ROOT / "scripts" / "_gitold_worker.py")
 
-# Subset spanning the spectrum: old's strongholds, full's strongholds, regressions
+# Full grid: identical to the new arm's datasets + the era showcase
 DATASETS = {
     "churn": "classification",
+    "spambase": "classification",
     "hypothyroid": "classification",
+    "coil2000": "classification",
     "satimage": "classification",
     "splice": "classification",
+    "optdigits": "classification",
+    "ann_thyroid": "classification",
     "503_wind": "regression",
     "537_houses": "regression",
+    "573_cpu_act": "regression",
+    "4544_GeographicalOriginalofMusic": "regression",
+    "synthetic_era": "era",
 }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="reports/comprehensive_ab.csv")
-    ap.add_argument("--seeds", default="42,43")
+    ap.add_argument("--out", default="reports/final_old_vs_new.csv")
+    ap.add_argument("--seeds", default="42,43,44")
     ap.add_argument("--time-budget", type=int, default=600)
     ap.add_argument("--parallel", type=int, default=2)
     args = ap.parse_args()
