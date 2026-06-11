@@ -1048,16 +1048,18 @@ class FeatureGenerator:
 
         In era mode, era_deltas (paired per-era deltas) additionally require the
         candidate to help in at least era_acceptance_frac of shared eras — a
-        feature that wins on a few eras but loses broadly is rejected.
+        feature that wins on a few eras but loses broadly is rejected. The era
+        gate applies in BOTH acceptance modes: setting era_col is an explicit
+        request for era-stability machinery, independent of the fold sign test.
         """
         if gain < self.adaptive_controller.get_adaptive_min_gain():
             return False
-        if getattr(self, "acceptance", "statistical") != "statistical":
-            return True
         if era_deltas is not None and len(era_deltas) >= 4:
             frac_pos = float(np.mean(era_deltas > 0))
             if frac_pos < getattr(self, "era_acceptance_frac", 0.55):
                 return False
+        if getattr(self, "acceptance", "mean") != "statistical":
+            return True
         if fold_deltas is None or len(fold_deltas) < 3:
             return True
         K = len(fold_deltas)
