@@ -45,8 +45,8 @@ def test_attr_stripped_state_loads_and_transforms(tmp_path):
     loaded = FeatureGenerator.load(path)
 
     # _ensure_backwards_compat must have restored sane defaults
-    assert loaded.acceptance == "statistical"
-    assert loaded.confirmation_seeds == 1
+    assert loaded.acceptance == "mean"
+    assert loaded.confirmation_seeds == 0
     assert loaded.proxy_mode in ("batched", "none")
     assert loaded.base_expander is None
     assert loaded.state["best"]["val_fold_scores"] is None

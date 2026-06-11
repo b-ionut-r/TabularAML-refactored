@@ -1,23 +1,53 @@
 # Competition-grade feature search
 
-The genetic feature search defaults are tuned for ML competitions
-(Kaggle / CrunchDAO / DrivenData): every acceptance decision is guarded
-against CV overfitting, throughput is spent on candidates that matter, and
+The genetic feature search carries a competition toolkit (Kaggle /
+CrunchDAO / DrivenData): paired-fold acceptance guards against CV
+overfitting, throughput is spent on candidates that matter, and
 era-structured data is handled natively.
 
-## What runs by default
+**What the A/B benchmark decided** (`reports/acceptance_ab.md`, 6 real
+datasets × 3 seeds × equal budget, pre-registered criteria): the throughput
+stack (2.24× candidate evals/min), gated base expansion and reporting fixes
+are **on by default** — they reduced the mean overfit gap with no dataset
+regression. The strict acceptance stack (statistical gate, alternate-seed
+confirmation, null importance) also reduced the overfit gap but did **not
+prove paired test-gain superiority at small budgets** (win-rate 47%,
+p=0.43), so per the pre-registered decision rule it ships **opt-in**.
+
+## On by default
 
 | Mechanism | Parameter(s) | Effect |
 |---|---|---|
-| Statistical acceptance | `acceptance="statistical"`, `acceptance_folds_frac=0.7` | A candidate must clear the adaptive mean-gain threshold AND improve ≥ ceil(0.7·K) of K paired CV folds (sign test). `acceptance="mean"` restores the old rule. |
-| Generation confirmation | `confirmation_seeds=1` (2 in best/extreme presets) | An improving generation is re-tested new-vs-previous-best under alternate CV seeds before being committed; unconfirmed improvements are reverted. |
-| Null-importance selection | `null_importance_selection=True`, `null_importance_n_perm=4`, `null_importance_pct=75` | Post-search, generated features (and base-expansion outputs) must beat the 75th percentile of their own target-permutation importance distribution. |
-| Expansion block gate | automatic | Datetime-part and row-stat blocks are kept only if they don't degrade the paired-fold baseline at search start. |
 | Two-stage batched proxy | `proxy_mode="batched"`, `proxy_ram_budget_mb=512` | One residual-boosting LightGBM over all candidates coarsely filters the batch; per-candidate FeatureBoost refines the survivors. `"featureboost"` / `"none"` restore old behaviors. |
 | Base-table expansion | `expand_datetime=True`, `expand_row_stats=True` | Datetime columns are decomposed (year/month/dow/hour/weekend/cyclical/epoch-days) and row stats (mean/std/max/min/NaN-count) join the base table before the search. |
+| Expansion block gate | automatic | Datetime-part and row-stat blocks are kept only if they don't degrade the paired-fold baseline at search start. |
 | Global transforms | op family `"global"` | `rank_pct`, `qbin`, `zscore_winsor`, `log_rank` — fitted on train folds inside the pipeline, leakage-free and batch-independent at transform time. |
 | ES-leak-free CV | `cross_val_score(eval_set_policy="auto")` | When the baseline model uses early stopping, the ES set is carved from the train fold; the validation fold is never seen during fit. |
 | Parallel folds | `cv_n_jobs="auto"` | Threads across CV folds with per-fold model-thread clamping. |
+| Honest gain reporting | automatic | Final feature set re-evaluated under the current splitter; baseline measured on pre-expansion columns. |
+
+## The opt-in acceptance stack (recommended at real competition budgets)
+
+```python
+gen = FeatureGenerator(
+    mode="best",
+    acceptance="statistical",        # paired-fold sign-test gate
+    confirmation_seeds=1,            # alternate-seed confirmation (2 for long runs)
+    null_importance_selection=True,  # target-permutation post-filter
+)
+```
+
+| Mechanism | Parameter(s) | Effect |
+|---|---|---|
+| Statistical acceptance | `acceptance="statistical"`, `acceptance_folds_frac=0.7` | A candidate must clear the adaptive mean-gain threshold AND improve ≥ ceil(0.7·K) of K paired CV folds (sign test). |
+| Generation confirmation | `confirmation_seeds>=1` | An improving generation is re-tested new-vs-previous-best under alternate CV seeds before being committed; unconfirmed improvements are reverted. |
+| Null-importance selection | `null_importance_selection=True`, `null_importance_n_perm=4`, `null_importance_pct=75` | Post-search, generated features (and base-expansion outputs) must beat the 75th percentile of their own target-permutation importance distribution. |
+
+At a 300-second budget on small noisy datasets the strict stack accepts few
+features and a liberal rule's lucky grabs win as many holdout pairs as they
+lose; with hours of budget and CV noise at stake, the strict stack is the
+safer bet (it cut the measured CV-to-holdout gap while accepting an order of
+magnitude fewer features).
 
 ## Era mode (CrunchDAO / Numerai-style)
 

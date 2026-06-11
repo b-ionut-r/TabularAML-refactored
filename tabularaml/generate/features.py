@@ -719,10 +719,14 @@ class FeatureGenerator:
                  random_state: int = 42,
                  n_jobs: int = -1,
                  cv_n_jobs: Union[int, str] = "auto",
-                 acceptance: Literal["statistical", "mean"] = "statistical",
+                 # A/B verdict (reports/acceptance_ab.md): the strict acceptance
+                 # stack reduced the overfit gap but did not prove paired
+                 # test-gain superiority at small budgets, so it ships OPT-IN
+                 # (see docs/competition_mode.md for the competition recipe).
+                 acceptance: Literal["statistical", "mean"] = "mean",
                  acceptance_folds_frac: float = 0.7,
-                 confirmation_seeds: int = 1,
-                 null_importance_selection: bool = True,
+                 confirmation_seeds: int = 0,
+                 null_importance_selection: bool = False,
                  null_importance_n_perm: int = 4,
                  null_importance_pct: float = 75.0,
                  expand_datetime: bool = True,
@@ -3728,13 +3732,13 @@ class FeatureGenerator:
 
         # Competition-grade additions (paired-fold acceptance, parallel CV)
         if not hasattr(self, 'acceptance'):
-            self.acceptance = "statistical"
+            self.acceptance = "mean"
         if not hasattr(self, 'acceptance_folds_frac'):
             self.acceptance_folds_frac = 0.7
         if not hasattr(self, 'confirmation_seeds'):
-            self.confirmation_seeds = 1
+            self.confirmation_seeds = 0
         if not hasattr(self, 'null_importance_selection'):
-            self.null_importance_selection = True
+            self.null_importance_selection = False
         if not hasattr(self, 'null_importance_n_perm'):
             self.null_importance_n_perm = 4
         if not hasattr(self, 'null_importance_pct'):

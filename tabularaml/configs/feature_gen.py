@@ -1,11 +1,13 @@
 _COMMON_COMPETITION_PARAMS = {
-    # Competition-grade defaults shared by all presets: paired-fold
-    # statistical acceptance, alternate-seed confirmation, two-stage batched
-    # proxy, null-importance post-selection, base-table expansion.
-    "acceptance": "statistical",
-    "confirmation_seeds": 1,
+    # Shared preset upgrades validated by the A/B benchmark
+    # (reports/acceptance_ab.md): two-stage batched proxy (2.24x candidate
+    # throughput), parallel CV folds, gated base-table expansion. The strict
+    # acceptance stack (statistical gate / confirmation / null importance)
+    # did not prove paired test-gain superiority at small budgets, so presets
+    # inherit the legacy acceptance defaults; opt in explicitly via
+    # acceptance="statistical", confirmation_seeds>=1,
+    # null_importance_selection=True (see docs/competition_mode.md).
     "proxy_mode": "batched",
-    "null_importance_selection": True,
     "cv_n_jobs": "auto",
     "expand_datetime": True,
     "expand_row_stats": True,
@@ -19,7 +21,7 @@ PRESET_PARAMS = {
         "n_children": 160,
         "early_stopping_child_eval": 30,
         "early_stopping_iter": 5,
-        "min_pct_gain": 0.002,
+        "min_pct_gain": 0.003,
         "max_gen_new_feats_pct": 0.6,
         "time_budget": 5 * 60, # 5 minutes
         "cv": 4,
@@ -40,7 +42,7 @@ PRESET_PARAMS = {
         "n_children": 260,
         "early_stopping_child_eval": 45,
         "early_stopping_iter": 6,
-        "min_pct_gain": 0.0015,
+        "min_pct_gain": 0.002,
         "max_gen_new_feats_pct": 1.2,
         "time_budget": 15 * 60, # 15 minutes
         "cv": 4,
@@ -61,7 +63,7 @@ PRESET_PARAMS = {
         "n_children": 420,
         "early_stopping_child_eval": 70,
         "early_stopping_iter": 8,
-        "min_pct_gain": 0.001,
+        "min_pct_gain": 0.0015,
         "max_gen_new_feats_pct": 2.0,
         "time_budget": 60 * 60 * 1, # 1 hours
         "cv": 5,
@@ -74,7 +76,6 @@ PRESET_PARAMS = {
         "rotate_cv_folds": True,
         "fold_rotation_period": 5,
         **_COMMON_COMPETITION_PARAMS,
-        "confirmation_seeds": 2,
     },
     "extreme": {
         # Maximum thoroughness with efficiency guardrails
@@ -83,7 +84,7 @@ PRESET_PARAMS = {
         "n_children": 640,
         "early_stopping_child_eval": 100,
         "early_stopping_iter": 12,
-        "min_pct_gain": 0.0008,
+        "min_pct_gain": 0.001,
         "max_gen_new_feats_pct": 3.0,
         "time_budget": 60 * 60 * 4, # 4 hours
         "cv": 5,
@@ -96,7 +97,6 @@ PRESET_PARAMS = {
         "rotate_cv_folds": True,
         "fold_rotation_period": 5,
         **_COMMON_COMPETITION_PARAMS,
-        "confirmation_seeds": 2,
     }
 }
 
