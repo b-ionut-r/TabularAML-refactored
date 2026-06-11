@@ -675,6 +675,19 @@ class FeatureGenerator:
     """
     Enhanced Feature Generator with improved stagnation handling.
     """
+
+    # Budget-aware preamble degradation (see _proxy_screen_candidates ladder)
+    _TIME_EMA_ALPHA_CV = 0.3        # per-candidate CV evals (many samples/gen)
+    _TIME_EMA_ALPHA_STAGE = 0.5     # OOF / proxy-rank stages (one lumpy sample/gen)
+    _PROXY_SKIP_FACTOR = 1.0        # avail < 1.0x expected proxy -> skip proxy entirely
+    _PROXY_COARSE_ONLY_FACTOR = 2.0 # avail < 2.0x expected proxy -> skip FeatureBoost refinement
+    _FB_DEADLINE_CHECK_EVERY = 4    # candidates between deadline checks in the FB loop
+    _SELECTION_RESERVE_FRAC = 0.20  # of remaining-at-generation-start kept for elite selection
+    _SELECTION_RESERVE_MIN_EVALS = 5
+    _REFRESH_SKIP_FRAC = 0.12       # skip importance/SHAP refresh below this fraction of budget
+    _OOF_EST_VS_CV = 1.2            # gen-1 static estimate: OOF cost ~ 1.2x one baseline CV
+    _RANK_EST_VS_CV = 3.0           # gen-1 static estimate: rank+FB cost ~ 3x one baseline CV
+
     def __init__(self,
                  baseline_model = None,
                  model_fit_kwargs: dict = {},
@@ -709,6 +722,7 @@ class FeatureGenerator:
                  proxy_ram_budget_mb: int = 512,
                  proxy_halving: bool = False,
                  proxy_top_pct: float = 0.15,
+                 proxy_row_cap: int = 8000,
                  meta_validation_frac: float = 0.15,
                  rotate_cv_folds: bool = True,
                  fold_rotation_period: int = 5,
@@ -772,6 +786,15 @@ class FeatureGenerator:
         self.proxy_ram_budget_mb = proxy_ram_budget_mb
         self.proxy_halving = proxy_halving
         self.proxy_top_pct = proxy_top_pct
+        self.proxy_row_cap = proxy_row_cap
+
+        # Budget-aware preamble runtime state (reset per search)
+        self._search_deadline = None
+        self._gen_start_remaining = None
+        self._cv_eval_time_ema = None
+        self._oof_time_ema = None
+        self._proxy_time_ema = None
+        self._proxy_row_idx = None
 
         # Mode overrides only params still at their constructor defaults
         if mode:
@@ -1034,6 +1057,84 @@ class FeatureGenerator:
         """Invalidate cached fold vectors after any change to splitter state or data."""
         self._cv_epoch += 1
 
+    # --- Budget-aware preamble helpers ---
+
+    def _remaining_budget(self) -> float:
+        deadline = getattr(self, '_search_deadline', None)
+        if deadline is None:
+            return float('inf')
+        return max(0.0, deadline - time.time())
+
+    def _update_time_ema(self, attr: str, seconds: float, alpha: float) -> None:
+        current = getattr(self, attr, None)
+        setattr(self, attr, seconds if current is None else (1 - alpha) * current + alpha * seconds)
+
+    def _selection_reserve(self) -> float:
+        """Wall-clock seconds guaranteed to elite selection each generation."""
+        if getattr(self, '_search_deadline', None) is None:
+            return 0.0
+        cv_ema = getattr(self, '_cv_eval_time_ema', None)
+        r0 = getattr(self, '_gen_start_remaining', None)
+        if r0 is None or not np.isfinite(r0):
+            r0 = self._remaining_budget()
+        reserve = self._SELECTION_RESERVE_FRAC * r0 if np.isfinite(r0) else 0.0
+        if cv_ema:
+            reserve = max(reserve, self._SELECTION_RESERVE_MIN_EVALS * cv_ema)
+        return reserve
+
+    def _skip_expensive_refresh(self) -> bool:
+        """True when remaining budget is too low for importance/SHAP refreshes."""
+        if getattr(self, '_search_deadline', None) is None or not self.time_budget:
+            return False
+        return self._remaining_budget() < self._REFRESH_SKIP_FRAC * self.time_budget
+
+    def _proxy_row_cap_indices(self, X: pd.DataFrame, y: pd.Series) -> Optional[np.ndarray]:
+        """Sorted positional indices for the proxy row cap, or None for full rows.
+
+        Whole groups when grouped (per-era metrics and grouped CV need intact
+        groups), class-stratified for classification (preserves num_class
+        coverage), uniform otherwise. Sorted to preserve chronology for
+        position-based time-series splitters.
+        """
+        cap = getattr(self, 'proxy_row_cap', 8000)
+        if not cap or len(X) <= cap:
+            return None
+        seed = self.random_state + int(self.state['counters'].get('current_gen', 0)) \
+            if hasattr(self, 'state') else self.random_state
+        rng = np.random.RandomState(seed)
+
+        groups = self._groups_active
+        if groups is not None:
+            groups_arr = np.asarray(groups)
+            uniques = pd.unique(groups_arr)
+            n_splits_hint = getattr(self.cv, 'n_splits', self.cv if isinstance(self.cv, int) else 5)
+            order = rng.permutation(uniques)
+            take, rows = [], 0
+            for g in order:
+                idx_g = np.where(groups_arr == g)[0]
+                take.append(idx_g)
+                rows += len(idx_g)
+                if rows >= cap and len(take) >= min(len(uniques), 2 * n_splits_hint):
+                    break
+            if len(take) < 2 * n_splits_hint:
+                self._log(f"  Proxy row cap keeps only {len(take)} groups for "
+                          f"{n_splits_hint}-fold grouped CV")
+            return np.sort(np.concatenate(take))
+
+        if self.task != "regression":
+            y_arr = np.asarray(y)
+            idx_parts = []
+            for cls in np.unique(y_arr):
+                cls_idx = np.where(y_arr == cls)[0]
+                n_take = max(1, int(np.ceil(cap * len(cls_idx) / len(y_arr))))
+                if n_take >= len(cls_idx):
+                    idx_parts.append(cls_idx)
+                else:
+                    idx_parts.append(rng.choice(cls_idx, n_take, replace=False))
+            return np.sort(np.concatenate(idx_parts))
+
+        return np.sort(rng.choice(len(X), cap, replace=False))
+
     def _acceptance_gate(self, gain: float, fold_deltas: Optional[np.ndarray],
                          era_deltas: Optional[np.ndarray] = None) -> bool:
         """Decide candidate acceptance.
@@ -1116,38 +1217,46 @@ class FeatureGenerator:
             n_classes = len(np.unique(getattr(self, '_current_y', [0, 1])))
             return "binary" if n_classes <= 2 else "multiclass"
 
-    def _train_base_model_and_get_residuals(self, X, y, cv):
-        """Train base model on current features, return OOF predictions."""
+    def _train_base_model_and_get_residuals(self, X, y, cv, groups=None):
+        """Train base model on current features, return OOF predictions.
+
+        groups must match X's rows (callers slice it when running on a
+        row-capped subset); num_class always derives from the FULL target so
+        subset OOF matrices keep full class width.
+        """
         import lightgbm as lgb
+        groups = self._groups_active if groups is None else groups
         objective = self._get_lgb_objective()
         oof_preds = np.zeros(len(y))
         params = {"objective": objective, "verbosity": -1,
                   "learning_rate": 0.1, "num_leaves": 31,
                   "n_jobs": self.n_jobs, "random_state": self.random_state}
         if objective == "multiclass":
-            n_classes = len(np.unique(y))
+            n_classes = len(np.unique(getattr(self, '_current_y', y)))
             params["num_class"] = n_classes
             oof_preds = np.zeros((len(y), n_classes))
 
-        for train_idx, val_idx in cv.split(X, y, groups=self._groups_active):
+        for train_idx, val_idx in cv.split(X, y, groups=groups):
             X_train = sanitize_model_features(X.iloc[train_idx].copy())
             X_val = sanitize_model_features(X.iloc[val_idx].copy())
             for col in X_train.select_dtypes(include=['object']).columns:
                 X_train[col] = X_train[col].astype('category')
                 X_val[col] = pd.Categorical(X_val[col], categories=X_train[col].cat.categories)
             dtrain = lgb.Dataset(X_train, y.iloc[train_idx])
-            model = lgb.train(params, dtrain, num_boost_round=200)
+            model = lgb.train(params, dtrain, num_boost_round=120)
             # Must use raw margins for init_score
             oof_preds[val_idx] = model.predict(X_val, raw_score=True)
         return oof_preds
 
-    def _featureboost_score(self, candidate_series, y, oof_preds, cv):
+    def _featureboost_score(self, candidate_series, y, oof_preds, cv, groups=None):
         """Score a single candidate feature via residual-based incremental training.
-        
+
         Uses the OpenFE 'FeatureBoost' trick: train a tiny single-feature LightGBM
-        with init_score set to the base model's OOF predictions.
+        with init_score set to the base model's OOF predictions. groups must be
+        row-aligned with candidate_series/y (callers slice it under a row cap).
         """
         import lightgbm as lgb
+        groups = self._groups_active if groups is None else groups
         objective = self._get_lgb_objective()
         
         # Prepare candidate values
@@ -1169,9 +1278,9 @@ class FeatureGenerator:
                   "verbosity": -1, "n_jobs": self.n_jobs, "learning_rate": 0.1,
                   "random_state": self.random_state}
         if objective == "multiclass":
-            params["num_class"] = len(np.unique(y))
+            params["num_class"] = len(np.unique(getattr(self, '_current_y', y)))
 
-        for train_idx, val_idx in cv.split(cand_vals, y, groups=self._groups_active):
+        for train_idx, val_idx in cv.split(cand_vals, y, groups=groups):
             try:
                 train_cand = cand_vals[train_idx].copy()
                 val_cand = cand_vals[val_idx].copy()
@@ -1217,8 +1326,8 @@ class FeatureGenerator:
                     new_preds = new_preds_margin
 
                 score_kwargs = {}
-                if getattr(self.scorer, 'needs_groups', False) and self._groups_active is not None:
-                    score_kwargs['groups'] = np.asarray(self._groups_active)[val_idx]
+                if getattr(self.scorer, 'needs_groups', False) and groups is not None:
+                    score_kwargs['groups'] = np.asarray(groups)[val_idx]
                 base_score = self.scorer.score(y.iloc[val_idx], base_preds, **score_kwargs)
                 new_score = self.scorer.score(y.iloc[val_idx], new_preds, **score_kwargs)
                 
@@ -1257,13 +1366,47 @@ class FeatureGenerator:
         try:
             cv = self._get_cv_splitter()
 
-            # Train base model and get OOF predictions (once per generation)
-            if not hasattr(self, '_current_oof_preds') or self._oof_preds_stale:
-                self._current_oof_preds = self._train_base_model_and_get_residuals(X, y, cv)
+            # --- Budget-aware degradation ladder (inert without a deadline) ---
+            deadline = getattr(self, '_search_deadline', None) is not None
+            reserve = self._selection_reserve()
+            cv_ema = getattr(self, '_cv_eval_time_ema', None)
+            sub = getattr(self, '_proxy_row_idx', None)
+            oof_fresh = (hasattr(self, '_current_oof_preds') and not self._oof_preds_stale
+                         and ((sub is not None and len(self._current_oof_preds) == len(sub))
+                              or (sub is None and len(self._current_oof_preds) == len(X))))
+            coarse_only = False
+            if deadline:
+                avail = self._remaining_budget() - reserve
+                oof_need = 0.0 if oof_fresh else (getattr(self, '_oof_time_ema', None)
+                            or (self._OOF_EST_VS_CV * cv_ema if cv_ema else 0.0))
+                rank_need = (getattr(self, '_proxy_time_ema', None)
+                             or (self._RANK_EST_VS_CV * cv_ema if cv_ema else 0.0))
+                expected = oof_need + rank_need
+                if expected > 0 and avail < self._PROXY_SKIP_FACTOR * expected:
+                    self._log(f"  Proxy skipped: {avail:.1f}s left after selection reserve "
+                              f"({reserve:.1f}s) < {expected:.1f}s expected proxy cost")
+                    return batch  # memory ranking + selection early-stop take over
+                coarse_only = expected > 0 and avail < self._PROXY_COARSE_ONLY_FACTOR * expected
+
+            # Train base model and get OOF predictions (once per generation),
+            # on the proxy row-cap subset when the data is large
+            if not oof_fresh:
+                t0 = time.time()
+                self._proxy_row_idx = self._proxy_row_cap_indices(X, y)
+                if self._proxy_row_idx is not None:
+                    cap_idx = self._proxy_row_idx
+                    g_sub = (np.asarray(self._groups_active)[cap_idx]
+                             if self._groups_active is not None else None)
+                    self._current_oof_preds = self._train_base_model_and_get_residuals(
+                        X.iloc[cap_idx], y.iloc[cap_idx], cv, groups=g_sub)
+                else:
+                    self._current_oof_preds = self._train_base_model_and_get_residuals(X, y, cv)
                 self._oof_preds_stale = False
+                self._update_time_ema('_oof_time_ema', time.time() - t0, self._TIME_EMA_ALPHA_STAGE)
 
             top_candidates = None
             n_final = max(3, int(len(scorable_candidates) * self.proxy_top_pct))
+            t_rank = time.time()
             if proxy_mode == "batched":
                 # Two-stage screen: one joint residual-boosting model coarsely
                 # filters the batch (cheap), then per-candidate FeatureBoost
@@ -1274,8 +1417,19 @@ class FeatureGenerator:
                     coarse = self._batched_proxy_rank(scorable_candidates, X, y, cv)
                     if coarse is not None:
                         if len(coarse) > n_final:
-                            top_candidates = self._featureboost_screen(
-                                coarse, X, y, cv, n_keep=n_final)
+                            # Re-check between stages: refinement only if the
+                            # ladder allows and budget still covers ~half a rank
+                            fb_ok = True
+                            if deadline:
+                                rank_share = 0.5 * (getattr(self, '_proxy_time_ema', None)
+                                                    or (self._RANK_EST_VS_CV * cv_ema if cv_ema else 0.0))
+                                fb_ok = (self._remaining_budget() - reserve) >= rank_share
+                            if coarse_only or not fb_ok:
+                                top_candidates = coarse[:n_final]  # coarse is gain-ordered
+                                self._log("  Proxy: FeatureBoost refinement skipped (budget); coarse top kept")
+                            else:
+                                top_candidates = self._featureboost_screen(
+                                    coarse, X, y, cv, n_keep=n_final)
                         else:
                             top_candidates = coarse
                 except (Exception, MemoryError) as e:
@@ -1283,6 +1437,7 @@ class FeatureGenerator:
             if top_candidates is None:
                 top_candidates = self._featureboost_screen(scorable_candidates, X, y, cv,
                                                            n_keep=n_final)
+            self._update_time_ema('_proxy_time_ema', time.time() - t_rank, self._TIME_EMA_ALPHA_STAGE)
             if top_candidates is None:
                 return batch
 
@@ -1303,9 +1458,33 @@ class FeatureGenerator:
             return batch
 
     def _featureboost_screen(self, scorable_candidates, X, y, cv, n_keep=None):
-        """Per-candidate FeatureBoost screen (refinement and fallback path)."""
+        """Per-candidate FeatureBoost screen (refinement and fallback path).
+
+        Candidate values are generated full-row through the feature cache (so
+        _apply_interactions reuses them) and sliced positionally when a proxy
+        row cap is active. Honors the search deadline: every few candidates the
+        remaining budget is checked against the selection reserve; on a break,
+        scored candidates rank first and the quota is topped up with unscored
+        ones in input order (input order = coarse gain order on the batched
+        path), keeping selection supplied with material.
+        """
+        sub = getattr(self, '_proxy_row_idx', None)
+        if sub is not None:
+            y_fb = y.iloc[sub]
+            g_fb = (np.asarray(self._groups_active)[sub]
+                    if self._groups_active is not None else None)
+        else:
+            y_fb = y
+            g_fb = self._groups_active
+
         fb_scores = {}
-        for interaction in scorable_candidates:
+        deadline_break = False
+        for i, interaction in enumerate(scorable_candidates):
+            if (i % self._FB_DEADLINE_CHECK_EVERY == 0 and i > 0
+                    and self._remaining_budget() <= self._selection_reserve()):
+                self._log(f"  FeatureBoost: deadline reached after {i}/{len(scorable_candidates)} candidates")
+                deadline_break = True
+                break
             try:
                 parent_names = [interaction.feature_1.name]
                 if interaction.feature_2 is not None:
@@ -1319,20 +1498,32 @@ class FeatureGenerator:
                     lambda inter=interaction: (inter.name, inter.generate(X))
                 )
 
+                vals_fb = np.asarray(vals.values if hasattr(vals, 'values') else vals)
+                if sub is not None:
+                    vals_fb = vals_fb[sub]
+
                 score = self._featureboost_score(
-                    vals, y, self._current_oof_preds, cv
+                    vals_fb, y_fb, self._current_oof_preds, cv, groups=g_fb
                 )
                 fb_scores[id(interaction)] = (interaction, score)
             except Exception:
                 pass  # Skip failed candidates
 
         if not fb_scores:
-            return None
+            return scorable_candidates[:n_keep] if (deadline_break and n_keep) else None
 
         if n_keep is None:
             n_keep = max(3, int(len(fb_scores) * self.proxy_top_pct))
         sorted_candidates = sorted(fb_scores.values(), key=lambda x: x[1], reverse=True)
-        return [interaction for interaction, _ in sorted_candidates[:n_keep]]
+        kept = [interaction for interaction, _ in sorted_candidates[:n_keep]]
+        if deadline_break and len(kept) < n_keep:
+            scored_ids = set(fb_scores.keys())
+            for interaction in scorable_candidates:
+                if len(kept) >= n_keep:
+                    break
+                if id(interaction) not in scored_ids and interaction not in kept:
+                    kept.append(interaction)
+        return kept
 
     def _materialize_candidate_matrix(self, scorable_candidates, X):
         """Build a float32/category frame of candidate columns via the feature cache.
@@ -1386,10 +1577,21 @@ class FeatureGenerator:
         if C is None or len(kept) < 5:
             return None
 
+        # Effective view: candidate columns stay full-row in the cache, but
+        # scoring happens on the proxy row-cap subset the OOF was computed on.
+        sub = getattr(self, '_proxy_row_idx', None)
+        if sub is not None:
+            C = C.iloc[sub]
+            y = y.iloc[sub]
+            groups = (np.asarray(self._groups_active)[sub]
+                      if self._groups_active is not None else None)
+        else:
+            groups = self._groups_active
         oof = self._current_oof_preds
-        groups = self._groups_active
+        if len(oof) != len(C):  # stale pairing -> dispatcher falls back to FeatureBoost
+            raise RuntimeError("proxy OOF/row-cap misalignment")
 
-        # RAM guard: row-subsample to fit the configured budget
+        # RAM guard: row-subsample WITHIN the capped view to fit the budget
         ram_budget = getattr(self, 'proxy_ram_budget_mb', 512)
         est_mb = len(C) * C.shape[1] * 4 / 2**20
         row_idx = None
@@ -1405,7 +1607,7 @@ class FeatureGenerator:
                       "n_jobs": self.n_jobs, "learning_rate": 0.1,
                       "feature_fraction": 0.8, "random_state": self.random_state}
             if objective == "multiclass":
-                params["num_class"] = len(np.unique(y))
+                params["num_class"] = len(np.unique(getattr(self, '_current_y', y)))
             gain = np.zeros(C_sub.shape[1])
             cv_local = self._get_cv_splitter()
             for fold_i, (tr, va) in enumerate(cv_local.split(C_sub, y_sub, groups=groups_sub)):
@@ -2263,7 +2465,10 @@ class FeatureGenerator:
             pipe_iter = self._extend_pipeline(self.pipeline, self._prepare_pipeline([inter] + selected))
 
             try:
+                t_eval = time.time()
                 res = self._eval_cv_light(X_try, y, pipe_iter)
+                self._update_time_ema('_cv_eval_time_ema', time.time() - t_eval,
+                                      self._TIME_EMA_ALPHA_CV)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -2300,6 +2505,8 @@ class FeatureGenerator:
                 break
 
         if callback: callback(len(ranked), len(selected), force_complete=True)
+        if hasattr(self, 'state') and 'counters' in getattr(self, 'state', {}):
+            self.state['counters']['last_gen_evals'] = evals
         return selected, X_base, self._extend_pipeline(self.pipeline, self._prepare_pipeline(selected))
 
     def _get_feature_dependencies(self, generation: list) -> dict:
@@ -2507,11 +2714,13 @@ class FeatureGenerator:
     def _gate_base_expansion(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
         """Expansion features must earn their place like any candidate.
 
-        Each expansion block (datetime parts, row stats) is kept only if it
-        does not degrade the paired-fold baseline: dropped when the mean fold
-        delta is negative AND a majority of folds get worse. The fitted
-        expander is mutated to match, so transform() reproduces exactly the
-        kept schema. Costs at most 3 light CVs at search start.
+        Each expansion block (datetime parts, row stats) must affirmatively WIN
+        to join: kept only when the mean paired-fold delta is positive AND at
+        least half the folds improve. (The earlier benefit-of-the-doubt rule
+        kept CV-neutral blocks that then hurt holdout — burden of proof is on
+        the feature.) The fitted expander is mutated to match, so transform()
+        reproduces exactly the kept schema. Costs at most 3 light CVs at
+        search start.
         """
         expander = getattr(self, 'base_expander', None)
         if expander is None or not expander.added_cols_:
@@ -2529,8 +2738,8 @@ class FeatureGenerator:
                     continue
                 res = self._eval_cv_light(X[kept_cols + block], y, self.pipeline)
                 deltas = sign * (res.fold_scores - ref.fold_scores)
-                keep = (float(np.mean(deltas)) >= 0
-                        or int(np.sum(deltas > 0)) >= int(np.ceil(len(deltas) / 2)))
+                keep = (float(np.mean(deltas)) > 0
+                        and int(np.sum(deltas > 0)) >= int(np.ceil(len(deltas) / 2)))
                 if keep:
                     kept_cols = kept_cols + block
                     ref = res
@@ -2634,6 +2843,14 @@ class FeatureGenerator:
         random.seed(self.random_state)
         np.random.seed(self.random_state)
         start_time = time.time()
+
+        # Budget-aware preamble state for this run
+        self._search_deadline = (start_time + self.time_budget) if self.time_budget else None
+        self._gen_start_remaining = None
+        self._cv_eval_time_ema = None
+        self._oof_time_ema = None
+        self._proxy_time_ema = None
+        self._proxy_row_idx = None
 
         # Era mode: the era column becomes the CV grouping (never a feature),
         # and an int cv is upgraded to era-grouped folds.
@@ -2752,8 +2969,12 @@ class FeatureGenerator:
         self._bump_cv_epoch("search init")  # final data shape known only now (subsample/meta split)
         X = self._gate_base_expansion(X, y)
         self.initial_features = [c for c in self.initial_features if c in X.columns]
+        t_gen0 = time.time()
         self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(
             X, y, self.pipeline, update_fold_cache=True)
+        # Seed the CV-eval EMA from the timed gen-0 baseline (slight overestimate
+        # vs the light path -> errs toward larger selection reserves)
+        self._update_time_ema('_cv_eval_time_ema', time.time() - t_gen0, alpha=1.0)
         gen0_log = f"Gen 0: Train {self.scorer.name}={self.state['best']['train_score']:.5f}, Val {self.scorer.name}={self.state['best']['val_score']:.5f}"
         if self.logging_scorers:
             logging_scores = self._eval_logging_scorers(X, y, self.pipeline)
@@ -2762,8 +2983,10 @@ class FeatureGenerator:
         self.state['best']['X'], self.state['best']['pipeline'] = X.copy(), deepcopy(self.pipeline)
         self.state['best']['pruned_features'] = getattr(self, 'pruned_features', set()).copy()
         
-        # Initialize interactions and generation
-        self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
+        # Initialize interactions and generation (smaller SHAP pair budget under
+        # tight wall-clock budgets — the gen-0 preamble must not eat the run)
+        gen0_max_pairs = 2000 if (self.time_budget and self.time_budget <= 600) else 10000
+        self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=gen0_max_pairs)
         top_feats_df = self._get_top_k_features(X, y, k=2*self.n_parents, pipeline=self.pipeline)
         generation = [Feature(name=feat, dtype="num" if feat in num_cols else "cat", 
                              weight=top_feats_df.loc[feat, "weighted_importance"]) for feat in top_feats_df.index]
@@ -2786,7 +3009,8 @@ class FeatureGenerator:
                 if self.time_budget and (time.time() - start_time) > self.time_budget:
                     self._log(f"Time budget exceeded. Stopping.")
                     break
-                
+
+                self._gen_start_remaining = self._remaining_budget()
                 progress = N / self.n_generations
                 tau, beta, gamma, lambda_ = self._get_search_parameters(progress, N)
                 self.adaptive_controller.assess_stagnation(
@@ -2898,7 +3122,8 @@ class FeatureGenerator:
                             
                             self._sync_state_components(X, self.pipeline, generation)
                             self._save_current_as_best()
-                            self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
+                            if not self._skip_expensive_refresh():
+                                self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
 
                             for elite in elites:
                                 self.adaptive_controller.update_operation_stats(elite, success=True, gain=delta/(abs(best_score) + 1e-8))
@@ -3046,8 +3271,9 @@ class FeatureGenerator:
                                 for agg_op in self.ops["agg"]["binary"]:
                                     self._priority_candidates.append(Interaction(feat, agg_op, np_feat))
 
-                    # Update weights if changes made
-                    if new_feature_names or elites:
+                    # Update weights if changes made (skipped in the endgame:
+                    # new features keep parent-derived weights, which is safe)
+                    if (new_feature_names or elites) and not self._skip_expensive_refresh():
                         weights = self._get_top_k_features(X, y, k=-1, pipeline=self.pipeline)
                         for feat in new_generation:
                             if feat.name in weights.index:
@@ -3094,7 +3320,8 @@ class FeatureGenerator:
                         self.state['best'].update(gen_num=N+1, val_score=new_val_score)
                         self.state['counters']['consecutive_no_improvement_iters'] = 0
                         stagnation_counter = 0
-                        self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
+                        if not self._skip_expensive_refresh():
+                            self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
 
                         self._sync_state_components(X, self.pipeline, generation)
                         self._save_current_as_best()
@@ -3713,6 +3940,12 @@ class FeatureGenerator:
             self.proxy_ram_budget_mb = 512
         if not hasattr(self, 'proxy_halving'):
             self.proxy_halving = False
+        if not hasattr(self, 'proxy_row_cap'):
+            self.proxy_row_cap = 8000
+        for attr in ('_search_deadline', '_gen_start_remaining', '_cv_eval_time_ema',
+                     '_oof_time_ema', '_proxy_time_ema', '_proxy_row_idx'):
+            if not hasattr(self, attr):
+                setattr(self, attr, None)
 
         # Enhancement 4: CV bias fix
         if not hasattr(self, 'meta_validation_frac'):

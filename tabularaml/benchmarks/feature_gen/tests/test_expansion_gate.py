@@ -51,11 +51,13 @@ def test_gate_keeps_helpful_row_stats(monkeypatch):
     assert "row_mean" in gen.base_expander.row_stat_outputs_
 
 
-def test_gate_keeps_neutral_row_stats(monkeypatch):
+def test_gate_drops_neutral_row_stats(monkeypatch):
+    """Burden of proof is on the block: CV-neutral expansions are dropped
+    (they previously passed and then hurt holdout on some datasets)."""
     gen, X_exp, y = _gen_with_expansion()
-    _patch_scores(gen, monkeypatch, rowstat_delta=0.0)  # identical -> keep
+    _patch_scores(gen, monkeypatch, rowstat_delta=0.0)  # identical -> no win -> drop
     X_out = gen._gate_base_expansion(X_exp, y)
-    assert "row_mean" in X_out.columns
+    assert "row_mean" not in X_out.columns
 
 
 def test_search_schema_consistent_after_gate_drop(monkeypatch):

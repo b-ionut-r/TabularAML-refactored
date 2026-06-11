@@ -86,7 +86,8 @@ def _preprocess(X: pd.DataFrame, y, task: str, n_classes: int):
         if pd.api.types.is_numeric_dtype(X[c]):
             X[c] = pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
     for c in X.columns:
-        if X[c].dtype == object:
+        # pandas >= 3 infers the str dtype (not object) for text columns
+        if X[c].dtype == object or pd.api.types.is_string_dtype(X[c]):
             X[c] = X[c].astype("category")
 
     y_ser = pd.Series(y).reset_index(drop=True)
