@@ -1482,15 +1482,20 @@ class FeatureGenerator:
         Olivier-style null importances: fit the selection tree on the real
         target for actual gains, then n_perm times on a permuted target; a
         generated feature survives only if its actual importance exceeds the
-        configured percentile of its own null distribution. Original (and
-        expander) features are never dropped here. When era_groups is given,
+        configured percentile of its own null distribution. Original features
+        are never dropped; base-expansion outputs ARE in scope (they joined
+        without per-feature evidence, so this is their second filter — the
+        paired-fold block gate being the first). When era_groups is given,
         the target is permuted within eras so era-level structure is preserved
         in the null.
         """
         if not getattr(self, 'null_importance_selection', True):
             return []
-        generated = [c for c in X.columns if c not in self.initial_features]
-        if len(generated) < 10:
+        expander_cols = set(getattr(self.base_expander, 'added_cols_', []) or []) \
+            if getattr(self, 'base_expander', None) is not None else set()
+        generated = [c for c in X.columns
+                     if c not in self.initial_features or c in expander_cols]
+        if len(generated) < (5 if expander_cols else 10):
             return []
         n_perm = int(getattr(self, 'null_importance_n_perm', 4))
         pct = float(getattr(self, 'null_importance_pct', 75.0))
@@ -3274,9 +3279,25 @@ class FeatureGenerator:
         n_global = len(getattr(self.pipeline, "global_encoders", []))
         n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal + n_global
 
-        # Use a clean pipeline for baseline evaluation to get true initial performance
+        # Re-evaluate the final feature set under the CURRENT splitter so the
+        # reported gain compares like with like: fold rotation otherwise
+        # injects splitter-assignment noise into best-vs-initial deltas.
+        try:
+            _, final_val = self._eval_baseline(X, y, self.pipeline, update_fold_cache=True)
+            self.state['best']['val_score'] = final_val
+        except Exception as e:
+            self._log(f"Final re-evaluation failed: {e}")
+
+        # Use a clean pipeline for baseline evaluation to get true initial performance,
+        # measured on the PRE-expansion columns (the user's raw starting table)
         baseline_pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
-        self.initial_train_metric, self.initial_val_metric = self._eval_baseline(X[self.initial_features], y, baseline_pipeline)
+        expander_cols = set(getattr(self.base_expander, 'added_cols_', []) or []) \
+            if getattr(self, 'base_expander', None) is not None else set()
+        raw_initial = [c for c in self.initial_features if c not in expander_cols and c in X.columns]
+        if not raw_initial:
+            raw_initial = [c for c in self.initial_features if c in X.columns]
+        self.initial_train_metric, self.initial_val_metric = self._eval_baseline(
+            X[raw_initial], y, baseline_pipeline)
         self.final_metric = self.state['best']['val_score']
         self.gain = self.final_metric - self.initial_val_metric if self.scorer.greater_is_better else self.initial_val_metric - self.final_metric
         self.pct_gain = self.gain / (abs(self.initial_val_metric) + 1e-8)

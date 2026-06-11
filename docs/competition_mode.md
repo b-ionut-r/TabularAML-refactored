@@ -11,7 +11,8 @@ era-structured data is handled natively.
 |---|---|---|
 | Statistical acceptance | `acceptance="statistical"`, `acceptance_folds_frac=0.7` | A candidate must clear the adaptive mean-gain threshold AND improve ≥ ceil(0.7·K) of K paired CV folds (sign test). `acceptance="mean"` restores the old rule. |
 | Generation confirmation | `confirmation_seeds=1` (2 in best/extreme presets) | An improving generation is re-tested new-vs-previous-best under alternate CV seeds before being committed; unconfirmed improvements are reverted. |
-| Null-importance selection | `null_importance_selection=True`, `null_importance_n_perm=4`, `null_importance_pct=75` | Post-search, generated features must beat the 75th percentile of their own target-permutation importance distribution. |
+| Null-importance selection | `null_importance_selection=True`, `null_importance_n_perm=4`, `null_importance_pct=75` | Post-search, generated features (and base-expansion outputs) must beat the 75th percentile of their own target-permutation importance distribution. |
+| Expansion block gate | automatic | Datetime-part and row-stat blocks are kept only if they don't degrade the paired-fold baseline at search start. |
 | Two-stage batched proxy | `proxy_mode="batched"`, `proxy_ram_budget_mb=512` | One residual-boosting LightGBM over all candidates coarsely filters the batch; per-candidate FeatureBoost refines the survivors. `"featureboost"` / `"none"` restore old behaviors. |
 | Base-table expansion | `expand_datetime=True`, `expand_row_stats=True` | Datetime columns are decomposed (year/month/dow/hour/weekend/cyclical/epoch-days) and row stats (mean/std/max/min/NaN-count) join the base table before the search. |
 | Global transforms | op family `"global"` | `rank_pct`, `qbin`, `zscore_winsor`, `log_rank` — fitted on train folds inside the pipeline, leakage-free and batch-independent at transform time. |
