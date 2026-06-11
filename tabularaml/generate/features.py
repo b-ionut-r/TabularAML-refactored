@@ -2493,6 +2493,54 @@ class FeatureGenerator:
             return True
         return False
 
+    def _gate_base_expansion(self, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
+        """Expansion features must earn their place like any candidate.
+
+        Each expansion block (datetime parts, row stats) is kept only if it
+        does not degrade the paired-fold baseline: dropped when the mean fold
+        delta is negative AND a majority of folds get worse. The fitted
+        expander is mutated to match, so transform() reproduces exactly the
+        kept schema. Costs at most 3 light CVs at search start.
+        """
+        expander = getattr(self, 'base_expander', None)
+        if expander is None or not expander.added_cols_:
+            return X
+        dt_cols = [c for outs in expander.dt_outputs_.values() for c in outs]
+        rs_cols = [c for c in expander.row_stat_outputs_]
+        orig_cols = [c for c in X.columns if c not in set(dt_cols) | set(rs_cols)]
+        sign = 1.0 if self.scorer.greater_is_better else -1.0
+        try:
+            ref = self._eval_cv_light(X[orig_cols], y, self.pipeline)
+            kept_cols = list(orig_cols)
+            for label, block in (("datetime parts", dt_cols), ("row stats", rs_cols)):
+                block = [c for c in block if c in X.columns]
+                if not block:
+                    continue
+                res = self._eval_cv_light(X[kept_cols + block], y, self.pipeline)
+                deltas = sign * (res.fold_scores - ref.fold_scores)
+                keep = (float(np.mean(deltas)) >= 0
+                        or int(np.sum(deltas > 0)) >= int(np.ceil(len(deltas) / 2)))
+                if keep:
+                    kept_cols = kept_cols + block
+                    ref = res
+                else:
+                    self._log(f"Base expansion: dropping {label} ({len(block)} cols) — "
+                              f"degrades the paired-fold baseline")
+                    if label == "row stats":
+                        expander.row_stat_outputs_ = []
+                    else:
+                        # raw datetime cols still get dropped (models reject datetime64)
+                        expander.dt_outputs_ = {c: [] for c in expander.datetime_cols_}
+            expander.added_cols_ = ([c for outs in expander.dt_outputs_.values() for c in outs]
+                                    + list(expander.row_stat_outputs_))
+            if len(kept_cols) != len(X.columns):
+                X = X[kept_cols]
+            if not expander.added_cols_ and not expander.datetime_cols_:
+                self.base_expander = None
+        except Exception as e:
+            self._log(f"Base expansion gate failed ({e}); keeping expansion as-is")
+        return X
+
     def _budget_scaled_sizes(self, start_time: float, N: int) -> tuple[int, Optional[int]]:
         """Shrink per-generation work when wall-clock burn outpaces generation progress.
 
@@ -2691,6 +2739,8 @@ class FeatureGenerator:
         self.adaptive_controller.initialize_operations(self.ops)
         self.adaptive_controller.reset_for_new_run()
         self._bump_cv_epoch("search init")  # final data shape known only now (subsample/meta split)
+        X = self._gate_base_expansion(X, y)
+        self.initial_features = [c for c in self.initial_features if c in X.columns]
         self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(
             X, y, self.pipeline, update_fold_cache=True)
         gen0_log = f"Gen 0: Train {self.scorer.name}={self.state['best']['train_score']:.5f}, Val {self.scorer.name}={self.state['best']['val_score']:.5f}"
