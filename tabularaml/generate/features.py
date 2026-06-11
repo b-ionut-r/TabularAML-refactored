@@ -3510,7 +3510,11 @@ class FeatureGenerator:
         n_groupby = len(getattr(self.pipeline, "groupby_encoders", []))
         n_temporal = len(getattr(self.pipeline, "temporal_encoders", []))
         n_global = len(getattr(self.pipeline, "global_encoders", []))
-        n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal + n_global
+        # Count net-new columns directly: initial columns are not immortal
+        # (post-selection may prune expansion outputs), so len(X) - n_init
+        # would go negative in that case
+        n_added_feats = (len([c for c in X.columns if c not in self.initial_features])
+                         + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal + n_global)
 
         # Re-evaluate the final feature set under the CURRENT splitter so the
         # reported gain compares like with like: fold rotation otherwise
@@ -3669,6 +3673,10 @@ class FeatureGenerator:
                 y = pd.Series(y_encoded, index=y.index, name=y.name)
         X_transformed = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
 
+        # The era column is CV grouping metadata, never a feature (search drops it too)
+        if getattr(self, 'era_col', None) and self.era_col in X_transformed.columns:
+            X_transformed = X_transformed.drop(columns=[self.era_col])
+
         # Re-apply base expansion (datetime parts, row stats)
         if getattr(self, 'base_expander', None) is not None:
             X_transformed = self.base_expander.transform(X_transformed)
@@ -3695,6 +3703,10 @@ class FeatureGenerator:
     def transform(self, X: pd.DataFrame):
         """Transform data by applying interactions and pipeline."""
         X_transformed = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X.copy()
+
+        # The era column is CV grouping metadata, never a feature (search drops it too)
+        if getattr(self, 'era_col', None) and self.era_col in X_transformed.columns:
+            X_transformed = X_transformed.drop(columns=[self.era_col])
 
         # Re-apply base expansion (datetime parts, row stats) — also when no
         # interactions were accepted, so the output schema matches search()
