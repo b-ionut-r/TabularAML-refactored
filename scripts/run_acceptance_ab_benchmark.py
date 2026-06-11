@@ -323,6 +323,11 @@ def summarize(df, out_md):
     base = "gitold" if "gitold" in present else "old"
     configs = [c for c in present if c != base]
     ch = configs[0] if configs else "new"
+    if base not in present or not configs:
+        msg = f"SUMMARY SKIPPED: need baseline + challenger arms, have {present}."
+        Path(out_md).write_text(msg + "\n")
+        print(msg)
+        return
 
     # Era showcase rows use ABSOLUTE Spearman deltas — summarized separately
     era = ok[ok.get("task", pd.Series(dtype=str)) == "era"] if "task" in ok.columns else ok.iloc[0:0]
