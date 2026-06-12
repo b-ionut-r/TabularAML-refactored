@@ -1035,28 +1035,28 @@ class FeatureGenerator:
         return self.scorer.score(y_true=y_true, y_pred=preds)
 
     def _score_feature_sets_fresh_cv(self, sets: dict, X: pd.DataFrame, y: pd.Series,
-                                     pipelines: dict) -> dict:
+                                     pipelines: dict) -> tuple[dict, dict]:
         """Score candidate feature sets with fresh-partition repeated CV.
 
         Fallback gate for datasets too small for a meta split: fold boundaries
-        the search never optimized against, averaged over two seeds.
+        the search never optimized against, over three seeds. Returns
+        (mean_scores, per_seed_scores); the per-seed scores enable a paired
+        majority-vote do-no-harm rule that one unlucky partition cannot decide.
         """
         n_splits = self.cv if isinstance(self.cv, int) else getattr(self.cv, "n_splits", 4)
-        scores = {}
-        for name, cols in sets.items():
-            vals = []
-            for seed_off in (777, 778):
-                cv = make_cv_splitter(int(n_splits), y, shuffle=True,
-                                      random_state=self.random_state + seed_off,
-                                      groups=self._groups_active)
+        per_seed = {name: [] for name in sets}
+        for seed_off in (777, 778, 779):
+            cv = make_cv_splitter(int(n_splits), y, shuffle=True,
+                                  random_state=self.random_state + seed_off,
+                                  groups=self._groups_active)
+            for name, cols in sets.items():
                 pipe = pipelines[name]
                 pipe_obj = pipe.get_pipeline(X[cols], y) if pipe is not None else None
-                vals.append(cross_val_score(self.baseline_model, X[cols], y, self.scorer,
-                                            cv=cv, pipeline=pipe_obj,
-                                            model_fit_kwargs=self.model_fit_kwargs,
-                                            groups=self._groups_active))
-            scores[name] = float(np.mean(vals))
-        return scores
+                per_seed[name].append(cross_val_score(self.baseline_model, X[cols], y, self.scorer,
+                                                      cv=cv, pipeline=pipe_obj,
+                                                      model_fit_kwargs=self.model_fit_kwargs,
+                                                      groups=self._groups_active))
+        return {name: float(np.mean(v)) for name, v in per_seed.items()}, per_seed
 
     def _eval_logging_scorers(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> Dict[str, Tuple[float, float]]:
         """Evaluate all logging scorers and return dict of {scorer_name: (train_score, val_score)}."""
@@ -1841,8 +1841,9 @@ class FeatureGenerator:
             for (f1, f2), _ in interaction_pairs[:n//2]:
                 feature_pairs.append((f1, f2))
         
-        # Add random diverse pairs
-        families = list(set(self._get_feature_family(f.name) for f in generation))
+        # Add random diverse pairs (sorted: hash-order lists would make the seeded
+        # random.sample non-reproducible across processes)
+        families = sorted(set(self._get_feature_family(f.name) for f in generation))
         while len(feature_pairs) < n:
             if len(families) >= 2 and random.random() < 0.7:
                 # Cross-family pair
@@ -2100,11 +2101,13 @@ class FeatureGenerator:
                 merged_gb.append(gb)
                 seen_gb.add(gb.output_col)
         
+        # sorted() (not bare set order) keeps encoder column order independent of
+        # the per-process hash seed, so identical runs produce identical pipelines.
         result = PipelineWrapper(imputer=None, scaler=None,
             encoder=CategoricalEncoder(
-                target_enc_cols=list(set(pipeline.encoder.target_enc_cols + new_pipeline.encoder.target_enc_cols)),
-                count_enc_cols=list(set(pipeline.encoder.count_enc_cols + new_pipeline.encoder.count_enc_cols)),
-                freq_enc_cols=list(set(pipeline.encoder.freq_enc_cols + new_pipeline.encoder.freq_enc_cols))))
+                target_enc_cols=sorted(set(pipeline.encoder.target_enc_cols + new_pipeline.encoder.target_enc_cols)),
+                count_enc_cols=sorted(set(pipeline.encoder.count_enc_cols + new_pipeline.encoder.count_enc_cols)),
+                freq_enc_cols=sorted(set(pipeline.encoder.freq_enc_cols + new_pipeline.encoder.freq_enc_cols))))
         result.groupby_encoders = merged_gb
         
         # Merge temporal encoders
@@ -3125,6 +3128,7 @@ class FeatureGenerator:
                     set_pipes = {name: (clean_pipe if name == "orig" else self.pipeline)
                                  for name in drop_sets}
 
+                    per_seed_scores = None
                     if X_meta_transformed is not None and X_search_gate is not None:
                         gate_scores = {}
                         for name, cols in set_cols.items():
@@ -3136,7 +3140,8 @@ class FeatureGenerator:
                                 X_meta_transformed[common], y_meta, set_pipes[name])
                         gate_kind = "meta-holdout"
                     else:
-                        gate_scores = self._score_feature_sets_fresh_cv(set_cols, X, y, set_pipes)
+                        gate_scores, per_seed_scores = self._score_feature_sets_fresh_cv(
+                            set_cols, X, y, set_pipes)
                         gate_kind = "fresh-CV"
 
                     sgn = 1.0 if self.scorer.greater_is_better else -1.0
@@ -3144,7 +3149,8 @@ class FeatureGenerator:
                                      key=lambda k: (sgn * gate_scores[k], -len(set_cols[k])),
                                      reverse=True)
                     winner = ordered[0]
-                    # Do no harm: a generated set must strictly beat the originals.
+                    # Do no harm: a generated set must strictly beat the originals
+                    # (on the meta holdout, or on the mean of three fresh-seed CVs).
                     orig_score = gate_scores.get("orig")
                     if winner != "orig" and orig_score is not None:
                         margin = self.meta_gate_epsilon * abs(orig_score)
