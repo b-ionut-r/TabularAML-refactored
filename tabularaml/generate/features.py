@@ -21,7 +21,8 @@ from tqdm.auto import tqdm
 from tabularaml.eval.cv import cross_val_score, make_cv_splitter, sanitize_model_features
 from tabularaml.eval.scorers import PREDEFINED_REG_SCORERS, PREDEFINED_CLS_SCORERS, PREDEFINED_SCORERS, Scorer
 from tabularaml.eval.splitters import RotatedGroupKFold, normalize_rotatable_splitter
-from tabularaml.generate.ops import OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, build_temporal_ops
+from tabularaml.generate.ops import (OPS, ALL_OPS_LAMBDAS, AGG_OPS, TEMPORAL_OPS, build_temporal_ops,
+                                     SYMMETRIC_OPS, ANTISYMMETRIC_OPS, DEFAULT_OP_PRIORS)
 from tabularaml.inspect.importance import FeatureImportanceAnalyzer
 from tabularaml.preprocessing.encoders import CategoricalEncoder, GroupByEncoder, TemporalEncoder
 from tabularaml.preprocessing.imputers import SimpleImputer
@@ -244,6 +245,37 @@ class FeatureCache:
         return self.hits / total if total > 0 else 0.0
 
 
+class _SearchDeadline:
+    """Wall-clock budget tracker with a reserved finalization tail.
+
+    The search loop stops at budget * (1 - reserve_frac) so that replay,
+    final selection and the meta-holdout gate always have time to run
+    before any outer hard cap (e.g. a benchmark harness kill) hits.
+    """
+    def __init__(self, start_time: float, budget: Optional[float], reserve_frac: float = 0.0):
+        self.start = start_time
+        self.budget = budget
+        self.reserve_frac = max(0.0, min(0.5, reserve_frac)) if budget else 0.0
+
+    def elapsed(self) -> float:
+        return time.time() - self.start
+
+    def soft_exceeded(self) -> bool:
+        if not self.budget:
+            return False
+        return self.elapsed() > self.budget * (1.0 - self.reserve_frac)
+
+    def hard_exceeded(self) -> bool:
+        if not self.budget:
+            return False
+        return self.elapsed() > self.budget
+
+    def remaining_frac(self) -> float:
+        if not self.budget:
+            return 1.0
+        return max(0.0, 1.0 - self.elapsed() / self.budget)
+
+
 class StagnationLevel(Enum):
     NONE, MILD, MODERATE, SEVERE, CRITICAL = 0, 1, 2, 3, 4
 
@@ -291,8 +323,13 @@ class ImprovedAdaptiveController:
         self.successful_patterns = []  # List of (parent_features, operation, gain) tuples
         self.weight_modifications = {}
 
-    def initialize_operations(self, ops):
-        """Initialize operation statistics with diversity bias."""
+    def initialize_operations(self, ops, priors: Optional[dict] = None):
+        """Initialize operation statistics with diversity bias.
+
+        When `priors` is given (op_name -> score in [0, 1]), seed both
+        success_rate and priority_score from it instead of the uniform
+        default; the EWMA updates still adapt per dataset during search.
+        """
         for dtype in ops:
             # Dynamically create op_stats entry for new op categories (agg, temporal, etc.)
             if dtype not in self.op_stats:
@@ -302,11 +339,15 @@ class ImprovedAdaptiveController:
                     self.op_stats[dtype][op_type] = {}
                 for op in ops[dtype][op_type]:
                     if op not in self.op_stats[dtype][op_type]:
-                        # Start with higher scores for rarely used operations
-                        initial_score = 0.7 if self.op_usage[op] < 5 else 0.5
+                        prior = priors.get(op) if priors else None
+                        if prior is not None:
+                            initial_score = float(prior)
+                        else:
+                            # Start with higher scores for rarely used operations
+                            initial_score = 0.7 if self.op_usage[op] < 5 else 0.5
                         self.op_stats[dtype][op_type][op] = {
-                            "success_rate": initial_score, 
-                            "avg_gain": 0.0, 
+                            "success_rate": initial_score,
+                            "avg_gain": 0.0,
                             "priority_score": initial_score,
                             "consecutive_failures": 0
                         }
@@ -666,7 +707,32 @@ class FeatureGenerator:
                  id_col: Optional[str] = None,
                  temporal_windows: Optional[list] = None,
                  random_state: int = 42,
-                 n_jobs: int = -1):
+                 n_jobs: int = -1,
+                 # --- search-efficiency upgrades ---
+                 prefilter_candidates: bool = True,
+                 near_dup_threshold: float = 0.99,
+                 prefilter_sample_rows: int = 2048,
+                 proxy_fast_mode: bool = True,
+                 proxy_max_rows: int = 5000,
+                 proxy_num_rounds: int = 30,
+                 proxy_pipeline_candidates: bool = True,
+                 elite_ranking: Literal["proxy_blend", "memory"] = "proxy_blend",
+                 cache_baseline_evals: bool = True,
+                 importance_refresh_period: int = 3,
+                 shap_refresh_period: int = 5,
+                 shap_interactions_max_pairs: int = 2000,
+                 deadline_reserve_frac: float = 0.12,
+                 # --- statistical-rigor upgrades ---
+                 fold_consistency_gate: bool = True,
+                 fold_consistency_min_frac: float = 0.65,
+                 noise_probes: int = 5,
+                 noise_probe_quantile: float = 0.5,
+                 meta_gate: bool = True,
+                 meta_gate_epsilon: float = 0.0,
+                 # --- search-quality upgrades ---
+                 use_op_priors: bool = True,
+                 warm_start_battery: bool = True,
+                 warm_start_top_k: int = 8):
 
         # Capture provided parameters
         provided_params = locals().copy()
@@ -729,6 +795,43 @@ class FeatureGenerator:
         self.use_proxy_evaluation = use_proxy_evaluation
         self.proxy_top_pct = proxy_top_pct
         self._lgb_available = None  # Lazy check
+
+        # Search-efficiency upgrades
+        self.prefilter_candidates = prefilter_candidates
+        self.near_dup_threshold = near_dup_threshold
+        self.prefilter_sample_rows = prefilter_sample_rows
+        self.proxy_fast_mode = proxy_fast_mode
+        self.proxy_max_rows = proxy_max_rows
+        self.proxy_num_rounds = proxy_num_rounds
+        self.proxy_pipeline_candidates = proxy_pipeline_candidates
+        self.elite_ranking = elite_ranking
+        self.cache_baseline_evals = cache_baseline_evals
+        self.importance_refresh_period = importance_refresh_period
+        self.shap_refresh_period = shap_refresh_period
+        self.shap_interactions_max_pairs = shap_interactions_max_pairs
+        self.deadline_reserve_frac = deadline_reserve_frac
+
+        # Statistical-rigor upgrades
+        self.fold_consistency_gate = fold_consistency_gate
+        self.fold_consistency_min_frac = fold_consistency_min_frac
+        self.noise_probes = noise_probes
+        self.noise_probe_quantile = noise_probe_quantile
+        self.meta_gate = meta_gate
+        self.meta_gate_epsilon = meta_gate_epsilon
+
+        # Search-quality upgrades
+        self.use_op_priors = use_op_priors
+        self.warm_start_battery = warm_start_battery
+        self.warm_start_top_k = warm_start_top_k
+
+        # Internal state for the upgrades (reset per run in _set_defaults)
+        self._deadline = None
+        self._baseline_eval_cache = {}
+        self._oof_cand_cache = {}
+        self._proxy_split_cache = {}
+        self._cv_epoch = 0
+        self._last_weight_refresh_gen = -10
+        self._last_shap_gen = -10
         
         # CV bias fix settings
         self.meta_validation_frac = meta_validation_frac
@@ -858,14 +961,102 @@ class FeatureGenerator:
         imp_df.sort_values(by="weighted_importance", axis=0, ascending=False, inplace=True)
         return imp_df if k == -1 else imp_df[:k]
 
-    def _eval_baseline(self, X: pd.DataFrame, y: pd.Series, pipeline=None, groups=None) -> tuple[float, float]:
-        """Evaluate baseline model performance."""
-        pipeline = pipeline.get_pipeline(X, y) if pipeline is not None else pipeline
+    @staticmethod
+    def _pipeline_signature(pipeline) -> tuple:
+        """Stable signature of a PipelineWrapper's output-feature configuration."""
+        if pipeline is None:
+            return ()
+        enc = getattr(pipeline, "encoder", None)
+        sig = []
+        if enc is not None:
+            sig.append(tuple(sorted(enc.target_enc_cols)))
+            sig.append(tuple(sorted(enc.count_enc_cols)))
+            sig.append(tuple(sorted(enc.freq_enc_cols)))
+        sig.append(tuple(sorted(gb.output_col for gb in getattr(pipeline, "groupby_encoders", []))))
+        sig.append(tuple(sorted(te.output_col for te in getattr(pipeline, "temporal_encoders", []))))
+        return tuple(sig)
+
+    def _eval_baseline_cached(self, X: pd.DataFrame, y: pd.Series, pipeline=None, groups=None,
+                              cache: bool = True) -> tuple[float, float, list]:
+        """Full-CV evaluation returning (train, val, per-fold val scores).
+
+        Results are memoized on (columns, n_rows, cv epoch, pipeline signature):
+        the generation loop evaluates the same X/pipeline at generation end and
+        again at the start of the next elite-selection pass, so caching removes
+        one full CV per generation. Per-candidate evals pass cache=False.
+        """
+        use_cache = self.cache_baseline_evals and cache and groups is None
+        key = None
+        if use_cache:
+            key = (hash(tuple(X.columns)), len(X), self._cv_epoch, self._pipeline_signature(pipeline))
+            hit = self._baseline_eval_cache.get(key)
+            if hit is not None:
+                return hit
+        pipeline_obj = pipeline.get_pipeline(X, y) if pipeline is not None else pipeline
         eval_groups = self._groups_active if groups is None else groups
         cv_dict = cross_val_score(self.baseline_model, X, y, self.scorer, cv=self.cv,
-                                 return_dict=True, pipeline=pipeline, model_fit_kwargs=self.model_fit_kwargs,
+                                 return_dict=True, pipeline=pipeline_obj, model_fit_kwargs=self.model_fit_kwargs,
                                  groups=eval_groups)
-        return cv_dict["mean_train_score"], cv_dict["mean_val_score"]
+        fold_scores = [cv_dict[k]["val_score"] for k in cv_dict if str(k).startswith("fold_")]
+        out = (cv_dict["mean_train_score"], cv_dict["mean_val_score"], fold_scores)
+        if use_cache:
+            if len(self._baseline_eval_cache) > 64:
+                self._baseline_eval_cache.clear()
+            self._baseline_eval_cache[key] = out
+        return out
+
+    def _eval_baseline(self, X: pd.DataFrame, y: pd.Series, pipeline=None, groups=None) -> tuple[float, float]:
+        """Evaluate baseline model performance."""
+        train, val, _ = self._eval_baseline_cached(X, y, pipeline, groups)
+        return train, val
+
+    def _fit_score_holdout(self, X_tr: pd.DataFrame, y_tr: pd.Series,
+                           X_ho: pd.DataFrame, y_ho: pd.Series, pipeline=None) -> float:
+        """Fit on X_tr, score on a held-out frame (mirrors one cross_val_score fold)."""
+        pipe = deepcopy(pipeline) if pipeline is not None else None
+        pipe_obj = pipe.get_pipeline(X_tr, y_tr) if pipe is not None else None
+        if pipe_obj is not None:
+            X_tr_t = pipe_obj.fit_transform(X_tr, y_tr)
+            X_ho_t = pipe_obj.transform(X_ho)
+        else:
+            X_tr_t, X_ho_t = X_tr, X_ho
+        X_tr_t = sanitize_model_features(X_tr_t)
+        X_ho_t = sanitize_model_features(X_ho_t)
+        model = deepcopy(self.baseline_model)
+        model.fit(X_tr_t, y_tr)
+        preds = model.predict_proba(X_ho_t) if self.scorer.from_probs else model.predict(X_ho_t)
+        if self.scorer.name == "categorical_crossentropy":
+            from sklearn.preprocessing import OneHotEncoder
+            oh = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+            oh.fit(np.asarray(y_tr).reshape(-1, 1))
+            y_true = oh.transform(np.asarray(y_ho).reshape(-1, 1))
+        else:
+            y_true = y_ho
+        return self.scorer.score(y_true=y_true, y_pred=preds)
+
+    def _score_feature_sets_fresh_cv(self, sets: dict, X: pd.DataFrame, y: pd.Series,
+                                     pipelines: dict) -> dict:
+        """Score candidate feature sets with fresh-partition repeated CV.
+
+        Fallback gate for datasets too small for a meta split: fold boundaries
+        the search never optimized against, averaged over two seeds.
+        """
+        n_splits = self.cv if isinstance(self.cv, int) else getattr(self.cv, "n_splits", 4)
+        scores = {}
+        for name, cols in sets.items():
+            vals = []
+            for seed_off in (777, 778):
+                cv = make_cv_splitter(int(n_splits), y, shuffle=True,
+                                      random_state=self.random_state + seed_off,
+                                      groups=self._groups_active)
+                pipe = pipelines[name]
+                pipe_obj = pipe.get_pipeline(X[cols], y) if pipe is not None else None
+                vals.append(cross_val_score(self.baseline_model, X[cols], y, self.scorer,
+                                            cv=cv, pipeline=pipe_obj,
+                                            model_fit_kwargs=self.model_fit_kwargs,
+                                            groups=self._groups_active))
+            scores[name] = float(np.mean(vals))
+        return scores
 
     def _eval_logging_scorers(self, X: pd.DataFrame, y: pd.Series, pipeline=None) -> Dict[str, Tuple[float, float]]:
         """Evaluate all logging scorers and return dict of {scorer_name: (train_score, val_score)}."""
@@ -915,7 +1106,13 @@ class FeatureGenerator:
             return "binary" if n_classes <= 2 else "multiclass"
 
     def _train_base_model_and_get_residuals(self, X, y, cv):
-        """Train base model on current features, return OOF predictions."""
+        """Train base model on current features, return OOF raw-margin predictions.
+
+        Each fold's model early-stops on a held-out slice of its own training
+        fold (never the OOF fold), so the OOF margins are calibrated rather than
+        overfit — critical because FeatureBoost deltas and the noise-probe gate
+        compare candidates against these margins in absolute terms.
+        """
         import lightgbm as lgb
         objective = self._get_lgb_objective()
         oof_preds = np.zeros(len(y))
@@ -933,75 +1130,151 @@ class FeatureGenerator:
             for col in X_train.select_dtypes(include=['object']).columns:
                 X_train[col] = X_train[col].astype('category')
                 X_val[col] = pd.Categorical(X_val[col], categories=X_train[col].cat.categories)
-            dtrain = lgb.Dataset(X_train, y.iloc[train_idx])
-            model = lgb.train(params, dtrain, num_boost_round=200)
+
+            # Nested early-stopping split inside the training fold
+            y_train = y.iloc[train_idx]
+            es_seed = self.random_state + self._cv_epoch
+            try:
+                from sklearn.model_selection import train_test_split
+                stratify = y_train if self.task != "regression" else None
+                fit_loc, es_loc = train_test_split(np.arange(len(train_idx)), test_size=0.15,
+                                                   random_state=es_seed, stratify=stratify)
+            except Exception:
+                rs = np.random.RandomState(es_seed)
+                perm = rs.permutation(len(train_idx))
+                cut = max(1, int(0.15 * len(train_idx)))
+                es_loc, fit_loc = perm[:cut], perm[cut:]
+
+            dtrain = lgb.Dataset(X_train.iloc[fit_loc], y_train.iloc[fit_loc])
+            des = lgb.Dataset(X_train.iloc[es_loc], y_train.iloc[es_loc], reference=dtrain)
+            model = lgb.train(params, dtrain, num_boost_round=500,
+                              valid_sets=[des],
+                              callbacks=[lgb.early_stopping(25, verbose=False),
+                                         lgb.log_evaluation(period=0)])
             # Must use raw margins for init_score
             oof_preds[val_idx] = model.predict(X_val, raw_score=True)
         return oof_preds
 
+    def _get_proxy_split(self, y):
+        """Deterministic per-cv-epoch (train_idx, val_idx) pair for fast proxy scoring.
+
+        Uses at most proxy_max_rows rows (stratified subsample for classification)
+        and a single 80/20 split; cached so every candidate within a generation is
+        scored on identical rows.
+        """
+        key = (self._cv_epoch, len(y))
+        cached = self._proxy_split_cache.get(key)
+        if cached is not None:
+            return cached
+
+        from sklearn.model_selection import train_test_split
+        n = len(y)
+        seed = self.random_state + 104729 * (self._cv_epoch + 1)
+        idx = np.arange(n)
+        if n > self.proxy_max_rows:
+            try:
+                if self.task != "regression":
+                    from sklearn.model_selection import StratifiedShuffleSplit
+                    sss = StratifiedShuffleSplit(n_splits=1, train_size=self.proxy_max_rows, random_state=seed)
+                    idx, _ = next(sss.split(np.zeros(n), y))
+                else:
+                    idx = np.random.RandomState(seed).choice(n, self.proxy_max_rows, replace=False)
+            except Exception:
+                idx = np.random.RandomState(seed).choice(n, self.proxy_max_rows, replace=False)
+            idx = np.sort(idx)
+
+        y_sub = np.asarray(y)[idx]
+        local = np.arange(len(idx))
+        try:
+            stratify = y_sub if self.task != "regression" else None
+            tr, va = train_test_split(local, test_size=0.2, random_state=seed, stratify=stratify)
+        except Exception:
+            tr, va = train_test_split(local, test_size=0.2, random_state=seed)
+        out = (idx[np.sort(tr)], idx[np.sort(va)])
+        self._proxy_split_cache[key] = out
+        return out
+
     def _featureboost_score(self, candidate_series, y, oof_preds, cv):
         """Score a single candidate feature via residual-based incremental training.
-        
+
         Uses the OpenFE 'FeatureBoost' trick: train a tiny single-feature LightGBM
-        with init_score set to the base model's OOF predictions.
+        with init_score set to the base model's OOF raw margins; the score is the
+        held-out metric delta. With proxy_fast_mode a single deterministic 80/20
+        split on a row subsample replaces the k-fold loop (~4-8x cheaper per
+        candidate, so far more candidates can be screened per generation).
         """
         import lightgbm as lgb
         objective = self._get_lgb_objective()
-        
-        # Prepare candidate values
+
         if hasattr(candidate_series, 'values'):
             cand_vals = candidate_series.values
         else:
             cand_vals = np.asarray(candidate_series)
-        
-        if cand_vals.ndim == 1:
-            cand_vals = cand_vals.reshape(-1, 1)
-        
-        # Skip if candidate has too many NaN/inf
-        finite_mask = np.isfinite(cand_vals.ravel())
-        if finite_mask.mean() < 0.5:
-            return -np.inf
-        
-        scores = []
+        cand_vals = np.asarray(cand_vals).ravel()
+
+        categorical = False
+        if not np.issubdtype(cand_vals.dtype, np.number):
+            # Categorical candidate (e.g. concat): integer-relabel; codes are
+            # value-independent of y so a global factorize cannot leak. -1 (NaN)
+            # is treated as missing by LightGBM for categorical features.
+            codes, _ = pd.factorize(pd.Series(cand_vals))
+            cand_vals = codes.astype(np.float64)
+            categorical = True
+        else:
+            cand_vals = cand_vals.astype(np.float64, copy=True)
+            cand_vals[~np.isfinite(cand_vals)] = np.nan  # keep NaN: LightGBM handles natively
+            if np.isnan(cand_vals).mean() > 0.5:
+                return -np.inf
+        cand_vals = cand_vals.reshape(-1, 1)
+
         params = {"objective": objective, "num_leaves": 16,
                   "verbosity": -1, "n_jobs": self.n_jobs, "learning_rate": 0.1,
                   "random_state": self.random_state}
         if objective == "multiclass":
             params["num_class"] = len(np.unique(y))
 
-        for train_idx, val_idx in cv.split(cand_vals, y, groups=self._groups_active):
+        # Fast mode pays off on larger data; below ~3k rows a single 80/20 split
+        # is too noisy and the k-fold loop is cheap anyway.
+        if self.proxy_fast_mode and len(y) >= 3000:
+            splits = [self._get_proxy_split(y)]
+            n_rounds = self.proxy_num_rounds
+        else:
+            splits = list(cv.split(cand_vals, y, groups=self._groups_active))
+            n_rounds = max(self.proxy_num_rounds, 30)
+
+        scores = []
+        for train_idx, val_idx in splits:
             try:
-                train_cand = cand_vals[train_idx].copy()
-                val_cand = cand_vals[val_idx].copy()
-                
-                # Replace non-finite with 0 for LGB
-                train_cand = np.nan_to_num(train_cand, nan=0.0, posinf=0.0, neginf=0.0)
-                val_cand = np.nan_to_num(val_cand, nan=0.0, posinf=0.0, neginf=0.0)
-                
+                train_cand = cand_vals[train_idx]
+                val_cand = cand_vals[val_idx]
                 init_train = oof_preds[train_idx]
                 init_val = oof_preds[val_idx]
-                
-                dtrain = lgb.Dataset(
-                    train_cand, y.iloc[train_idx],
-                    init_score=init_train
-                )
+
+                ds_kwargs = {"init_score": init_train}
+                if categorical:
+                    ds_kwargs["categorical_feature"] = [0]
+                dtrain = lgb.Dataset(train_cand, y.iloc[train_idx], **ds_kwargs)
                 dval = lgb.Dataset(
                     val_cand, y.iloc[val_idx],
                     init_score=init_val,
                     reference=dtrain
                 )
+                # ES on the scoring split gives every candidate the same mild
+                # optimistic bias; that cancels in ranking and in the noise gate
+                # (probes are scored identically), and is what keeps weak-signal
+                # candidates from being drowned by fixed-budget overfitting.
                 model = lgb.train(
-                    params, dtrain, num_boost_round=50,
+                    params, dtrain, num_boost_round=n_rounds,
                     valid_sets=[dval],
-                    callbacks=[lgb.early_stopping(10, verbose=False),
-                              lgb.log_evaluation(period=0)]
+                    callbacks=[lgb.early_stopping(8, verbose=False),
+                               lgb.log_evaluation(period=0)]
                 )
-                
+
                 # Score improvement: compare base predictions vs base + residual model
                 # init_val is raw margin
                 tree_margin = model.predict(val_cand, raw_score=True)
                 new_preds_margin = init_val + tree_margin
-                
+
                 if objective == "binary":
                     import scipy.special
                     base_preds = scipy.special.expit(init_val)
@@ -1016,75 +1289,336 @@ class FeatureGenerator:
 
                 base_score = self.scorer.score(y.iloc[val_idx], base_preds)
                 new_score = self.scorer.score(y.iloc[val_idx], new_preds)
-                
+
                 if self.scorer.greater_is_better:
                     scores.append(new_score - base_score)
                 else:
                     scores.append(base_score - new_score)  # Lower is better, so improvement = base - new
             except Exception:
                 scores.append(-np.inf)
-        
+
         return np.mean(scores) if scores else -np.inf
+
+    def _compute_oof_candidate_values(self, inter, X, y, cv):
+        """Leakage-free out-of-fold values for a pipeline-required candidate.
+
+        Fits the candidate's encoder on each training fold and transforms the
+        held-out fold — exactly what the full-CV pipeline would produce — so the
+        resulting vector can be FeatureBoost-scored like any lambda candidate.
+        Returns None when the candidate type is unsupported or computation fails.
+        """
+        cached = self._oof_cand_cache.get(inter.name)
+        if cached is not None:
+            return cached
+
+        oof = np.full(len(X), np.nan, dtype=float)
+        try:
+            for tr, va in cv.split(X, y, groups=self._groups_active):
+                X_tr, X_va = X.iloc[tr], X.iloc[va]
+                if getattr(inter, 'is_agg', False) and inter.feature_2 is not None:
+                    agg_func = inter.op.replace("groupby_", "")
+                    enc = GroupByEncoder(cat_col=inter.feature_1.name, num_col=inter.feature_2.name,
+                                         agg_func=agg_func, output_col=inter.name)
+                    enc.fit(X_tr)
+                    vals = enc.transform(X_va)[inter.name].to_numpy(dtype=float)
+                elif getattr(inter, 'is_temporal', False):
+                    enc = TemporalEncoder(col=inter.feature_1.name, id_col=self.id_col,
+                                          time_col=self.time_col, op_name=inter.op, output_col=inter.name)
+                    enc.fit(X_tr)
+                    vals = enc.transform(X_va)[inter.name].to_numpy(dtype=float)
+                elif inter.op == "target":
+                    import category_encoders as ce
+                    col = inter.feature_1.name
+                    y_tr = y.iloc[tr]
+                    if self.task != "regression":
+                        # Ordinal relabel: exact for binary; for multiclass this is a
+                        # biased but monotone-informative screening proxy (the full
+                        # evaluation still uses the real per-class encoder).
+                        y_tr = pd.Series(pd.factorize(y_tr, sort=True)[0], index=y_tr.index)
+                    enc = ce.TargetEncoder(cols=[col], handle_unknown='value', handle_missing='value')
+                    enc.fit(X_tr[[col]], y_tr)
+                    vals = enc.transform(X_va[[col]])[col].to_numpy(dtype=float)
+                elif inter.op in ("count", "freq"):
+                    import category_encoders as ce
+                    col = inter.feature_1.name
+                    enc = ce.CountEncoder(cols=[col], normalize=(inter.op == "freq"),
+                                          handle_unknown='value', handle_missing='value')
+                    enc.fit(X_tr[[col]])
+                    vals = enc.transform(X_va[[col]])[col].to_numpy(dtype=float)
+                else:
+                    return None
+                oof[va] = vals
+        except Exception:
+            return None
+
+        self._oof_cand_cache[inter.name] = oof
+        return oof
+
+    def _noise_probe_threshold(self, X, y, cv):
+        """Quantile of FeatureBoost scores over synthetic junk features (B3 gate).
+
+        Candidates that cannot beat permuted/random noise are indistinguishable
+        from selection noise and are screened out before any full CV is spent.
+        Probes are scored through the exact same path as candidates, so shared
+        biases cancel; a quantile (not the max) keeps one lucky probe from
+        blocking everything on small/noisy data.
+        """
+        if self.noise_probes <= 0:
+            return None
+        num_cols = X.select_dtypes(include=['number']).columns.tolist()
+        noise_scores = []
+        for j in range(self.noise_probes):
+            rs = np.random.RandomState(self.random_state * 1000 + self._cv_epoch * 17 + j)
+            if num_cols and j < self.noise_probes - 1:
+                col = num_cols[rs.randint(len(num_cols))]
+                probe = rs.permutation(X[col].to_numpy(dtype=float, na_value=np.nan))
+            else:
+                probe = rs.normal(size=len(X))
+            try:
+                s = self._featureboost_score(probe, y, self._current_oof_preds, cv)
+            except Exception:
+                continue
+            if np.isfinite(s):
+                noise_scores.append(s)
+        if not noise_scores:
+            return None
+        return float(np.quantile(noise_scores, self.noise_probe_quantile))
+
+    def _prefilter_candidates(self, batch: list, X: pd.DataFrame) -> list:
+        """Drop candidates that cannot add information before any model is fit.
+
+        Filters (microseconds each, vs ~0.1s per proxy fit / ~1s per full CV):
+          - duplicate names within the batch / already-existing columns
+          - operand-order mirrors of symmetric/antisymmetric ops (a+b vs b+a)
+          - >50% NaN, near-constant values on a row sample
+          - near-duplicates (|Spearman| > near_dup_threshold) of parent columns,
+            top existing numeric columns, or earlier candidates in the batch,
+            unless their NaN patterns differ materially (NaN masks can carry signal)
+        """
+        if not self.prefilter_candidates or not batch:
+            return batch
+
+        existing = set(X.columns)
+        dropped = Counter()
+        kept = []
+        seen_keys = set()
+        for inter in batch:
+            name = inter.name
+            if name in existing or name in getattr(self, 'pruned_features', set()):
+                dropped['already_exists'] += 1
+                continue
+            if inter.feature_2 is not None and inter.op in SYMMETRIC_OPS | ANTISYMMETRIC_OPS:
+                key = (inter.op, frozenset((inter.feature_1.name, inter.feature_2.name)))
+                mirror = f"{inter.feature_2.name}_{inter.op}_{inter.feature_1.name}"
+                if mirror in existing:
+                    dropped['mirror_exists'] += 1
+                    continue
+            else:
+                key = name
+            if key in seen_keys:
+                dropped['dup_in_batch'] += 1
+                continue
+            seen_keys.add(key)
+            kept.append(inter)
+
+        # --- value-based screening on a row sample (lambda candidates only) ---
+        n_sample = min(self.prefilter_sample_rows, len(X))
+        if n_sample >= 50:
+            gen_num = self.state['counters'].get('current_gen', 0) if hasattr(self, 'state') else 0
+            rs = np.random.RandomState(self.random_state + 31 * self._cv_epoch + gen_num)
+            sample_idx = rs.choice(len(X), size=n_sample, replace=False) if len(X) > n_sample else np.arange(len(X))
+            X_sample = X.iloc[sample_idx]
+
+            # Reference block: parents of the batch + top existing numeric columns
+            num_cols = X_sample.select_dtypes(include=['number']).columns.tolist()
+            ref_cols = num_cols[:150]
+            ref_ranks, ref_names = [], []
+            for c in ref_cols:
+                col = X_sample[c]
+                r = col.rank(pct=True).to_numpy(dtype=float, copy=True)
+                nan_mask = np.isnan(r)
+                r[nan_mask] = 0.5
+                sd = r.std()
+                if sd > 1e-12:
+                    ref_ranks.append((r - r.mean()) / sd)
+                    ref_names.append(c)
+            ref_block = np.column_stack(ref_ranks) if ref_ranks else None
+
+            survivors = []
+            kept_ranks = []   # accepted candidates this batch, for cand-vs-cand dedup
+            kept_nan_counts = []
+            for inter in kept:
+                if inter.require_pipeline:
+                    survivors.append(inter)
+                    continue
+                try:
+                    vals = inter.generate(X_sample)
+                    vals = np.asarray(vals).ravel()
+                except Exception:
+                    dropped['generate_failed'] += 1
+                    continue
+                if not np.issubdtype(vals.dtype, np.number):
+                    survivors.append(inter)  # categorical (concat): name-dedup only
+                    continue
+                vals = vals.astype(float)
+                vals[~np.isfinite(vals)] = np.nan
+                nan_count = int(np.isnan(vals).sum())
+                if nan_count > 0.5 * n_sample:
+                    dropped['too_many_nan'] += 1
+                    continue
+                finite = vals[~np.isnan(vals)]
+                if finite.size == 0 or np.nanstd(vals) < 1e-12:
+                    dropped['constant'] += 1
+                    continue
+                _, counts = np.unique(finite, return_counts=True)
+                if counts.max() / n_sample > 0.995:
+                    dropped['near_constant'] += 1
+                    continue
+
+                r = pd.Series(vals).rank(pct=True).to_numpy(dtype=float, copy=True)
+                r[np.isnan(r)] = 0.5
+                sd = r.std()
+                if sd < 1e-12:
+                    dropped['constant'] += 1
+                    continue
+                r = (r - r.mean()) / sd
+
+                is_dup = False
+                if ref_block is not None:
+                    corrs = np.abs(ref_block.T @ r) / n_sample
+                    j = int(np.argmax(corrs))
+                    if corrs[j] > self.near_dup_threshold:
+                        ref_nan = int(X_sample[ref_names[j]].isna().sum()) if ref_names[j] in X_sample.columns else 0
+                        if abs(nan_count - ref_nan) <= 0.01 * n_sample:
+                            is_dup = True
+                if not is_dup and kept_ranks:
+                    block = np.column_stack(kept_ranks)
+                    corrs = np.abs(block.T @ r) / n_sample
+                    j = int(np.argmax(corrs))
+                    if corrs[j] > self.near_dup_threshold and abs(nan_count - kept_nan_counts[j]) <= 0.01 * n_sample:
+                        is_dup = True
+                if is_dup:
+                    dropped['near_duplicate'] += 1
+                    continue
+
+                survivors.append(inter)
+                kept_ranks.append(r)
+                kept_nan_counts.append(nan_count)
+            kept = survivors
+
+        if dropped:
+            total_dropped = sum(dropped.values())
+            self._log(f"  Prefilter: dropped {total_dropped}/{len(batch)} candidates ({dict(dropped)})")
+        return kept
 
     def _proxy_screen_candidates(self, batch, X, y):
         """Pre-filter candidates using FeatureBoost proxy scoring.
-        
-        Returns the top proxy_top_pct fraction of non-pipeline candidates,
-        plus all pipeline-required candidates (which skip proxy).
+
+        Lambda candidates are scored on directly-generated values; pipeline-
+        required candidates (groupby/target/freq/count/temporal) are scored on
+        leakage-free OOF values instead of bypassing the screen (they are the
+        most expensive to full-CV and often the most valuable). Survivors are
+        the top proxy_top_pct that also beat the best noise probe; every scored
+        candidate keeps its score in `_proxy_score` for evaluation ordering.
         """
         if not self.use_proxy_evaluation or not self._check_lgb_available():
             return batch
-        
-        # Separate pipeline-required (skip proxy) from scorable candidates
+
+        # Separate pipeline-required from directly scorable candidates
         pipeline_candidates = [i for i in batch if i.require_pipeline]
         scorable_candidates = [i for i in batch if not i.require_pipeline]
-        
-        if len(scorable_candidates) <= 5:
+
+        n_screenable = len(scorable_candidates)
+        if self.proxy_pipeline_candidates:
+            n_screenable += len(pipeline_candidates)
+        if n_screenable <= 5:
             return batch  # Not enough to filter
-        
+
         try:
-            # Get CV splitter
             cv = self._get_cv_splitter()
-            
+
             # Train base model and get OOF predictions (once per generation)
             if not hasattr(self, '_current_oof_preds') or self._oof_preds_stale:
                 self._current_oof_preds = self._train_base_model_and_get_residuals(X, y, cv)
                 self._oof_preds_stale = False
-            
-            # Score each scorable candidate
+
+            noise_thr = self._noise_probe_threshold(X, y, cv)
+
             fb_scores = {}
+            unscreened = []   # pipeline candidates we could not score -> pass through
+            deadline_hit = False
+
             for interaction in scorable_candidates:
+                if self._deadline is not None and self._deadline.soft_exceeded():
+                    deadline_hit = True
+                    break
                 try:
-                    # Generate candidate values
                     parent_names = [interaction.feature_1.name]
                     if interaction.feature_2 is not None:
                         parent_names.append(interaction.feature_2.name)
-                    
                     if not all(p in X.columns for p in parent_names):
                         continue
-                    
+
                     name, vals = self._feature_cache.get_or_compute(
                         parent_names, interaction.op,
                         lambda inter=interaction: (inter.name, inter.generate(X))
                     )
-                    
-                    score = self._featureboost_score(
-                        vals, y, self._current_oof_preds, cv
-                    )
+                    score = self._featureboost_score(vals, y, self._current_oof_preds, cv)
+                    interaction._proxy_score = float(score)
                     fb_scores[id(interaction)] = (interaction, score)
                 except Exception:
                     pass  # Skip failed candidates
-            
+
+            if self.proxy_pipeline_candidates:
+                for interaction in pipeline_candidates:
+                    if deadline_hit or (self._deadline is not None and self._deadline.soft_exceeded()):
+                        deadline_hit = True
+                        break
+                    try:
+                        oof_vals = self._compute_oof_candidate_values(interaction, X, y, cv)
+                        if oof_vals is None:
+                            unscreened.append(interaction)
+                            continue
+                        score = self._featureboost_score(oof_vals, y, self._current_oof_preds, cv)
+                        interaction._proxy_score = float(score)
+                        fb_scores[id(interaction)] = (interaction, score)
+                    except Exception:
+                        unscreened.append(interaction)
+            else:
+                unscreened = list(pipeline_candidates)
+
             if not fb_scores:
-                return batch
-            
-            # Keep top proxy_top_pct
-            n_keep = max(3, int(len(fb_scores) * self.proxy_top_pct))
-            sorted_candidates = sorted(fb_scores.values(), key=lambda x: x[1], reverse=True)
-            top_candidates = [interaction for interaction, _ in sorted_candidates[:n_keep]]
-            
-            return top_candidates + pipeline_candidates
-            
+                return batch if not deadline_hit else unscreened
+
+            scored = list(fb_scores.values())
+            if noise_thr is not None:
+                passed = [(i, s) for i, s in scored if np.isfinite(s) and s > noise_thr]
+            else:
+                passed = [(i, s) for i, s in scored if np.isfinite(s)]
+
+            n_keep = max(3, int(len(scored) * self.proxy_top_pct))
+            top = sorted(passed, key=lambda t: t[1], reverse=True)[:n_keep]
+            top_candidates = [i for i, _ in top]
+
+            # Floor: keep the best few noise-passing pipeline candidates alive even
+            # if the joint cut starves them (OOF scoring can be conservative).
+            if self.proxy_pipeline_candidates and pipeline_candidates:
+                pipe_in_top = sum(1 for i in top_candidates if i.require_pipeline)
+                if pipe_in_top < 3:
+                    pipe_passed = sorted([(i, s) for i, s in passed if i.require_pipeline],
+                                         key=lambda t: t[1], reverse=True)
+                    for i, _ in pipe_passed[:3]:
+                        if i not in top_candidates:
+                            top_candidates.append(i)
+
+            n_noise_blocked = len(scored) - len(passed)
+            if noise_thr is not None and n_noise_blocked:
+                self._log(f"  Noise gate: {n_noise_blocked}/{len(scored)} candidates below noise threshold")
+            if deadline_hit:
+                self._log(f"  Proxy screening stopped early (time budget): scored {len(scored)}")
+
+            return top_candidates + unscreened
+
         except Exception as e:
             self._log(f"  Proxy screening failed ({e}), falling back to full evaluation")
             return batch
@@ -1106,29 +1640,40 @@ class FeatureGenerator:
 
     def _final_regularized_selection(self, X, y):
         """After search, use L1 regularization + tree importance to jointly select the best feature subset.
-        
+
         Only applies when ≥10 generated features exist. Original features are always kept.
-        Returns a list of features to drop (generated features that didn't survive selection).
+        Returns (drop_union, drop_strict): generated features outside the L1∪tree
+        selection and outside the stricter L1∩tree selection, respectively; the
+        finalization gate picks between them on held-out data.
         """
         generated_features = [col for col in X.columns if col not in self.initial_features]
-        
+
         if len(generated_features) < 10:
-            return []  # Not enough generated features to warrant selection
-        
+            return [], []  # Not enough generated features to warrant selection
+
         self._log(f"Regularized post-selection: evaluating {len(generated_features)} generated features...")
-        
+
         try:
             from sklearn.preprocessing import StandardScaler
-            
+
             # Prepare data — only numeric columns
             numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
             if len(numeric_cols) < 3:
-                return []
+                return [], []
             
             X_numeric = X[numeric_cols].copy()
             X_numeric = X_numeric.fillna(X_numeric.median())
             X_numeric = X_numeric.replace([np.inf, -np.inf], 0)
-            
+
+            # Subsample for the selector fits: LassoCV/LogisticRegressionCV on
+            # 50k rows costs minutes for no extra selection stability.
+            y_sel = y
+            if len(X_numeric) > 15000:
+                rs = np.random.RandomState(self.random_state)
+                sub = np.sort(rs.choice(len(X_numeric), 15000, replace=False))
+                X_numeric = X_numeric.iloc[sub]
+                y_sel = y.iloc[sub]
+
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X_numeric)
             
@@ -1138,13 +1683,13 @@ class FeatureGenerator:
                 if self.task == "regression":
                     from sklearn.linear_model import LassoCV
                     model = LassoCV(cv=5, alphas=np.logspace(-4, 1, 50), max_iter=10000, n_jobs=self.n_jobs)
-                    model.fit(X_scaled, y)
+                    model.fit(X_scaled, y_sel)
                     coef_mask = np.abs(model.coef_) > 1e-6
                 else:
                     from sklearn.linear_model import LogisticRegressionCV
                     model = LogisticRegressionCV(cv=5, penalty='l1', solver='saga',
                                                  max_iter=5000, n_jobs=self.n_jobs, Cs=50)
-                    model.fit(X_scaled, y)
+                    model.fit(X_scaled, y_sel)
                     # For multi-class, take absolute max across classes
                     if model.coef_.ndim > 1:
                         coef_mask = np.abs(model.coef_).max(axis=0) > 1e-6
@@ -1172,7 +1717,7 @@ class FeatureGenerator:
                         tree_model = LGBMRegressor(n_estimators=300, max_depth=6, n_jobs=self.n_jobs, verbose=-1)
                     else:
                         tree_model = LGBMClassifier(n_estimators=300, max_depth=6, n_jobs=self.n_jobs, verbose=-1)
-                tree_model.fit(X_numeric, y)
+                tree_model.fit(X_numeric, y_sel)
                 importances = pd.Series(tree_model.feature_importances_, index=numeric_cols)
                 # Keep top-K where K = number of L1-selected features (or at least initial features count)
                 n_keep = max(len(l1_selected), len(self.initial_features))
@@ -1182,31 +1727,28 @@ class FeatureGenerator:
                 self._log(f"  Tree importance failed: {e}")
                 tree_selected = set(numeric_cols)
             
-            # Final set: union of L1 and tree selected
-            selected = l1_selected | tree_selected
-            
-            # Original features are ALWAYS kept
-            selected.update(self.initial_features)
-            
-            # Also keep non-numeric generated features (categorical encodings, etc.)
+            # Union (permissive) and intersection (strict) of the two selectors;
+            # original and non-numeric generated features are always kept.
             non_numeric_generated = [col for col in generated_features if col not in numeric_cols]
-            selected.update(non_numeric_generated)
-            
-            # Features to drop
-            features_to_drop = [col for col in generated_features 
-                               if col in numeric_cols and col not in selected]
-            
-            if features_to_drop:
-                self._log(f"  Regularized selection: dropping {len(features_to_drop)} weak generated features")
-                self._log(f"  Dropped: {features_to_drop}")
+
+            keep_union = (l1_selected | tree_selected) | set(self.initial_features) | set(non_numeric_generated)
+            keep_strict = (l1_selected & tree_selected) | set(self.initial_features) | set(non_numeric_generated)
+
+            drop_union = [col for col in generated_features
+                          if col in numeric_cols and col not in keep_union]
+            drop_strict = [col for col in generated_features
+                           if col in numeric_cols and col not in keep_strict]
+
+            if drop_union:
+                self._log(f"  Regularized selection: union drops {len(drop_union)}, strict drops {len(drop_strict)} generated features")
             else:
-                self._log(f"  Regularized selection: all generated features retained")
-            
-            return features_to_drop
-            
+                self._log(f"  Regularized selection: all generated features retained (strict would drop {len(drop_strict)})")
+
+            return drop_union, drop_strict
+
         except Exception as e:
             self._log(f"  Regularized post-selection failed: {e}")
-            return []
+            return [], []
 
     def _softmax_temp_sampling(self, pool, weights, n=1, tau=0.5) -> list:
         """Sample items using softmax temperature sampling."""
@@ -1323,7 +1865,45 @@ class FeatureGenerator:
             
         return unary_features, feature_pairs[:n]
 
-    def _sample_children_with_creativity(self, candidates_pool: List[Interaction], n=200, 
+    def _build_warm_start_battery(self, generation: List[Feature], X: pd.DataFrame) -> List[Interaction]:
+        """Deterministic gen-0 candidate battery over the top-importance features.
+
+        Families chosen for their hit rate with GBDT learners: pairwise
+        sub/mul/div (both div orders) of the top numeric features, group-by
+        statistics of top categorical x numeric pairs, target/freq/count
+        encodings of categoricals, and (when configured) temporal ops.
+        """
+        nums = [f for f in generation if f.dtype == "num" and f.name in X.columns][:self.warm_start_top_k]
+        cats = [f for f in generation if f.dtype == "cat" and f.name in X.columns][:max(4, self.warm_start_top_k // 2)]
+        batt: List[Interaction] = []
+
+        for f1, f2 in combinations(nums, 2):
+            batt.append(Interaction(f1, "sub", f2))
+            batt.append(Interaction(f1, "mul", f2))
+            batt.append(Interaction(f1, "div", f2))
+            batt.append(Interaction(f2, "div", f1))
+
+        if "agg" in self.ops and cats and nums:
+            agg_ops = [op for op in ("groupby_mean", "groupby_std", "groupby_zscore")
+                       if op in self.ops["agg"]["binary"]]
+            for c in cats:
+                for nf in nums[:6]:
+                    for op in agg_ops:
+                        batt.append(Interaction(c, op, nf))
+
+        enc_ops = [op for op in ("target", "freq", "count") if op in self.ops.get("cat", {}).get("unary", [])]
+        for c in cats:
+            for enc_op in enc_ops:
+                batt.append(Interaction(c, enc_op))
+
+        if self.time_col and self.id_col and "temporal" in self.ops:
+            for nf in nums[:4]:
+                for op in self.ops["temporal"]["unary"][:6]:
+                    batt.append(Interaction(nf, op))
+
+        return batt
+
+    def _sample_children_with_creativity(self, candidates_pool: List[Interaction], n=200,
                                        tau=0.7, force_creative=False) -> List[Interaction]:
         """Enhanced child sampling with creativity injection."""
         if not candidates_pool:
@@ -1362,18 +1942,31 @@ class FeatureGenerator:
             
             result = []
             if creative_candidates:
-                weights = [i.weight for i in creative_candidates]
+                weights = self._candidate_sampling_weights(creative_candidates)
                 result.extend(self._softmax_temp_sampling(creative_candidates, weights, n_creative, tau * 1.5))
-            
+
             if normal_candidates and len(result) < n:
-                weights = [i.weight for i in normal_candidates]
+                weights = self._candidate_sampling_weights(normal_candidates)
                 result.extend(self._softmax_temp_sampling(normal_candidates, weights, n - len(result), tau))
-            
+
             return result
         else:
             # Normal sampling
-            weights = [i.weight for i in candidates_pool]
+            weights = self._candidate_sampling_weights(candidates_pool)
             return self._softmax_temp_sampling(candidates_pool, weights, n, tau)
+
+    def _candidate_sampling_weights(self, pool: List[Interaction]) -> list:
+        """Sampling weights for candidate interactions.
+
+        With op priors enabled, parent importance is modulated by the operator's
+        (prior-seeded, EWMA-updated) priority so that high-yield op families
+        (ratios, group-bys, encodings) receive more of the generation budget than
+        monotone unary transforms that GBDT learners are invariant to.
+        """
+        if not self.use_op_priors:
+            return [i.weight for i in pool]
+        ctrl = self.adaptive_controller
+        return [i.weight * (0.25 + 0.75 * ctrl._get_op_priority_score(i.op)) for i in pool]
 
     def _creative_hopeful_monster(self, X: pd.DataFrame, y: pd.Series, generation: list, 
                                 n_features: int = 10, callback: Optional[Callable] = None) -> tuple[list, pd.DataFrame, PipelineWrapper]:
@@ -1591,12 +2184,27 @@ class FeatureGenerator:
             return [], X, self.pipeline
             
         pipe_ext = self._extend_pipeline(self.pipeline, pipe_batch)
-        
+
         # Use memory-aware ranking
         ranked = self.adaptive_controller.rank_candidates_with_memory(valid_batch, X, y)
 
+        # Blend in proxy scores when available: full-CV evaluation order should be
+        # driven by the strongest available signal so that the consecutive-failure
+        # early stop fires only after the most promising candidates were tried.
+        if self.elite_ranking == "proxy_blend":
+            scored = [i for i in valid_batch
+                      if np.isfinite(getattr(i, '_proxy_score', np.nan))]
+            if len(scored) >= max(3, int(0.5 * len(valid_batch))):
+                proxy_rank = {id(i): r for r, i in
+                              enumerate(sorted(scored, key=lambda i: -i._proxy_score))}
+                median_rank = len(scored) / 2.0
+                mem_rank = {id(i): r for r, i in enumerate(ranked)}
+                ranked = sorted(valid_batch,
+                                key=lambda i: 0.8 * proxy_rank.get(id(i), median_rank)
+                                            + 0.2 * mem_rank[id(i)])
+
         # Selection loop with adaptive threshold
-        _, best_val = self._eval_baseline(X, y, self.pipeline)
+        _, best_val, base_fold_scores = self._eval_baseline_cached(X, y, self.pipeline)
         selected, X_base = [], X.copy()
         evals = consec_no_gain = 0
         
@@ -1623,11 +2231,13 @@ class FeatureGenerator:
         for inter in ranked:
             if hasattr(self, 'stop_requested') and self.stop_requested:
                 break
-                
+            if self._deadline is not None and self._deadline.soft_exceeded():
+                break
+
             evals += 1
             if callback and callback(evals, len(selected)):
                 break
-                
+
             if len(selected) >= n or not all(feat in X_base.columns for feat in ([inter.feature_1.name] + ([inter.feature_2.name] if inter.feature_2 else []))):
                 continue
 
@@ -1635,33 +2245,45 @@ class FeatureGenerator:
             X_try = X_base.copy()
             if not inter.require_pipeline and inter.name in X_copy.columns:
                 X_try[inter.name] = X_copy[inter.name].values
-            
+
             # Check for duplicates before evaluation
             if X_try.columns.duplicated().any():
                 self._log(f"Warning: Duplicate columns in X_try for {inter.name}, skipping")
                 continue
-                
+
             pipe_iter = self._extend_pipeline(self.pipeline, self._prepare_pipeline([inter] + selected))
-            
+
             try:
-                _, new_val = self._eval_baseline(X_try, y, pipe_iter)
+                _, new_val, fold_scores = self._eval_baseline_cached(X_try, y, pipe_iter, cache=False)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 self._log(f"Error evaluating {inter.name}: {str(e)}")
                 continue
-            
+
             delta = (new_val - best_val) if self.scorer.greater_is_better else (best_val - new_val)
             gain = delta / (abs(best_val) + 1e-8)
-            
+
             # Use adaptive threshold
             success = gain >= self.adaptive_controller.get_adaptive_min_gain()
-            
+
+            # Fold-consistency gate: a real feature should help most folds, not
+            # ride one lucky fold's noise (selection-overfitting guard).
+            if success and self.fold_consistency_gate and len(fold_scores) >= 2 \
+                    and len(fold_scores) == len(base_fold_scores):
+                sgn = 1.0 if self.scorer.greater_is_better else -1.0
+                n_pos = sum(1 for new_f, base_f in zip(fold_scores, base_fold_scores)
+                            if sgn * (new_f - base_f) > 0)
+                needed = int(np.ceil(self.fold_consistency_min_frac * len(fold_scores)))
+                if n_pos < needed:
+                    success = False
+
             self.adaptive_controller.update_operation_stats(inter, success=success, gain=gain)
-            
+
             if success:
                 selected.append(inter)
                 X_base, best_val, consec_no_gain = X_try, new_val, 0
+                base_fold_scores = fold_scores
             else:
                 consec_no_gain += 1
 
@@ -1903,6 +2525,7 @@ class FeatureGenerator:
         start_time = time.time()
         X = self._drop_id_columns(X)
         self._set_defaults(X, y)
+        self._deadline = _SearchDeadline(start_time, self.time_budget, self.deadline_reserve_frac)
         self.cv = normalize_rotatable_splitter(self.cv)
         self.initial_features = list(X.columns)
         num_cols, cat_cols = self._get_num_cat_cols(X)
@@ -1942,6 +2565,7 @@ class FeatureGenerator:
 
         # Meta-validation split (CV bias fix)
         X_meta, y_meta, groups_meta = None, None, None
+        self._pre_meta_index = X.index.copy()
         if self.meta_validation_frac > 0 and len(X) > 2000:
             try:
                 split_meta = getattr(self.cv, "split_meta", None)
@@ -1980,7 +2604,8 @@ class FeatureGenerator:
 
         self._log(f"Starting {self.task} on {self.device} - {X.shape[0]} samples, {X.shape[1]} features")
         self._log(f"Params: gen={self.n_generations}, parents={self.n_parents}, children={self.n_children}, limit={self.max_gen_new_feats}, time_budget={self.time_budget}s.")
-        self.adaptive_controller.initialize_operations(self.ops)
+        self.adaptive_controller.initialize_operations(
+            self.ops, priors=DEFAULT_OP_PRIORS if self.use_op_priors else None)
         self.adaptive_controller.reset_for_new_run()
         self.state['best']['train_score'], self.state['best']['val_score'] = self._eval_baseline(X, y, self.pipeline)
         gen0_log = f"Gen 0: Train {self.scorer.name}={self.state['best']['train_score']:.5f}, Val {self.scorer.name}={self.state['best']['val_score']:.5f}"
@@ -1992,11 +2617,51 @@ class FeatureGenerator:
         self.state['best']['pruned_features'] = getattr(self, 'pruned_features', set()).copy()
         
         # Initialize interactions and generation
-        self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
+        self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=self.shap_interactions_max_pairs)
+        self._last_shap_gen = 0
         top_feats_df = self._get_top_k_features(X, y, k=2*self.n_parents, pipeline=self.pipeline)
-        generation = [Feature(name=feat, dtype="num" if feat in num_cols else "cat", 
+        generation = [Feature(name=feat, dtype="num" if feat in num_cols else "cat",
                              weight=top_feats_df.loc[feat, "weighted_importance"]) for feat in top_feats_df.index]
         self.state['best']['generation'] = generation.copy()
+        self._last_weight_refresh_gen = 0
+
+        # Gen-0 warm-start battery: deterministically enumerate the highest-prior
+        # candidate families (pairwise ratios/differences/products of top numerics,
+        # group-by statistics, categorical encodings) and push them through the
+        # standard prefilter -> proxy -> greedy-CV path before adaptive search
+        # begins. Under tight budgets this front-loads the highest-hit-rate
+        # families (OpenFE's whole search is essentially this enumeration).
+        if self.warm_start_battery and not self._deadline.soft_exceeded():
+            try:
+                batt = self._build_warm_start_battery(generation, X)
+                batt = self._prefilter_candidates(batt, X)
+                batt = self._proxy_screen_candidates(batt, X, y)
+                if batt:
+                    cap = max(1, min(20, self.max_gen_new_feats if self.max_gen_new_feats != float('inf') else 20))
+                    elites0, X, self.pipeline = self._select_elites(batt, cap, X, y, None)
+                    if elites0:
+                        for inter in elites0:
+                            feat = inter.get_new_feature_instance()
+                            feat.set_generating_interaction(inter)
+                            generation.append(feat)
+                        self.state['counters']['total_new_features'] = X.shape[1] - len(self.initial_features)
+                        tr0, val0, _ = self._eval_baseline_cached(X, y, self.pipeline)
+                        delta0 = (val0 - self.state['best']['val_score']) if self.scorer.greater_is_better \
+                                 else (self.state['best']['val_score'] - val0)
+                        if delta0 > 0:
+                            self.state['best'].update(val_score=val0, train_score=tr0)
+                            self._sync_state_components(X, self.pipeline, generation)
+                            self._save_current_as_best()
+                            self._oof_preds_stale = True
+                            self._log(f"Gen 0 warm-start: +{len(elites0)} features "
+                                      f"({[i.name for i in elites0]}), Val {self.scorer.name}={val0:.5f}")
+                        else:
+                            self._log("Gen 0 warm-start: no joint improvement, reverting.")
+                            if self._revert_to_best():
+                                X, generation = self.X, self.generation
+                                self.state['counters']['total_new_features'] = X.shape[1] - len(self.initial_features)
+            except Exception as e:
+                self._log(f"Gen 0 warm-start battery failed ({e}); continuing with adaptive search.")
 
         # Main loop
         stagnation_counter = 0
@@ -2012,8 +2677,8 @@ class FeatureGenerator:
                     self._log(f"🛑 Generation stopped by user request at generation {N}")
                     break
                 
-                if self.time_budget and (time.time() - start_time) > self.time_budget:
-                    self._log(f"Time budget exceeded. Stopping.")
+                if self._deadline.soft_exceeded():
+                    self._log(f"Time budget reached (finalization reserve kept). Stopping search loop.")
                     break
                 
                 progress = N / self.n_generations
@@ -2048,6 +2713,10 @@ class FeatureGenerator:
                         self._log(f"  CV fold rotation skipped for {type(self.cv).__name__}")
                     else:
                         self._oof_preds_stale = True
+                        self._cv_epoch += 1
+                        self._oof_cand_cache.clear()
+                        self._proxy_split_cache.clear()
+                        self._baseline_eval_cache.clear()
                         self._log(f"  CV fold rotation: rotated to {type(self.cv).__name__}")
                 
                 # Check for restart conditions
@@ -2083,7 +2752,7 @@ class FeatureGenerator:
                     self._log(f"  Attempting creative hopeful monster...")
                     
                     def monster_callback(ec, sc, force_complete=False):
-                        return self.time_budget and (time.time() - start_time) > self.time_budget
+                        return self._deadline.soft_exceeded()
                     
                     # Use enhanced creative hopeful monster
                     monster_elites, X_monster, pipe_monster = self._creative_hopeful_monster(
@@ -2121,7 +2790,9 @@ class FeatureGenerator:
                             
                             self._sync_state_components(X, self.pipeline, generation)
                             self._save_current_as_best()
-                            self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
+                            if (N - self._last_shap_gen) >= self.shap_refresh_period and self._deadline.remaining_frac() > 0.35:
+                                self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=self.shap_interactions_max_pairs)
+                                self._last_shap_gen = N
 
                             for elite in elites:
                                 self.adaptive_controller.update_operation_stats(elite, success=True, gain=delta/(abs(best_score) + 1e-8))
@@ -2184,7 +2855,10 @@ class FeatureGenerator:
 
                     # Enhanced child sampling
                     batch = self._sample_children_with_creativity(candidates_pool, self.n_children, tau=tau)
-                    
+
+                    # Phase 0: free filters (dedup/constant/near-duplicate)
+                    batch = self._prefilter_candidates(batch, X)
+
                     # Phase 1: Proxy screening (fast FeatureBoost pre-filter)
                     n_before_proxy = len(batch)
                     batch = self._proxy_screen_candidates(batch, X, y)
@@ -2202,7 +2876,7 @@ class FeatureGenerator:
                         def update_callback(ec, sc, force_complete=False):
                             inner_pbar.update(max(0, ec - inner_pbar.n if not force_complete else len(batch) - inner_pbar.n))
                             inner_pbar.set_description(f"Evaluating features - Selected: {sc}")
-                            return self.time_budget and (time.time() - start_time) > self.time_budget
+                            return self._deadline.soft_exceeded()
 
                         elites, X, self.pipeline = self._select_elites(batch, features_per_gen, X, y, update_callback)
                         self._oof_preds_stale = True  # Mark OOF preds as stale after features change
@@ -2224,14 +2898,26 @@ class FeatureGenerator:
                         feat.set_generating_interaction(interaction)
                         new_generation.append(feat)
                     
-                    # Update weights if changes made
+                    # Update weights if changes made. The full importance analysis
+                    # (multiple CV model fits) is throttled to every
+                    # importance_refresh_period generations; in between, new
+                    # features inherit their interaction weight and old ones decay.
                     if new_feature_names or elites:
-                        weights = self._get_top_k_features(X, y, k=-1, pipeline=self.pipeline)
-                        for feat in new_generation:
-                            if feat.name in weights.index:
-                                feat.update_weight(weights.loc[feat.name, "weighted_importance"])
-                            elif hasattr(feat, 'weight') and feat.weight > 0:
-                                feat.update_weight(feat.weight * 0.95)
+                        refresh_due = ((N - self._last_weight_refresh_gen) >= self.importance_refresh_period
+                                       or len(elites) >= 5)
+                        if refresh_due:
+                            weights = self._get_top_k_features(X, y, k=-1, pipeline=self.pipeline)
+                            self._last_weight_refresh_gen = N
+                            for feat in new_generation:
+                                if feat.name in weights.index:
+                                    feat.update_weight(weights.loc[feat.name, "weighted_importance"])
+                                elif hasattr(feat, 'weight') and feat.weight > 0:
+                                    feat.update_weight(feat.weight * 0.95)
+                        else:
+                            new_names = set(new_feature_names)
+                            for feat in new_generation:
+                                if feat.name not in new_names and hasattr(feat, 'weight') and feat.weight > 0:
+                                    feat.update_weight(feat.weight * 0.95)
                     
                     generation = new_generation
                     features_added = len(elites)
@@ -2260,7 +2946,11 @@ class FeatureGenerator:
                         self.state['best'].update(gen_num=N+1, val_score=new_val_score)
                         self.state['counters']['consecutive_no_improvement_iters'] = 0
                         stagnation_counter = 0
-                        self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
+                        # SHAP interaction analysis is expensive; refresh on a period
+                        # and only while enough budget remains for it to pay off.
+                        if (N - self._last_shap_gen) >= self.shap_refresh_period and self._deadline.remaining_frac() > 0.35:
+                            self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=self.shap_interactions_max_pairs)
+                            self._last_shap_gen = N
 
                         self._sync_state_components(X, self.pipeline, generation)
                         self._save_current_as_best()
@@ -2329,6 +3019,14 @@ class FeatureGenerator:
         
         elapsed_time = time.time() - start_time
 
+        # Capture the best search-rows state before any full-data replay mutates
+        # X/y: the finalization gate must train on search rows and score on the
+        # meta rows, which stay held out only relative to the search rows.
+        X_search_gate, y_search_gate = None, None
+        if X_meta is not None:
+            X_search_gate = (self.state['best']['X'] if self.state['best']['X'] is not None else X).copy()
+            y_search_gate = y.copy()
+
         # Replay on full data if instance sampling was used
         if X_full is not None:
             # Revert to best state from search (sample-sized)
@@ -2371,10 +3069,20 @@ class FeatureGenerator:
             else:
                 self._sync_state_components(X, self.pipeline, generation)
 
-        # Meta-validation evaluation (CV bias diagnostic)
+        # ------------------------------------------------------------------
+        # Finalization gate: choose the feature set that actually validates.
+        # Candidate sets: full selection, L1∪tree-pruned, L1∩tree-pruned, and
+        # the original features ("do no harm"). Scored on the meta holdout
+        # (train on search rows, score on meta rows — data the per-candidate
+        # selection never touched); on small data without a meta split, on
+        # fresh-partition repeated CV. The search-CV score that drove greedy
+        # acceptance is upward-biased by selection, so it never decides alone.
+        # ------------------------------------------------------------------
+        X_meta_transformed = None
         if X_meta is not None and y_meta is not None:
             try:
-                # Replay features on meta split
+                # Replay lambda features on the meta split (pipeline features are
+                # produced by the fold-fitted pipeline at scoring time).
                 X_meta_transformed = X_meta.copy()
                 for interaction in getattr(self, 'interactions', []):
                     if interaction.name not in X_meta_transformed.columns and not interaction.require_pipeline:
@@ -2383,40 +3091,110 @@ class FeatureGenerator:
                             X_meta_transformed[interaction.name] = val
                         except Exception:
                             pass
-                
-                # Drop pruned features from meta
                 if hasattr(self, 'pruned_features') and self.pruned_features:
                     X_meta_transformed = X_meta_transformed.drop(
                         columns=[c for c in self.pruned_features if c in X_meta_transformed.columns], errors='ignore')
-                
-                meta_train, meta_val = self._eval_baseline(X_meta_transformed, y_meta, self.pipeline, groups=groups_meta)
-                search_val = self.state['best']['val_score']
-                
-                if self.scorer.greater_is_better:
-                    gap = search_val - meta_val
-                else:
-                    gap = meta_val - search_val
-                
-                self._log(f"Meta-validation: search_val={search_val:.5f}, meta_val={meta_val:.5f}, gap={gap:.5f}")
-                if abs(gap) > 0.02:  # Significant gap suggests overfitting to search folds
-                    self._log(f"  Warning: Notable gap between search and meta-validation scores - possible selection overfitting")
             except Exception as e:
-                self._log(f"Meta-validation evaluation failed: {e}")
+                self._log(f"Meta replay failed: {e}")
+                X_meta_transformed = None
 
-        # Regularized post-selection (Enhancement 5)
-        if self.final_selection and hasattr(self, 'interactions') and self.interactions:
-            features_to_drop = self._final_regularized_selection(X, y)
-            if features_to_drop:
-                X = X.drop(columns=[c for c in features_to_drop if c in X.columns], errors='ignore')
-                if not hasattr(self, 'pruned_features'):
-                    self.pruned_features = set()
-                self.pruned_features.update(features_to_drop)
+        if hasattr(self, 'interactions') and self.interactions:
+            drop_union, drop_strict = [], []
+            if self.final_selection:
+                if self._deadline is not None and self._deadline.hard_exceeded():
+                    self._log("Skipping L1 post-selection (hard time budget reached).")
+                else:
+                    drop_union, drop_strict = self._final_regularized_selection(X, y)
+
+            generated_cols = [c for c in X.columns if c not in self.initial_features]
+            drop_sets = {"full": []}
+            if drop_union:
+                drop_sets["union"] = drop_union
+            if drop_strict and set(drop_strict) != set(drop_union):
+                drop_sets["strict"] = drop_strict
+            drop_sets["orig"] = generated_cols  # plus pipeline reset below
+
+            winner = "union" if drop_union else "full"  # legacy default when gate is off
+            gate_scores = None
+            if self.meta_gate and len(drop_sets) > 1:
+                try:
+                    clean_pipe = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+                    set_cols = {name: [c for c in X.columns if c not in set(drops)]
+                                for name, drops in drop_sets.items()}
+                    set_cols["orig"] = [c for c in X.columns if c in self.initial_features]
+                    set_pipes = {name: (clean_pipe if name == "orig" else self.pipeline)
+                                 for name in drop_sets}
+
+                    if X_meta_transformed is not None and X_search_gate is not None:
+                        gate_scores = {}
+                        for name, cols in set_cols.items():
+                            tr_cols = [c for c in cols if c in X_search_gate.columns]
+                            ho_cols = [c for c in cols if c in X_meta_transformed.columns]
+                            common = [c for c in tr_cols if c in ho_cols]
+                            gate_scores[name] = self._fit_score_holdout(
+                                X_search_gate[common], y_search_gate,
+                                X_meta_transformed[common], y_meta, set_pipes[name])
+                        gate_kind = "meta-holdout"
+                    else:
+                        gate_scores = self._score_feature_sets_fresh_cv(set_cols, X, y, set_pipes)
+                        gate_kind = "fresh-CV"
+
+                    sgn = 1.0 if self.scorer.greater_is_better else -1.0
+                    ordered = sorted(gate_scores,
+                                     key=lambda k: (sgn * gate_scores[k], -len(set_cols[k])),
+                                     reverse=True)
+                    winner = ordered[0]
+                    # Do no harm: a generated set must strictly beat the originals.
+                    orig_score = gate_scores.get("orig")
+                    if winner != "orig" and orig_score is not None:
+                        margin = self.meta_gate_epsilon * abs(orig_score)
+                        if sgn * gate_scores[winner] <= sgn * orig_score + margin:
+                            winner = "orig"
+                    self._log(f"Finalization gate ({gate_kind}): "
+                              + ", ".join(f"{k}={v:.5f}" for k, v in gate_scores.items())
+                              + f" -> winner: {winner}")
+                except Exception as e:
+                    self._log(f"Finalization gate failed ({e}); keeping legacy selection.")
+                    gate_scores = None
+                    winner = "union" if drop_union else "full"
+
+            if not hasattr(self, 'pruned_features'):
+                self.pruned_features = set()
+            if winner == "orig":
+                X = X[[c for c in X.columns if c in self.initial_features]]
+                self.pruned_features.update(generated_cols)
+                self.interactions = []
+                generation = [f for f in generation if f.name in self.initial_features]
+                self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+                self._log("Finalization: generated features did not validate; returning original features.")
+            else:
+                features_to_drop = drop_sets[winner]
+                if features_to_drop:
+                    X = X.drop(columns=[c for c in features_to_drop if c in X.columns], errors='ignore')
+                    self.pruned_features.update(features_to_drop)
+                if X_meta_transformed is not None:
+                    X_meta_transformed = X_meta_transformed[[c for c in X_meta_transformed.columns
+                                                             if c in set(X.columns)]]
+
+            self._sync_state_components(X, self.pipeline, generation, preserve_pruned=True)
+            # Re-evaluate the chosen set so reported metrics match what is returned
+            train_score, val_score = self._eval_baseline(X, y, self.pipeline)
+            self.state['best']['val_score'] = val_score
+            self.state['best']['train_score'] = train_score
+            self._log(f"Post-selection validation: {self.scorer.name}={val_score:.5f}")
+
+        # Merge meta rows back so the returned X covers every input row
+        # (the search itself never saw the meta rows; selection is already final).
+        if X_meta is not None and X_full is None and X_meta_transformed is not None:
+            try:
+                X_meta_final = X_meta_transformed.reindex(columns=X.columns)
+                X_merged = pd.concat([X, X_meta_final])
+                y_merged = pd.concat([y, y_meta])
+                X = X_merged.loc[self._pre_meta_index]
+                y = y_merged.loc[self._pre_meta_index]
                 self._sync_state_components(X, self.pipeline, generation, preserve_pruned=True)
-                # Re-evaluate after pruning
-                train_score, val_score = self._eval_baseline(X, y, self.pipeline)
-                self.state['best']['val_score'] = val_score
-                self.state['best']['train_score'] = train_score
-                self._log(f"Post-selection validation: {self.scorer.name}={val_score:.5f}")
+            except Exception as e:
+                self._log(f"Meta merge-back failed ({e}); returning search rows only.")
 
         # Calculate and store metrics
         n_init_feats = len(self.initial_features)
@@ -2505,7 +3283,17 @@ class FeatureGenerator:
         # Pipeline & adaptive controller
         self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
         self.adaptive_controller.reset_for_new_run()
-        self.adaptive_controller.initialize_operations(self.ops)
+        self.adaptive_controller.initialize_operations(
+            self.ops, priors=DEFAULT_OP_PRIORS if self.use_op_priors else None)
+
+        # Reset per-run state of the search upgrades
+        self._deadline = None
+        self._baseline_eval_cache = {}
+        self._oof_cand_cache = {}
+        self._proxy_split_cache = {}
+        self._cv_epoch = 0
+        self._last_weight_refresh_gen = -10
+        self._last_shap_gen = -10
 
         # Search state
         self.state = {
@@ -2819,6 +3607,27 @@ class FeatureGenerator:
             self.rotate_cv_folds = True
         if not hasattr(self, 'fold_rotation_period'):
             self.fold_rotation_period = 5
+
+        # Search upgrades (screening, gates, priors, deadline)
+        upgrade_defaults = {
+            'prefilter_candidates': True, 'near_dup_threshold': 0.99, 'prefilter_sample_rows': 2048,
+            'proxy_fast_mode': True, 'proxy_max_rows': 5000, 'proxy_num_rounds': 30,
+            'proxy_pipeline_candidates': True, 'elite_ranking': 'proxy_blend',
+            'cache_baseline_evals': True, 'importance_refresh_period': 3,
+            'shap_refresh_period': 5, 'shap_interactions_max_pairs': 2000,
+            'deadline_reserve_frac': 0.12, 'fold_consistency_gate': True,
+            'fold_consistency_min_frac': 0.65, 'noise_probes': 5, 'noise_probe_quantile': 0.5,
+            'meta_gate': True, 'meta_gate_epsilon': 0.0, 'use_op_priors': True,
+            'warm_start_battery': True, 'warm_start_top_k': 8,
+            '_deadline': None, '_cv_epoch': 0,
+            '_last_weight_refresh_gen': -10, '_last_shap_gen': -10,
+        }
+        for attr, dval in upgrade_defaults.items():
+            if not hasattr(self, attr):
+                setattr(self, attr, dval)
+        for attr in ('_baseline_eval_cache', '_oof_cand_cache', '_proxy_split_cache'):
+            if not hasattr(self, attr):
+                setattr(self, attr, {})
 
         # Enhancement 5: Regularized post-selection
         if not hasattr(self, 'final_selection'):

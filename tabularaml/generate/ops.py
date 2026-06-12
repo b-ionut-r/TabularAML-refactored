@@ -48,6 +48,44 @@ OPS = {
     },
 }
 
+# Operand-order equivalence for candidate dedup: f(a,b) and f(b,a) are identical
+# (symmetric) or sign-flipped (antisymmetric => split-equivalent for tree models),
+# so only one operand order is worth evaluating.
+SYMMETRIC_OPS = {
+    "add", "mul", "max", "min", "absdiff", "logmul",
+    "geometric_mean", "harmonic_mean", "concat",
+}
+ANTISYMMETRIC_OPS = {"sub", "diff_ratio", "log_ratio"}
+
+# Informed initial priors for operator selection (in [0, 1], default 0.5).
+# Rationale: GBDT learners are invariant to monotone unary transforms, so unary
+# math ops rarely add signal on their own; cross-feature ratios/differences,
+# group-by statistics and target/frequency encodings are the high-yield families
+# (cf. OpenFE's operator set and common Kaggle practice). The adaptive
+# controller's EWMA still adapts these per dataset during the search.
+DEFAULT_OP_PRIORS = {
+    # numeric binary — interactions carry most signal for tree models
+    "div": 0.90, "sub": 0.85, "mul": 0.85, "diff_ratio": 0.80, "relative_diff": 0.80,
+    "log_ratio": 0.75, "add": 0.70, "absdiff": 0.70, "max": 0.60, "min": 0.60,
+    "geometric_mean": 0.55, "harmonic_mean": 0.55, "logmul": 0.50,
+    "angle_between": 0.45, "mod": 0.40, "pow": 0.35,
+    "weighted_sum": 0.30, "weighted_diff": 0.30,
+    # numeric unary — monotone transforms are split-invariant for GBDTs
+    "square": 0.50, "abs": 0.50, "inv": 0.45, "sign": 0.35, "log1p": 0.35,
+    "log": 0.30, "sqrt": 0.30, "exp": 0.25, "cbrt": 0.25, "sin": 0.25, "cos": 0.25,
+    "tan": 0.20, "reciprocal_sqrt": 0.25, "floor": 0.20, "ceil": 0.20, "round": 0.20,
+    "tanh": 0.15, "sigmoid": 0.15, "arctan": 0.15, "arcsin": 0.15, "arccos": 0.15,
+    "neg": 0.10,
+    # categorical
+    "target": 0.90, "freq": 0.75, "count": 0.70, "concat": 0.60,
+    # group-by aggregations
+    "groupby_mean": 0.90, "groupby_zscore": 0.85, "groupby_std": 0.80,
+    "groupby_median": 0.70, "groupby_rank": 0.70, "groupby_max": 0.70,
+    "groupby_min": 0.70, "groupby_count": 0.65,
+}
+# Temporal ops share one prior (only active when time_col/id_col are set).
+DEFAULT_OP_PRIORS.update({op: 0.80 for op in OPS["temporal"]["unary"]})
+
 # --- Helpers ---
 
 def _safe_power(base_series, exp_series):
