@@ -1,0 +1,44 @@
+{
+  "n_paired_runs": 74,
+  "n_unpaired_runs": 1,
+  "nofe_identity_drift_rows": 0,
+  "pair_level": {
+    "n": 74,
+    "median": 0.0021327869954647785,
+    "mean": 0.013992102092685204,
+    "stat": 1135.0,
+    "p_two_sided": 0.17374226146602179,
+    "p_after_greater": 0.08687113073301089,
+    "note": "",
+    "wins": 42,
+    "losses": 32,
+    "ties": 0,
+    "median_pct_before": 0.0068927700088894,
+    "median_pct_after": 0.0,
+    "mean_pct_before": 0.0651446465589879,
+    "mean_pct_after": 0.0791367486516731
+  },
+  "dataset_level": {
+    "n": 25,
+    "median": 0.0008407074011273996,
+    "mean": 0.011837236144598869,
+    "stat": 130.0,
+    "p_two_sided": 0.39571136236190796,
+    "p_after_greater": 0.19785568118095398,
+    "note": "",
+    "wins": 14,
+    "losses": 11,
+    "ties": 0
+  },
+  "status_counts_before": {
+    "ok": 74,
+    "timeout": 1
+  },
+  "status_counts_after": {
+    "ok": 75
+  },
+  "mean_wall_time_before": 460.05318020485544,
+  "mean_wall_time_after": 323.35845685649565,
+  "mean_n_added_before": 7.094594594594595,
+  "mean_n_added_after": 3.0945945945945947
+}
