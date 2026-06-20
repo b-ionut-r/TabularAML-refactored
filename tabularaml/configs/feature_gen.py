@@ -17,7 +17,9 @@ PRESET_PARAMS = {
         "proxy_top_pct": 0.20,
         "meta_validation_frac": 0.15,
         "rotate_cv_folds": True,
-        "fold_rotation_period": 4
+        "fold_rotation_period": 4,
+        "target_encoding_strategy": "smoothed",
+        "seed_templates": False
     },
     "medium": {
         # Better exploration/exploitation balance
@@ -37,7 +39,9 @@ PRESET_PARAMS = {
         "proxy_top_pct": 0.15,
         "meta_validation_frac": 0.15,
         "rotate_cv_folds": True,
-        "fold_rotation_period": 5
+        "fold_rotation_period": 5,
+        "target_encoding_strategy": "smoothed",
+        "seed_templates": True
     },
     "best": {
         # Deeper search with controlled patience
@@ -57,7 +61,9 @@ PRESET_PARAMS = {
         "proxy_top_pct": 0.12,
         "meta_validation_frac": 0.15,
         "rotate_cv_folds": True,
-        "fold_rotation_period": 5
+        "fold_rotation_period": 5,
+        "target_encoding_strategy": "catboost",
+        "seed_templates": True
     },
     "extreme": {
         # Maximum thoroughness with efficiency guardrails
@@ -77,6 +83,8 @@ PRESET_PARAMS = {
         "proxy_top_pct": 0.10,
         "meta_validation_frac": 0.15,
         "rotate_cv_folds": True,
-        "fold_rotation_period": 5
+        "fold_rotation_period": 5,
+        "target_encoding_strategy": "catboost",
+        "seed_templates": True
     }
 }

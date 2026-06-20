@@ -665,6 +665,18 @@ class FeatureGenerator:
                  time_col: Optional[str] = None,
                  id_col: Optional[str] = None,
                  temporal_windows: Optional[list] = None,
+                 target_encoding_strategy: Literal["mean", "smoothed", "catboost"] = "smoothed",
+                 te_smoothing: float = 10.0,
+                 use_adversarial_validation: bool = False,
+                 adv_drift_weight: float = 0.5,
+                 adv_drift_max: float = 0.1,
+                 seed_templates: bool = True,
+                 seed_top_k: int = 15,
+                 seed_max_candidates: int = 500,
+                 redundancy_prune: bool = True,
+                 redundancy_corr_threshold: float = 0.95,
+                 batch_evaluation: bool = False,
+                 batch_size: int = 5,
                  random_state: int = 42,
                  n_jobs: int = -1):
 
@@ -720,7 +732,12 @@ class FeatureGenerator:
         self.groups = groups
         self._groups_active = groups
         self.device = "cuda" if is_gpu_available() and use_gpu else "cpu"
-        self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+
+        # Target-encoding strategy (set before any CategoricalEncoder is built below)
+        self.target_encoding_strategy = target_encoding_strategy
+        self.te_smoothing = te_smoothing
+
+        self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=self._make_cat_encoder())
         
         # Feature value cache
         self._feature_cache = FeatureCache(max_size_mb=cache_size_mb)
@@ -742,6 +759,24 @@ class FeatureGenerator:
         self.time_col = time_col
         self.id_col = id_col
         self.temporal_windows = temporal_windows
+
+        # Adversarial validation (train/test distribution-shift aware feature pruning)
+        self.use_adversarial_validation = use_adversarial_validation
+        self.adv_drift_weight = adv_drift_weight
+        self.adv_drift_max = adv_drift_max
+        self.X_test = None            # optional unlabeled test features, set via search()
+        self._adv_drift_scores = {}   # per-feature drift score cache for current generation
+
+        # Template seeding (deterministic 2nd-order + groupby-cross coverage)
+        self.seed_templates = seed_templates
+        self.seed_top_k = seed_top_k
+        self.seed_max_candidates = seed_max_candidates
+
+        # Joint selection / redundancy pruning
+        self.redundancy_prune = redundancy_prune
+        self.redundancy_corr_threshold = redundancy_corr_threshold
+        self.batch_evaluation = batch_evaluation
+        self.batch_size = batch_size
         
         # Rebuild temporal ops with custom windows if provided
         if temporal_windows is not None:
@@ -763,6 +798,16 @@ class FeatureGenerator:
         # early-exit paths (e.g. fit/transform without generate) never hit AttributeError.
         self.interactions: list = []
         self.generation: list = []
+
+    def _make_cat_encoder(self, target_enc_cols=None, count_enc_cols=None, freq_enc_cols=None):
+        """Build a CategoricalEncoder using the generator's configured target-encoding strategy."""
+        return CategoricalEncoder(
+            target_enc_cols=target_enc_cols,
+            count_enc_cols=count_enc_cols,
+            freq_enc_cols=freq_enc_cols,
+            target_encoding_strategy=getattr(self, "target_encoding_strategy", "smoothed"),
+            te_smoothing=getattr(self, "te_smoothing", 10.0),
+        )
 
     def _ensure_no_duplicates(self, X: pd.DataFrame, context: str = "") -> pd.DataFrame:
         """Ensure DataFrame has no duplicate columns."""
@@ -1103,6 +1148,84 @@ class FeatureGenerator:
                 groups=self._groups_active,
             )
         return self.cv
+
+    def _compute_baseline_drift(self, X: pd.DataFrame) -> dict:
+        """Adversarial drift score per ORIGINAL column vs the held-out test features.
+
+        Returns {} when adversarial validation is disabled or no test set is set.
+        Cheap: one adversarial-validation fit on the raw (original) columns shared
+        with ``self.X_test``. Engineered features inherit these scores via parents.
+        """
+        if not self.use_adversarial_validation or self.X_test is None:
+            return {}
+        try:
+            from tabularaml.inspect.adversarial import AdversarialValidator
+            shared = [c for c in X.columns if c in set(self.X_test.columns)]
+            if not shared:
+                return {}
+            av = AdversarialValidator(cv=min(5, self.cv if isinstance(self.cv, int) else 5),
+                                      random_state=self.random_state,
+                                      use_gpu=self.device == "cuda", n_jobs=self.n_jobs)
+            av.fit(X[shared], self.X_test[shared])
+            self._adv_auc = av.auc_
+            scores = av.feature_drift_scores()
+            self._log(f"  Adversarial validation: train/test AUC={av.auc_:.4f} "
+                      f"({'shift detected' if av.auc_ > 0.6 else 'distributions match'})")
+            return scores
+        except Exception as e:
+            self._log(f"  Adversarial drift computation failed: {e}")
+            return {}
+
+    def _candidate_drift(self, inter) -> float:
+        """Drift proxy for a candidate = mean drift of its parent features."""
+        if not self._adv_drift_scores:
+            return 0.0
+        parents = [inter.feature_1.name]
+        if getattr(inter, "feature_2", None) is not None:
+            parents.append(inter.feature_2.name)
+        vals = [self._adv_drift_scores.get(p, 0.0) for p in parents]
+        return float(np.mean(vals)) if vals else 0.0
+
+    def _adv_final_drift_drop(self, X: pd.DataFrame, y: pd.Series) -> list:
+        """Drop generated features whose true (engineered) train/test drift is high.
+
+        Transforms the held-out test set through the fitted pipeline so engineered
+        columns exist on both sides, then runs adversarial validation and drops
+        generated columns with drift score above ``adv_drift_max``. Original
+        features are never dropped. Caps removal at 50% of generated features.
+        """
+        if not self.use_adversarial_validation or self.X_test is None:
+            return []
+        generated = [c for c in X.columns if c not in self.initial_features]
+        if not generated:
+            return []
+        try:
+            from tabularaml.inspect.adversarial import AdversarialValidator
+            # Fit a throwaway copy on the original columns so the live search
+            # pipeline/state is never mutated, then engineer the test matrix.
+            tmp = deepcopy(self)
+            tmp.X_test = None  # avoid recursion / extra work in the copy
+            tmp.fit(X[self.initial_features], y)
+            X_test_t = tmp.transform(self.X_test)
+            shared_gen = [c for c in generated if c in set(X_test_t.columns)]
+            if not shared_gen:
+                return []
+            av = AdversarialValidator(cv=min(5, self.cv if isinstance(self.cv, int) else 5),
+                                      random_state=self.random_state,
+                                      use_gpu=self.device == "cuda", n_jobs=self.n_jobs)
+            av.fit(X[shared_gen], X_test_t[shared_gen])
+            scores = av.feature_drift_scores()
+            flagged = [(c, s) for c, s in scores.items() if s > self.adv_drift_max]
+            flagged.sort(key=lambda kv: kv[1], reverse=True)
+            cap = max(0, int(0.5 * len(generated)))
+            to_drop = [c for c, _ in flagged[:cap]]
+            if to_drop:
+                self._log(f"  Adversarial drift drop (AUC={av.auc_:.4f}): removing "
+                          f"{len(to_drop)} high-drift generated features (>{self.adv_drift_max})")
+            return to_drop
+        except Exception as e:
+            self._log(f"  Adversarial final drift drop failed: {e}")
+            return []
 
     def _final_regularized_selection(self, X, y):
         """After search, use L1 regularization + tree importance to jointly select the best feature subset.
@@ -1480,7 +1603,7 @@ class FeatureGenerator:
                 )
         
         pipeline = PipelineWrapper(imputer=None, scaler=None,
-                                   encoder=CategoricalEncoder(target_enc_cols, count_enc_cols, freq_enc_cols))
+                                   encoder=self._make_cat_encoder(target_enc_cols, count_enc_cols, freq_enc_cols))
         pipeline.groupby_encoders = groupby_encoders
         
         # Collect Temporal encoders for temporal interactions
@@ -1508,7 +1631,7 @@ class FeatureGenerator:
                 seen_gb.add(gb.output_col)
         
         result = PipelineWrapper(imputer=None, scaler=None,
-            encoder=CategoricalEncoder(
+            encoder=self._make_cat_encoder(
                 target_enc_cols=list(set(pipeline.encoder.target_enc_cols + new_pipeline.encoder.target_enc_cols)),
                 count_enc_cols=list(set(pipeline.encoder.count_enc_cols + new_pipeline.encoder.count_enc_cols)),
                 freq_enc_cols=list(set(pipeline.encoder.freq_enc_cols + new_pipeline.encoder.freq_enc_cols))))
@@ -1563,9 +1686,175 @@ class FeatureGenerator:
         X_copy = X_copy.replace([np.inf, -np.inf], np.nan)
         return X_copy, self._prepare_pipeline(interactions)
 
+    def _is_redundant(self, cand_name: str, X_with_cand: pd.DataFrame,
+                      X_accepted: pd.DataFrame, strong: bool = False) -> bool:
+        """True if a candidate is near-duplicate of an already-accepted engineered feature.
+
+        Compares absolute Pearson correlation against accepted *generated* columns
+        only. Features whose standalone gain is materially higher (``strong``) are
+        kept regardless, so genuinely better replacements are not blocked.
+        """
+        if strong or cand_name not in X_with_cand.columns:
+            return False
+        cand = pd.to_numeric(X_with_cand[cand_name], errors="coerce")
+        if not np.isfinite(cand.to_numpy(dtype=float)).any() or cand.nunique(dropna=True) <= 1:
+            return False
+        accepted_generated = [c for c in X_accepted.columns
+                              if c not in self.initial_features and c != cand_name
+                              and pd.api.types.is_numeric_dtype(X_accepted[c])]
+        if not accepted_generated:
+            return False
+        cand_vals = cand.to_numpy(dtype=float)
+        for col in accepted_generated:
+            other = pd.to_numeric(X_accepted[col], errors="coerce").to_numpy(dtype=float)
+            mask = np.isfinite(cand_vals) & np.isfinite(other)
+            if mask.sum() < 10:
+                continue
+            a, b = cand_vals[mask], other[mask]
+            if a.std() == 0 or b.std() == 0:
+                continue
+            corr = abs(np.corrcoef(a, b)[0, 1])
+            if np.isfinite(corr) and corr >= self.redundancy_corr_threshold:
+                return True
+        return False
+
+    def _seed_template_candidates(self, X: pd.DataFrame, generation: list) -> list:
+        """Deterministic 2nd-order + groupby-cross template pool to guarantee coverage.
+
+        Seeds the first generation with the highest-value region of the search
+        space (OpenFE-style): all arithmetic crosses among top-importance numeric
+        features, every categorical x numeric groupby aggregation, and count/freq
+        of top categoricals. Genetic search then explores beyond these.
+        """
+        if not self.seed_templates:
+            return []
+        num_cols, cat_cols = self._get_num_cat_cols(X)
+        num_set, cat_set = set(num_cols), set(cat_cols)
+        feats = [f for f in generation if f.name in X.columns]
+        num_feats = sorted([f for f in feats if f.dtype == "num" and f.name in num_set],
+                           key=lambda f: f.weight, reverse=True)[:self.seed_top_k]
+        cat_feats = sorted([f for f in feats if f.dtype == "cat" and f.name in cat_set],
+                           key=lambda f: f.weight, reverse=True)[:self.seed_top_k]
+
+        cands = []
+        # Numeric x numeric arithmetic crosses (classic 2nd-order pool)
+        bin_ops = [op for op in ("add", "sub", "mul", "div", "absdiff")
+                   if op in self.ops.get("num", {}).get("binary", [])]
+        for i in range(len(num_feats)):
+            for j in range(i + 1, len(num_feats)):
+                for op in bin_ops:
+                    cands.append(Interaction(num_feats[i], op, num_feats[j]))
+        # Categorical x numeric groupby aggregations
+        if "agg" in self.ops:
+            for cf in cat_feats:
+                for nf in num_feats:
+                    for op in self.ops["agg"]["binary"]:
+                        cands.append(Interaction(cf, op, nf))
+        # Count / frequency encodings of top categoricals
+        for cf in cat_feats:
+            for op in ("count", "freq"):
+                if op in self.ops.get("cat", {}).get("unary", []):
+                    cands.append(Interaction(cf, op))
+
+        # Drop templates whose feature already exists; cap total (preserve priority order)
+        existing = set(X.columns)
+        cands = [c for c in cands if c.name not in existing]
+        if len(cands) > self.seed_max_candidates:
+            cands = cands[:self.seed_max_candidates]
+        self._log(f"Seeded {len(cands)} template candidates from "
+                  f"{len(num_feats)} numeric + {len(cat_feats)} categorical top features")
+        return cands
+
+    def _select_elites_batch(self, batch: list[Interaction], n: int, X: pd.DataFrame, y: pd.Series,
+                             callback: Optional[Callable] = None) -> tuple[list[Interaction], pd.DataFrame, PipelineWrapper]:
+        """Batched joint selection: evaluate non-pipeline candidates in groups.
+
+        Fits one model per batch (instead of one per candidate), so complementary
+        "suppressor" features that only help together can be admitted as a set.
+        Pipeline-required candidates (encodings/groupby/temporal) are deferred to
+        the sequential selector, which fits their leakage-safe encoders per fold.
+        """
+        self._in_batch_select = True
+        X = self._ensure_no_duplicates(X, "in _select_elites_batch")
+        valid = [i for i in batch if all(feat in X.columns for feat in
+                 ([i.feature_1.name] + ([i.feature_2.name] if i.feature_2 else [])))
+                 and i.name not in getattr(self, 'blacklisted_features', set())]
+        nonpipe = [i for i in valid if not i.require_pipeline]
+        pipe = [i for i in valid if i.require_pipeline]
+
+        ranked = self.adaptive_controller.rank_candidates_with_memory(nonpipe, X, y)
+        _, best_val = self._eval_baseline(X, y, self.pipeline)
+        selected, X_base = [], X.copy()
+        bs = max(2, int(self.batch_size))
+        min_gain = self.adaptive_controller.get_adaptive_min_gain()
+        evals = 0
+
+        for start in range(0, len(ranked), bs):
+            if len(selected) >= n:
+                break
+            if hasattr(self, 'stop_requested') and self.stop_requested:
+                break
+            chunk = ranked[start:start + bs]
+            X_try = X_base.copy()
+            added = []
+            for inter in chunk:
+                if len(selected) + len(added) >= n or inter.name in X_try.columns:
+                    continue
+                try:
+                    val = inter.generate(X_try)
+                except Exception:
+                    continue
+                X_try[inter.name] = np.asarray(val)
+                added.append(inter)
+            if not added:
+                continue
+            X_try = X_try.replace([np.inf, -np.inf], np.nan)
+            evals += 1
+            try:
+                _, new_val = self._eval_baseline(X_try, y, self.pipeline)
+            except Exception:
+                continue
+            delta = (new_val - best_val) if self.scorer.greater_is_better else (best_val - new_val)
+            gain = delta / (abs(best_val) + 1e-8)
+            if callback and callback(start + len(chunk), len(selected)):
+                break
+            if gain >= min_gain:
+                # Keep the improving batch, dropping redundant near-duplicates.
+                for inter in added:
+                    if self.redundancy_prune and self._is_redundant(inter.name, X_try, X_base):
+                        X_try = X_try.drop(columns=[inter.name])
+                        continue
+                    selected.append(inter)
+                    self.adaptive_controller.update_operation_stats(inter, success=True, gain=gain)
+                X_base, best_val = X_try, new_val
+
+        # Defer pipeline-required candidates to the sequential selector. The
+        # re-entrancy guard stays set so the nested call runs the greedy path
+        # (the dispatcher resets it in a finally once the whole batch completes).
+        if pipe and len(selected) < n:
+            pipe_sel, X_base, pipe_pipeline = self._select_elites(
+                pipe, n - len(selected), X_base, y, callback)
+            selected.extend(pipe_sel)
+            if callback:
+                callback(len(ranked) + len(pipe), len(selected), force_complete=True)
+            return selected, X_base, self._extend_pipeline(self.pipeline, self._prepare_pipeline(selected))
+
+        if callback:
+            callback(len(ranked), len(selected), force_complete=True)
+        return selected, X_base, self._extend_pipeline(self.pipeline, self._prepare_pipeline(selected))
+
     def _select_elites(self, batch: list[Interaction], n: int, X: pd.DataFrame, y: pd.Series,
                       callback: Optional[Callable] = None) -> tuple[list[Interaction], pd.DataFrame, PipelineWrapper]:
         """Greedy forward-selection with adaptive thresholds."""
+        # Joint/batch selection path (opt-in, or auto during severe stagnation).
+        # The re-entrancy guard prevents infinite recursion when the batch selector
+        # defers its pipeline-required candidates back to this greedy selector.
+        if (getattr(self, 'batch_evaluation', False) and batch
+                and not getattr(self, '_in_batch_select', False)):
+            try:
+                return self._select_elites_batch(batch, n, X, y, callback)
+            finally:
+                self._in_batch_select = False
         if not batch:
             if callback: callback(0, 0, force_complete=True)
             return [], X, self.pipeline
@@ -1653,15 +1942,32 @@ class FeatureGenerator:
             
             delta = (new_val - best_val) if self.scorer.greater_is_better else (best_val - new_val)
             gain = delta / (abs(best_val) + 1e-8)
-            
+
+            # Adversarial drift penalty: discount the gain of candidates built from
+            # train/test-shifting parents so they must clear a higher acceptance bar.
+            if self.use_adversarial_validation and self._adv_drift_scores:
+                drift = self._candidate_drift(inter)
+                if drift > 0:
+                    gain -= self.adv_drift_weight * drift * abs(self.adaptive_controller.get_adaptive_min_gain())
+
             # Use adaptive threshold
             success = gain >= self.adaptive_controller.get_adaptive_min_gain()
-            
+
+            # Redundancy guard: reject near-duplicate features that barely beat the bar.
+            if (success and self.redundancy_prune and not inter.require_pipeline
+                    and inter.name in X_copy.columns):
+                if self._is_redundant(inter.name, X_copy, X_base,
+                                      strong=gain >= 2 * self.adaptive_controller.get_adaptive_min_gain()):
+                    success = False
+
             self.adaptive_controller.update_operation_stats(inter, success=success, gain=gain)
-            
+
             if success:
                 selected.append(inter)
                 X_base, best_val, consec_no_gain = X_try, new_val, 0
+                # Engineered feature inherits its parents' drift for downstream candidates.
+                if self.use_adversarial_validation and self._adv_drift_scores:
+                    self._adv_drift_scores[inter.name] = self._candidate_drift(inter)
             else:
                 consec_no_gain += 1
 
@@ -1896,12 +2202,21 @@ class FeatureGenerator:
             return X.drop(columns=cols_to_drop)
         return X
 
-    def search(self, X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, PipelineWrapper, list[Feature], list[Interaction]]:
-        """Enhanced genetic algorithm with better stagnation handling."""
+    def search(self, X: pd.DataFrame, y: pd.Series, X_test: Optional[pd.DataFrame] = None) -> tuple[pd.DataFrame, PipelineWrapper, list[Feature], list[Interaction]]:
+        """Enhanced genetic algorithm with better stagnation handling.
+
+        If ``X_test`` (unlabeled test features) is provided and
+        ``use_adversarial_validation`` is enabled, engineered features that drift
+        between train and test distributions are penalized during selection and
+        pruned at the end. Only test *features* are used -- never a target.
+        """
         random.seed(self.random_state)
         np.random.seed(self.random_state)
         start_time = time.time()
         X = self._drop_id_columns(X)
+        if X_test is not None:
+            self.X_test = self._drop_id_columns(X_test.copy())
+        self._adv_drift_scores = {}
         self._set_defaults(X, y)
         self.cv = normalize_rotatable_splitter(self.cv)
         self.initial_features = list(X.columns)
@@ -1936,6 +2251,7 @@ class FeatureGenerator:
         # Initialize
         self.pruned_features = set()
         self._parent_usage = {}
+        self._seeds_injected = False
         self._feature_cache.clear()
         self._oof_preds_stale = True  # Proxy evaluation: force recompute on first generation
         self._current_y = y  # Reference for proxy eval objective detection
@@ -1991,6 +2307,10 @@ class FeatureGenerator:
         self.state['best']['X'], self.state['best']['pipeline'] = X.copy(), deepcopy(self.pipeline)
         self.state['best']['pruned_features'] = getattr(self, 'pruned_features', set()).copy()
         
+        # Baseline adversarial drift on original columns (engineered feats inherit via parents)
+        if self.use_adversarial_validation and self.X_test is not None:
+            self._adv_drift_scores = self._compute_baseline_drift(X)
+
         # Initialize interactions and generation
         self.feature_interactions = self._analyze_feature_interactions(X, y, max_pairs=10000)
         top_feats_df = self._get_top_k_features(X, y, k=2*self.n_parents, pipeline=self.pipeline)
@@ -2184,7 +2504,15 @@ class FeatureGenerator:
 
                     # Enhanced child sampling
                     batch = self._sample_children_with_creativity(candidates_pool, self.n_children, tau=tau)
-                    
+
+                    # Seed deterministic template candidates once (first normal generation)
+                    if self.seed_templates and not getattr(self, '_seeds_injected', False):
+                        seeds = self._seed_template_candidates(X, generation)
+                        if seeds:
+                            seen_names = {i.name for i in batch}
+                            batch = [s for s in seeds if s.name not in seen_names] + batch
+                        self._seeds_injected = True
+
                     # Phase 1: Proxy screening (fast FeatureBoost pre-filter)
                     n_before_proxy = len(batch)
                     batch = self._proxy_screen_candidates(batch, X, y)
@@ -2403,6 +2731,18 @@ class FeatureGenerator:
             except Exception as e:
                 self._log(f"Meta-validation evaluation failed: {e}")
 
+        # Adversarial drift drop: remove generated features that don't transfer to test.
+        # Mirrors the regularized-selection path: pruned_features drives removal at
+        # transform() time, so interactions/encoders stay internally consistent.
+        if self.use_adversarial_validation and self.X_test is not None and getattr(self, 'interactions', None):
+            drift_drop = self._adv_final_drift_drop(X, y)
+            if drift_drop:
+                X = X.drop(columns=[c for c in drift_drop if c in X.columns], errors='ignore')
+                if not hasattr(self, 'pruned_features'):
+                    self.pruned_features = set()
+                self.pruned_features.update(drift_drop)
+                self._sync_state_components(X, self.pipeline, generation, preserve_pruned=True)
+
         # Regularized post-selection (Enhancement 5)
         if self.final_selection and hasattr(self, 'interactions') and self.interactions:
             features_to_drop = self._final_regularized_selection(X, y)
@@ -2425,7 +2765,7 @@ class FeatureGenerator:
         n_added_feats = len(X.columns) - n_init_feats + self.pipeline.encoder.n_new_feats + n_groupby + n_temporal
 
         # Use a clean pipeline for baseline evaluation to get true initial performance
-        baseline_pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+        baseline_pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=self._make_cat_encoder())
         self.initial_train_metric, self.initial_val_metric = self._eval_baseline(X[self.initial_features], y, baseline_pipeline)
         self.final_metric = self.state['best']['val_score']
         self.gain = self.final_metric - self.initial_val_metric if self.scorer.greater_is_better else self.initial_val_metric - self.final_metric
@@ -2503,7 +2843,7 @@ class FeatureGenerator:
                           PREDEFINED_CLS_SCORERS["categorical_crossentropy"])
 
         # Pipeline & adaptive controller
-        self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder())
+        self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=self._make_cat_encoder())
         self.adaptive_controller.reset_for_new_run()
         self.adaptive_controller.initialize_operations(self.ops)
 
@@ -2544,7 +2884,7 @@ class FeatureGenerator:
             
         if not getattr(self, 'pipeline', None):
             self._log("Warning: No pipeline. Creating default.")
-            self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=CategoricalEncoder()).get_pipeline(X, y)
+            self.pipeline = PipelineWrapper(imputer=None, scaler=None, encoder=self._make_cat_encoder()).get_pipeline(X, y)
 
         # Label encode target (same as search) — category_encoders internally
         # converts non-numeric y to numpy via LabelEncoder without wrapping back in Series

@@ -10,16 +10,28 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
     A custom transformer that applies various category encodings and ensures proper handling of column names.
     """
     def __init__(self, target_enc_cols=None, count_enc_cols=None, freq_enc_cols=None,
-                 return_original=True, handle_unknown='value', handle_missing='value'):
+                 return_original=True, handle_unknown='value', handle_missing='value',
+                 target_encoding_strategy='smoothed', te_smoothing=10.0):
 
         # Validate and initialize columns
         self.target_enc_cols = self._validate_columns(target_enc_cols)
         self.count_enc_cols = self._validate_columns(count_enc_cols)
         self.freq_enc_cols = self._validate_columns(freq_enc_cols)
-        
+
         self.return_original = return_original
         self.handle_unknown = handle_unknown
         self.handle_missing = handle_missing
+
+        # Target-encoding strategy: "mean" (plain), "smoothed" (Bayesian shrinkage),
+        # or "catboost" (ordered, leakage-resistant). Output column names are identical
+        # across strategies so downstream name tracking is unaffected.
+        if target_encoding_strategy not in ("mean", "smoothed", "catboost"):
+            raise ValueError(
+                f"target_encoding_strategy must be 'mean', 'smoothed' or 'catboost', "
+                f"got {target_encoding_strategy!r}."
+            )
+        self.target_encoding_strategy = target_encoding_strategy
+        self.te_smoothing = te_smoothing
 
         self._all_configured_cols = sorted(list(set(
             self.target_enc_cols + self.count_enc_cols + self.freq_enc_cols
@@ -127,15 +139,33 @@ class CategoricalEncoder(BaseEstimator, TransformerMixin):
         return self
 
     def _init_target_encoder(self, y):
-        """Initialize target encoder, using polynomial wrapper for multiclass."""
+        """Initialize target encoder, using polynomial wrapper for multiclass.
+
+        The encoder class depends on ``target_encoding_strategy``:
+          - "mean"     -> ce.TargetEncoder with no smoothing (plain mean target encoding)
+          - "smoothed" -> ce.TargetEncoder with Bayesian smoothing (default)
+          - "catboost" -> ce.CatBoostEncoder (ordered, leakage-resistant by construction)
+        """
         if not self.target_enc_cols:
             return None
 
-        base_encoder = ce.TargetEncoder(
-            cols=self.target_enc_cols,
-            handle_unknown=self.handle_unknown,
-            handle_missing=self.handle_missing,
-        )
+        if self.target_encoding_strategy == "catboost":
+            base_encoder = ce.CatBoostEncoder(
+                cols=self.target_enc_cols,
+                handle_unknown=self.handle_unknown,
+                handle_missing=self.handle_missing,
+            )
+        else:
+            te_kwargs = dict(
+                cols=self.target_enc_cols,
+                handle_unknown=self.handle_unknown,
+                handle_missing=self.handle_missing,
+            )
+            if self.target_encoding_strategy == "smoothed":
+                te_kwargs["smoothing"] = self.te_smoothing
+            else:  # "mean": minimal smoothing to recover plain mean target encoding
+                te_kwargs["smoothing"] = 1e-8
+            base_encoder = ce.TargetEncoder(**te_kwargs)
 
         if self._is_multiclass_target(y):
             from category_encoders.wrapper import PolynomialWrapper
