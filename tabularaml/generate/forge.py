@@ -221,6 +221,69 @@ class TargetEnc(Spec):
         return out[:, 0] if self.n_out == 1 else out
 
 
+class KNNTarget(Spec):
+    """Mean target of the k nearest training rows in a standardised numeric subspace.
+
+    A classic contest meta-feature: it injects local, smooth structure that
+    axis-aligned trees approximate poorly. Training rows are encoded out of
+    fold (a row is never its own neighbour); new rows query all training rows.
+    Multiclass targets give per-class neighbour frequencies.
+    """
+    target_dep = True
+
+    def __init__(self, cols: Sequence[str], ks: Sequence[int], n_classes: int, label: str):
+        super().__init__(cols)
+        self.ks = tuple(ks)
+        self.n_classes = n_classes
+        self.per = n_classes if n_classes > 2 else 1
+        self.n_out = len(self.ks) * self.per
+        self.name = f"knn__{label}"
+
+    def _matrix(self, df, fit=False):
+        M = df[self.parents].to_numpy(dtype=float)
+        if fit:
+            lo, hi = np.nanpercentile(M, 1, axis=0), np.nanpercentile(M, 99, axis=0)
+            self.lo_, self.hi_ = lo, hi
+            Mc = np.clip(M, lo, hi)
+            self.med_ = np.nanmedian(Mc, axis=0)
+            Mc = np.where(np.isnan(Mc), self.med_, Mc)
+            self.mu_, self.sd_ = Mc.mean(0), Mc.std(0) + 1e-12
+        Mc = np.clip(M, self.lo_, self.hi_)
+        Mc = np.where(np.isnan(Mc), self.med_, Mc)
+        return ((Mc - self.mu_) / self.sd_).astype(np.float32)
+
+    def _targets(self, y):
+        y = np.asarray(y, dtype=float)
+        return np.eye(self.n_classes)[y.astype(int)] if self.per > 1 else y[:, None]
+
+    def _query(self, M_ref, Y_ref, M_q):
+        from sklearn.neighbors import NearestNeighbors
+        kmax = min(max(self.ks), len(M_ref))
+        nn = NearestNeighbors(n_neighbors=kmax).fit(M_ref)
+        _, idx = nn.kneighbors(M_q)
+        out = np.empty((len(M_q), self.n_out))
+        csum = np.cumsum(Y_ref[idx], axis=1)  # (n, kmax, per)
+        for i, k in enumerate(self.ks):
+            k = min(k, kmax)
+            out[:, i * self.per:(i + 1) * self.per] = csum[:, k - 1, :] / k
+        return out
+
+    def fit(self, df, y, ctx):
+        self.M_ = self._matrix(df, fit=True)
+        self.Y_ = self._targets(y)
+        return self
+
+    def transform(self, df, ctx):
+        return self._query(self.M_, self.Y_, self._matrix(df))
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        self.fit(df, y, ctx)
+        out = np.empty((len(df), self.n_out))
+        for tr, va in folds:
+            out[va] = self._query(self.M_[tr], self.Y_[tr], self.M_[va])
+        return out
+
+
 class RowStat(Spec):
     """Row-wise statistic over a family of columns (e.g. one-hot blocks, repeated measurements)."""
 
@@ -357,7 +420,7 @@ class FeatureForge:
     """
 
     def __init__(self, task: Optional[str] = None, log_target: bool = False,
-                 time_budget: float = 300, n_rounds: int = 2, max_new_features: int = 60,
+                 time_budget: float = 300, n_rounds: int = 3, max_new_features: int = 60,
                  top_numeric: int = 24, top_keys: int = 10, max_key_cardinality: int = 200,
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, min_rel_gain: float = 0.001, cv: int = 3,
@@ -462,6 +525,12 @@ class FeatureForge:
                 add(RowStat(raw_num, "nonzero", "all"))
                 if W[raw_num].isna().any().any():
                     add(RowStat(raw_num, "nan", "all"))
+            dense_num = [c for c in top_num if W[c].nunique() > 10]
+            if len(W) <= 300_000:
+                for d in (4, 12, 32):
+                    if len(dense_num) >= max(2, d // 2):
+                        ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
+                        add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"top{d}"))
             for a, b in combinations(top_num, 2):
                 for op in self.arith_ops:
                     add(Arith(op, a, b))
@@ -599,7 +668,14 @@ class FeatureForge:
         return alive
 
     # ------------------------------------------------------------------ fit
-    def fit(self, X: pd.DataFrame, y):
+    def fit(self, X: pd.DataFrame, y, X_unlabeled: Optional[pd.DataFrame] = None):
+        """Search features on ``(X, y)``.
+
+        ``X_unlabeled`` (e.g. the competition test set) is optional: when given,
+        the final count and group statistics of the selected features are
+        computed over training plus unlabeled rows, a standard transductive
+        contest trick. Target statistics only ever use labeled rows.
+        """
         self._t0 = time.time()
         X = X.reset_index(drop=True).copy()
         y = pd.Series(np.asarray(y))
@@ -702,6 +778,8 @@ class FeatureForge:
                 self._log(f"round {r + 1}: no prefix beats current CV loss by {self.min_rel_gain:.2%}; stopping")
                 break
             chosen = [spec_by_name[nm] for nm in rank[:best_k]]
+            for sp in chosen:
+                sp.round_ = r
             selected.extend(chosen)
             Wm = joint[best_fit[2]]
             for s in chosen:
@@ -718,7 +796,10 @@ class FeatureForge:
         self.selected_ = selected
         self.gate_passed_ = None
         if selected and len(idx_gate):
-            self.gate_passed_, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate)
+            best_round, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate)
+            self.gate_passed_ = best_round is not None
+            if self.gate_passed_:
+                self.selected_ = [s for s in self.selected_ if s.round_ <= best_round]
             self._log(f"gate: raw={self.gate_raw_loss_:.6f} fe={self.gate_fe_loss_:.6f} "
                       f"({100 * (self.gate_raw_loss_ - self.gate_fe_loss_) / self.gate_raw_loss_:+.2f}%) "
                       f"-> {'PASS' if self.gate_passed_ else 'REJECT'}")
@@ -726,7 +807,7 @@ class FeatureForge:
                 self.selected_ = []
 
         # Refit every spec's statistics on all training rows.
-        self._fit_full(X, y_np)
+        self._fit_full(X, y_np, None if X_unlabeled is None else self._prep(X_unlabeled))
         self.elapsed_ = time.time() - self._t0
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
         return self
@@ -743,33 +824,44 @@ class FeatureForge:
             for j, col in enumerate(s.out_names()):
                 Fs[col] = vs if np.ndim(vs) == 1 else vs[:, j]
                 Fg[col] = vg if np.ndim(vg) == 1 else vg[:, j]
-        raw_cols = self.raw_cols_
-        losses = {"raw": [], "fe": []}
+        import lightgbm as lgb
         es_split = self._folds(len(Xs), ys, 5, self.random_state + 11)[0]
-        for name, cols in (("raw", raw_cols), ("fe", list(Fs.columns))):
+
+        def gate_loss(cols):
             A, G = self._model_frame(Fs[cols]), self._model_frame(Fg[cols])
             tr, va = es_split
             b = self._fit_eval(A.iloc[tr], ys[tr], A.iloc[va], ys[va], lr=0.05, es=100)
             # Refit on all search rows at the early-stopped size, then score the gate rows.
-            import lightgbm as lgb
             full = lgb.train(self._lgb_params(0.05), lgb.Dataset(A, ys), max(1, b.best_iteration))
-            losses[name] = _loss(self.task_, yg, full.predict(G, raw_score=True))
-        raw_l, fe_l = losses["raw"], losses["fe"]
-        return fe_l < raw_l, raw_l, fe_l
+            return _loss(self.task_, yg, full.predict(G, raw_score=True))
 
-    def _required_specs(self) -> List[Spec]:
-        """Selected specs plus any (unselected) parents they depend on, in creation order."""
-        return list(self.selected_)
+        raw_l = gate_loss(self.raw_cols_)
+        # Candidate feature sets are the cumulative rounds; the best one on the gate wins.
+        best_round, best_l = None, raw_l
+        for r in sorted({s.round_ for s in self.selected_}):
+            cols = self.raw_cols_ + [c for s in self.selected_ if s.round_ <= r for c in s.out_names()]
+            l = gate_loss(cols)
+            self._log(f"  gate rounds<={r + 1}: loss={l:.6f} vs raw {raw_l:.6f}")
+            if l < best_l:
+                best_round, best_l = r, l
+        return best_round, raw_l, best_l
 
-    def _fit_full(self, X, y):
+    def _fit_full(self, X, y, U=None):
         folds = self._folds(len(X), y, 5, self.random_state + 1)
         F = X.copy()
-        self.train_values_ = {}
+        U = None if U is None else U[self.raw_cols_].copy()
         for s in self.selected_:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
+            elif U is not None:
+                s.fit(pd.concat([F, U], ignore_index=True), None, self.ctx_)
+                v = s.transform(F, self.ctx_)
             else:
                 v = s.fit(F, y, self.ctx_).transform(F, self.ctx_)
+            if U is not None:
+                vu = s.transform(U, self.ctx_)
+                for j, col in enumerate(s.out_names()):
+                    U[col] = vu if np.ndim(vu) == 1 else vu[:, j]
             for j, col in enumerate(s.out_names()):
                 F[col] = v if np.ndim(v) == 1 else v[:, j]
         self.new_columns_ = [c for s in self.selected_ for c in s.out_names()]
@@ -803,8 +895,8 @@ class FeatureForge:
             out[c] = self._train_frame[c].to_numpy()
         return out
 
-    def fit_transform(self, X, y):
-        return self.fit(X, y).transform_train(X)
+    def fit_transform(self, X, y, X_unlabeled=None):
+        return self.fit(X, y, X_unlabeled).transform_train(X)
 
     def report(self) -> pd.DataFrame:
         return pd.DataFrame(self.history_)
