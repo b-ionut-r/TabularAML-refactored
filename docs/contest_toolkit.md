@@ -119,12 +119,15 @@ held-out gain and returned the raw features unchanged.
 | Dataset | Lift | FE time | Features kept |
 |---|---|---|---|
 | magic | +0.00% | 349s | 0 |
+| adult | +1.02% | 307s | 8 |
 | houses | −0.54% | 808s | 1 |
 | fried | +0.00% | 442s | 0 |
 | churn | +0.00% | 997s | 0 |
 | phoneme | +0.00% | 402s | 0 |
 
-Its configured 300 s budget is not enforced.
+Its configured 300 s budget is not enforced. On the same seed-0 splits
+FeatureForge scored Magic +9.75% (12 s), Adult +4.18% (23 s), Houses +2.81%
+(8 s), Fried +0.60% (7 s), Churn −2.74% (23 s) and Phoneme +0.00% (3 s).
 
 ### ContestSolver vs. the repo's fixed XGBoost learner (8 classification datasets × 3 holdouts)
 
