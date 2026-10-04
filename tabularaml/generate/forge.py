@@ -284,6 +284,36 @@ class KNNTarget(Spec):
         return out
 
 
+class BinnedPairTE(TargetEnc):
+    """Out-of-fold target map over a 2-D quantile grid of two numerics.
+
+    Captures smooth two-way interactions (including rotated ones) that
+    axis-aligned splits approximate with many leaves.
+    """
+
+    def __init__(self, a: str, b: str, n_classes: int = 0, n_bins: int = 16):
+        super().__init__([a, b], n_classes)
+        self.n_bins = n_bins
+        self.name = f"te2d__{a}__{b}"
+
+    def _bin(self, x, edges):
+        finite = np.isfinite(x)
+        return np.where(finite, np.searchsorted(edges, np.where(finite, x, 0.0), side="right"), len(edges) + 1)
+
+    def _fit_codes(self, df):
+        self.edges_ = []
+        for c in self.parents:
+            x = df[c].to_numpy(dtype=float)
+            q = np.linspace(0, 1, self.n_bins + 1)[1:-1]
+            self.edges_.append(np.unique(np.nanquantile(x[np.isfinite(x)], q)) if np.isfinite(x).any() else np.array([]))
+        return self._codes(df)
+
+    def _codes(self, df):
+        a = self._bin(df[self.parents[0]].to_numpy(dtype=float), self.edges_[0])
+        b = self._bin(df[self.parents[1]].to_numpy(dtype=float), self.edges_[1])
+        return a.astype(np.int64) * (len(self.edges_[1]) + 2) + b
+
+
 class RowStat(Spec):
     """Row-wise statistic over a family of columns (e.g. one-hot blocks, repeated measurements)."""
 
@@ -540,6 +570,8 @@ class FeatureForge:
                     if len(dense_num) >= max(2, d // 2):
                         ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
                         add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"top{d}"))
+            for a, b in combinations(dense_num[:10], 2):
+                add(BinnedPairTE(a, b, self.n_classes_))
             for a, b in combinations(top_num, 2):
                 for op in self.arith_ops:
                     add(Arith(op, a, b))
