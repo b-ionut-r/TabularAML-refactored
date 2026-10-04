@@ -422,8 +422,9 @@ class FeatureForge:
         Fraction of rows held out (before search) to confirm the final gain.
         0 disables the gate.
     gate_z : float
-        Required paired z-score of the per-row gate improvement (1.0 ~ 84%
-        one-sided confidence). Protects small tables from noise-driven adds.
+        Required paired z-score of the (winsorised) per-row gate improvement
+        (1.0 ~ 84% one-sided confidence; raised to 1.645 when the gate has fewer
+        than 1000 rows). Protects small tables from noise-driven adds.
     """
 
     def __init__(self, task: Optional[str] = None, log_target: bool = False,
@@ -845,6 +846,8 @@ class FeatureForge:
 
         raw_rows = gate_loss(self.raw_cols_)
         raw_l = float(raw_rows.mean())
+        # Small gates are noisy: demand 95% one-sided confidence below 1000 rows.
+        z_needed = self.gate_z if len(yg) >= 1000 else max(self.gate_z, 1.645)
         # Candidate feature sets are the cumulative rounds; the best one on the gate is
         # kept only if its paired per-row improvement clears ``gate_z`` standard errors.
         best_round, best_l, best_z = None, raw_l, 0.0
@@ -852,9 +855,12 @@ class FeatureForge:
             cols = self.raw_cols_ + [c for s in self.selected_ if s.round_ <= r for c in s.out_names()]
             rows = gate_loss(cols)
             d = raw_rows - rows
-            z = float(d.mean() / (d.std(ddof=1) / np.sqrt(len(d)) + 1e-300))
-            self._log(f"  gate rounds<={r + 1}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f})")
-            if rows.mean() < best_l and z >= self.gate_z:
+            # Winsorise so a handful of extreme rows cannot carry the decision.
+            lo, hi = np.quantile(d, [0.01, 0.99])
+            dw = np.clip(d, lo, hi)
+            z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
+            self._log(f"  gate rounds<={r + 1}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
+            if rows.mean() < best_l and z >= z_needed:
                 best_round, best_l, best_z = r, float(rows.mean()), z
         return best_round, raw_l, best_l
 
