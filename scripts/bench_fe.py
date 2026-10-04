@@ -69,7 +69,29 @@ def fe_tabularaml(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
 ARMS = {"raw": fe_raw, "forge": fe_forge, "tabularaml": fe_tabularaml}
 
 
-def evaluate(X_tr, y_tr, X_te, y_te, task, metric, seed, models, threads):
+def evaluate_repo(X_tr, y_tr, X_te, y_te, task, metric, seed, threads):
+    """The repo's original evaluator: one early-stopped XGBoost with fixed params."""
+    from tabularaml.benchmarks.feature_gen.evaluator import (
+        build_base_learner, split_early_stopping_validation)
+    from tabularaml.contest.solver import prepare_frames
+    X_tr, X_te = prepare_frames(X_tr, X_te)
+    t = "regression" if task == "regression" else "classification"
+    yt = np.log1p(y_tr) if metric == "rmsle" else y_tr
+    X_fit, X_val, y_fit, y_val = split_early_stopping_validation(X_tr, yt, t, seed)
+    model = build_base_learner(t, int(pd.Series(y_tr).nunique()), seed, n_jobs=threads)
+    model.fit(X_fit, y_fit, eval_set=[(X_val, y_val)], verbose=False)
+    if task == "regression":
+        p = model.predict(X_te)
+        p = np.expm1(p) if metric == "rmsle" else p
+    else:
+        p = model.predict_proba(X_te)
+        p = p[:, 1] if task == "binary" else p
+    return get_metric(metric)(y_te, p), np.nan
+
+
+def evaluate(X_tr, y_tr, X_te, y_te, task, metric, seed, models, threads, judge="solver"):
+    if judge == "repo":
+        return evaluate_repo(X_tr, y_tr, X_te, y_te, task, metric, seed, threads)
     solver = ContestSolver(task=task, metric=metric, models=models, n_folds=5, seeds=(seed,),
                            n_jobs=threads, verbose=False).fit(X_tr, y_tr, X_te)
     m = get_metric(metric)
@@ -85,6 +107,8 @@ def main():
     ap.add_argument("--models", nargs="*", default=["lgbm"])
     ap.add_argument("--budget", type=float, default=300)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--judge", default="solver", choices=["solver", "repo"],
+                    help="downstream model: ContestSolver(--models) or the repo's fixed XGBoost")
     ap.add_argument("--tag", default="", help="suffix for non-raw arm names (algorithm versions)")
     ap.add_argument("--out", type=Path, default=Path("reports/fe_bench.csv"))
     args = ap.parse_args()
@@ -103,13 +127,15 @@ def main():
             y_tr, y_te = y_tr.reset_index(drop=True), y_te.reset_index(drop=True).to_numpy()
             for base_arm in args.arms:
                 arm = base_arm if base_arm == "raw" or not args.tag else f"{base_arm}_{args.tag}"
+                if args.judge == "repo":
+                    arm = f"{base_arm}@repo"
                 if (name, seed, arm) in done:
                     continue
                 t0 = time.time()
                 try:
                     A, B, info = ARMS[base_arm](X_tr, y_tr, X_te, task, metric, seed, args.budget, args.threads)
                     fe_secs = time.time() - t0
-                    test, oof = evaluate(A, y_tr, B, y_te, task, metric, seed, args.models, args.threads)
+                    test, oof = evaluate(A, y_tr, B, y_te, task, metric, seed, args.models, args.threads, args.judge)
                     status, err = "ok", ""
                 except Exception as exc:  # keep the suite running
                     import traceback

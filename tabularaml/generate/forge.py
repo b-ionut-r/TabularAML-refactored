@@ -284,6 +284,38 @@ class KNNTarget(Spec):
         return out
 
 
+class LinearOOF(KNNTarget):
+    """Out-of-fold prediction of a spline-additive linear model (a ridge GAM).
+
+    Smooth additive structure spread over many numerics (``sum_i f_i(x_i)``)
+    costs a tree ensemble many splits; one stacked GAM margin hands it over
+    in a single column. Training rows are encoded out of fold.
+    """
+
+    def __init__(self, cols: Sequence[str], n_classes: int, label: str):
+        super().__init__(cols, (1,), n_classes, label)
+        self.name = f"gam__{label}"
+
+    def _model(self):
+        from sklearn.linear_model import LogisticRegression, Ridge
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import SplineTransformer, StandardScaler
+        est = Ridge(alpha=10.0) if self.n_classes == 0 else LogisticRegression(C=0.3, max_iter=300)
+        return make_pipeline(SplineTransformer(n_knots=6, degree=3), StandardScaler(), est)
+
+    def _query(self, M_ref, Y_ref, M_q):
+        m = self._model()
+        if self.n_classes == 0:
+            return m.fit(M_ref, Y_ref[:, 0]).predict(M_q)[:, None]
+        yc = Y_ref.argmax(1) if self.per > 1 else Y_ref[:, 0].astype(int)
+        m.fit(M_ref, yc)
+        if self.per == 1:
+            return m.decision_function(M_q)[:, None]
+        P = np.full((len(M_q), self.per), 1e-6)
+        P[:, m.classes_] = m.predict_proba(M_q)
+        return np.log(P)
+
+
 class BinnedPairTE(TargetEnc):
     """Out-of-fold target map over a 2-D quantile grid of two numerics.
 
@@ -566,10 +598,12 @@ class FeatureForge:
                     add(RowStat(raw_num, "nan", "all"))
             dense_num = [c for c in top_num if W[c].nunique() > 10]
             if len(W) <= 300_000:
-                for d in (4, 12, 32):
-                    if len(dense_num) >= max(2, d // 2):
+                for d in (2, 4, 8, 16, 32):
+                    if len(dense_num) >= d or (d == 32 and len(dense_num) > 16):
                         ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
                         add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"top{d}"))
+                if len(dense_num) >= 3 and len(W) <= 200_000 and self.n_classes_ <= 2:
+                    add(LinearOOF(dense_num, self.n_classes_, "top"))
             for a, b in combinations(dense_num[:10], 2):
                 add(BinnedPairTE(a, b, self.n_classes_))
             for a, b in combinations(top_num, 2):
@@ -739,7 +773,8 @@ class FeatureForge:
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.raw_cols_ = list(X.columns)
         self.key_cols_ = [c for c in X.columns
-                          if c in self.cat_cols_ or 2 <= X[c].nunique() <= self.max_key_cardinality]
+                          if 2 <= X[c].nunique() <= (0.5 * len(X) if c in self.cat_cols_
+                                                     else self.max_key_cardinality)]
         self.ctx_ = Context(self.task_, self.n_classes_, self.random_state)
 
         # Gate split: these rows never influence the search.
