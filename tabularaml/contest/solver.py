@@ -41,6 +41,10 @@ def infer_task(y: pd.Series) -> str:
     return "regression"
 
 
+def _as_str(s: pd.Series) -> pd.Series:
+    return s.astype(object).where(s.notna(), "__NA__").astype(str)
+
+
 def prepare_frames(X: pd.DataFrame, X_test: Optional[pd.DataFrame] = None,
                    cat_cols: Optional[Sequence[str]] = None):
     """Cast object/bool/declared columns to a shared ``category`` dtype.
@@ -57,9 +61,9 @@ def prepare_frames(X: pd.DataFrame, X_test: Optional[pd.DataFrame] = None,
                   or pd.api.types.is_string_dtype(X[c]))
         if not is_cat:
             continue
-        vals = X[c].astype(str)
+        vals = _as_str(X[c])
         if X_test is not None:
-            test_vals = X_test[c].astype(str)
+            test_vals = _as_str(X_test[c])
             cats = pd.Index(pd.unique(pd.concat([vals, test_vals]))).sort_values()
             X_test[c] = pd.Categorical(test_vals, categories=cats)
         else:
@@ -220,7 +224,7 @@ class ContestSolver:
     def _align(self, X: pd.DataFrame) -> pd.DataFrame:
         X = X.reset_index(drop=True)[self.columns_].copy()
         for c, cats in self.categories_.items():
-            X[c] = pd.Categorical(X[c].astype(str), categories=cats)
+            X[c] = pd.Categorical(_as_str(X[c]), categories=cats)
         return X
 
     def predict_models(self, X: pd.DataFrame) -> Dict[str, np.ndarray]:

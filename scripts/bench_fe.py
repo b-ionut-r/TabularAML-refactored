@@ -1,0 +1,124 @@
+"""Measure feature-engineering lift on an untouched outer holdout.
+
+For each dataset and repeat:
+  1. Outer 80/20 split (stratified for classification). The 20% is never
+     seen by feature search, selection, encoders or early stopping.
+  2. Each FE arm is fitted on the 80% only; target encodings on training
+     rows are out-of-fold.
+  3. The same downstream model (``ContestSolver``: 5-fold bagged LightGBM by
+     default, test predictions averaged over folds) is trained on raw and on
+     engineered features and scored on the holdout.
+
+Lift is reported as percent reduction of the holdout loss (positive = FE
+helps) together with FE wall time.
+
+    python scripts/bench_fe.py --arms raw forge --out reports/fe_bench.csv
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tabularaml.benchmarks.contest_suite import SUITE, load_suite_dataset  # noqa: E402
+from tabularaml.contest import ContestSolver, get_metric  # noqa: E402
+
+
+def fe_raw(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
+    return X_tr, X_te, {}
+
+
+def fe_forge(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
+    from tabularaml.generate.forge import FeatureForge
+    forge = FeatureForge(task=task, log_target=(metric == "rmsle"), time_budget=budget,
+                         random_state=seed, n_jobs=threads, verbose=True).fit(X_tr, y_tr)
+    info = dict(n_added=len(forge.new_columns_), gate=forge.gate_passed_,
+                base_cv=forge.base_cv_loss_, search_cv=forge.search_cv_loss_,
+                features=forge.new_columns_[:80])
+    return forge.transform_train(X_tr), forge.transform(X_te), info
+
+
+def fe_tabularaml(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
+    """The existing genetic FeatureGenerator (lite preset, budget-capped)."""
+    from tabularaml.generate.features import FeatureGenerator
+    from tabularaml.eval.scorers import rmse, binary_crossentropy, categorical_crossentropy
+    scorer = rmse if task == "regression" else (binary_crossentropy if task == "binary" else categorical_crossentropy)
+    gen = FeatureGenerator(task="regression" if task == "regression" else "classification",
+                           scorer=scorer, mode="lite", time_budget=budget, use_gpu=False,
+                           log_file=None, random_state=seed, n_jobs=threads)
+    gen.generate(X_tr, y_tr)
+    gen.fit(X_tr, y_tr)
+    A, B = gen.transform(X_tr), gen.transform(X_te)
+    return A, B, dict(n_added=A.shape[1] - X_tr.shape[1])
+
+
+ARMS = {"raw": fe_raw, "forge": fe_forge, "tabularaml": fe_tabularaml}
+
+
+def evaluate(X_tr, y_tr, X_te, y_te, task, metric, seed, models, threads):
+    solver = ContestSolver(task=task, metric=metric, models=models, n_folds=5, seeds=(seed,),
+                           n_jobs=threads, verbose=False).fit(X_tr, y_tr, X_te)
+    m = get_metric(metric)
+    return m(y_te, solver.test_ensemble_), solver.oof_ensemble_score_
+
+
+def main():
+    warnings.filterwarnings("ignore")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--datasets", nargs="*", default=list(SUITE))
+    ap.add_argument("--arms", nargs="*", default=["raw", "forge"])
+    ap.add_argument("--seeds", type=int, nargs="*", default=[0, 1, 2])
+    ap.add_argument("--models", nargs="*", default=["lgbm"])
+    ap.add_argument("--budget", type=float, default=300)
+    ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--tag", default="", help="suffix for non-raw arm names (algorithm versions)")
+    ap.add_argument("--out", type=Path, default=Path("reports/fe_bench.csv"))
+    args = ap.parse_args()
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    done = set()
+    if args.out.exists():
+        prev = pd.read_csv(args.out)
+        done = set(zip(prev.dataset, prev.seed, prev.arm))
+
+    for name in args.datasets:
+        X, y, task, metric = load_suite_dataset(name)
+        for seed in args.seeds:
+            strat = y if task != "regression" else None
+            X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=seed, stratify=strat)
+            X_tr, X_te = X_tr.reset_index(drop=True), X_te.reset_index(drop=True)
+            y_tr, y_te = y_tr.reset_index(drop=True), y_te.reset_index(drop=True).to_numpy()
+            for base_arm in args.arms:
+                arm = base_arm if base_arm == "raw" or not args.tag else f"{base_arm}_{args.tag}"
+                if (name, seed, arm) in done:
+                    continue
+                t0 = time.time()
+                try:
+                    A, B, info = ARMS[base_arm](X_tr, y_tr, X_te, task, metric, seed, args.budget, args.threads)
+                    fe_secs = time.time() - t0
+                    test, oof = evaluate(A, y_tr, B, y_te, task, metric, seed, args.models, args.threads)
+                    status, err = "ok", ""
+                except Exception as exc:  # keep the suite running
+                    import traceback
+                    traceback.print_exc()
+                    fe_secs, test, oof, info, status, err = time.time() - t0, np.nan, np.nan, {}, "error", repr(exc)[:300]
+                row = dict(dataset=name, seed=seed, arm=arm, task=task, metric=metric,
+                           n_train=len(X_tr), n_raw=X.shape[1], test_score=test, oof_score=oof,
+                           fe_seconds=fe_secs, n_added=info.get("n_added", 0),
+                           gate=info.get("gate"), status=status, error=err,
+                           info=json.dumps({k: v for k, v in info.items() if k != "n_added"}, default=str))
+                pd.DataFrame([row]).to_csv(args.out, mode="a", header=not args.out.exists(), index=False)
+                print(f"### {name:<12} seed={seed} {arm:<10} {metric}={test:.6f} "
+                      f"fe={fe_secs:.0f}s added={row['n_added']} gate={row['gate']}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
