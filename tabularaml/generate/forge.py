@@ -380,18 +380,22 @@ def _lgb_objective(task: str, n_classes: int) -> dict:
     return {"objective": "multiclass", "metric": "multi_logloss", "num_class": n_classes}
 
 
-def _loss(task, y, margin) -> float:
-    """Loss of raw margins in the LightGBM objective's own units."""
+def _row_loss(task, y, margin) -> np.ndarray:
+    """Per-row loss of raw margins in the LightGBM objective's own units."""
     y = np.asarray(y)
     if task == "regression":
-        return float(np.mean((y - margin) ** 2))
+        return (y - margin) ** 2
     if task == "binary":
         p = 1 / (1 + np.exp(-margin))
         p = np.clip(p, 1e-15, 1 - 1e-15)
-        return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+        return -(y * np.log(p) + (1 - y) * np.log(1 - p))
     m = margin - margin.max(axis=1, keepdims=True)
     logp = m - np.log(np.exp(m).sum(axis=1, keepdims=True))
-    return float(-np.mean(logp[np.arange(len(y)), y.astype(int)]))
+    return -logp[np.arange(len(y)), y.astype(int)]
+
+
+def _loss(task, y, margin) -> float:
+    return float(np.mean(_row_loss(task, y, margin)))
 
 
 # ============================================================================
@@ -417,13 +421,16 @@ class FeatureForge:
     gate_frac : float
         Fraction of rows held out (before search) to confirm the final gain.
         0 disables the gate.
+    gate_z : float
+        Required paired z-score of the per-row gate improvement (1.0 ~ 84%
+        one-sided confidence). Protects small tables from noise-driven adds.
     """
 
     def __init__(self, task: Optional[str] = None, log_target: bool = False,
                  time_budget: float = 300, n_rounds: int = 3, max_new_features: int = 60,
                  top_numeric: int = 24, top_keys: int = 10, max_key_cardinality: int = 200,
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
-                 gate_frac: float = 0.2, min_rel_gain: float = 0.001, cv: int = 3,
+                 gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -436,6 +443,7 @@ class FeatureForge:
         self.arith_ops = tuple(arith_ops)
         self.group_stats = tuple(group_stats)
         self.gate_frac = gate_frac
+        self.gate_z = gate_z
         self.min_rel_gain = min_rel_gain
         self.cv = cv
         self.random_state = random_state
@@ -833,17 +841,21 @@ class FeatureForge:
             b = self._fit_eval(A.iloc[tr], ys[tr], A.iloc[va], ys[va], lr=0.05, es=100)
             # Refit on all search rows at the early-stopped size, then score the gate rows.
             full = lgb.train(self._lgb_params(0.05), lgb.Dataset(A, ys), max(1, b.best_iteration))
-            return _loss(self.task_, yg, full.predict(G, raw_score=True))
+            return _row_loss(self.task_, yg, full.predict(G, raw_score=True))
 
-        raw_l = gate_loss(self.raw_cols_)
-        # Candidate feature sets are the cumulative rounds; the best one on the gate wins.
-        best_round, best_l = None, raw_l
+        raw_rows = gate_loss(self.raw_cols_)
+        raw_l = float(raw_rows.mean())
+        # Candidate feature sets are the cumulative rounds; the best one on the gate is
+        # kept only if its paired per-row improvement clears ``gate_z`` standard errors.
+        best_round, best_l, best_z = None, raw_l, 0.0
         for r in sorted({s.round_ for s in self.selected_}):
             cols = self.raw_cols_ + [c for s in self.selected_ if s.round_ <= r for c in s.out_names()]
-            l = gate_loss(cols)
-            self._log(f"  gate rounds<={r + 1}: loss={l:.6f} vs raw {raw_l:.6f}")
-            if l < best_l:
-                best_round, best_l = r, l
+            rows = gate_loss(cols)
+            d = raw_rows - rows
+            z = float(d.mean() / (d.std(ddof=1) / np.sqrt(len(d)) + 1e-300))
+            self._log(f"  gate rounds<={r + 1}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f})")
+            if rows.mean() < best_l and z >= self.gate_z:
+                best_round, best_l, best_z = r, float(rows.mean()), z
         return best_round, raw_l, best_l
 
     def _fit_full(self, X, y, U=None):
