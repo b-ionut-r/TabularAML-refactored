@@ -76,3 +76,57 @@ training rows (`transform_train`) and fitted on all training rows for new data
 * `scripts/summarize_fe.py` — per-dataset lift, win rate and FE runtime.
 * `scripts/bench_contest.py` — ContestSolver vs. the repo's fixed XGBoost base
   learner on the same kind of holdout.
+
+## Measured results (outer 20% holdout, 3 splits per dataset)
+
+Raw CSVs: `docs/results/`. Lift = % reduction of holdout loss (logloss / RMSE /
+RMSLE) of 5-fold bagged LightGBM on engineered vs. raw features; positive is better.
+
+### FeatureForge, 20 datasets × 3 holdouts (default settings, 300 s budget)
+
+| Dataset | Holdout lift (mean of 3) | FE time | Features kept |
+|---|---|---|---|
+| magic | +11.30% | 12s | 15.3 |
+| adult | +4.24% | 30s | 32.3 |
+| houses | +3.62% | 10s | 3.7 |
+| wind | +0.95% | 8s | 4.0 |
+| puma8NH | +0.63% | 3s | 1.0 |
+| fried | +0.56% | 8s | 2.0 |
+| coil2000 | +0.15% | 18s | 18.0 |
+| ames | +0.00% | 37s | 0.0 |
+| page_blocks | +0.00% | 3s | 0.0 |
+| cpu_act | +0.00% | 15s | 0.0 |
+| fars | +0.00% | 48s | 0.0 |
+| covertype | +0.00% | 69s | 0.0 |
+| sleep | +0.00% | 12s | 0.0 |
+| house_16H | +0.00% | 8s | 0.0 |
+| pol | +0.00% | 33s | 0.0 |
+| phoneme | +0.00% | 3s | 0.0 |
+| wine_white | +0.00% | 9s | 0.0 |
+| spambase | +0.00% | 20s | 0.0 |
+| churn | -0.36% | 23s | 12.0 |
+| titanic | -1.30% | 8s | 2.0 |
+
+Mean +0.99%, 18/60 runs improved, 3/60 worse (Titanic −3.9% on a 712-row
+split, Churn −2.7%, Coil2000 −0.3%), mean search time 19 s. Gains concentrate where
+the data has structure trees approximate poorly: local neighbourhoods (Magic,
+via kNN target features), rotated coordinates (Houses, `latitude ± longitude`),
+categorical interactions (Adult). On the other 11 datasets the gate found no
+held-out gain and returned the raw features unchanged.
+
+### Previous genetic `FeatureGenerator` (`mode="lite"`, same protocol, seed 0)
+
+| Dataset | Lift | FE time | Features kept |
+|---|---|---|---|
+| magic | +0.00% | 349s | 0 |
+| houses | −0.54% | 808s | 1 |
+| fried | +0.00% | 442s | 0 |
+| churn | +0.00% | 997s | 0 |
+| phoneme | +0.00% | 402s | 0 |
+
+Its configured 300 s budget is not enforced.
+
+### ContestSolver vs. the repo's fixed XGBoost learner (8 classification datasets × 3 holdouts)
+
+Logloss lift of the OOF hill-climbed LightGBM + XGBoost + CatBoost ensemble:
+mean +6.7%, median +6.2%, better on 24/24 holdouts (Adult +0.7% … Ring +13.4%).
