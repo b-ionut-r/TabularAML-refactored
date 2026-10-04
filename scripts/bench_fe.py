@@ -55,6 +55,11 @@ def fe_tabularaml(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
     gen = FeatureGenerator(task="regression" if task == "regression" else "classification",
                            scorer=scorer, mode="lite", time_budget=budget, use_gpu=False,
                            log_file=None, random_state=seed, n_jobs=threads)
+    # The genetic engine predates pandas' string dtype; hand it object columns.
+    X_tr, X_te = X_tr.copy(), X_te.copy()
+    for c in X_tr.columns:
+        if pd.api.types.is_string_dtype(X_tr[c]) and X_tr[c].dtype != object:
+            X_tr[c], X_te[c] = X_tr[c].astype(object), X_te[c].astype(object)
     gen.generate(X_tr, y_tr)
     gen.fit(X_tr, y_tr)
     A, B = gen.transform(X_tr), gen.transform(X_te)
