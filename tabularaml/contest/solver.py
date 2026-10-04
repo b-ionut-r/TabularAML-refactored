@@ -22,7 +22,7 @@ import pandas as pd
 from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold
 from sklearn.preprocessing import LabelEncoder
 
-from .ensemble import blend, hill_climb
+from .ensemble import Stacker, blend, choose_ensemble, hill_climb
 from .metrics import Metric, default_metric, get_metric
 from .models import make_model
 
@@ -98,6 +98,9 @@ class ContestSolver:
         Extra columns to treat as categorical (object/bool columns always are).
     log_target : bool | None
         Train regression models on ``log1p(y)``. Defaults to True for rmsle.
+    ensemble : "auto" | "hill" | "stack"
+        Blend by Caruana hill climbing, by a linear stacker on OOF logits, or
+        pick whichever scores better under cross-validation on the OOF rows.
     """
 
     def __init__(self, task: Optional[str] = None, metric=None,
@@ -105,7 +108,7 @@ class ContestSolver:
                  seeds: Sequence[int] = (0,), cv=None, groups=None,
                  cat_cols: Optional[Sequence[str]] = None,
                  log_target: Optional[bool] = None, n_jobs: int = -1,
-                 verbose: bool = True):
+                 ensemble: str = "auto", verbose: bool = True):
         self.task = task
         self.metric = metric
         self.models = list(models)
@@ -116,6 +119,7 @@ class ContestSolver:
         self.cat_cols = cat_cols
         self.log_target = log_target
         self.n_jobs = n_jobs
+        self.ensemble = ensemble
         self.verbose = verbose
 
     # ------------------------------------------------------------------ utils
@@ -206,12 +210,24 @@ class ContestSolver:
 
         self.weights_ = hill_climb(self.oof_, y_fit, self.metric_)
         self.oof_ensemble_ = blend([self.oof_[k] for k in self.weights_], np.array(list(self.weights_.values())))
+        self.stacker_ = None
+        self.ensemble_kind_ = "hill"
+        if self.ensemble in ("auto", "stack") and len(self.oof_) > 1:
+            y_st = y_model if self.task_ == "regression" else y_fit
+            oof_st = {k: (np.log1p(v) if self.log_target_ else v) for k, v in self.oof_.items()}
+            kind, cv_scores = choose_ensemble(oof_st, y_st, self.metric_ if not self.log_target_
+                                              else get_metric("rmse"), self.task_)
+            self._log(f"ensemble CV on OOF rows: {cv_scores}")
+            if self.ensemble == "stack" or kind == "stack":
+                self.ensemble_kind_ = "stack"
+                self.stacker_ = Stacker(self.task_).fit([oof_st[k] for k in self.oof_], y_st)
+                self.oof_ensemble_ = self._to_output(self.stacker_.predict([oof_st[k] for k in self.oof_]))
         self.oof_ensemble_score_ = self.metric_(y_fit, self.oof_ensemble_)
         rows.append(dict(model="ensemble", oof_score=self.oof_ensemble_score_,
                          mean_best_iter=np.nan, fit_seconds=time.time() - t0))
         self.leaderboard_ = pd.DataFrame(rows).sort_values(
             "oof_score", ascending=not self.metric_.greater_is_better).reset_index(drop=True)
-        self._log(f"ensemble weights {self.weights_}  OOF {self.metric_.name}="
+        self._log(f"ensemble {self.ensemble_kind_} weights {self.weights_}  OOF {self.metric_.name}="
                   f"{self.oof_ensemble_score_:.6f}  total {time.time() - t0:.1f}s")
         if X_test is not None:
             self.test_ensemble_ = self._blend_test(self.test_pred_)
@@ -219,6 +235,9 @@ class ContestSolver:
 
     # ---------------------------------------------------------------- predict
     def _blend_test(self, preds: Dict[str, np.ndarray]) -> np.ndarray:
+        if self.stacker_ is not None:
+            z = [(np.log1p(preds[k]) if self.log_target_ else preds[k]) for k in self.oof_]
+            return self._to_output(self.stacker_.predict(z))
         return blend([preds[k] for k in self.weights_], np.array(list(self.weights_.values())))
 
     def _align(self, X: pd.DataFrame) -> pd.DataFrame:

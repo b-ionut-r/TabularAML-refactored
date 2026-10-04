@@ -170,11 +170,114 @@ class CatBoostModel(BaseModel):
         return self._finish_proba(self.model.predict_proba(X))
 
 
+class MLPModel(BaseModel):
+    """Small scikit-learn MLP on quantile-normalised numerics and one-hot categories.
+
+    Weaker than the boosters on its own but makes different errors, which is
+    what the hill-climbed blend needs. Early-stopped on the validation fold.
+    """
+    name = "mlp"
+
+    DEFAULTS = dict(hidden_layer_sizes=(256, 128), alpha=1e-4, learning_rate_init=1e-3,
+                    batch_size=256, max_epochs=200, patience=12, max_onehot=50)
+
+    def _design(self, X: pd.DataFrame, fit: bool):
+        from sklearn.preprocessing import QuantileTransformer
+        if fit:
+            self.num_cols_ = [c for c in X.columns if not isinstance(X[c].dtype, pd.CategoricalDtype)]
+            self.cat_cols_ = [c for c in X.columns if isinstance(X[c].dtype, pd.CategoricalDtype)]
+            self.levels_ = {}
+            for c in self.cat_cols_:
+                vc = X[c].value_counts()
+                self.levels_[c] = list(vc.index[:self.p["max_onehot"]])
+        parts = []
+        if self.num_cols_:
+            M = X[self.num_cols_].to_numpy(dtype=float)
+            nan = np.isnan(M)
+            if fit:
+                self.med_ = np.nanmedian(M, axis=0)
+                self.med_ = np.where(np.isnan(self.med_), 0.0, self.med_)
+                self.qt_ = QuantileTransformer(n_quantiles=min(1000, len(X)), output_distribution="normal",
+                                               subsample=100_000, random_state=self.seed)
+                self.qt_.fit(np.where(nan, self.med_, M))
+                self.nan_cols_ = np.where(nan.any(0))[0]
+            parts.append(self.qt_.transform(np.where(nan, self.med_, M)))
+            parts.append(nan[:, self.nan_cols_].astype(float))
+        for c in self.cat_cols_:
+            v = X[c].astype(object).to_numpy()
+            parts.append(np.stack([v == lv for lv in self.levels_[c]], 1).astype(float)
+                         if self.levels_[c] else np.zeros((len(X), 0)))
+        return np.hstack(parts).astype(np.float32) if parts else np.zeros((len(X), 1), np.float32)
+
+    def fit(self, X_tr, y_tr, X_va, y_va):
+        from sklearn.neural_network import MLPClassifier, MLPRegressor
+        self.p = {**self.DEFAULTS, **self.params}
+        A, B = self._design(X_tr, True), self._design(X_va, False)
+        y_tr, y_va = np.asarray(y_tr), np.asarray(y_va)
+        if self.task == "regression":
+            self.mu_, self.sd_ = float(y_tr.mean()), float(y_tr.std() + 1e-12)
+            est = MLPRegressor
+        else:
+            est = MLPClassifier
+        kw = dict(hidden_layer_sizes=self.p["hidden_layer_sizes"], alpha=self.p["alpha"],
+                  learning_rate_init=self.p["learning_rate_init"],
+                  batch_size=min(self.p["batch_size"], len(A)), random_state=self.seed)
+        self.model = est(max_iter=1, warm_start=True, **kw)
+        classes = np.arange(self.n_classes if self.task == "multiclass" else 2)
+        best, best_state, bad = np.inf, None, 0
+        import copy
+        import warnings
+        for epoch in range(self.p["max_epochs"]):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if self.task == "regression":
+                    self.model.partial_fit(A, (y_tr - self.mu_) / self.sd_)
+                else:
+                    self.model.partial_fit(A, y_tr, classes=classes)
+            loss = self._val_loss(B, y_va)
+            if loss < best - 1e-6:
+                best, best_state, bad = loss, copy.deepcopy(self.model), 0
+                self.best_iteration_ = epoch + 1
+            else:
+                bad += 1
+                if bad >= self.p["patience"]:
+                    break
+        self.model = best_state or self.model
+        return self
+
+    def _raw_predict(self, A):
+        if self.task == "regression":
+            return self.model.predict(A) * self.sd_ + self.mu_
+        return np.clip(self.model.predict_proba(A), 1e-7, 1 - 1e-7)
+
+    def _val_loss(self, B, y):
+        p = self._raw_predict(B)
+        if self.task == "regression":
+            return float(np.mean((p - y) ** 2))
+        return float(-np.mean(np.log(p[np.arange(len(y)), y.astype(int)])))
+
+    def predict(self, X):
+        return self._finish_proba(self._raw_predict(self._design(X, False)))
+
+
 MODEL_REGISTRY = {
     "lgbm": LGBMModel,
     "xgb": XGBModel,
     "catboost": CatBoostModel,
+    "mlp": MLPModel,
 }
+
+# Diverse variants for a wider blend (``ContestSolver(models=ZOO)``).
+ZOO = [
+    "lgbm",
+    ("lgbm:deep", dict(num_leaves=127, min_child_samples=10, learning_rate=0.02, colsample_bytree=0.5)),
+    ("lgbm:shallow", dict(num_leaves=7, min_child_samples=40, learning_rate=0.05, reg_lambda=5.0)),
+    "xgb",
+    ("xgb:deep", dict(max_depth=0, grow_policy="lossguide", max_leaves=63, min_child_weight=3.0,
+                      colsample_bytree=0.5)),
+    "catboost",
+    ("catboost:deep", dict(depth=8, l2_leaf_reg=6.0)),
+]
 
 
 def make_model(spec, task: str, n_classes: int, seed: int, n_jobs: int) -> BaseModel:
