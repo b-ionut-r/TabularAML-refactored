@@ -3,7 +3,8 @@ import pandas as pd
 import pytest
 
 from tabularaml.contest import ContestSolver, get_metric, hill_climb
-from tabularaml.generate.forge import FeatureForge, column_families
+from tabularaml.generate.forge import (CrossLinearOOF, FeatureForge, GeoPair, column_families,
+                                       geo_points)
 
 
 def _frame(n=1500, seed=0):
@@ -81,3 +82,51 @@ def test_forge_adds_nothing_on_pure_noise_target():
     y = rng.normal(size=len(X))
     f = FeatureForge(task="regression", time_budget=60, n_jobs=1, verbose=False).fit(X, y)
     assert f.new_columns_ == []
+
+
+def test_column_families_sorted_by_index():
+    fam = column_families(["PAY_0", "PAY_10", "PAY_2", "PAY_3"])
+    assert fam == {"PAY": ["PAY_0", "PAY_2", "PAY_3", "PAY_10"]}
+
+
+def test_geo_points_and_haversine():
+    cols = ["Restaurant_latitude", "Restaurant_longitude", "drop_lat", "drop_lng", "x"]
+    pts = geo_points(cols)
+    assert pts == [("Restaurant_latitude", "Restaurant_longitude"), ("drop_lat", "drop_lng")]
+    df = pd.DataFrame({"Restaurant_latitude": [0.0], "Restaurant_longitude": [0.0],
+                       "drop_lat": [0.0], "drop_lng": [1.0]})
+    km = GeoPair(pts[0], pts[1], "hav").transform(df, None)
+    assert abs(km[0] - 111.19) < 0.1
+
+
+def test_cross_linear_is_out_of_fold_and_learns_pairs():
+    from sklearn.model_selection import StratifiedKFold
+    rng = np.random.default_rng(0)
+    n = 4000
+    X = pd.DataFrame({"u": rng.choice(list("abcdefghij"), n), "v": rng.choice(list("klmnopqrst"), n)})
+    # The label depends only on the (u, v) pair, not on u or v alone.
+    good = {(a, b) for a in "abcdefghij" for b in "klmnopqrst" if rng.random() < 0.5}
+    y = np.array([int((a, b) in good) for a, b in zip(X.u, X.v)])
+    folds = list(StratifiedKFold(5, shuffle=True, random_state=0).split(X, y))
+    pair = CrossLinearOOF(["u", "v"], 2, pairs=True).fit_transform_oof(X, y, None, folds)
+    single = CrossLinearOOF(["u", "v"], 2, pairs=False).fit_transform_oof(X, y, None, folds)
+    acc = lambda m: ((m > 0) == y).mean()
+    assert acc(pair) > 0.95 > 0.7 > acc(single)
+    spec = CrossLinearOOF(["u", "v"], 2).fit(X, y, None)
+    assert spec.transform(X.iloc[:7], None).shape == (7,)
+
+
+def test_forge_high_cardinality_recode_is_consistent():
+    rng = np.random.default_rng(0)
+    n = 6000
+    ids = np.array([f"id{i}" for i in range(400)])
+    X = pd.DataFrame({"user": rng.choice(ids, n), "x": rng.normal(size=n)})
+    eff = dict(zip(ids, rng.normal(size=len(ids))))
+    y = (X.user.map(eff) + X.x + rng.normal(scale=0.5, size=n) > 0).astype(int)
+    f = FeatureForge(task="binary", time_budget=60, n_rounds=1, n_jobs=1, verbose=False).fit(X, y)
+    A, B = f.transform_train(X), f.transform(X)
+    assert list(A.columns) == list(B.columns)
+    if f.recode_:
+        assert A["user"].dtype.kind == "f" and np.array_equal(A["user"], B["user"])
+    new = f.transform(pd.DataFrame({"user": ["never_seen"], "x": [0.0]}))
+    assert len(new) == 1
