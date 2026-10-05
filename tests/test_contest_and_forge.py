@@ -130,3 +130,36 @@ def test_forge_high_cardinality_recode_is_consistent():
         assert A["user"].dtype.kind == "f" and np.array_equal(A["user"], B["user"])
     new = f.transform(pd.DataFrame({"user": ["never_seen"], "x": [0.0]}))
     assert len(new) == 1
+
+
+def test_linresid_recovers_unexplained_part():
+    from tabularaml.generate.forge import LinResid
+    rng = np.random.default_rng(0)
+    n = 3000
+    a, b, c = rng.uniform(1, 5, (3, n))
+    extra = rng.normal(0, 1, n)
+    X = pd.DataFrame({"a": a, "b": b, "c": c, "w": a + b + c + extra})
+    r = LinResid(["a", "b", "c", "w"], "w").fit(X, None, None).transform(X, None)
+    assert np.corrcoef(r, extra)[0, 1] > 0.95
+    assert np.isfinite(LinResid(["a", "b", "c", "w"], "w", log=True).fit(X, None, None).transform(X, None)).all()
+
+
+def test_expr_spec_is_canonical_and_evaluates():
+    from tabularaml.generate.forge import Expr
+    X = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [2.0, 0.0, 1.0], "c": [1.0, 1.0, 2.0]})
+    e1, e2 = Expr(("div", ("add", "a", "b"), "c")), Expr(("div", ("add", "b", "a"), "c"))
+    assert e1.name == e2.name and e1.parents == ["a", "b", "c"]
+    assert np.allclose(e1.transform(X, None), [3.0, 2.0, 2.0])
+    assert np.isnan(Expr(("div", "a", "b")).transform(X, None)[1])
+
+
+def test_genetic_search_finds_compound_ratio():
+    rng = np.random.default_rng(0)
+    n = 3000
+    X = pd.DataFrame(rng.uniform(1, 5, (n, 6)), columns=list("abcdef"))
+    y = X.a * X.b / X.c - X.d * X.e / X.f + rng.normal(0, 0.3, n)
+    kw = dict(task="regression", n_rounds=1, max_new_features=10, n_jobs=1, verbose=False, random_state=0)
+    base = FeatureForge(**kw).fit(X, y)
+    ga = FeatureForge(evolve_time=8, **kw).fit(X, y)
+    assert any(c.startswith("gp__") for c in ga.new_columns_)
+    assert ga.gate_fe_loss_ < base.gate_fe_loss_
