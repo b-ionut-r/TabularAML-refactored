@@ -169,39 +169,47 @@ included yet.
 ### Results, 22 tables × 3 outer 20% holdouts
 
 Lift = % reduction of holdout loss of 5-fold bagged LightGBM on engineered vs.
-raw features (positive = better). Raw CSV: `docs/results/fe_contest_bench.csv`.
+raw features (positive = better). "Merged" is this branch: v9 plus PR #1's later
+interaction mining (tree-path and FAST pairs/triples, key × binned cells,
+PCA/PLS projections, importance-weighted and per-class kNN). "PR #1 @ branch
+point" is FeatureForge at commit a8fbdb1. Raw CSV: `docs/results/fe_contest_bench.csv`.
 
-| Dataset | Train rows | Metric | v9 lift, mean of 3 (min … max) | v9 FE time | Features kept | Seed 0: PR #1 → v9 lift | Seed 0: PR #1 → v9 time |
+| Dataset | Train rows | Metric | Merged lift, mean of 3 (min … max) | FE time | Features kept | PR #1 @ branch point | v9 |
 |---|---|---|---|---|---|---|---|
-| amazon | 26215 | logloss | **+12.95%** (+11.2 … +15.6) | 39s | 29.3 | +11.29% → +15.57% | 77s → 54s |
-| kdd_appetency | 40000 | logloss | **+5.74%** (+5.1 … +6.6) | 131s | 2.3 | +0.00% → +5.53% | 189s → 150s |
-| kdd_upselling | 40000 | logloss | **+4.95%** (+4.6 … +5.3) | 148s | 10.3 | +0.99% → +4.85% | 304s → 166s |
-| kick | 58386 | logloss | **+4.26%** (+3.3 … +4.9) | 155s | 17.7 | +2.26% → +3.35% | 348s → 129s |
-| food_delivery | 36360 | rmse | **+3.67%** (+3.4 … +4.0) | 47s | 19.3 | +2.14% → +3.66% | 152s → 41s |
-| miami_housing | 11020 | rmsle | **+2.50%** (+0.5 … +3.7) | 21s | 12.0 | +0.00% → +3.66% | 13s → 21s |
-| airline_satisfaction | 48000 | logloss | **+1.86%** (+0.0 … +3.0) | 95s | 7.0 | +2.63% → +2.63% | 223s → 93s |
-| diamonds | 43152 | rmsle | **+1.72%** (+1.5 … +2.0) | 43s | 4.7 | +1.98% → +1.68% | 78s → 47s |
-| abalone | 3340 | rmsle | **+1.15%** (+0.0 … +2.4) | 4s | 1.3 | +1.06% → +1.06% | 3s → 4s |
-| bank_marketing | 36168 | logloss | **+1.11%** (+0.0 … +2.4) | 39s | 4.0 | +2.67% → +2.41% | 41s → 40s |
-| allstate | 48000 | rmsle | **+0.83%** (+0.6 … +1.0) | 70s | 0.0 | +0.00% → +1.02% | 62s → 69s |
-| porto_seguro | 80000 | logloss | **+0.31%** (+0.0 … +0.7) | 122s | 6.7 | +0.00% → +0.69% | 119s → 152s |
-| house_prices | 1168 | rmsle | **+0.24%** (+0.0 … +0.7) | 28s | 8.3 | +0.00% → +0.00% | 53s → 15s |
-| bike_sharing | 13903 | rmsle | **+0.10%** (+0.0 … +0.3) | 12s | 0.7 | +0.00% → +0.00% | 29s → 12s |
-| click | 31958 | logloss | **+0.02%** (+0.0 … +0.1) | 17s | 1.7 | +0.05% → +0.05% | 20s → 24s |
-| bank_churn | 8000 | logloss | **+0.00%** (+0.0 … +0.0) | 9s | 0.0 | +0.00% → +0.00% | 42s → 8s |
-| coupon | 10147 | logloss | **+0.00%** (+0.0 … +0.0) | 7s | 0.0 | +0.00% → +0.00% | 16s → 10s |
-| credit_default | 24000 | logloss | **+0.00%** (+0.0 … +0.0) | 52s | 0.0 | +0.00% → +0.00% | 84s → 56s |
-| give_me_credit | 48000 | logloss | **+0.00%** (+0.0 … +0.0) | 30s | 0.0 | +0.00% → +0.00% | 32s → 31s |
-| hr_analytics | 15326 | logloss | **+0.00%** (+0.0 … +0.0) | 11s | 0.0 | +0.00% → +0.00% | 30s → 8s |
-| steel_plates | 1552 | logloss | **+0.00%** (+0.0 … +0.0) | 20s | 0.0 | +0.00% → +0.00% | 21s → 28s |
-| mercedes | 3367 | rmse | **-0.04%** (-0.5 … +0.4) | 23s | 18.0 | +0.00% → +0.00% | 18s → 19s |
+| amazon | 26215 | logloss | **+13.21%** (+10.4 … +16.0) | 32s | 60.0 | +10.15% (59s) | +12.95% (39s) |
+| kdd_appetency | 40000 | logloss | **+5.56%** (+5.0 … +6.6) | 193s | 0.0 | +0.31% (179s) | +5.74% (131s) |
+| kdd_upselling | 40000 | logloss | **+5.02%** (+4.6 … +5.3) | 208s | 0.0 | +0.26% (232s) | +4.95% (148s) |
+| airline_satisfaction | 48000 | logloss | **+4.86%** (+4.2 … +5.3) | 117s | 18.3 | +1.87% (166s) | +1.86% (95s) |
+| kick | 58386 | logloss | **+4.46%** (+4.0 … +4.9) | 262s | 36.7 | +2.65% (264s) | +4.26% (155s) |
+| food_delivery | 36360 | rmse | **+3.70%** (+3.4 … +4.0) | 57s | 17.0 | +2.64% (79s) | +3.67% (47s) |
+| miami_housing | 11020 | rmsle | **+2.51%** (+0.0 … +3.8) | 34s | 7.3 | +0.01% (14s) | +2.50% (21s) |
+| diamonds | 43152 | rmsle | **+1.91%** (+1.8 … +2.0) | 69s | 5.7 | +1.95% (51s) | +1.72% (43s) |
+| abalone | 3340 | rmsle | **+1.83%** (+1.0 … +2.4) | 5s | 2.3 | +1.15% (3s) | +1.15% (4s) |
+| bank_marketing | 36168 | logloss | **+1.39%** (+0.0 … +2.7) | 59s | 6.7 | +1.18% (35s) | +1.11% (39s) |
+| allstate | 48000 | rmsle | **+0.83%** (+0.6 … +1.0) | 140s | 1.0 | +0.00% (70s) | +0.83% (70s) |
+| bank_churn | 8000 | logloss | **+0.39%** (+0.0 … +0.6) | 19s | 6.7 | +0.00% (18s) | +0.00% (9s) |
+| porto_seguro | 80000 | logloss | **+0.31%** (+0.0 … +0.7) | 257s | 0.0 | +0.00% (94s) | +0.31% (122s) |
+| house_prices | 1168 | rmsle | **+0.22%** (+0.0 … +0.6) | 56s | 3.0 | +0.24% (38s) | +0.24% (28s) |
+| bike_sharing | 13903 | rmsle | **+0.10%** (+0.0 … +0.3) | 16s | 0.7 | +0.10% (16s) | +0.10% (12s) |
+| mercedes | 3367 | rmse | **+0.03%** (+0.0 … +0.1) | 34s | 0.0 | -0.05% (19s) | -0.04% (23s) |
+| credit_default | 24000 | logloss | **+0.00%** (+0.0 … +0.0) | 71s | 0.0 | +0.00% (62s) | +0.00% (52s) |
+| coupon | 10147 | logloss | **+0.00%** (+0.0 … +0.0) | 9s | 0.0 | +0.00% (8s) | +0.00% (7s) |
+| hr_analytics | 15326 | logloss | **+0.00%** (+0.0 … +0.0) | 13s | 0.0 | +0.00% (17s) | +0.00% (11s) |
+| give_me_credit | 48000 | logloss | **+0.00%** (+0.0 … +0.0) | 74s | 0.0 | +0.00% (29s) | +0.00% (30s) |
+| steel_plates | 1552 | logloss | **+0.00%** (+0.0 … +0.0) | 28s | 0.0 | +0.00% (14s) | +0.00% (20s) |
+| click | 31958 | logloss | **-0.04%** (-0.1 … +0.0) | 36s | 1.7 | +0.02% (14s) | +0.02% (17s) |
 
-v9 mean **+1.88%** over 66 runs (36 better, 29 unchanged, 1 worse: Mercedes −0.5%
-on one split), mean FE time 51 s. On seed 0, PR #1's version averaged +1.14% in
-89 s with 9/22 tables improved; v9 +2.10% in 54 s with 13/22.
+| Version | Mean lift | Runs better / worse (of 66) | Mean FE time |
+|---|---|---|---|
+| PR #1 @ branch point | +1.02% | 24 / 2 | 67s |
+| v9 | +1.88% | 36 / 1 | 51s |
+| Merged (this branch) | +2.10% | 38 / 1 | 81s |
 
 The big gains are where tables carry interaction structure a GBDT approximates
-poorly: many-level categorical crosses (Amazon +13%, KDD Cup +5–6%, Kick +4%)
-and geography (food delivery +3.7%, Miami housing +2.5%). Seven tables (bank
-churn, coupon, credit default, Give Me Some Credit, HR analytics, steel plates,
-and Mercedes) show no held-out gain from any candidate family yet.
+poorly: many-level categorical crosses (Amazon +13%, KDD Cup +5–6%, Kick +4.5%),
+geography (food delivery +3.7%, Miami housing +2.5%) and local neighbourhoods
+(airline satisfaction +4.9% from PR #1's kNN additions). Six tables (coupon,
+credit default, Give Me Some Credit, HR analytics, steel plates, click) show no
+held-out gain from any candidate family yet. A tree-path interaction search
+written on this branch independently of PR #1's (+1.96%, 3 worse runs) was
+dropped in favour of PR #1's version.
