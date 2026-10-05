@@ -134,6 +134,8 @@ class Spec:
 
 class Arith(Spec):
     def __init__(self, op: str, a: str, b: str):
+        if op in ("add", "mul", "sub") and b < a:
+            a, b = b, a  # symmetric (or sign-symmetric) ops: one canonical order
         super().__init__([a, b])
         self.op = op
         self.name = f"{a}__{op}__{b}"
@@ -820,7 +822,7 @@ class FeatureForge:
                 code = pd.Categorical(v, categories=top).codes.astype(np.int64)
                 code[code < 0] = len(top)
                 codes[c], sizes[c] = code, len(top) + 1
-            else:
+            elif c not in self.cat_cols_:
                 x = W[c].to_numpy(dtype=float)
                 fin = np.isfinite(x)
                 if fin.sum() < 20:
@@ -873,7 +875,7 @@ class FeatureForge:
             else:
                 k, c = (a, b) if is_key(a) else (b, a)
                 binned = [x for x in (a, b) if not is_key(x)]
-                if not is_key(k):
+                if not is_key(k) or any(x in self.cat_cols_ for x in binned):
                     continue
                 add(MixedTE([k, c], binned, self.n_classes_, 8))
                 add(MixedCount([k, c], binned, 8))
@@ -1088,18 +1090,32 @@ class FeatureForge:
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
             room = self.max_new_features - len(selected)
-            ladder = [k for k in (3, 6, 12, 25, 50, 80) if k < min(len(rank), room)] + [min(len(rank), room)]
-            best_k, best_loss, best_fit = 0, cur_loss, None
-            for k in sorted(set(ladder)):
-                if k <= 0:
-                    continue
-                cols = list(Wm.columns) + [c for nm in rank[:k] for c in spec_by_name[nm].out_names()]
-                oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds)
-                self._log(f"  top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
-                if loss_k < best_loss:
-                    best_k, best_loss, best_fit = k, loss_k, (oof_k, imp_k, cols)
-                if self._time_left() < 0:
-                    break
+            # Two orderings: joint-model split gain, and novel residual gain from
+            # screening. Wide candidate pools can push strong but narrow features
+            # (a single pairwise interaction) down the split-gain order.
+            novel_rank = sorted(survivors, key=lambda nm: -self._last_novelty.get(nm, 0.0))
+            orders = [("gain", rank, (3, 6, 12, 25, 50, 80)), ("novelty", novel_rank, (3, 6, 12))]
+            best_k, best_loss, best_fit, best_rank = 0, cur_loss, None, rank
+            tried = set()
+            for label, order, steps in orders:
+                ladder = [k for k in steps if k < min(len(order), room)]
+                if label == "gain":
+                    ladder.append(min(len(order), room))
+                for k in sorted(set(ladder)):
+                    if k <= 0:
+                        continue
+                    key = frozenset(order[:k])
+                    if key in tried:
+                        continue
+                    tried.add(key)
+                    cols = list(Wm.columns) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
+                    oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds)
+                    self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
+                    if loss_k < best_loss:
+                        best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
+                    if self._time_left() < 0:
+                        break
+            rank = best_rank
             if best_k == 0 or (cur_loss - best_loss) / cur_loss < self.min_rel_gain:
                 self._log(f"round {r + 1}: no prefix beats current CV loss by {self.min_rel_gain:.2%}; stopping")
                 break
