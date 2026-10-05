@@ -1382,9 +1382,20 @@ class FeatureForge:
 
     def _materialize(self, specs: List[Spec], W: pd.DataFrame, y, folds) -> Dict[str, np.ndarray]:
         out = {}
+        # Label-free statistics (counts, group statistics, ...) over every row whose
+        # features are known: search rows plus gate and unlabeled rows, as at the end.
+        WU = None
+        if getattr(self, "U_search_", None) is not None:
+            WU = pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
+            raw = set(self.raw_cols_)
         for s in specs:
             try:
-                v = s.fit_transform_oof(W, y, self.ctx_, folds) if s.target_dep else s.fit(W, y, self.ctx_).transform(W, self.ctx_)
+                if s.target_dep:
+                    v = s.fit_transform_oof(W, y, self.ctx_, folds)
+                elif WU is not None and set(s.parents) <= raw:
+                    v = s.fit(WU, None, self.ctx_).transform(W, self.ctx_)
+                else:
+                    v = s.fit(W, y, self.ctx_).transform(W, self.ctx_)
             except Exception:
                 continue
             v = np.asarray(v, dtype=np.float32)
@@ -1713,6 +1724,9 @@ class FeatureForge:
 
         W = X.iloc[idx_sel].reset_index(drop=True)
         yW = y_np[idx_sel]
+        self.U_search_ = None
+        if X_unlabeled is not None:
+            self.U_search_ = pd.concat([X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]], ignore_index=True)
         # Small tables get repeated CV so that selection is not driven by fold noise.
         n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
         folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
@@ -1835,6 +1849,7 @@ class FeatureForge:
                 self.selected_ = []
 
         # Refit every spec's statistics on all training rows.
+        self.U_search_ = None
         self._fit_full(X, y_np, None if X_unlabeled is None else self._prep(X_unlabeled))
         self.elapsed_ = time.time() - self._t0
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
