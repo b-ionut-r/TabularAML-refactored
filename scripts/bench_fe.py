@@ -38,12 +38,14 @@ def fe_raw(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
 
 
 FORGE_KW: dict = {}  # extra FeatureForge arguments from --forge-kw
+TRANSDUCTIVE = False  # --transductive: hand the holdout's features (never its labels) to FeatureForge
 
 
 def fe_forge(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
     from tabularaml.generate.forge import FeatureForge
     forge = FeatureForge(task=task, log_target=(metric == "rmsle"), time_budget=budget,
-                         random_state=seed, n_jobs=threads, verbose=True, **FORGE_KW).fit(X_tr, y_tr)
+                         random_state=seed, n_jobs=threads, verbose=True, **FORGE_KW).fit(
+        X_tr, y_tr, X_unlabeled=X_te if TRANSDUCTIVE else None)
     info = dict(n_added=len(forge.new_columns_), gate=forge.gate_passed_,
                 base_cv=forge.base_cv_loss_, search_cv=forge.search_cv_loss_,
                 features=forge.new_columns_[:80])
@@ -184,6 +186,8 @@ def main():
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--judge", default="solver", choices=["solver", "repo", "autogluon"],
                     help="downstream model: ContestSolver(--models), the repo's fixed XGBoost, or AutoGluon")
+    ap.add_argument("--transductive", action="store_true",
+                    help="contest setting: FeatureForge sees the test rows' features (counts, group stats)")
     ap.add_argument("--ag-preset", default="medium_quality")
     ap.add_argument("--ag-time", type=float, default=120, help="AutoGluon time limit per fit (s)")
     ap.add_argument("--ensemble", default="hill", choices=["hill", "stack", "auto"])
@@ -193,6 +197,8 @@ def main():
     args = ap.parse_args()
     FORGE_KW.update(json.loads(args.forge_kw))
     AG_KW.update(presets=args.ag_preset, time_limit=args.ag_time)
+    global TRANSDUCTIVE
+    TRANSDUCTIVE = args.transductive
     if args.datasets is None:
         args.datasets = list(CONTEST if args.suite == "contest" else SUITE)
     if args.models == ["zoo"]:

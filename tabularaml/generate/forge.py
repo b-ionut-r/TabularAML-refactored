@@ -979,6 +979,9 @@ class FeatureForge:
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
         Cap on features added in total.
+    gate_bags : int
+        Models averaged per feature set on the gate (different seeds and
+        early-stopping splits), to keep model noise out of the decision.
     evolve_time : float
         Seconds of genetic interaction search per round (0 disables): populations
         of key/binned-numeric cells (target-encoded) and arithmetic expression
@@ -1003,7 +1006,7 @@ class FeatureForge:
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
-                 evolve_time: float = 0.0,
+                 evolve_time: float = 0.0, gate_bags: int = 1,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1023,6 +1026,7 @@ class FeatureForge:
         self.n_interactions = n_interactions
         self.novelty_slack = novelty_slack
         self.evolve_time = evolve_time
+        self.gate_bags = gate_bags
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1851,15 +1855,20 @@ class FeatureForge:
             for j, col in enumerate(s.out_names()):
                 Fg[col] = vg if np.ndim(vg) == 1 else vg[:, j]
         import lightgbm as lgb
-        es_split = self._folds(len(Fs), ys, 5, self.random_state + 11)[0]
+        es_splits = [self._folds(len(Fs), ys, 5, self.random_state + 11 + k)[0] for k in range(self.gate_bags)]
 
         def gate_loss(cols, recode=None):
+            # A bag of differently seeded / early-stopped models: one model's
+            # randomness otherwise flips keep-or-drop decisions on small gates.
             A, G = self._model_frame(Fs[cols], recode), self._model_frame(Fg[cols], recode)
-            tr, va = es_split
-            b = self._fit_eval(A.iloc[tr], ys[tr], A.iloc[va], ys[va], lr=0.05, es=100)
-            # Refit on all search rows at the early-stopped size, then score the gate rows.
-            full = lgb.train(self._lgb_params(0.05), lgb.Dataset(A, ys), max(1, b.best_iteration))
-            return _row_loss(self.task_, yg, full.predict(G, raw_score=True))
+            margin = 0.0
+            for k, (tr, va) in enumerate(es_splits):
+                b = self._fit_eval(A.iloc[tr], ys[tr], A.iloc[va], ys[va], lr=0.05, es=100)
+                # Refit on all search rows at the early-stopped size, then score the gate rows.
+                full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), lgb.Dataset(A, ys),
+                                 max(1, b.best_iteration))
+                margin = margin + full.predict(G, raw_score=True) / len(es_splits)
+            return _row_loss(self.task_, yg, margin)
 
         # The baseline is always the raw columns as given (native categoricals).
         raw_rows = gate_loss(self.raw_cols_, recode=False)
