@@ -44,6 +44,9 @@ Each round:
      5–100 nearest rows) in subspaces of 2…32 top numerics, both standardised
      and **importance-weighted** (each axis scaled by the root of its split gain,
      so distance follows what the model uses);
+   * a rank-normalised (rank-gauss) variant of the weighted kNN for skewed
+     axes;
+   * same-scale sums of 3–4 top numerics (total-area-style aggregates);
    * out-of-fold **per-class kNN distances** (mean distance to the 1, 2, 4
      nearest rows of each class);
    * **interaction cells**: pairs and triples mined from the base model's tree
@@ -97,29 +100,29 @@ RMSLE) of 5-fold bagged LightGBM on engineered vs. raw features; positive is bet
 
 | Dataset | Holdout lift, current (mean of 3) | First version (v7) | FE time | Features kept |
 |---|---|---|---|---|
-| pol | +18.45% | +0.00% | 63s | 22.7 |
-| magic | +13.74% | +11.30% | 27s | 23.0 |
-| covertype | +6.71% | +0.00% | 95s | 106.3 |
-| wine_white | +5.51% | +0.00% | 50s | 54.3 |
-| adult | +4.29% | +4.24% | 31s | 13.0 |
-| phoneme | +3.79% | +0.00% | 7s | 8.3 |
-| houses | +3.58% | +3.62% | 12s | 5.7 |
-| churn | +1.87% | -0.36% | 27s | 25.0 |
-| fried | +0.82% | +0.56% | 16s | 3.0 |
-| wind | +0.68% | +0.95% | 10s | 3.7 |
-| coil2000 | +0.29% | +0.15% | 25s | 25.0 |
-| puma8NH | +0.27% | +0.63% | 5s | 3.3 |
+| pol | +18.26% | +0.00% | 52s | 16.0 |
+| magic | +13.77% | +11.30% | 33s | 31.3 |
+| churn | +7.97% | -0.36% | 28s | 24.7 |
+| covertype | +6.90% | +0.00% | 90s | 118.0 |
+| phoneme | +6.60% | +0.00% | 7s | 7.7 |
+| wine_white | +5.56% | +0.00% | 52s | 37.3 |
+| adult | +4.29% | +4.24% | 32s | 13.0 |
+| houses | +3.58% | +3.62% | 13s | 5.7 |
+| fried | +0.82% | +0.56% | 18s | 3.0 |
+| wind | +0.68% | +0.95% | 11s | 3.7 |
+| coil2000 | +0.29% | +0.15% | 26s | 25.0 |
+| puma8NH | +0.12% | +0.63% | 7s | 11.0 |
 | ames | +0.00% | +0.00% | 52s | 0.0 |
-| page_blocks | +0.00% | +0.00% | 4s | 0.0 |
+| page_blocks | +0.00% | +0.00% | 5s | 0.0 |
 | cpu_act | +0.00% | +0.00% | 13s | 0.0 |
-| house_16H | +0.00% | +0.00% | 11s | 0.0 |
+| house_16H | +0.00% | +0.00% | 14s | 0.0 |
 | titanic | +0.00% | -1.30% | 6s | 0.0 |
-| sleep | +0.00% | +0.00% | 20s | 0.0 |
-| spambase | +0.00% | +0.00% | 36s | 0.0 |
-| fars | -0.09% | +0.00% | 73s | 15.7 |
+| sleep | +0.00% | +0.00% | 22s | 0.0 |
+| spambase | +0.00% | +0.00% | 41s | 0.0 |
+| fars | -0.09% | +0.00% | 75s | 15.7 |
 
-Mean +3.0% (first version +0.99%), 29/60 runs improved, 2/60 worse (Churn
-−0.6%, Fars −0.3%), mean search time 29 s. The big gains come from
+Mean +3.44% (first version +0.99%), 29/60 runs improved, 2/60 worse (by at most
+0.28%), mean search time 30 s. The big gains come from
 importance-weighted kNN target and per-class distance features (Pol, Magic,
 Phoneme, Covertype), rotated coordinates (Houses) and categorical / binned
 interactions (Adult, Covertype). Wine White's gain is concentrated in one

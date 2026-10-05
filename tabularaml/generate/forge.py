@@ -234,9 +234,10 @@ class KNNTarget(Spec):
     target_dep = True
 
     def __init__(self, cols: Sequence[str], ks: Sequence[int], n_classes: int, label: str,
-                 weights: Optional[Sequence[float]] = None):
+                 weights: Optional[Sequence[float]] = None, rank: bool = False):
         super().__init__(cols)
         self.weights = None if weights is None else np.asarray(weights, dtype=float)
+        self.rank = rank
         self.ks = tuple(ks)
         self.n_classes = n_classes
         self.per = n_classes if n_classes > 2 else 1
@@ -245,6 +246,18 @@ class KNNTarget(Spec):
 
     def _matrix(self, df, fit=False):
         M = df[self.parents].to_numpy(dtype=float)
+        if getattr(self, "rank", False):
+            # Rank-gauss: skewed / heavy-tailed axes get comparable spread.
+            from scipy.special import ndtri
+            if fit:
+                self.qgrid_ = [np.unique(np.nanquantile(M[:, j], np.linspace(0, 1, 201)))
+                               if np.isfinite(M[:, j]).any() else np.array([0.0])
+                               for j in range(M.shape[1])]
+            M = np.column_stack([
+                ndtri(np.clip(np.interp(M[:, j], g, np.linspace(0, 1, len(g))) if len(g) > 1
+                              else np.full(len(M), 0.5), 0.005, 0.995))
+                for j, g in enumerate(self.qgrid_)])
+            M = np.where(np.isfinite(df[self.parents].to_numpy(dtype=float)), M, np.nan)
         if fit:
             lo, hi = np.nanpercentile(M, 1, axis=0), np.nanpercentile(M, 99, axis=0)
             self.lo_, self.hi_ = lo, hi
@@ -776,6 +789,7 @@ class FeatureForge:
                             # Importance-weighted metric: distance follows what the model uses.
                             w = np.sqrt(imp.reindex(dense_num[:d]).clip(lower=0).to_numpy() + 1e-12)
                             add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"w{d}", w / w.mean()))
+                            add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"rw{d}", w / w.mean(), rank=True))
                             if 2 <= self.n_classes_ <= 10 and len(W) <= 200_000:
                                 add(KNNClassDist(dense_num[:d], (1, 2, 4), self.n_classes_, f"w{d}", w / w.mean()))
                 for d in (8, 24):
@@ -784,6 +798,12 @@ class FeatureForge:
                         add(Projection(dense_num[:d], "pls", 3, self.n_classes_, f"top{d}"))
                 if len(dense_num) >= 3 and len(W) <= 200_000 and self.n_classes_ <= 2:
                     add(LinearOOF(dense_num, self.n_classes_, "top"))
+            # Same-scale sums of 3-4 columns (total area, total spend, ...).
+            mag = {c: np.log10(np.nanmedian(np.abs(W[c].to_numpy(dtype=float))) + 1e-9) for c in dense_num[:10]}
+            for m in (3, 4):
+                for combo in combinations(dense_num[:10], m):
+                    if max(mag[c] for c in combo) - min(mag[c] for c in combo) <= 1.0:
+                        add(RowStat(list(combo), "sum", "+".join(combo)))
             for a, b in combinations(dense_num[:10], 2):
                 add(BinnedPairTE(a, b, self.n_classes_))
             for a, b in combinations(top_num, 2):
