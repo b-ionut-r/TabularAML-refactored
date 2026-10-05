@@ -41,7 +41,17 @@ Each round:
    * group statistics of a numeric within a key: mean, std, min, max,
      deviation from the group mean, z-score;
    * out-of-fold **kNN target features** (mean target / class frequencies of the
-     5–100 nearest rows in standardised subspaces of the top numerics);
+     5–100 nearest rows) in subspaces of 2…32 top numerics, both standardised
+     and **importance-weighted** (each axis scaled by the root of its split gain,
+     so distance follows what the model uses);
+   * out-of-fold **per-class kNN distances** (mean distance to the 1, 2, 4
+     nearest rows of each class);
+   * **interaction cells**: pairs and triples mined from the base model's tree
+     paths (features split on in sequence) and from a FAST-style residual grid
+     probe, expanded into every applicable family: pairwise arithmetic, 2-D
+     target maps, out-of-fold target encodings and counts of key ×
+     quantile-binned-numeric cells, group statistics;
+   * PCA and (out-of-fold) PLS projections of the top numerics;
    * row statistics over column families (`Soil_Type_1..40`, `px1..px784`):
      argmax, sum, mean, std, min, max, plus row-wise non-zero and missing counts.
 
@@ -55,8 +65,9 @@ Each round:
 4. **Novelty filter.** A candidate's gain must exceed the gain of its own parent
    columns under the same probe. Without this, re-expressions of a column that
    the early-stopped base model under-uses dominate the ranking.
-5. **Selection.** Survivors are ranked by split gain in a joint model; the best
-   prefix (3, 6, 12, 25, ...) is chosen by repeated-CV loss.
+5. **Selection.** Survivors are ordered two ways, by split gain in a joint
+   model and by novel residual gain; the best prefix (3, 6, 12, 25, ...) of
+   either order is chosen by repeated-CV loss.
 
 Finally the **gate**: 20% of the training rows are held out before any search.
 Raw features and each cumulative round are compared on those rows with the
@@ -84,35 +95,38 @@ RMSLE) of 5-fold bagged LightGBM on engineered vs. raw features; positive is bet
 
 ### FeatureForge, 20 datasets × 3 holdouts (default settings, 300 s budget)
 
-| Dataset | Holdout lift (mean of 3) | FE time | Features kept |
-|---|---|---|---|
-| magic | +11.30% | 12s | 15.3 |
-| adult | +4.24% | 30s | 32.3 |
-| houses | +3.62% | 10s | 3.7 |
-| wind | +0.95% | 8s | 4.0 |
-| puma8NH | +0.63% | 3s | 1.0 |
-| fried | +0.56% | 8s | 2.0 |
-| coil2000 | +0.15% | 18s | 18.0 |
-| ames | +0.00% | 37s | 0.0 |
-| page_blocks | +0.00% | 3s | 0.0 |
-| cpu_act | +0.00% | 15s | 0.0 |
-| fars | +0.00% | 48s | 0.0 |
-| covertype | +0.00% | 69s | 0.0 |
-| sleep | +0.00% | 12s | 0.0 |
-| house_16H | +0.00% | 8s | 0.0 |
-| pol | +0.00% | 33s | 0.0 |
-| phoneme | +0.00% | 3s | 0.0 |
-| wine_white | +0.00% | 9s | 0.0 |
-| spambase | +0.00% | 20s | 0.0 |
-| churn | -0.36% | 23s | 12.0 |
-| titanic | -1.30% | 8s | 2.0 |
+| Dataset | Holdout lift, current (mean of 3) | First version (v7) | FE time | Features kept |
+|---|---|---|---|---|
+| pol | +18.45% | +0.00% | 63s | 22.7 |
+| magic | +13.74% | +11.30% | 27s | 23.0 |
+| covertype | +6.71% | +0.00% | 95s | 106.3 |
+| wine_white | +5.51% | +0.00% | 50s | 54.3 |
+| adult | +4.29% | +4.24% | 31s | 13.0 |
+| phoneme | +3.79% | +0.00% | 7s | 8.3 |
+| houses | +3.58% | +3.62% | 12s | 5.7 |
+| churn | +1.87% | -0.36% | 27s | 25.0 |
+| fried | +0.82% | +0.56% | 16s | 3.0 |
+| wind | +0.68% | +0.95% | 10s | 3.7 |
+| coil2000 | +0.29% | +0.15% | 25s | 25.0 |
+| puma8NH | +0.27% | +0.63% | 5s | 3.3 |
+| ames | +0.00% | +0.00% | 52s | 0.0 |
+| page_blocks | +0.00% | +0.00% | 4s | 0.0 |
+| cpu_act | +0.00% | +0.00% | 13s | 0.0 |
+| house_16H | +0.00% | +0.00% | 11s | 0.0 |
+| titanic | +0.00% | -1.30% | 6s | 0.0 |
+| sleep | +0.00% | +0.00% | 20s | 0.0 |
+| spambase | +0.00% | +0.00% | 36s | 0.0 |
+| fars | -0.09% | +0.00% | 73s | 15.7 |
 
-Mean +0.99%, 18/60 runs improved, 3/60 worse (Titanic −3.9% on a 712-row
-split, Churn −2.7%, Coil2000 −0.3%), mean search time 19 s. Gains concentrate where
-the data has structure trees approximate poorly: local neighbourhoods (Magic,
-via kNN target features), rotated coordinates (Houses, `latitude ± longitude`),
-categorical interactions (Adult). On the other 11 datasets the gate found no
-held-out gain and returned the raw features unchanged.
+Mean +3.0% (first version +0.99%), 29/60 runs improved, 2/60 worse (Churn
+−0.6%, Fars −0.3%), mean search time 29 s. The big gains come from
+importance-weighted kNN target and per-class distance features (Pol, Magic,
+Phoneme, Covertype), rotated coordinates (Houses) and categorical / binned
+interactions (Adult, Covertype). Wine White's gain is concentrated in one
+split (+16.5%; the other two returned raw) and comes from out-of-fold target
+encodings of exact value triples, which exploit the many duplicate rows in
+that dataset. On 8 datasets the gate found no held-out gain and returned the
+raw features unchanged.
 
 ### Previous genetic `FeatureGenerator` (`mode="lite"`, same protocol, seed 0)
 

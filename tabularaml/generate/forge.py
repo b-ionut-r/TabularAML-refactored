@@ -745,7 +745,7 @@ class FeatureForge:
         keys_rank = [c for c in imp.sort_values(ascending=False).index if c in self.key_cols_]
         top_num = num_rank[:self.top_numeric]
         top_keys = keys_rank[:self.top_keys]
-        existing = set(W.columns)
+        existing = set(W.columns) | {sp.name for sp in selected}
         cands: List[Spec] = []
 
         def add(spec):
