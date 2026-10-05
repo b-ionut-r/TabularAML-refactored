@@ -375,6 +375,16 @@ class RowStat(Spec):
                 return (np.nan_to_num(M) != 0).sum(axis=1).astype(float)
             if self.stat == "nan":
                 return np.isnan(M).sum(axis=1).astype(float)
+            # Ordered families (repeated measurements): trend over the running index.
+            if self.stat == "slope":
+                t = np.arange(M.shape[1], dtype=float)
+                t -= t.mean()
+                Mc = M - np.nanmean(M, axis=1, keepdims=True)
+                return np.nansum(Mc * t, axis=1) / (t ** 2).sum()
+            if self.stat == "delta":
+                return M[:, 0] - M[:, -1]
+            if self.stat == "npos":
+                return (np.nan_to_num(M) > 0).sum(axis=1).astype(float)
         raise ValueError(self.stat)
 
 
@@ -382,11 +392,13 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
     """Group columns sharing a name stem that ends in a running index (``Soil_Type_12``, ``px3``)."""
     import re
     fam: Dict[str, List[str]] = {}
+    idx: Dict[str, int] = {}
     for c in cols:
         m = re.match(r"^(.*?)[_.\-]?(\d+)$", str(c))
         if m and m.group(1):
             fam.setdefault(m.group(1), []).append(c)
-    return {k: v for k, v in fam.items() if len(v) >= min_size}
+            idx[c] = int(m.group(2))
+    return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
 
 
 class GroupStat(Spec):
@@ -428,6 +440,204 @@ class GroupStat(Spec):
                 r = (df[self.parents[1]].to_numpy(dtype=float) - a) / np.where(b > 0, b, np.nan)
             return r
         return a
+
+
+class CrossLinearOOF(Spec):
+    """Out-of-fold sparse linear model on one-hot keys and all their pairwise crosses.
+
+    The classic winning recipe on high-cardinality categorical contests (Amazon
+    access, click-through, insurance): a regularised logistic / ridge model over
+    one-hot features of every key and key pair learns thousands of interaction
+    effects with shrinkage, which a tree ensemble can then use as one column.
+    Training rows are encoded out of fold.
+    """
+    target_dep = True
+
+    def __init__(self, keys: Sequence[str], n_classes: int, pairs: bool = True, label: str = "keys"):
+        super().__init__(keys)
+        self.n_classes = n_classes
+        self.pairs = pairs
+        self.n_out = n_classes if n_classes > 2 else 1
+        self.name = f"xlin__{label}" + ("" if pairs else "_1")
+
+    def _codes_matrix(self, df) -> np.ndarray:
+        """int64 code per (row, block): each key, then each key pair."""
+        cols = [_codes(df, [c], [v]) for c, v in zip(self.parents, self.vocabs_)]
+        out = list(cols)
+        if self.pairs:
+            for i, j in combinations(range(len(cols)), 2):
+                out.append(cols[i] * (len(self.vocabs_[j]) + 1) + cols[j])
+        return np.stack(out, axis=1)
+
+    @staticmethod
+    def _design(C_ref, C_q):
+        """Sparse one-hot of ``C_q`` over the levels seen at least twice per block of ``C_ref``."""
+        from scipy import sparse
+        rows, cols, off = [], [], 0
+        n = len(C_q)
+        for b in range(C_ref.shape[1]):
+            lv, cnt = np.unique(C_ref[:, b], return_counts=True)
+            lv = lv[cnt >= 2]
+            pos = np.searchsorted(lv, C_q[:, b])
+            pos = np.minimum(pos, max(len(lv) - 1, 0))
+            hit = (len(lv) > 0) & (lv[pos] == C_q[:, b]) if len(lv) else np.zeros(n, bool)
+            rows.append(np.nonzero(hit)[0])
+            cols.append(pos[hit] + off)
+            off += len(lv)
+        r, c = np.concatenate(rows), np.concatenate(cols)
+        return sparse.csr_matrix((np.ones(len(r), np.float32), (r, c)), shape=(n, max(off, 1)))
+
+    def _model(self, shape):
+        from sklearn.linear_model import LogisticRegression, Ridge
+        if self.n_classes == 0:
+            return Ridge(alpha=3.0, solver="sparse_cg")
+        if self.n_classes > 2:
+            return LogisticRegression(C=0.5, max_iter=300)
+        # Wide one-hot designs solve much faster in the dual.
+        return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0])
+
+    def _query(self, S_ref, y_ref, S_q):
+        A, B = self._design(S_ref, S_ref), self._design(S_ref, S_q)
+        m = self._model(A.shape)
+        if self.n_classes == 0:
+            mu = y_ref.mean()
+            m.fit(A, y_ref - mu)
+            return (m.predict(B) + mu)[:, None]
+        m.fit(A, y_ref.astype(int))
+        if self.n_out == 1:
+            return m.decision_function(B)[:, None]
+        P = np.full((B.shape[0], self.n_out), 1e-6)
+        P[:, m.classes_] = m.predict_proba(B)
+        return np.log(P)
+
+    def fit(self, df, y, ctx):
+        self.vocabs_ = _fit_vocab(df, self.parents)
+        self.S_ = self._codes_matrix(df)
+        self.y_ = np.asarray(y, dtype=float)
+        return self
+
+    def transform(self, df, ctx):
+        r = self._query(self.S_, self.y_, self._codes_matrix(df))
+        return r[:, 0] if self.n_out == 1 else r
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        self.fit(df, y, ctx)
+        out = np.empty((len(df), self.n_out))
+        for tr, va in folds:
+            out[va] = self._query(self.S_[tr], self.y_[tr], self.S_[va])
+        return out[:, 0] if self.n_out == 1 else out
+
+
+class KeyBinTE(BinnedPairTE):
+    """Out-of-fold target map over (key level x quantile bin of a numeric).
+
+    The categorical-by-numeric interaction ("price band within this model",
+    "age band within this country") that a tree needs one split per level for.
+    """
+
+    def __init__(self, key: str, num: str, n_classes: int = 0, n_bins: int = 8):
+        TargetEnc.__init__(self, [key, num], n_classes)
+        self.n_bins = n_bins
+        self.name = f"tekb__{key}__{num}"
+
+    def _fit_codes(self, df):
+        self.vocabs_ = _fit_vocab(df, self.parents[:1])
+        x = df[self.parents[1]].to_numpy(dtype=float)
+        q = np.linspace(0, 1, self.n_bins + 1)[1:-1]
+        self.edges_ = np.unique(np.nanquantile(x[np.isfinite(x)], q)) if np.isfinite(x).any() else np.array([])
+        return self._codes(df)
+
+    def _codes(self, df):
+        k = _codes(df, self.parents[:1], self.vocabs_)
+        b = self._bin(df[self.parents[1]].to_numpy(dtype=float), self.edges_)
+        return k * (len(self.edges_) + 2) + b.astype(np.int64)
+
+
+class Digits(Spec):
+    """Value-representation features: fractional part, last digits, rounding residue.
+
+    Contest tables (prices, synthetic Playground data, sensor readings) often carry
+    signal in how a value is written rather than in its magnitude.
+    """
+
+    def __init__(self, col: str, kind: str):
+        super().__init__([col])
+        self.kind = kind
+        self.name = f"dig_{kind}__{col}"
+
+    def transform(self, df, ctx):
+        x = df[self.parents[0]].to_numpy(dtype=float)
+        with np.errstate(all="ignore"):
+            if self.kind == "frac":
+                return x - np.floor(x)
+            if self.kind == "mod10":
+                return np.mod(np.round(x), 10)
+            if self.kind == "mod100":
+                return np.mod(np.round(x), 100)
+            if self.kind == "frac100":   # cents
+                return np.mod(np.round(x * 100), 100)
+        raise ValueError(self.kind)
+
+
+def geo_points(cols: Sequence[str]) -> List[tuple]:
+    """(lat, lon) column pairs found by name: ``*lat*`` matched with the same name using ``lon``/``lng``."""
+    import re
+    out = []
+    low = {c.lower(): c for c in cols}
+    for c in cols:
+        lc = c.lower()
+        if "lat" not in lc:
+            continue
+        for rep in ("lon", "lng", "long"):
+            for pat in ("latitude", "lat"):
+                if pat in lc:
+                    cand = lc.replace(pat, "longitude" if rep == "lon" and pat == "latitude" else rep)
+                    if cand in low and low[cand] != c:
+                        out.append((c, low[cand]))
+                        break
+            else:
+                continue
+            break
+    return list(dict.fromkeys(out))
+
+
+class GeoPair(Spec):
+    """Distance / bearing between two (lat, lon) points (haversine, km)."""
+
+    def __init__(self, p: tuple, q: tuple, kind: str):
+        super().__init__([p[0], p[1], q[0], q[1]])
+        self.kind = kind
+        self.name = f"geo_{kind}__{p[0]}__{q[0]}"
+
+    def transform(self, df, ctx):
+        la1, lo1, la2, lo2 = (np.radians(df[c].to_numpy(dtype=float)) for c in self.parents)
+        dla, dlo = la2 - la1, lo2 - lo1
+        with np.errstate(all="ignore"):
+            if self.kind == "hav":
+                a = np.sin(dla / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin(dlo / 2) ** 2
+                return 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+            if self.kind == "manh":
+                return 6371.0 * (np.abs(dla) + np.abs(dlo) * np.cos((la1 + la2) / 2))
+            if self.kind == "bearing":
+                yb = np.sin(dlo) * np.cos(la2)
+                xb = np.cos(la1) * np.sin(la2) - np.sin(la1) * np.cos(la2) * np.cos(dlo)
+                return np.degrees(np.arctan2(yb, xb))
+        raise ValueError(self.kind)
+
+
+class Rotate(Spec):
+    """Coordinates rotated by a fixed angle: oblique boundaries become axis-aligned."""
+
+    def __init__(self, a: str, b: str, deg: int):
+        super().__init__([a, b])
+        self.deg = deg
+        self.name = f"rot{deg}__{a}__{b}"
+
+    def transform(self, df, ctx):
+        a = df[self.parents[0]].to_numpy(dtype=float)
+        b = df[self.parents[1]].to_numpy(dtype=float)
+        t = np.radians(self.deg)
+        return a * np.cos(t) + b * np.sin(t)
 
 
 # ============================================================================
@@ -494,6 +704,7 @@ class FeatureForge:
                  top_numeric: int = 24, top_keys: int = 10, max_key_cardinality: int = 200,
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
+                 hc_threshold: int = 32,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -509,6 +720,7 @@ class FeatureForge:
         self.gate_z = gate_z
         self.min_rel_gain = min_rel_gain
         self.cv = cv
+        self.hc_threshold = hc_threshold
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -530,12 +742,30 @@ class FeatureForge:
             return list(KFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows)))
         return list(StratifiedKFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows), y))
 
-    def _model_frame(self, X: pd.DataFrame) -> pd.DataFrame:
+    def _model_frame(self, X: pd.DataFrame, recode: Optional[bool] = None) -> pd.DataFrame:
+        """Model view of a frame: categoricals as ``category`` dtype, or, when the
+        high-cardinality recode is active, those columns as frequency-rank numbers."""
+        recode = self.recode_ if recode is None else recode
         X = X.copy()
         for c in self.cat_cols_:
-            if c in X.columns:
+            if c not in X.columns:
+                continue
+            if recode and c in self.rank_maps_:
+                X[c] = self._rank(X[c], c)
+            else:
                 X[c] = pd.Categorical(_as_str(X[c]), categories=self.cat_levels_[c])
         return X
+
+    def _fit_rank_maps(self, X: pd.DataFrame):
+        """Frequency rank of each level of the high-cardinality categoricals (1 = most common)."""
+        self.rank_maps_ = {}
+        for c in self.hc_cols_:
+            vc = _as_str(X[c]).value_counts()
+            order = sorted(vc.index, key=lambda v: (-vc[v], v))
+            self.rank_maps_[c] = pd.Series(np.arange(1, len(order) + 1, dtype=float), index=order)
+
+    def _rank(self, s: pd.Series, c: str) -> np.ndarray:
+        return self.rank_maps_[c].reindex(_as_str(s).to_numpy()).to_numpy(dtype=float)
 
     def _lgb_params(self, lr=0.1, threads=None, **kw):
         p = dict(_lgb_objective(self.task_, self.n_classes_), learning_rate=lr, num_leaves=31,
@@ -585,11 +815,13 @@ class FeatureForge:
                 cands.append(spec)
 
         sel_names = [s.name for s in selected if s.n_out == 1 and s.name in num_cols]
+        label_free = {s.name for s in selected if not s.target_dep}
         if round_idx == 0:
             raw_num = [c for c in self.raw_cols_ if c not in self.cat_cols_]
             for stem, cols in column_families(raw_num).items():
                 binary = all(set(pd.unique(W[c].dropna())) <= {0, 1} for c in cols)
-                stats = ("argmax", "sum") if binary else ("sum", "mean", "std", "max", "min", "argmax")
+                stats = ("argmax", "sum") if binary else ("sum", "mean", "std", "max", "min", "argmax",
+                                                          "slope", "delta", "npos")
                 for st in stats:
                     add(RowStat(cols, st, stem))
             if len(raw_num) >= 3:
@@ -603,9 +835,47 @@ class FeatureForge:
                         ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
                         add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"top{d}"))
                 if len(dense_num) >= 3 and len(W) <= 200_000 and self.n_classes_ <= 2:
-                    add(LinearOOF(dense_num, self.n_classes_, "top"))
+                    add(LinearOOF(dense_num[:16], self.n_classes_, "top"))
             for a, b in combinations(dense_num[:10], 2):
                 add(BinnedPairTE(a, b, self.n_classes_))
+            # Geography: distances/bearings between points, rotations, kNN on the map.
+            pts = [p for p in geo_points(raw_num) if p[0] in W.columns]
+            for p, q in combinations(pts, 2):
+                for kind in ("hav", "manh", "bearing"):
+                    add(GeoPair(p, q, kind))
+            for la, lo in pts:
+                for deg in (15, 30, 60, 75, 105, 120, 150, 165):
+                    add(Rotate(la, lo, deg))
+                if len(W) <= 300_000:
+                    ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
+                    add(KNNTarget([la, lo], ks, self.n_classes_, f"geo_{la}"))
+            # Shrunken linear model over one-hot keys and all key pairs.
+            lin_keys = [k for k in keys_rank if W[k].nunique() > 2]
+            if len(lin_keys) >= 2 and len(W) <= 500_000:
+                add(CrossLinearOOF(lin_keys[:8], self.n_classes_, pairs=True))
+                add(CrossLinearOOF(lin_keys[:20], self.n_classes_, pairs=False))
+            # Key x numeric-band target maps.
+            for k in top_keys[:8]:
+                for c in dense_num[:8]:
+                    if c != k:
+                        add(KeyBinTE(k, c, self.n_classes_))
+            # Numerics as categories: target encoding of exact values.
+            for c in top_num[:12]:
+                nu = W[c].nunique()
+                if c not in self.key_cols_ and 10 < nu <= len(W) // 4:
+                    add(TargetEnc([c], self.n_classes_))
+            # How the value is written.
+            for c in top_num[:12]:
+                x = W[c].to_numpy(dtype=float)
+                fin = x[np.isfinite(x)]
+                if len(fin) == 0 or W[c].nunique() <= 20:
+                    continue
+                if np.any(fin != np.round(fin)):
+                    add(Digits(c, "frac"))
+                    add(Digits(c, "frac100"))
+                elif np.nanmax(np.abs(fin)) >= 100:
+                    add(Digits(c, "mod10"))
+                    add(Digits(c, "mod100"))
             for a, b in combinations(top_num, 2):
                 for op in self.arith_ops:
                     add(Arith(op, a, b))
@@ -634,9 +904,12 @@ class FeatureForge:
                         continue
                     for op in self.arith_ops:
                         add(Arith(op, s, c))
-                for k in top_keys[:6]:
-                    for st in ("mean", "dev", "z"):
-                        add(GroupStat(k, s, st))
+                # Group statistics of an out-of-fold target feature would leak: other
+                # rows' encodings were fitted on this row's label.
+                if s in label_free:
+                    for k in top_keys[:6]:
+                        for st in ("mean", "dev", "z"):
+                            add(GroupStat(k, s, st))
             for k1, k2, k3 in list(combinations(top_keys[:6], 3)):
                 add(Count([k1, k2, k3]))
                 add(TargetEnc([k1, k2, k3], self.n_classes_))
@@ -771,6 +1044,11 @@ class FeatureForge:
         for c in self.cat_cols_:
             X[c] = _as_str(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
+        # Native categorical splits on many-level columns overfit; frequency-rank codes
+        # are the usual contest alternative. Which one wins is measured, not assumed.
+        self.hc_cols_ = [c for c in self.cat_cols_ if X[c].nunique() > self.hc_threshold]
+        self.recode_ = False
+        self.rank_maps_ = {}
         self.raw_cols_ = list(X.columns)
         self.key_cols_ = [c for c in X.columns
                           if 2 <= X[c].nunique() <= (0.5 * len(X) if c in self.cat_cols_
@@ -810,6 +1088,15 @@ class FeatureForge:
         Wm = self._model_frame(W)
         margin, cur_loss, imp = self._cv(Wm, yW, folds)
         self.base_cv_loss_ = cur_loss
+        if self.hc_cols_:
+            self._fit_rank_maps(W)
+            Wr = self._model_frame(W, recode=True)
+            m_r, loss_r, imp_r = self._cv(Wr, yW, folds)
+            self._log(f"high-cardinality recode of {len(self.hc_cols_)} columns: CV loss "
+                      f"{cur_loss:.6f} -> {loss_r:.6f} ({100 * (cur_loss - loss_r) / cur_loss:+.2f}%)")
+            if loss_r < cur_loss * (1 - self.min_rel_gain):
+                self.recode_ = True
+                Wm, margin, cur_loss, imp = Wr, m_r, loss_r, imp_r
         self._log(f"task={self.task_} rows={n} (search {len(W)}, gate {len(idx_gate)}) "
                   f"cols={X.shape[1]} base CV loss={cur_loss:.6f}")
 
@@ -871,11 +1158,13 @@ class FeatureForge:
         self.search_cv_loss_ = cur_loss
         self.selected_ = selected
         self.gate_passed_ = None
-        if selected and len(idx_gate):
-            best_round, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate)
+        if (selected or self.recode_) and len(idx_gate):
+            best_round, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
             self.gate_passed_ = best_round is not None
             if self.gate_passed_:
                 self.selected_ = [s for s in self.selected_ if s.round_ <= best_round]
+            else:
+                self.recode_ = False
             self._log(f"gate: raw={self.gate_raw_loss_:.6f} fe={self.gate_fe_loss_:.6f} "
                       f"({100 * (self.gate_raw_loss_ - self.gate_fe_loss_) / self.gate_raw_loss_:+.2f}%) "
                       f"-> {'PASS' if self.gate_passed_ else 'REJECT'}")
@@ -888,37 +1177,41 @@ class FeatureForge:
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
         return self
 
-    def _gate(self, X, y, idx_sel, idx_gate):
-        Xs = X.iloc[idx_sel].reset_index(drop=True)
+    def _gate(self, X, y, idx_sel, idx_gate, W):
+        """Score raw vs. engineered feature sets on the held-out gate rows.
+
+        ``W`` holds the search rows with the selected features as computed during
+        the search (target features out of fold); every selected spec is still
+        fitted on exactly those rows, so the gate rows only need ``transform``.
+        """
         Xg = X.iloc[idx_gate].reset_index(drop=True)
         ys, yg = y[idx_sel], y[idx_gate]
-        folds = self._folds(len(Xs), ys, 5, self.random_state + 7)
-        Fs, Fg = Xs.copy(), Xg.copy()
+        Fs, Fg = W, Xg.copy()
         for s in self.selected_:
-            vs = s.fit_transform_oof(Fs, ys, self.ctx_, folds) if s.target_dep else s.fit(Fs, ys, self.ctx_).transform(Fs, self.ctx_)
             vg = s.transform(Fg, self.ctx_)
             for j, col in enumerate(s.out_names()):
-                Fs[col] = vs if np.ndim(vs) == 1 else vs[:, j]
                 Fg[col] = vg if np.ndim(vg) == 1 else vg[:, j]
         import lightgbm as lgb
-        es_split = self._folds(len(Xs), ys, 5, self.random_state + 11)[0]
+        es_split = self._folds(len(Fs), ys, 5, self.random_state + 11)[0]
 
-        def gate_loss(cols):
-            A, G = self._model_frame(Fs[cols]), self._model_frame(Fg[cols])
+        def gate_loss(cols, recode=None):
+            A, G = self._model_frame(Fs[cols], recode), self._model_frame(Fg[cols], recode)
             tr, va = es_split
             b = self._fit_eval(A.iloc[tr], ys[tr], A.iloc[va], ys[va], lr=0.05, es=100)
             # Refit on all search rows at the early-stopped size, then score the gate rows.
             full = lgb.train(self._lgb_params(0.05), lgb.Dataset(A, ys), max(1, b.best_iteration))
             return _row_loss(self.task_, yg, full.predict(G, raw_score=True))
 
-        raw_rows = gate_loss(self.raw_cols_)
+        # The baseline is always the raw columns as given (native categoricals).
+        raw_rows = gate_loss(self.raw_cols_, recode=False)
         raw_l = float(raw_rows.mean())
         # Small gates are noisy: demand 95% one-sided confidence below 1000 rows.
         z_needed = self.gate_z if len(yg) >= 1000 else max(self.gate_z, 1.645)
         # Candidate feature sets are the cumulative rounds; the best one on the gate is
         # kept only if its paired per-row improvement clears ``gate_z`` standard errors.
         best_round, best_l, best_z = None, raw_l, 0.0
-        for r in sorted({s.round_ for s in self.selected_}):
+        # Round -1: the high-cardinality recode alone, without new features.
+        for r in ([-1] if self.recode_ else []) + sorted({s.round_ for s in self.selected_}):
             cols = self.raw_cols_ + [c for s in self.selected_ if s.round_ <= r for c in s.out_names()]
             rows = gate_loss(cols)
             d = raw_rows - rows
@@ -926,12 +1219,14 @@ class FeatureForge:
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
-            self._log(f"  gate rounds<={r + 1}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
+            self._log(f"  gate rounds<={r + 1}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
             if rows.mean() < best_l and z >= z_needed:
                 best_round, best_l, best_z = r, float(rows.mean()), z
         return best_round, raw_l, best_l
 
     def _fit_full(self, X, y, U=None):
+        if self.recode_:
+            self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
         folds = self._folds(len(X), y, 5, self.random_state + 1)
         F = X.copy()
         U = None if U is None else U[self.raw_cols_].copy()
@@ -966,14 +1261,21 @@ class FeatureForge:
             v = s.transform(F, self.ctx_)
             for j, col in enumerate(s.out_names()):
                 F[col] = v if np.ndim(v) == 1 else v[:, j]
-        out = X.reset_index(drop=True).copy()
+        out = self._recode_out(X)
         for c in self.new_columns_:
             out[c] = F[c].astype(np.float32).to_numpy()
         return out
 
+    def _recode_out(self, X):
+        out = X.reset_index(drop=True).copy()
+        if self.recode_:
+            for c in self.rank_maps_:
+                out[c] = self._rank(out[c], c)
+        return out
+
     def transform_train(self, X: pd.DataFrame) -> pd.DataFrame:
         """Training rows with features as fitted (target encodings out-of-fold)."""
-        out = X.reset_index(drop=True).copy()
+        out = self._recode_out(X)
         if len(out) != len(self._train_frame):
             raise ValueError("transform_train expects the exact frame passed to fit")
         for c in self.new_columns_:

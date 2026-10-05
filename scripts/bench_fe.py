@@ -29,7 +29,7 @@ from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tabularaml.benchmarks.contest_suite import SUITE, load_suite_dataset  # noqa: E402
+from tabularaml.benchmarks.contest_suite import CONTEST, SUITE, load_suite_dataset  # noqa: E402
 from tabularaml.contest import ContestSolver, get_metric  # noqa: E402
 
 
@@ -101,7 +101,9 @@ def evaluate(X_tr, y_tr, X_te, y_te, task, metric, seed, models, threads, judge=
 def main():
     warnings.filterwarnings("ignore")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--datasets", nargs="*", default=list(SUITE))
+    ap.add_argument("--datasets", nargs="*", default=None)
+    ap.add_argument("--suite", default="public", choices=["public", "contest"],
+                    help="public: PMLB/AutoGluon tables; contest: real competition tables from OpenML")
     ap.add_argument("--arms", nargs="*", default=["raw", "forge"])
     ap.add_argument("--seeds", type=int, nargs="*", default=[0, 1, 2])
     ap.add_argument("--models", nargs="*", default=["lgbm"])
@@ -112,6 +114,8 @@ def main():
     ap.add_argument("--tag", default="", help="suffix for non-raw arm names (algorithm versions)")
     ap.add_argument("--out", type=Path, default=Path("reports/fe_bench.csv"))
     args = ap.parse_args()
+    if args.datasets is None:
+        args.datasets = list(CONTEST if args.suite == "contest" else SUITE)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     done = set()
     if args.out.exists():
