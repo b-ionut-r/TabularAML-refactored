@@ -291,6 +291,42 @@ class KNNTarget(Spec):
         return out
 
 
+class KNNClassDist(KNNTarget):
+    """Mean distance to the k nearest training rows of each class (k = 1, 2, 4, ...).
+
+    The kNN distance features of top Otto / contest solutions: how close a row
+    sits to each class's manifold, a margin-like signal trees cannot form
+    from raw axes. Out of fold on training rows.
+    """
+
+    def __init__(self, cols, ks, n_classes, label, weights=None):
+        super().__init__(cols, ks, n_classes, label, weights)
+        self.n_out = len(self.ks) * n_classes
+        self.name = f"knnd__{label}"
+
+    def _query(self, M_ref, Y_ref, M_q):
+        from sklearn.neighbors import NearestNeighbors
+        yc = Y_ref.argmax(1) if Y_ref.shape[1] > 1 else Y_ref[:, 0].astype(int)
+        out = np.zeros((len(M_q), self.n_out))
+        kmax = max(self.ks)
+        for c in range(self.n_classes):
+            R = M_ref[yc == c]
+            if len(R) == 0:
+                out[:, c * len(self.ks):(c + 1) * len(self.ks)] = np.nan
+                continue
+            kk = min(kmax, len(R))
+            d, _ = NearestNeighbors(n_neighbors=kk).fit(R).kneighbors(M_q)
+            cs = np.cumsum(d, axis=1)
+            for i, k in enumerate(self.ks):
+                k = min(k, kk)
+                out[:, c * len(self.ks) + i] = cs[:, k - 1] / k
+        return out
+
+    def _targets(self, y):
+        y = np.asarray(y, dtype=float)
+        return np.eye(self.n_classes)[y.astype(int)] if self.n_classes > 2 else y[:, None]
+
+
 class LinearOOF(KNNTarget):
     """Out-of-fold prediction of a spline-additive linear model (a ridge GAM).
 
@@ -740,6 +776,8 @@ class FeatureForge:
                             # Importance-weighted metric: distance follows what the model uses.
                             w = np.sqrt(imp.reindex(dense_num[:d]).clip(lower=0).to_numpy() + 1e-12)
                             add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"w{d}", w / w.mean()))
+                            if 2 <= self.n_classes_ <= 10 and len(W) <= 200_000:
+                                add(KNNClassDist(dense_num[:d], (1, 2, 4), self.n_classes_, f"w{d}", w / w.mean()))
                 for d in (8, 24):
                     if len(dense_num) >= max(4, d // 2) and (d == 8 or len(dense_num) > 8):
                         add(Projection(dense_num[:d], "pca", 4, self.n_classes_, f"top{d}"))
