@@ -588,21 +588,30 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
 
 
 class GroupStat(Spec):
-    """Statistic of numeric ``num`` within groups of ``key``."""
+    """Statistic of numeric ``num`` within groups of ``key``.
 
-    def __init__(self, key: str, num: str, stat: str):
-        super().__init__([key, num])
+    ``key`` may be a tuple of columns: a composite group (``card`` x ``address``,
+    the "user id" of fraud contests), whose statistics describe an entity no
+    single column identifies. ``nunique`` counts distinct values of ``num``
+    in the group.
+    """
+
+    def __init__(self, key, num: str, stat: str):
+        keys = [key] if isinstance(key, str) else list(key)
+        super().__init__(keys + [num])
         self.stat = stat
-        self.name = f"grp_{stat}__{num}__by__{key}"
+        self.name = f"grp_{stat}__{num}__by__{'+'.join(keys)}"
 
     def _keys(self):
-        return self.parents[:1]
+        return self.parents[:-1]
 
     def fit(self, df, y, ctx):
         k = self._fit_codes(df)
-        v = pd.Series(df[self.parents[1]].to_numpy(dtype=float))
+        v = pd.Series(df[self.parents[-1]].to_numpy(dtype=float))
         g = v.groupby(k)
-        if self.stat in ("mean", "dev"):
+        if self.stat == "nunique":
+            self.a_ = g.nunique()
+        elif self.stat in ("mean", "dev"):
             self.a_ = g.mean()
         elif self.stat == "std":
             self.a_ = g.std()
@@ -619,11 +628,11 @@ class GroupStat(Spec):
         k = self._codes(df)
         a = self.a_.reindex(k).to_numpy(dtype=float)
         if self.stat == "dev":
-            return df[self.parents[1]].to_numpy(dtype=float) - a
+            return df[self.parents[-1]].to_numpy(dtype=float) - a
         if self.stat == "z":
             b = self.b_.reindex(k).to_numpy(dtype=float)
             with np.errstate(all="ignore"):
-                r = (df[self.parents[1]].to_numpy(dtype=float) - a) / np.where(b > 0, b, np.nan)
+                r = (df[self.parents[-1]].to_numpy(dtype=float) - a) / np.where(b > 0, b, np.nan)
             return r
         return a
 
@@ -979,6 +988,8 @@ class FeatureForge:
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
         Cap on features added in total.
+    n_composite : int
+        Key pairs (most interacting first) whose groups get numeric aggregations.
     gate_bags : int
         Models averaged per feature set on the gate (different seeds and
         early-stopping splits), to keep model noise out of the decision.
@@ -1006,7 +1017,7 @@ class FeatureForge:
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
-                 evolve_time: float = 0.0, gate_bags: int = 1,
+                 evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1027,6 +1038,7 @@ class FeatureForge:
         self.novelty_slack = novelty_slack
         self.evolve_time = evolve_time
         self.gate_bags = gate_bags
+        self.n_composite = n_composite
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1243,6 +1255,14 @@ class FeatureForge:
             for k1, k2 in combinations(top_keys, 2):
                 add(Count([k1, k2]))
                 add(TargetEnc([k1, k2], self.n_classes_))
+            # Composite-key aggregations: statistics of the strongest numerics within
+            # the groups of the most interacting key pairs.
+            kp = [p for p in sorted(getattr(self, "pair_gain_", {}), key=self.pair_gain_.get, reverse=True)
+                  if all(c in self.key_cols_ for c in p)][:self.n_composite]
+            for kk in kp:
+                for c in [c for c in top_num if c not in kk and c not in self.cat_cols_][:6]:
+                    for st in ("mean", "dev", "z", "nunique"):
+                        add(GroupStat(kk, c, st))
             for c in top_num:
                 if c not in self.key_cols_:
                     add(Count([c]))

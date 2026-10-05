@@ -234,3 +234,43 @@ airline −1.4 points, KDD appetency +0.3) and add ~12 s per table; they are kep
 because they carry PR #1's public-benchmark gains. A tree-path interaction
 search written on this branch independently of PR #1's (+1.96%, 3 worse runs)
 was dropped in favour of PR #1's.
+
+### v14: residual features, contest setting, faster search (2026-10-05)
+
+| Version | Mean lift | Runs better / worse (of 66) | Mean FE time |
+|---|---|---|---|
+| v9 + PR #1 v13 | +2.00% | 35 / 1 | 93s |
+| **v14** (`--transductive`) | **+2.18%** | 35 / 1 | **85s** |
+
+What changed:
+
+- **Linear-residual features** (`LinResid`): the part of a column the other
+  top numerics do not explain (raw and log scale). Abalone +1.8% → +4.0%.
+- **Contest setting** (`bench_fe.py --transductive`): FeatureForge gets the
+  test rows' features (never labels), so counts and group statistics cover
+  train + test, both while searching and in the final features. Amazon and
+  KDD Cup gain about +0.3 to +1.0 points.
+- **Speed:** key codes are cached per frame, which makes group statistics about
+  5× faster. kNN switches to brute force past 5 dimensions. Porto Seguro
+  320s → 140s, Kick 350s → 280s.
+
+Measured and **not** adopted (each run on 9–15 tables × 3 holdouts, same
+protocol):
+
+| Idea | Result |
+|---|---|
+| Genetic interaction search (`evolve_time=20`): target-encoded column sets + depth-3 arithmetic trees evolved under the novel residual gain | +2.75% vs +2.86% on 12 tables, 26% slower (synthetic compound ratio: +27% → +36%) |
+| OpenFE (ICML 2023) via the repo adapter | crashes on 13 of 22 tables; worse on 5 of 9 that ran |
+| Wider search (2× seeds, 4 rounds, 80 features) | +2.36% vs +2.34%, 35% slower |
+| Looser novelty filter, no gate | no gain; without the gate house prices −8% |
+| Gate averaged over 3 models | +2.25% vs +2.30% |
+| Composite-key group statistics (`n_composite`) | +2.02% vs +2.05% (kept, off by default) |
+| Gate z ≥ 0 on large gates | +2.01% vs +1.96%, more losing runs |
+| Denoising-autoencoder code, OOF MLP prediction, permutation-based column drop | no gain on the zero tables (MLP: steel plates −2 to −5%) |
+
+**Downstream AutoGluon** (`--judge autogluon`, medium_quality, 120s per fit):
+on 8 tables × 2 holdouts, PR #2's features gave +1.5% (13 of 16 runs better).
+The LightGBM judge gave +4.3% on the same runs. With the contest setting, a
+partial 22-table run (33 pairs) gave +0.95% mean, with 18 pairs better and 4
+worse: Amazon +4.3%, diamonds +2.6%, Kick +2.4%, bank marketing +2.3%, food
+delivery +2.1%.
