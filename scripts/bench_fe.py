@@ -162,13 +162,13 @@ def evaluate_autogluon(X_tr, y_tr, X_te, y_te, task, metric, seed, threads):
         shutil.rmtree(path, ignore_errors=True)
 
 
-def evaluate(X_tr, y_tr, X_te, y_te, task, metric, seed, models, threads, judge="solver", ensemble="hill"):
+def evaluate(X_tr, y_tr, X_te, y_te, task, metric, seed, models, threads, judge="solver"):
     if judge == "autogluon":
         return evaluate_autogluon(X_tr, y_tr, X_te, y_te, task, metric, seed, threads)
     if judge == "repo":
         return evaluate_repo(X_tr, y_tr, X_te, y_te, task, metric, seed, threads)
     solver = ContestSolver(task=task, metric=metric, models=models, n_folds=5, seeds=(seed,),
-                           n_jobs=threads, ensemble=ensemble, verbose=False).fit(X_tr, y_tr, X_te)
+                           n_jobs=threads, verbose=False).fit(X_tr, y_tr, X_te)
     m = get_metric(metric)
     return m(y_te, solver.test_ensemble_), solver.oof_ensemble_score_
 
@@ -181,7 +181,7 @@ def main():
                     help="public: PMLB/AutoGluon tables; contest: real competition tables from OpenML")
     ap.add_argument("--arms", nargs="*", default=["raw", "forge"])
     ap.add_argument("--seeds", type=int, nargs="*", default=[0, 1, 2])
-    ap.add_argument("--models", nargs="*", default=["lgbm"], help="model specs, or 'zoo'")
+    ap.add_argument("--models", nargs="*", default=["lgbm"])
     ap.add_argument("--budget", type=float, default=300)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--judge", default="solver", choices=["solver", "repo", "autogluon"],
@@ -190,7 +190,6 @@ def main():
                     help="contest setting: FeatureForge sees the test rows' features (counts, group stats)")
     ap.add_argument("--ag-preset", default="medium_quality")
     ap.add_argument("--ag-time", type=float, default=120, help="AutoGluon time limit per fit (s)")
-    ap.add_argument("--ensemble", default="hill", choices=["hill", "stack", "auto"])
     ap.add_argument("--tag", default="", help="suffix for non-raw arm names (algorithm versions)")
     ap.add_argument("--out", type=Path, default=Path("reports/fe_bench.csv"))
     ap.add_argument("--forge-kw", default="{}", help='JSON of extra FeatureForge arguments, e.g. \'{"top_keys": 16}\'')
@@ -201,9 +200,6 @@ def main():
     TRANSDUCTIVE = args.transductive
     if args.datasets is None:
         args.datasets = list(CONTEST if args.suite == "contest" else SUITE)
-    if args.models == ["zoo"]:
-        from tabularaml.contest import ZOO
-        args.models = ZOO
     args.out.parent.mkdir(parents=True, exist_ok=True)
     done = set()
     if args.out.exists():
@@ -227,7 +223,7 @@ def main():
                 try:
                     A, B, info = ARMS[base_arm](X_tr, y_tr, X_te, task, metric, seed, args.budget, args.threads)
                     fe_secs = time.time() - t0
-                    test, oof = evaluate(A, y_tr, B, y_te, task, metric, seed, args.models, args.threads, args.judge, args.ensemble)
+                    test, oof = evaluate(A, y_tr, B, y_te, task, metric, seed, args.models, args.threads, args.judge)
                     status, err = "ok", ""
                 except Exception as exc:  # keep the suite running
                     import traceback
