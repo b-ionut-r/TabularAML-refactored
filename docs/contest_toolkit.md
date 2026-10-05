@@ -207,8 +207,8 @@ point" is FeatureForge at commit a8fbdb1. Raw CSV: `docs/results/fe_contest_benc
 
 The big gains are where tables carry interaction structure a GBDT approximates
 poorly: many-level categorical crosses (Amazon +13%, KDD Cup +5–6%, Kick +4.5%),
-geography (food delivery +3.7%, Miami housing +2.5%) and local neighbourhoods
-(airline satisfaction +4.9% from PR #1's kNN additions). Six tables (coupon,
+geography (food delivery +3.7%, Miami housing +2.5%) and three-way rating crosses
+(airline satisfaction +4.9%, from PR #1's mined triple counts and encodings). Six tables (coupon,
 credit default, Give Me Some Credit, HR analytics, steel plates, click) show no
 held-out gain from any candidate family yet. A tree-path interaction search
 written on this branch independently of PR #1's (+1.96%, 3 worse runs) was
