@@ -134,6 +134,8 @@ class Spec:
 
 class Arith(Spec):
     def __init__(self, op: str, a: str, b: str):
+        if op in ("add", "mul", "sub") and b < a:
+            a, b = b, a  # symmetric (or sign-symmetric) ops: one canonical order
         super().__init__([a, b])
         self.op = op
         self.name = f"{a}__{op}__{b}"
@@ -231,8 +233,10 @@ class KNNTarget(Spec):
     """
     target_dep = True
 
-    def __init__(self, cols: Sequence[str], ks: Sequence[int], n_classes: int, label: str):
+    def __init__(self, cols: Sequence[str], ks: Sequence[int], n_classes: int, label: str,
+                 weights: Optional[Sequence[float]] = None):
         super().__init__(cols)
+        self.weights = None if weights is None else np.asarray(weights, dtype=float)
         self.ks = tuple(ks)
         self.n_classes = n_classes
         self.per = n_classes if n_classes > 2 else 1
@@ -250,7 +254,10 @@ class KNNTarget(Spec):
             self.mu_, self.sd_ = Mc.mean(0), Mc.std(0) + 1e-12
         Mc = np.clip(M, self.lo_, self.hi_)
         Mc = np.where(np.isnan(Mc), self.med_, Mc)
-        return ((Mc - self.mu_) / self.sd_).astype(np.float32)
+        Z = (Mc - self.mu_) / self.sd_
+        if self.weights is not None:
+            Z = Z * self.weights
+        return Z.astype(np.float32)
 
     def _targets(self, y):
         y = np.asarray(y, dtype=float)
@@ -282,6 +289,42 @@ class KNNTarget(Spec):
         for tr, va in folds:
             out[va] = self._query(self.M_[tr], self.Y_[tr], self.M_[va])
         return out
+
+
+class KNNClassDist(KNNTarget):
+    """Mean distance to the k nearest training rows of each class (k = 1, 2, 4, ...).
+
+    The kNN distance features of top Otto / contest solutions: how close a row
+    sits to each class's manifold, a margin-like signal trees cannot form
+    from raw axes. Out of fold on training rows.
+    """
+
+    def __init__(self, cols, ks, n_classes, label, weights=None):
+        super().__init__(cols, ks, n_classes, label, weights)
+        self.n_out = len(self.ks) * n_classes
+        self.name = f"knnd__{label}"
+
+    def _query(self, M_ref, Y_ref, M_q):
+        from sklearn.neighbors import NearestNeighbors
+        yc = Y_ref.argmax(1) if Y_ref.shape[1] > 1 else Y_ref[:, 0].astype(int)
+        out = np.zeros((len(M_q), self.n_out))
+        kmax = max(self.ks)
+        for c in range(self.n_classes):
+            R = M_ref[yc == c]
+            if len(R) == 0:
+                out[:, c * len(self.ks):(c + 1) * len(self.ks)] = np.nan
+                continue
+            kk = min(kmax, len(R))
+            d, _ = NearestNeighbors(n_neighbors=kk).fit(R).kneighbors(M_q)
+            cs = np.cumsum(d, axis=1)
+            for i, k in enumerate(self.ks):
+                k = min(k, kk)
+                out[:, c * len(self.ks) + i] = cs[:, k - 1] / k
+        return out
+
+    def _targets(self, y):
+        y = np.asarray(y, dtype=float)
+        return np.eye(self.n_classes)[y.astype(int)] if self.n_classes > 2 else y[:, None]
 
 
 class LinearOOF(KNNTarget):
@@ -316,6 +359,40 @@ class LinearOOF(KNNTarget):
         return np.log(P)
 
 
+class Projection(KNNTarget):
+    """Linear projections of standardised numerics: PCA (unsupervised) or PLS.
+
+    Trees split on one axis at a time; a rotated basis turns oblique
+    structure (``lat + lon``-like directions across many columns) into
+    single splits. PLS directions are fitted out of fold on training rows.
+    """
+
+    def __init__(self, cols: Sequence[str], kind: str, n_comp: int, n_classes: int, label: str):
+        super().__init__(cols, (1,), n_classes, label)
+        self.kind = kind
+        self.n_out = min(n_comp, len(cols))
+        self.target_dep = kind == "pls"
+        self.name = f"{kind}__{label}"
+
+    def _proj(self, M_ref, Y_ref):
+        if self.kind == "pca":
+            from sklearn.decomposition import PCA
+            return PCA(self.n_out, random_state=0).fit(M_ref)
+        from sklearn.cross_decomposition import PLSRegression
+        return PLSRegression(self.n_out, scale=False).fit(M_ref, Y_ref)
+
+    def _query(self, M_ref, Y_ref, M_q):
+        return self._proj(M_ref, Y_ref).transform(M_q)
+
+    def fit(self, df, y, ctx):
+        super().fit(df, y if y is not None else np.zeros(len(df)), ctx)
+        self.model_ = self._proj(self.M_, self.Y_)
+        return self
+
+    def transform(self, df, ctx):
+        return self.model_.transform(self._matrix(df))
+
+
 class BinnedPairTE(TargetEnc):
     """Out-of-fold target map over a 2-D quantile grid of two numerics.
 
@@ -344,6 +421,65 @@ class BinnedPairTE(TargetEnc):
         a = self._bin(df[self.parents[0]].to_numpy(dtype=float), self.edges_[0])
         b = self._bin(df[self.parents[1]].to_numpy(dtype=float), self.edges_[1])
         return a.astype(np.int64) * (len(self.edges_[1]) + 2) + b
+
+
+class _MixedCodes:
+    """Joint code over keys and quantile-binned numerics (``binned`` names the latter)."""
+
+    def _setup(self, binned: Sequence[str], n_bins: int):
+        self.binned = list(binned)
+        self.n_bins = n_bins
+
+    def _fit_codes(self, df):
+        self.edges_ = {}
+        q = np.linspace(0, 1, self.n_bins + 1)[1:-1]
+        for c in self.binned:
+            x = df[c].to_numpy(dtype=float)
+            fin = np.isfinite(x)
+            self.edges_[c] = np.unique(np.nanquantile(x[fin], q)) if fin.any() else np.array([])
+        keys = [c for c in self.parents if c not in self.edges_]
+        self.vocabs_ = _fit_vocab(df, keys)
+        return self._codes(df)
+
+    def _codes(self, df):
+        out = np.zeros(len(df), dtype=np.int64)
+        vocabs = iter(self.vocabs_)
+        for c in self.parents:
+            if c in self.edges_:
+                e = self.edges_[c]
+                x = df[c].to_numpy(dtype=float)
+                fin = np.isfinite(x)
+                idx = np.where(fin, np.searchsorted(e, np.where(fin, x, 0.0), side="right"), len(e) + 1)
+                out = out * (len(e) + 2) + idx
+            else:
+                vocab = next(vocabs)
+                idx = vocab.get_indexer(_key_values(df[c]))
+                idx[idx < 0] = len(vocab)
+                out = out * (len(vocab) + 1) + idx
+        return out
+
+
+class MixedTE(_MixedCodes, TargetEnc):
+    """Out-of-fold target encoding of a key/numeric interaction cell.
+
+    Numerics are quantile-binned, so ``(city, income_bin)`` or
+    ``(age_bin, hours_bin, sex)`` become categorical cells whose target rate
+    is learned directly instead of through many tree splits.
+    """
+
+    def __init__(self, cols: Sequence[str], binned: Sequence[str], n_classes: int = 0, n_bins: int = 8):
+        TargetEnc.__init__(self, cols, n_classes)
+        self._setup(binned, n_bins)
+        self.name = "tex__" + "__".join(f"{c}~{n_bins}" if c in binned else c for c in cols)
+
+
+class MixedCount(_MixedCodes, Count):
+    """Frequency of a key/binned-numeric interaction cell."""
+
+    def __init__(self, cols: Sequence[str], binned: Sequence[str], n_bins: int = 8):
+        Count.__init__(self, cols)
+        self._setup(binned, n_bins)
+        self.name = "cntx__" + "__".join(f"{c}~{n_bins}" if c in binned else c for c in cols)
 
 
 class RowStat(Spec):
@@ -688,6 +824,9 @@ class FeatureForge:
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
         Cap on features added in total.
+    n_interactions : int
+        Number of feature pairs (and half as many triples) mined from the base
+        model's tree paths and expanded into explicit interaction features.
     top_numeric, top_keys : int
         How many of the most important numeric / key columns seed candidates.
     gate_frac : float
@@ -704,7 +843,7 @@ class FeatureForge:
                  top_numeric: int = 24, top_keys: int = 10, max_key_cardinality: int = 200,
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
-                 hc_threshold: int = 32,
+                 hc_threshold: int = 32, n_interactions: int = 40,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -721,6 +860,7 @@ class FeatureForge:
         self.min_rel_gain = min_rel_gain
         self.cv = cv
         self.hc_threshold = hc_threshold
+        self.n_interactions = n_interactions
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -783,9 +923,36 @@ class FeatureForge:
                       callbacks=[lgb.early_stopping(es, verbose=False)])
         return b
 
-    def _cv(self, X: pd.DataFrame, y, repeats, lr=0.1):
+    @staticmethod
+    def _mine_paths(booster, names, pairs, triples, max_trees=300):
+        """Accumulate split gain of parent->child (and grandparent chains) feature pairs.
+
+        Features that a tree splits on in sequence along one path interact in
+        the model; their gain is a cheap, model-guided interaction ranking.
+        """
+        dump = booster.dump_model(num_iteration=booster.best_iteration or None)
+        for tree in dump["tree_info"][:max_trees]:
+            stack = [(tree["tree_structure"], None, None)]
+            while stack:
+                node, par, gpar = stack.pop()
+                if "split_feature" not in node:
+                    continue
+                f = names[node["split_feature"]]
+                g = float(node.get("split_gain", 0.0))
+                if par is not None and par != f:
+                    key = tuple(sorted((par, f)))
+                    pairs[key] = pairs.get(key, 0.0) + g
+                    if gpar is not None and len({gpar, par, f}) == 3:
+                        k3 = tuple(sorted((gpar, par, f)))
+                        triples[k3] = triples.get(k3, 0.0) + g
+                for side in ("left_child", "right_child"):
+                    stack.append((node[side], f, par))
+
+    def _cv(self, X: pd.DataFrame, y, repeats, lr=0.1, mine=False):
         """Repeated K-fold: OOF raw margins (averaged over repeats), mean loss, summed gain importance."""
         n = len(X)
+        if mine:
+            self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
         imp = pd.Series(0.0, index=X.columns)
         losses = []
@@ -795,6 +962,8 @@ class FeatureForge:
                 b = self._fit_eval(X.iloc[tr], y[tr], X.iloc[va], y[va], lr=lr)
                 oof[va] = b.predict(X.iloc[va], num_iteration=b.best_iteration, raw_score=True)
                 imp += pd.Series(b.feature_importance("gain"), index=X.columns)
+                if mine:
+                    self._mine_paths(b, list(X.columns), self.pair_gain_, self.triple_gain_)
             losses.append(_loss(self.task_, y, oof))
             oof_mean += oof / len(repeats)
         return oof_mean, float(np.mean(losses)), imp
@@ -830,10 +999,21 @@ class FeatureForge:
                     add(RowStat(raw_num, "nan", "all"))
             dense_num = [c for c in top_num if W[c].nunique() > 10]
             if len(W) <= 300_000:
-                for d in (2, 4, 8, 16, 32):
-                    if len(dense_num) >= d or (d == 32 and len(dense_num) > 16):
+                sizes = sorted({d for d in (2, 4, 8, 16) if d <= len(dense_num)} | {min(len(dense_num), 32)})
+                for d in sizes:
+                    if d >= 2:
                         ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
                         add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"top{d}"))
+                        if d >= 4:
+                            # Importance-weighted metric: distance follows what the model uses.
+                            w = np.sqrt(imp.reindex(dense_num[:d]).clip(lower=0).to_numpy() + 1e-12)
+                            add(KNNTarget(dense_num[:d], ks, self.n_classes_, f"w{d}", w / w.mean()))
+                            if 2 <= self.n_classes_ <= 10 and len(W) <= 200_000:
+                                add(KNNClassDist(dense_num[:d], (1, 2, 4), self.n_classes_, f"w{d}", w / w.mean()))
+                for d in (8, 24):
+                    if len(dense_num) >= max(4, d // 2) and (d == 8 or len(dense_num) > 8):
+                        add(Projection(dense_num[:d], "pca", 4, self.n_classes_, f"top{d}"))
+                        add(Projection(dense_num[:d], "pls", 3, self.n_classes_, f"top{d}"))
                 if len(dense_num) >= 3 and len(W) <= 200_000 and self.n_classes_ <= 2:
                     add(LinearOOF(dense_num[:16], self.n_classes_, "top"))
             for a, b in combinations(dense_num[:10], 2):
@@ -895,6 +1075,7 @@ class FeatureForge:
                         continue
                     for st in self.group_stats:
                         add(GroupStat(k, c, st))
+            self._interaction_candidates(W, add)
         else:
             # Compose selected features with the strongest raw columns.
             partners = top_num[: max(8, self.top_numeric // 2)]
@@ -914,6 +1095,113 @@ class FeatureForge:
                 add(Count([k1, k2, k3]))
                 add(TargetEnc([k1, k2, k3], self.n_classes_))
         return cands
+
+    def _cell_gain(self, cell, ncell, g, h, lam, fold, K, y, margin, base):
+        """Cross-fitted Newton gain of a lookup table over integer cells."""
+        idx = fold * ncell + cell
+        def step_for(gk, hk):
+            G = np.bincount(idx, gk, minlength=K * ncell).reshape(K, ncell)
+            H = np.bincount(idx, hk, minlength=K * ncell).reshape(K, ncell)
+            return (-(G.sum(0) - G) / (H.sum(0) - H + lam))[fold, cell]
+        if g.ndim == 1:
+            corr = step_for(g, h)
+        else:
+            corr = np.stack([step_for(g[:, k], h[:, k]) for k in range(g.shape[1])], 1)
+        return base - _loss(self.task_, y, margin + corr)
+
+    def _fast_interactions(self, W, y, margin, imp, n_cols=30, n_bins=8, n_levels=16):
+        """FAST-style interaction detection on the current model's residuals.
+
+        Every pair of the top columns is cut into a 2-D grid (quantile bins for
+        numerics, frequent levels for keys) and scored by the cross-fitted
+        Newton gain of the grid minus the better of its two 1-D gains: what a
+        pairwise lookup adds that neither column explains alone, measured on
+        rows the lookup did not see. Triples extend the best pairs the same way.
+        """
+        cols = [c for c in imp.sort_values(ascending=False).index if c in W.columns][:n_cols]
+        n = len(y)
+        K = 5
+        fold = np.random.default_rng(self.random_state + 7).permutation(n) % K
+        g, h = self._grad_hess(y, margin)
+        lam = 10.0 * float(h.mean())
+        base = _loss(self.task_, y, margin)
+        codes, sizes = {}, {}
+        for c in cols:
+            if c in self.key_cols_ and (c in self.cat_cols_ or W[c].nunique() <= n_levels):
+                v = pd.Series(_key_values(W[c]))
+                top = v.value_counts().index[:n_levels]
+                code = pd.Categorical(v, categories=top).codes.astype(np.int64)
+                code[code < 0] = len(top)
+                codes[c], sizes[c] = code, len(top) + 1
+            elif c not in self.cat_cols_:
+                x = W[c].to_numpy(dtype=float)
+                fin = np.isfinite(x)
+                if fin.sum() < 20:
+                    continue
+                e = np.unique(np.nanquantile(x[fin], np.linspace(0, 1, n_bins + 1)[1:-1]))
+                codes[c] = np.where(fin, np.searchsorted(e, np.where(fin, x, 0.0), side="right"), len(e) + 1)
+                sizes[c] = len(e) + 2
+        args = (g, h, lam, fold, K, y, margin, base)
+        one = {c: self._cell_gain(codes[c], sizes[c], *args) for c in codes}
+        pairs = {}
+        for a, b in combinations(list(codes), 2):
+            pairs[(a, b)] = self._cell_gain(codes[a] * sizes[b] + codes[b], sizes[a] * sizes[b], *args) \
+                - max(one[a], one[b], 0.0)
+        best = sorted(pairs, key=pairs.get, reverse=True)
+        triples = {}
+        for a, b in best[:10]:
+            if pairs[(a, b)] <= 0:
+                break
+            ab = codes[a] * sizes[b] + codes[b]
+            for c in list(codes)[:15]:
+                if c in (a, b):
+                    continue
+                t = tuple(sorted((a, b, c)))
+                if t in triples:
+                    continue
+                triples[t] = self._cell_gain(ab * sizes[c] + codes[c], sizes[a] * sizes[b] * sizes[c], *args) \
+                    - max(pairs[(a, b)] + max(one[a], one[b], 0.0), 0.0)
+        return ({k: v for k, v in pairs.items() if v > 0}, {k: v for k, v in triples.items() if v > 0})
+
+    def _interaction_candidates(self, W, add):
+        """Turn tree-path interactions into explicit features of every applicable family."""
+        if not self.n_interactions or not getattr(self, "pair_gain_", None):
+            return
+        is_key = lambda c: c in self.key_cols_
+        dense = lambda c: c not in self.cat_cols_ and W[c].nunique() > 10
+        half = self.n_interactions // 2
+        fp, ft = getattr(self, "fast_pairs_", {}), getattr(self, "fast_triples_", {})
+        pairs = list(dict.fromkeys(
+            [tuple(sorted(p)) for p in sorted(fp, key=fp.get, reverse=True)[:half]]
+            + sorted(self.pair_gain_, key=self.pair_gain_.get, reverse=True)))[:self.n_interactions]
+        for a, b in pairs:
+            if dense(a) and dense(b):
+                for op in self.arith_ops:
+                    add(Arith(op, a, b))
+                add(BinnedPairTE(a, b, self.n_classes_))
+                add(MixedCount([a, b], [a, b], 16))
+            elif is_key(a) and is_key(b):
+                add(Count([a, b]))
+                add(TargetEnc([a, b], self.n_classes_))
+            else:
+                k, c = (a, b) if is_key(a) else (b, a)
+                binned = [x for x in (a, b) if not is_key(x)]
+                if not is_key(k) or any(x in self.cat_cols_ for x in binned):
+                    continue
+                add(MixedTE([k, c], binned, self.n_classes_, 8))
+                add(MixedCount([k, c], binned, 8))
+                if c not in self.cat_cols_:
+                    for st in self.group_stats:
+                        add(GroupStat(k, c, st))
+        triples = list(dict.fromkeys(
+            sorted(ft, key=ft.get, reverse=True)[:half // 2]
+            + sorted(self.triple_gain_, key=self.triple_gain_.get, reverse=True)))[:half]
+        for t in triples:
+            binned = [c for c in t if not is_key(c) or (c not in self.cat_cols_ and W[c].nunique() > 16)]
+            if any(c in self.cat_cols_ and c in binned for c in t):
+                continue
+            add(MixedTE(list(t), binned, self.n_classes_, 6))
+            add(MixedCount(list(t), binned, 6))
 
     def _materialize(self, specs: List[Spec], W: pd.DataFrame, y, folds) -> Dict[str, np.ndarray]:
         out = {}
@@ -1086,7 +1374,9 @@ class FeatureForge:
         selected: List[Spec] = []
         self.history_ = []
         Wm = self._model_frame(W)
-        margin, cur_loss, imp = self._cv(Wm, yW, folds)
+        margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
+        if self.n_interactions:
+            self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
             self._fit_rank_maps(W)
@@ -1125,18 +1415,32 @@ class FeatureForge:
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
             room = self.max_new_features - len(selected)
-            ladder = [k for k in (3, 6, 12, 25, 50, 80) if k < min(len(rank), room)] + [min(len(rank), room)]
-            best_k, best_loss, best_fit = 0, cur_loss, None
-            for k in sorted(set(ladder)):
-                if k <= 0:
-                    continue
-                cols = list(Wm.columns) + [c for nm in rank[:k] for c in spec_by_name[nm].out_names()]
-                oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds)
-                self._log(f"  top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
-                if loss_k < best_loss:
-                    best_k, best_loss, best_fit = k, loss_k, (oof_k, imp_k, cols)
-                if self._time_left() < 0:
-                    break
+            # Two orderings: joint-model split gain, and novel residual gain from
+            # screening. Wide candidate pools can push strong but narrow features
+            # (a single pairwise interaction) down the split-gain order.
+            novel_rank = sorted(survivors, key=lambda nm: -self._last_novelty.get(nm, 0.0))
+            orders = [("gain", rank, (3, 6, 12, 25, 50, 80)), ("novelty", novel_rank, (3, 6, 12))]
+            best_k, best_loss, best_fit, best_rank = 0, cur_loss, None, rank
+            tried = set()
+            for label, order, steps in orders:
+                ladder = [k for k in steps if k < min(len(order), room)]
+                if label == "gain":
+                    ladder.append(min(len(order), room))
+                for k in sorted(set(ladder)):
+                    if k <= 0:
+                        continue
+                    key = frozenset(order[:k])
+                    if key in tried:
+                        continue
+                    tried.add(key)
+                    cols = list(Wm.columns) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
+                    oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds)
+                    self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
+                    if loss_k < best_loss:
+                        best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
+                    if self._time_left() < 0:
+                        break
+            rank = best_rank
             if best_k == 0 or (cur_loss - best_loss) / cur_loss < self.min_rel_gain:
                 self._log(f"round {r + 1}: no prefix beats current CV loss by {self.min_rel_gain:.2%}; stopping")
                 break
