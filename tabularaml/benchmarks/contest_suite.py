@@ -96,6 +96,24 @@ CONTEST = {d.name: d for d in [
 ]}
 
 
+# Tables with entity / ID / time structure (flights, providers, locations, stops,
+# wineries): the setting where contest feature engineering usually earns most.
+# Columns that would make the target trivial are dropped (total_amount includes
+# the tip; Medicare payments are most of the total payment).
+STRUCTURED = {d.name: d for d in [
+    SuiteDataset("airlines", OML.format(1169), "", "binary", "logloss", cat_cols=["Flight"], max_rows=100_000),
+    SuiteDataset("medical_charges", OML.format(42130), "", "regression", "rmsle",
+                 drop=["provider_name", "provider_street_address", "average_medicare_payments"],
+                 cat_cols=["provider_id", "provider_zip_code"], max_rows=100_000),
+    SuiteDataset("nyc_taxi_tip", OML.format(42729), "", "regression", "rmse", drop=["total_amount"],
+                 max_rows=100_000),
+    SuiteDataset("sf_crime", OML.format(42344), "", "binary", "logloss", max_rows=100_000),
+    SuiteDataset("kc_house", OML.format(42731), "", "regression", "rmsle", drop=["id"], cat_cols=["zipcode"],
+                 max_rows=None),
+    SuiteDataset("wine_reviews", OML.format(41275), "", "regression", "rmse", max_rows=100_000),
+    SuiteDataset("zurich_delays", OML.format(42495), "", "regression", "rmse", max_rows=None),
+]}
+
 def data_dir() -> Path:
     d = Path(os.environ.get("TABULARAML_DATA", Path.home() / "data"))
     d.mkdir(parents=True, exist_ok=True)
@@ -116,7 +134,7 @@ def _load_openml(did: int):
     drop = []
     for key in ("ignore_attribute", "row_id_attribute"):
         v = meta.get(key)
-        drop += [v] if isinstance(v, str) else list(v or [])
+        drop += v.split(",") if isinstance(v, str) else list(v or [])  # may be one comma-joined string
     for c in df.columns:
         if isinstance(df[c].dtype, pd.CategoricalDtype) or df[c].dtype == bool:
             df[c] = df[c].astype(object).where(df[c].notna(), None)
@@ -124,7 +142,7 @@ def _load_openml(did: int):
 
 
 def load_suite_dataset(name: str, seed: int = 0):
-    spec = SUITE[name] if name in SUITE else CONTEST[name]
+    spec = SUITE.get(name) or CONTEST.get(name) or STRUCTURED[name]
     if spec.url.startswith("openml:"):
         df, target = _load_openml(int(spec.url.split(":")[1]))
         spec = SuiteDataset(**{**spec.__dict__, "target": spec.target or target})

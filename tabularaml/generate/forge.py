@@ -241,17 +241,25 @@ class TargetEnc(Spec):
         return self
 
     def transform(self, df, ctx):
-        return self._apply(self._codes(df), self.sums_, self.counts_, self.prior_)
+        k = self._codes(df)
+        if getattr(self, "fold_stats_", None):
+            # New rows get the average of the fold encoders, so their values carry
+            # the same shrinkage as the out-of-fold values the model was trained on.
+            return sum(self._apply(k, *st) for st in self.fold_stats_) / len(self.fold_stats_)
+        return self._apply(k, self.sums_, self.counts_, self.prior_)
 
     def fit_transform_oof(self, df, y, ctx, folds):
         k = self._fit_codes(df)
         Y = self._targets(y)
         out = np.zeros((len(df), self.n_out))
+        stats = []
         for tr, va in folds:
-            sums, counts, prior = self._stats(k[tr], Y[tr])
-            r = self._apply(k[va], sums, counts, prior)
+            st = self._stats(k[tr], Y[tr])
+            stats.append(st)
+            r = self._apply(k[va], *st)
             out[va] = r if r.ndim == 2 else r[:, None]
         self.fit(df, y, ctx)
+        self.fold_stats_ = stats if getattr(ctx, "fold_avg_te", False) else None
         return out[:, 0] if self.n_out == 1 else out
 
 
@@ -988,6 +996,15 @@ class FeatureForge:
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
         Cap on features added in total.
+    nested_cv : bool
+        Recompute target encodings inside each CV fold when ranking feature sets,
+        so search CV is not optimistic about sparse-key encodings.
+    gate_subsets : bool
+        Also offer each round's label-free features alone to the gate.
+    fold_avg_te : bool
+        New rows get target encodings averaged over the out-of-fold encoders
+        instead of one encoder fitted on all rows, matching the shrinkage of
+        the training values (matters for sparse, many-level keys).
     n_composite : int
         Key pairs (most interacting first) whose groups get numeric aggregations.
     gate_bags : int
@@ -1017,7 +1034,8 @@ class FeatureForge:
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
-                 evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0,
+                 evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
+                 gate_subsets: bool = False, nested_cv: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1039,6 +1057,9 @@ class FeatureForge:
         self.evolve_time = evolve_time
         self.gate_bags = gate_bags
         self.n_composite = n_composite
+        self.fold_avg_te = fold_avg_te
+        self.gate_subsets = gate_subsets
+        self.nested_cv = nested_cv
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1126,19 +1147,51 @@ class FeatureForge:
                 for side in ("left_child", "right_child"):
                     stack.append((node[side], f, par))
 
-    def _cv(self, X: pd.DataFrame, y, repeats, lr=0.1, mine=False):
-        """Repeated K-fold: OOF raw margins (averaged over repeats), mean loss, summed gain importance."""
+    def _nested_values(self, spec, W, y, key, tr, va):
+        """Encodings of one CV fold computed from its training rows only.
+
+        Out-of-fold target statistics over the whole search frame still let a
+        training row's value depend on the validation rows' labels; for sparse
+        keys that makes CV favour target encodings that do not generalise.
+        Here the training rows get an inner out-of-fold encoding and the
+        validation rows an encoding fitted on the training rows alone.
+        """
+        ck = (spec.name,) + key
+        if ck not in self._nested_cache:
+            import copy
+            s = copy.copy(spec)
+            inner = self._folds(len(tr), y[tr], 5, self.random_state + 7)
+            vt = s.fit_transform_oof(W.iloc[tr].reset_index(drop=True), y[tr], self.ctx_, inner)
+            vv = s.transform(W.iloc[va].reset_index(drop=True), self.ctx_)
+            self._nested_cache[ck] = (np.asarray(vt, dtype=np.float32), np.asarray(vv, dtype=np.float32))
+        return self._nested_cache[ck]
+
+    def _cv(self, X: pd.DataFrame, y, repeats, lr=0.1, mine=False, nested=None):
+        """Repeated K-fold: OOF raw margins (averaged over repeats), mean loss, summed gain importance.
+
+        ``nested`` maps target-encoding specs to the frame they were built on;
+        their columns are then recomputed per fold from the fold's training rows.
+        """
         n = len(X)
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
         imp = pd.Series(0.0, index=X.columns)
         losses = []
-        for folds in repeats:
+        for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
-            for tr, va in folds:
-                b = self._fit_eval(X.iloc[tr], y[tr], X.iloc[va], y[va], lr=lr)
-                oof[va] = b.predict(X.iloc[va], num_iteration=b.best_iteration, raw_score=True)
+            for f_i, (tr, va) in enumerate(folds):
+                Xtr, Xva = X.iloc[tr], X.iloc[va]
+                specs = [sp for sp in (nested or {}).get("specs", []) if sp.out_names()[0] in X.columns]
+                if specs:
+                    Xtr, Xva = Xtr.copy(), Xva.copy()
+                    for sp in specs:
+                        vt, vv = self._nested_values(sp, nested["W"], y, (r_i, f_i), tr, va)
+                        for j, col in enumerate(sp.out_names()):
+                            Xtr[col] = vt if vt.ndim == 1 else vt[:, j]
+                            Xva[col] = vv if vv.ndim == 1 else vv[:, j]
+                b = self._fit_eval(Xtr, y[tr], Xva, y[va], lr=lr)
+                oof[va] = b.predict(Xva, num_iteration=b.best_iteration, raw_score=True)
                 imp += pd.Series(b.feature_importance("gain"), index=X.columns)
                 if mine:
                     self._mine_paths(b, list(X.columns), self.pair_gain_, self.triple_gain_)
@@ -1726,6 +1779,7 @@ class FeatureForge:
                           if 2 <= X[c].nunique() <= (0.5 * len(X) if c in self.cat_cols_
                                                      else self.max_key_cardinality)]
         self.ctx_ = Context(self.task_, self.n_classes_, self.random_state)
+        self.ctx_.fold_avg_te = self.fold_avg_te
 
         # Gate split: these rows never influence the search.
         n = len(X)
@@ -1760,6 +1814,7 @@ class FeatureForge:
 
         selected: List[Spec] = []
         self.history_ = []
+        self._nested_cache = {}
         Wm = self._model_frame(W)
         margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
         if self.n_interactions:
@@ -1807,6 +1862,11 @@ class FeatureForge:
             rank = sorted(survivors, key=lambda nm: -sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()))
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
+            nested = None
+            if self.nested_cv:
+                te_specs = [sp for sp in list(selected) + [spec_by_name[nm] for nm in survivors]
+                            if isinstance(sp, TargetEnc)]
+                nested = {"specs": te_specs, "W": W}
             room = self.max_new_features - len(selected)
             # Two orderings: joint-model split gain, and novel residual gain from
             # screening. Wide candidate pools can push strong but narrow features
@@ -1827,7 +1887,7 @@ class FeatureForge:
                         continue
                     tried.add(key)
                     cols = list(Wm.columns) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
-                    oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds)
+                    oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds, nested=nested)
                     self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
                     if loss_k < best_loss:
                         best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
@@ -1856,10 +1916,10 @@ class FeatureForge:
         self.selected_ = selected
         self.gate_passed_ = None
         if (selected or self.recode_) and len(idx_gate):
-            best_round, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
-            self.gate_passed_ = best_round is not None
+            best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
+            self.gate_passed_ = best_set is not None
             if self.gate_passed_:
-                self.selected_ = [s for s in self.selected_ if s.round_ <= best_round]
+                self.selected_ = list(best_set)
             else:
                 self.recode_ = False
             self._log(f"gate: raw={self.gate_raw_loss_:.6f} fe={self.gate_fe_loss_:.6f} "
@@ -1912,20 +1972,31 @@ class FeatureForge:
         z_needed = self.gate_z if len(yg) >= 1000 or self.gate_z < 0 else max(self.gate_z, 1.645)
         # Candidate feature sets are the cumulative rounds; the best one on the gate is
         # kept only if its paired per-row improvement clears ``gate_z`` standard errors.
-        best_round, best_l, best_z = None, raw_l, 0.0
-        # Round -1: the high-cardinality recode alone, without new features.
+        best_set, best_l, best_z = None, raw_l, 0.0
+        # Candidate sets: the cumulative rounds; round -1 is the high-cardinality recode
+        # alone. Each round also offers its label-free subset: target statistics are the
+        # features whose search CV can be optimistic (training rows' encodings carry the
+        # validation rows' labels), so a gate can reject them without losing the rest.
+        cands = []
         for r in ([-1] if self.recode_ else []) + sorted({s.round_ for s in self.selected_}):
-            cols = self.raw_cols_ + [c for s in self.selected_ if s.round_ <= r for c in s.out_names()]
+            full = [s for s in self.selected_ if s.round_ <= r]
+            cands.append((f"rounds<={r + 1}", full))
+            if self.gate_subsets:
+                free = [s for s in full if not s.target_dep]
+                if free and len(free) < len(full):
+                    cands.append((f"rounds<={r + 1} label-free", free))
+        for label, specs in cands:
+            cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
             rows = gate_loss(cols)
             d = raw_rows - rows
             # Winsorise so a handful of extreme rows cannot carry the decision.
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
-            self._log(f"  gate rounds<={r + 1}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
+            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
             if rows.mean() < best_l and z >= z_needed:
-                best_round, best_l, best_z = r, float(rows.mean()), z
-        return best_round, raw_l, best_l
+                best_set, best_l, best_z = specs, float(rows.mean()), z
+        return best_set, raw_l, best_l
 
     def _fit_full(self, X, y, U=None):
         if self.recode_:

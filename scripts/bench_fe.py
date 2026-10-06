@@ -29,7 +29,7 @@ from sklearn.model_selection import train_test_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tabularaml.benchmarks.contest_suite import CONTEST, SUITE, load_suite_dataset  # noqa: E402
+from tabularaml.benchmarks.contest_suite import CONTEST, STRUCTURED, SUITE, load_suite_dataset  # noqa: E402
 from tabularaml.contest import ContestSolver, get_metric  # noqa: E402
 
 
@@ -177,7 +177,7 @@ def main():
     warnings.filterwarnings("ignore")
     ap = argparse.ArgumentParser()
     ap.add_argument("--datasets", nargs="*", default=None)
-    ap.add_argument("--suite", default="public", choices=["public", "contest"],
+    ap.add_argument("--suite", default="public", choices=["public", "contest", "structured"],
                     help="public: PMLB/AutoGluon tables; contest: real competition tables from OpenML")
     ap.add_argument("--arms", nargs="*", default=["raw", "forge"])
     ap.add_argument("--seeds", type=int, nargs="*", default=[0, 1, 2])
@@ -199,7 +199,7 @@ def main():
     global TRANSDUCTIVE
     TRANSDUCTIVE = args.transductive
     if args.datasets is None:
-        args.datasets = list(CONTEST if args.suite == "contest" else SUITE)
+        args.datasets = list({"contest": CONTEST, "structured": STRUCTURED}.get(args.suite, SUITE))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     done = set()
     if args.out.exists():
