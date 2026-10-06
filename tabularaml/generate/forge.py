@@ -1048,7 +1048,7 @@ class FeatureForge:
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
                  evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
                  gate_subsets: bool = False, nested_cv: bool = False, entities: bool = True,
-                 time_col: Optional[str] = "auto",
+                 time_col: Optional[str] = "auto", entity_nums: int = 6,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1075,6 +1075,7 @@ class FeatureForge:
         self.nested_cv = nested_cv
         self.entities = entities
         self.time_col = time_col
+        self.entity_nums = entity_nums
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1368,7 +1369,8 @@ class FeatureForge:
         ids = sorted(self.id_cols_, key=lambda c: -imp.get(c, 0.0))[:4]
         if not ids:
             return
-        nums = [c for c in top_num if c not in ids and c not in self.cat_cols_][:6]
+        nums = [c for c in top_num if c not in ids and c not in self.cat_cols_
+                and not c.startswith("anchor__")][:self.entity_nums]
         ents = [(k,) for k in ids]
         for _, _, _, a in self.anchors_:
             ents += [(k, a) for k in ids[:3]]
@@ -1490,7 +1492,7 @@ class FeatureForge:
             add(MixedTE(list(t), binned, self.n_classes_, 6))
             add(MixedCount(list(t), binned, 6))
 
-    def _materialize(self, specs: List[Spec], W: pd.DataFrame, y, folds) -> Dict[str, np.ndarray]:
+    def _materialize(self, specs: List[Spec], W: pd.DataFrame, y, folds, keep_fn=None) -> Dict[str, np.ndarray]:
         out = {}
         # Label-free statistics (counts, group statistics, ...) over every row whose
         # features are known: search rows plus gate and unlabeled rows, as at the end.
@@ -1514,7 +1516,10 @@ class FeatureForge:
             finite = np.isfinite(col)
             if finite.mean() < 0.05 or np.nanstd(np.where(finite, col, np.nan)) == 0:
                 continue
+            if keep_fn is not None and not keep_fn(s, v, out):
+                continue
             out[s.name] = v
+        _CODE_CACHE.clear()  # factorised keys of large frames add up to gigabytes
         return out
 
     # ------------------------------------------------------------ screening
@@ -1755,7 +1760,7 @@ class FeatureForge:
         return {nm: out[nm] for nm in best}
 
     def _screen(self, values: Dict[str, np.ndarray], specs: Dict[str, Spec], W: pd.DataFrame,
-                y, margin, idx_a, idx_b, keep: int) -> List[str]:
+                y, margin, idx_a, idx_b, keep: int, scores=None) -> List[str]:
         """Rank candidates by *novel* residual gain.
 
         A candidate's raw residual gain is compared with the gain of its own
@@ -1765,14 +1770,18 @@ class FeatureForge:
         otherwise look useful. Only gain beyond the best parent counts.
         """
         n = len(y)
-        probe, parent_gain = self._probe_setup(W, y, margin)
-        gains, novelty = {}, {}
-        for name, v in values.items():
-            gains[name] = probe(v)
-            novelty[name] = gains[name] - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in specs[name].parents)
-        ranked = sorted(novelty, key=novelty.get, reverse=True)
+        scores = dict(scores or {})
+        missing = [nm for nm in values if nm not in scores]
+        if missing:
+            probe, parent_gain = self._probe_setup(W, y, margin)
+            for name in missing:
+                g = probe(values[name])
+                scores[name] = (g, g - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in specs[name].parents))
+        gains = {nm: g for nm, (g, _) in scores.items()}
+        novelty = {nm: v for nm, (_, v) in scores.items()}
+        ranked = sorted([nm for nm in novelty if nm in values], key=novelty.get, reverse=True)
         alive = [nm for nm in ranked if novelty[nm] > 0][:keep]
-        self._log(f"  screened {len(values)} candidates on {n} rows (5-fold cross-fitted) "
+        self._log(f"  screened {len(novelty)} candidates on {n} rows (5-fold cross-fitted) "
                   f"-> {sum(g > 0 for g in novelty.values())} novel, {len(alive)} kept")
         self._last_gains, self._last_novelty = gains, novelty
         return alive
@@ -1884,20 +1893,40 @@ class FeatureForge:
         for r in range(self.n_rounds):
             if self._time_left() <= 0 or len(selected) >= self.max_new_features:
                 break
+            values = joint = None  # release the previous round's candidates first
             cands = self._generate(W, imp, selected, r)
-            values = self._materialize(cands, W, yW, te_folds)
+            keep = min(80, 3 * self.max_new_features)
+            spec_by_name = {s.name: s for s in cands}
+            # Screen while materialising: only candidates with novel residual gain are
+            # kept in memory (thousands of full-length columns otherwise).
+            probe, parent_gain = self._probe_setup(W, yW, margin)
+            scores = {}
+
+            def keep_fn(spec, v, out):
+                g = probe(v)
+                nov = g - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in spec.parents)
+                scores[spec.name] = (g, nov)
+                if nov <= 0:
+                    return False
+                if len(out) >= 4 * keep:
+                    worst = min(out, key=lambda nm: scores[nm][1])
+                    if scores[worst][1] >= nov:
+                        return False
+                    del out[worst]
+                return True
+            values = self._materialize(cands, W, yW, te_folds, keep_fn=keep_fn)
             if self.evolve_time > 0 and r == 0:
                 evolved = self._evolve(W, yW, margin, imp, te_folds, self.evolve_time,
                                        {s.name for s in cands} | {s.name for s in selected})
                 for nm, (sp, v) in evolved.items():
                     cands.append(sp)
                     values[nm] = v
-            self._log(f"round {r + 1}: {len(cands)} candidates generated, {len(values)} valid")
+            self._log(f"round {r + 1}: {len(cands)} candidates generated, {len(scores)} valid")
             if not values:
                 break
             spec_by_name = {s.name: s for s in cands}
             survivors = self._screen(values, spec_by_name, W, yW, margin, idx_a, idx_b,
-                                     keep=min(80, 3 * self.max_new_features))
+                                     keep=keep, scores=scores)
             if not survivors:
                 break
             # Joint model ranks survivors by split gain alongside current features.
@@ -1963,6 +1992,10 @@ class FeatureForge:
 
         self.search_cv_loss_ = cur_loss
         self.selected_ = selected
+        # Candidate values of the last round can be gigabytes on large tables.
+        values = joint = cands = None
+        import gc
+        gc.collect()
         self.gate_passed_ = None
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
