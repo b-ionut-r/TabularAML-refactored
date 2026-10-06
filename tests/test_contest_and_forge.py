@@ -163,3 +163,23 @@ def test_genetic_search_finds_compound_ratio():
     ga = FeatureForge(evolve_time=8, **kw).fit(X, y)
     assert any(c.startswith("gp__") for c in ga.new_columns_)
     assert ga.gate_fe_loss_ < base.gate_fe_loss_
+
+
+def test_entity_anchor_detection_finds_opening_day():
+    rng = np.random.default_rng(0)
+    n_ent, n = 3000, 30000
+    card = rng.integers(1000, 1300, n_ent)          # many entities share a card number
+    opened = rng.integers(0, 400, n_ent)            # hidden account-opening day
+    ent = rng.integers(0, n_ent, n)
+    day = rng.uniform(400, 580, n)
+    X = pd.DataFrame({"T": day * 86400, "card": card[ent], "D1": np.floor(day) - opened[ent],
+                      "D3": rng.integers(0, 300, n), "amt": rng.gamma(2, 50, n)})
+    f = FeatureForge(task="binary", verbose=False)
+    f.cat_cols_ = []
+    f.id_cols_ = f._id_columns(X)
+    assert "card" in f.id_cols_
+    anchors = f._find_anchors(X)
+    assert [(t, s, d) for t, s, d, _ in anchors] == [("T", 86400, "D1")]
+    f.anchors_ = anchors
+    A = f._add_anchors(X.copy())
+    assert (A.groupby(ent)[anchors[0][3]].nunique() == 1).all()

@@ -274,3 +274,36 @@ The LightGBM judge gave +4.3% on the same runs. With the contest setting, a
 partial 22-table run (33 pairs) gave +0.95% mean, with 18 pairs better and 4
 worse: Amazon +4.3%, diamonds +2.6%, Kick +2.4%, bank marketing +2.3%, food
 delivery +2.1%.
+
+## v15: hidden entities and a time-ordered gate (IEEE-CIS Fraud Detection)
+
+Tested on a real paid competition: IEEE-CIS Fraud Detection (Kaggle 2019, $20k),
+most recent 236k of 590k transactions, holdout = the latest 20% by time (the
+competition's test set was later in time too). Judge: one LightGBM; reproduce
+with `python scripts/ieee_fraud.py`.
+
+| Columns | Holdout AUC | Log loss |
+|---|---|---|
+| Raw | 0.9338 | 0.0886 |
+| FeatureForge v14 (random gate) | 0.9207 | 0.1022 |
+| FeatureForge v14 + time-ordered gate | 0.9338 (rejects everything) | 0.0886 |
+| FeatureForge v15 (entities + time-ordered gate) | **0.9522** | 0.0910 |
+| Raw + v15's anchors and entity target maps only | 0.9553 | 0.0823 |
+
+* **Hidden entities** (`entities=True`, default). A timestamp-like column minus a
+  "days since X" column is constant per customer (the account-opening day);
+  FeatureForge finds such anchors by checking that, within ID-like columns,
+  `t - delta` takes clearly fewer distinct values than the control `t + delta`.
+  On IEEE it finds `floor(TransactionDT / 86400) - D1` (also D15, D10) and
+  ID columns card1, addr1, card2 by itself: the winning team's "UID". Anchors
+  are added as columns, and counts, target maps and group statistics over
+  ID x anchor composites join the candidates.
+* **Time-ordered gate** (`time_col="auto"`). When the unlabeled rows lie beyond
+  the training range of a column, the gate holds out the latest training rows
+  instead of a random sample. Without it, kNN target features and out-of-fold
+  models that only work within a period passed the gate and lost 1.3 AUC points
+  on the later holdout.
+* Benchmark tables (random holdouts, 15 tables with ID columns, 3 holdouts each):
+  neutral, +3.41% vs +3.46% for v14 (all within ±0.1% per table except sf_crime
+  0.25% -> 0.11% and kdd_upselling 5.2% -> 5.6%). Tables without ID columns are
+  unchanged; the time gate never triggers on random splits.

@@ -1005,6 +1005,18 @@ class FeatureForge:
         New rows get target encodings averaged over the out-of-fold encoders
         instead of one encoder fitted on all rows, matching the shrinkage of
         the training values (matters for sparse, many-level keys).
+    entities : bool
+        Look for hidden entity ids: a timestamp-like column minus a "days since
+        X" column is constant per entity (account opening date, first visit);
+        such anchors are added as columns and combined with ID-like columns
+        into composite keys for counts, target maps and group statistics.
+    time_col : str | "auto" | None
+        Column that orders rows in time. When set, the gate holds out the most
+        recent rows instead of a random sample, so features that only work
+        within a period (neighbours of the same day, encodings of entities that
+        stop appearing) are judged as they will be on a later test set. "auto"
+        picks a numeric column whose unlabeled values (``X_unlabeled``) lie
+        beyond the training range, as a competition's test period does.
     n_composite : int
         Key pairs (most interacting first) whose groups get numeric aggregations.
     gate_bags : int
@@ -1035,7 +1047,8 @@ class FeatureForge:
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
                  evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
-                 gate_subsets: bool = False, nested_cv: bool = False,
+                 gate_subsets: bool = False, nested_cv: bool = False, entities: bool = True,
+                 time_col: Optional[str] = "auto",
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1060,6 +1073,8 @@ class FeatureForge:
         self.fold_avg_te = fold_avg_te
         self.gate_subsets = gate_subsets
         self.nested_cv = nested_cv
+        self.entities = entities
+        self.time_col = time_col
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1217,7 +1232,7 @@ class FeatureForge:
         sel_names = [s.name for s in selected if s.n_out == 1 and s.name in num_cols]
         label_free = {s.name for s in selected if not s.target_dep}
         if round_idx == 0:
-            raw_num = [c for c in self.raw_cols_ if c not in self.cat_cols_]
+            raw_num = [c for c in self.base_cols_ if c not in self.cat_cols_]
             for stem, cols in column_families(raw_num).items():
                 binary = all(set(pd.unique(W[c].dropna())) <= {0, 1} for c in cols)
                 stats = ("argmax", "sum") if binary else ("sum", "mean", "std", "max", "min", "argmax",
@@ -1325,6 +1340,7 @@ class FeatureForge:
                         continue
                     for st in self.group_stats:
                         add(GroupStat(k, c, st))
+            self._entity_candidates(W, imp, top_num, add)
             self._interaction_candidates(W, add)
         else:
             # Compose selected features with the strongest raw columns.
@@ -1345,6 +1361,27 @@ class FeatureForge:
                 add(Count([k1, k2, k3]))
                 add(TargetEnc([k1, k2, k3], self.n_classes_))
         return cands
+
+    def _entity_candidates(self, W, imp, top_num, add):
+        """Counts, target maps and group statistics over ID-like columns and over
+        composite entities (ID x anchor, ID pair x anchor)."""
+        ids = sorted(self.id_cols_, key=lambda c: -imp.get(c, 0.0))[:4]
+        if not ids:
+            return
+        nums = [c for c in top_num if c not in ids and c not in self.cat_cols_][:6]
+        ents = [(k,) for k in ids]
+        for _, _, _, a in self.anchors_:
+            ents += [(k, a) for k in ids[:3]]
+            ents += [(k1, k2, a) for k1, k2 in combinations(ids[:3], 2)]
+        for e in ents:
+            if len(e) > 1:
+                add(Count(list(e)))
+            add(TargetEnc(list(e), self.n_classes_))
+            for c in nums:
+                if c in e:
+                    continue
+                for st in ("mean", "dev", "std", "nunique"):
+                    add(GroupStat(e if len(e) > 1 else e[0], c, st))
 
     def _cell_gain(self, cell, ncell, g, h, lam, fold, K, y, margin, base):
         """Cross-fitted Newton gain of a lookup table over integer cells."""
@@ -1774,10 +1811,15 @@ class FeatureForge:
         self.hc_cols_ = [c for c in self.cat_cols_ if X[c].nunique() > self.hc_threshold]
         self.recode_ = False
         self.rank_maps_ = {}
+        self.base_cols_ = list(X.columns)
+        self.id_cols_ = self._id_columns(X)
+        self.anchors_ = self._find_anchors(X) if self.entities else []
+        X = self._add_anchors(X)
         self.raw_cols_ = list(X.columns)
         self.key_cols_ = [c for c in X.columns
                           if 2 <= X[c].nunique() <= (0.5 * len(X) if c in self.cat_cols_
                                                      else self.max_key_cardinality)]
+        self.key_cols_ += [a[3] for a in self.anchors_]
         self.ctx_ = Context(self.task_, self.n_classes_, self.random_state)
         self.ctx_.fold_avg_te = self.fold_avg_te
 
@@ -1785,7 +1827,14 @@ class FeatureForge:
         n = len(X)
         idx = np.arange(n)
         strat = y_np if self.task_ != "regression" else None
-        if self.gate_frac and n >= 200:
+        self.time_col_ = self._detect_time(X, X_unlabeled)
+        if self.time_col_ is not None:
+            self._log(f"time-ordered gate on {self.time_col_}")
+        if self.gate_frac and n >= 200 and self.time_col_ is not None:
+            order = np.argsort(X[self.time_col_].to_numpy(dtype=float), kind="stable")
+            n_gate = int(round(self.gate_frac * n))
+            idx_sel, idx_gate = np.sort(order[:n - n_gate]), np.sort(order[n - n_gate:])
+        elif self.gate_frac and n >= 200:
             try:
                 idx_sel, idx_gate = train_test_split(idx, test_size=self.gate_frac,
                                                      random_state=self.random_state, stratify=strat)
@@ -1915,7 +1964,7 @@ class FeatureForge:
         self.search_cv_loss_ = cur_loss
         self.selected_ = selected
         self.gate_passed_ = None
-        if (selected or self.recode_) and len(idx_gate):
+        if (selected or self.recode_ or self.anchors_) and len(idx_gate):
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
             self.gate_passed_ = best_set is not None
             if self.gate_passed_:
@@ -1927,6 +1976,7 @@ class FeatureForge:
                       f"-> {'PASS' if self.gate_passed_ else 'REJECT'}")
             if not self.gate_passed_:
                 self.selected_ = []
+                self.anchors_ = []
 
         # Refit every spec's statistics on all training rows.
         self.U_search_ = None
@@ -1966,7 +2016,7 @@ class FeatureForge:
             return _row_loss(self.task_, yg, margin)
 
         # The baseline is always the raw columns as given (native categoricals).
-        raw_rows = gate_loss(self.raw_cols_, recode=False)
+        raw_rows = gate_loss(self.base_cols_, recode=False)
         raw_l = float(raw_rows.mean())
         # Small gates are noisy: demand 95% one-sided confidence below 1000 rows.
         z_needed = self.gate_z if len(yg) >= 1000 or self.gate_z < 0 else max(self.gate_z, 1.645)
@@ -1977,7 +2027,7 @@ class FeatureForge:
         # alone. Each round also offers its label-free subset: target statistics are the
         # features whose search CV can be optimistic (training rows' encodings carry the
         # validation rows' labels), so a gate can reject them without losing the rest.
-        cands = []
+        cands = [("anchors", [])] if self.anchors_ else []
         for r in ([-1] if self.recode_ else []) + sorted({s.round_ for s in self.selected_}):
             full = [s for s in self.selected_ if s.round_ <= r]
             cands.append((f"rounds<={r + 1}", full))
@@ -2018,7 +2068,7 @@ class FeatureForge:
                     U[col] = vu if np.ndim(vu) == 1 else vu[:, j]
             for j, col in enumerate(s.out_names()):
                 F[col] = v if np.ndim(v) == 1 else v[:, j]
-        self.new_columns_ = [c for s in self.selected_ for c in s.out_names()]
+        self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
         self._train_frame = F[self.new_columns_].astype(np.float32)
 
     # ------------------------------------------------------------- transform
@@ -2026,6 +2076,116 @@ class FeatureForge:
         X = X.reset_index(drop=True).copy()
         for c in self.cat_cols_:
             X[c] = _as_str(X[c])
+        return self._add_anchors(X)
+
+    def _detect_time(self, X, U):
+        if self.time_col != "auto":
+            return self.time_col if self.time_col in X.columns else None
+        if U is None or len(U) < 50:
+            return None
+        best, best_frac = None, 0.0
+        for c in X.columns:
+            if c in self.cat_cols_ or c not in U.columns or X[c].nunique() < 0.05 * len(X):
+                continue
+            x, u = X[c].to_numpy(dtype=float), U[c].to_numpy(dtype=float)
+            if np.isfinite(x).mean() < 0.99 or np.isfinite(u).mean() < 0.99:
+                continue
+            # Test rows later than (almost) every training row.
+            frac = float(np.mean(u > np.nanquantile(x, 0.99)))
+            if frac > 0.9 and frac > best_frac:
+                best, best_frac = c, frac
+        return best
+
+    # ------------------------------------------------------------- entities
+    def _id_columns(self, X, cap=8):
+        """Integer or categorical columns with many levels that repeat: card numbers,
+        addresses, customer or store ids. Most levels first."""
+        n, out = len(X), []
+        for c in X.columns:
+            nu = X[c].nunique()
+            if not (100 <= nu <= n / 5):
+                continue
+            vc = X[c].value_counts(normalize=True)
+            if vc.iloc[0] > 0.5:  # mostly one value: a count or flag, not an id
+                continue
+            if c not in self.cat_cols_:
+                x = X[c].to_numpy(dtype=float)
+                fin = x[np.isfinite(x)]
+                if len(fin) < 0.5 * n or np.any(fin != np.round(fin)):
+                    continue
+                # Counts and amounts get rarer as they grow; codes do not.
+                if pd.Series(vc.index.to_numpy(dtype=float)).corr(pd.Series(vc.to_numpy(dtype=float)),
+                                                                  method="spearman") < -0.3:
+                    continue
+            out.append((nu, c))
+        return [c for _, c in sorted(out, reverse=True)][:cap]
+
+    def _find_anchors(self, X, max_anchors=3, max_ratio=0.8):
+        """Find (time, scale, delta) triples where ``floor(time / scale) - delta`` is
+        constant within entities, as an account-opening day is while "days since
+        opening" keeps growing. Test: grouped by an ID-like column, ``t - delta``
+        takes clearly fewer distinct values than the control ``t + delta``; for a
+        delta unrelated to time the two counts match."""
+        n = len(X)
+        if n < 2000 or not self.id_cols_:
+            return []
+        self._t0 = getattr(self, "_t0", time.time())
+        S = X.sample(min(n, 100_000), random_state=self.random_state) if n > 100_000 else X
+        num = [c for c in X.columns if c not in self.cat_cols_]
+        vals = {c: S[c].to_numpy(dtype=float) for c in num}
+        def is_int(v):
+            f = v[np.isfinite(v)]
+            return len(f) > 0 and not np.any(f != np.round(f))
+        times = [c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0]
+        deltas = sorted([c for c in num if is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
+                        key=lambda c: -X[c].nunique())[:80]
+        ids = []
+        for c in self.id_cols_[:3]:
+            v = S[c]
+            ids.append(pd.factorize(v)[0].astype(np.int64) if c in self.cat_cols_
+                       else np.nan_to_num(v.to_numpy(dtype=float), nan=-1).astype(np.int64))
+        def n_pairs(idc, v):
+            ok = np.isfinite(v)
+            if ok.sum() < 0.3 * len(v):
+                return 0
+            code = idc[ok] * (1 << 32) + (v[ok].astype(np.int64) - int(v[ok].min()))
+            return len(np.unique(code))
+        found = []
+        for t in times:
+            tv = vals[t]
+            for s in (1, 60, 3600, 86400, 604800):
+                span = (np.nanmax(tv) - np.nanmin(tv)) / s
+                if span < 10:
+                    continue
+                for d in deltas:
+                    if d == t:
+                        continue
+                    dv = vals[d]
+                    if np.nanmax(dv) - np.nanmin(dv) < 0.5 * span:
+                        continue
+                    a = np.floor(tv / s) - dv
+                    ratios = []
+                    for idc in ids:
+                        nd = n_pairs(idc, a + 2 * dv)
+                        if nd:
+                            ratios.append(n_pairs(idc, a) / nd)
+                    if ratios and min(ratios) < max_ratio:
+                        found.append((min(ratios) / np.isfinite(dv).mean(), t, s, d))
+        found.sort()
+        out, used = [], set()
+        for r, t, s, d in found:
+            if d in used:
+                continue
+            used.add(d)
+            out.append((t, s, d, f"anchor__{d}__{t}_{s}"))
+            self._log(f"entity anchor: floor({t}/{s}) - {d} (score {r:.2f})")
+            if len(out) >= max_anchors:
+                break
+        return out
+
+    def _add_anchors(self, X):
+        for t, s, d, name in getattr(self, "anchors_", []):
+            X[name] = np.floor(X[t].to_numpy(dtype=float) / s) - X[d].to_numpy(dtype=float)
         return X
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
