@@ -317,3 +317,12 @@ with `python scripts/ieee_fraud.py`.
 * Gap left on the table: raw + anchors + entity target maps alone score 0.9550;
   the full selection adds out-of-fold kNN and linear features that the gate's
   model likes but the judge's deeper trees do not carry to later rows.
+* Confirmed on three time windows of the IEEE data (each 40% of the 590k rows,
+  holdout = latest 20% of the window):
+
+  | Window ends at | Raw AUC | v15 AUC | Raw log loss | v15 log loss |
+  |---|---|---|---|---|
+  | 40% | 0.9229 | 0.9461 | 0.0977 | 0.0960 |
+  | 70% | 0.9334 | 0.9487 | 0.0987 | 0.0947 |
+  | 100% | 0.9338 | 0.9522 | 0.0886 | 0.0910 |
+  | mean | 0.9300 | **0.9490 (+1.9 pts)** | | -1.0% |
