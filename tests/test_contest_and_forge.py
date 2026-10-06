@@ -194,3 +194,20 @@ def test_entity_lag_prev_next_nth():
     np.testing.assert_allclose(get("next", df), [10, 15, np.nan, 2, np.nan])
     np.testing.assert_allclose(get("nth", q), [2, 2])
     np.testing.assert_allclose(get("prev", q), [5, 93])
+
+
+def test_related_tables_aggregates_children_and_grandchildren():
+    from tabularaml.generate.relational import Child, RelatedTables
+    main = pd.DataFrame({"id": [1, 2, 3]})
+    loans = pd.DataFrame({"id": [1, 1, 2], "loan": [10, 11, 12], "DAYS_DUE": [-30., -10., -5.],
+                          "DAYS_PAID": [-28., -12., -5.], "kind": ["a", "b", "a"]})
+    pays = pd.DataFrame({"loan": [10, 10, 11], "AMT_PAID": [5., 7., 1.]})
+    rt = RelatedTables([Child("loans", loans, key="id", time="DAYS_DUE", drop=["loan"],
+                              children=[Child("pay", pays, key="loan")])], recent=1)
+    X = rt.join(main, key="id")
+    assert list(X["loans__count"]) == [2, 1, 0]
+    late = X["loans__DAYS_DUE_sub_DAYS_PAID_max"]
+    assert late.iloc[0] == 2 and late.iloc[1] == 0 and np.isnan(late.iloc[2])
+    assert X["loans__kind_is_a"].iloc[0] == 0.5
+    assert X["loans__pay__AMT_PAID_sum_sum"].iloc[0] == 13
+    assert X["loans__DAYS_DUE_last1"].iloc[0] == -10

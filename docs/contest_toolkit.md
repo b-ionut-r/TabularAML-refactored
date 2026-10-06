@@ -326,3 +326,27 @@ with `python scripts/ieee_fraud.py`.
   | 70% | 0.9334 | 0.9487 | 0.0987 | 0.0947 |
   | 100% | 0.9338 | 0.9522 | 0.0886 | 0.0910 |
   | mean | 0.9300 | **0.9490 (+1.9 pts)** | | -1.0% |
+
+## Related tables: Home Credit Default Risk (Kaggle 2018, $70k)
+
+`tabularaml.generate.relational.RelatedTables` aggregates child tables (and
+their children) onto the main table: within-row differences and ratios of
+same-unit columns (days late = paid day minus due day, paid / owed), then per
+entity counts, mean / max / min / sum / std, category shares and distinct
+counts, and means over the most recent rows. Label-free; FeatureForge selects
+and searches interactions on top.
+
+Home Credit, application table (307k loans), random stratified 80/20 holdouts,
+one LightGBM judge, AUC:
+
+| Columns | Holdout 0 | Holdout 1 | Mean |
+|---|---|---|---|
+| Raw application table | 0.7653 | 0.7659 | 0.7656 |
+| + FeatureForge | 0.7772 | 0.7757 | 0.7764 |
+| Winners' hand-made application features (reference) | 0.7744 | 0.7761 | 0.7753 |
+| + RelatedTables (5 child tables, 1,055 columns, 3.5 min) | 0.7946 | 0.7974 | **0.7960** |
+| + RelatedTables top 200 + FeatureForge | 0.7947 | 0.7996 | 0.7971 |
+
+On the main table alone FeatureForge matches the hand-made features the
+winners used (credit / annuity is its first pick); the side tables are where
+the remaining gain is.
