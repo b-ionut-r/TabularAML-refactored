@@ -307,3 +307,13 @@ with `python scripts/ieee_fraud.py`.
   neutral, +3.41% vs +3.46% for v14 (all within ±0.1% per table except sf_crime
   0.25% -> 0.11% and kdd_upselling 5.2% -> 5.6%). Tables without ID columns are
   unchanged; the time gate never triggers on random splits.
+* Also tried on IEEE (not adopted): 16 instead of 6 numerics aggregated per
+  entity (AUC 0.9529 vs 0.9522, 25% slower; `entity_nums`); each row's place in
+  its entity's history, i.e. time since previous / until next transaction and
+  rows before it (0.9555 vs 0.9550 on top of the entity features, log loss
+  worse; `entity_lags=True`). The search now screens candidates as it builds
+  them, so only promising columns stay in memory (peak 6.1 -> 5.0 GB on 94k x
+  430; the rest is the frame copies).
+* Gap left on the table: raw + anchors + entity target maps alone score 0.9550;
+  the full selection adds out-of-fold kNN and linear features that the gate's
+  model likes but the judge's deeper trees do not carry to later rows.

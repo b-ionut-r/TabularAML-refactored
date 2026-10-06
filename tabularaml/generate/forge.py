@@ -645,6 +645,59 @@ class GroupStat(Spec):
         return a
 
 
+class EntityLag(Spec):
+    """Where a row sits in its entity's history: time since the entity's previous
+    and until its next row, and how many earlier rows it has. Label-free; with
+    unlabeled rows the history spans train and test, as in a contest."""
+
+    def __init__(self, key, time: str, kind: str):
+        keys = [key] if isinstance(key, str) else list(key)
+        super().__init__(keys + [time])
+        self.kind = kind
+        self.name = f"lag_{kind}__{'+'.join(keys)}__{time}"
+
+    def _keys(self):
+        return self.parents[:-1]
+
+    def _span(self):
+        # Room for times well outside the fitted range (later test periods).
+        R = self.t1_ - self.t0_ + 1.0
+        return 6.0 * R, 2.5 * R - self.t0_
+
+    def _pos(self, k, t):
+        span, off = self._span()
+        return k.astype(np.float64) * span + np.clip(t + off, 0.0, span - 1.0)
+
+    def fit(self, df, y, ctx):
+        k = self._fit_codes(df)
+        t = df[self.parents[-1]].to_numpy(dtype=float)
+        ok = np.isfinite(t) & (k >= 0)
+        self.t0_, self.t1_ = float(np.nanmin(t)), float(np.nanmax(t))
+        self.ref_ = np.sort(self._pos(k[ok], t[ok]))
+        return self
+
+    def transform(self, df, ctx):
+        k = self._codes(df)
+        t = df[self.parents[-1]].to_numpy(dtype=float)
+        q = self._pos(k, np.nan_to_num(t, nan=self.t0_))
+        span = self._span()[0]
+        lo = np.searchsorted(self.ref_, q, side="left")    # first ref row at or after t
+        hi = np.searchsorted(self.ref_, q, side="right")   # first ref row after t
+        start = np.searchsorted(self.ref_, np.floor(q / span) * span, side="left")
+        end = np.searchsorted(self.ref_, (np.floor(q / span) + 1) * span, side="left")
+        ref = np.append(self.ref_, np.inf)
+        if self.kind == "prev":
+            r = np.where(lo > start, q - ref[np.maximum(lo - 1, 0)], np.nan)
+        elif self.kind == "next":
+            r = np.where(hi < end, ref[np.minimum(hi, len(self.ref_))] - q, np.nan)
+        else:  # "nth": earlier rows of the entity
+            r = (lo - start).astype(float)
+        bad = ~np.isfinite(t) | (k < 0)
+        r = r.astype(float)
+        r[bad] = np.nan
+        return r
+
+
 class CrossLinearOOF(Spec):
     """Out-of-fold sparse linear model on one-hot keys and all their pairwise crosses.
 
@@ -1010,6 +1063,10 @@ class FeatureForge:
         X" column is constant per entity (account opening date, first visit);
         such anchors are added as columns and combined with ID-like columns
         into composite keys for counts, target maps and group statistics.
+    entity_nums, entity_lags : int, bool
+        Numerics aggregated per entity; whether to add each row's place in its
+        entity's history (time since previous / until next row, rows before it)
+        when a time column is known. Lags were neutral on IEEE-CIS, so off.
     time_col : str | "auto" | None
         Column that orders rows in time. When set, the gate holds out the most
         recent rows instead of a random sample, so features that only work
@@ -1048,7 +1105,7 @@ class FeatureForge:
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
                  evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
                  gate_subsets: bool = False, nested_cv: bool = False, entities: bool = True,
-                 time_col: Optional[str] = "auto", entity_nums: int = 6,
+                 time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1076,6 +1133,7 @@ class FeatureForge:
         self.entities = entities
         self.time_col = time_col
         self.entity_nums = entity_nums
+        self.entity_lags = entity_lags
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1375,7 +1433,11 @@ class FeatureForge:
         for _, _, _, a in self.anchors_:
             ents += [(k, a) for k in ids[:3]]
             ents += [(k1, k2, a) for k1, k2 in combinations(ids[:3], 2)]
+        t = getattr(self, "time_col_", None)
         for e in ents:
+            if self.entity_lags and t is not None and t not in e:
+                for kind in ("prev", "next", "nth"):
+                    add(EntityLag(e if len(e) > 1 else e[0], t, kind))
             if len(e) > 1:
                 add(Count(list(e)))
             add(TargetEnc(list(e), self.n_classes_))

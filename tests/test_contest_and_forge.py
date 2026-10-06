@@ -183,3 +183,14 @@ def test_entity_anchor_detection_finds_opening_day():
     f.anchors_ = anchors
     A = f._add_anchors(X.copy())
     assert (A.groupby(ent)[anchors[0][3]].nunique() == 1).all()
+
+
+def test_entity_lag_prev_next_nth():
+    from tabularaml.generate.forge import EntityLag
+    df = pd.DataFrame({"k": [1, 1, 1, 2, 2], "t": [10., 20., 35., 5., 7.]})
+    q = pd.DataFrame({"k": [1, 2], "t": [25., 100.]})
+    get = lambda kind, d: EntityLag("k", "t", kind).fit(df, None, None).transform(d, None)
+    np.testing.assert_allclose(get("prev", df), [np.nan, 10, 15, np.nan, 2])
+    np.testing.assert_allclose(get("next", df), [10, 15, np.nan, 2, np.nan])
+    np.testing.assert_allclose(get("nth", q), [2, 2])
+    np.testing.assert_allclose(get("prev", q), [5, 93])
