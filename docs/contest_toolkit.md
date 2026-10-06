@@ -350,3 +350,18 @@ one LightGBM judge, AUC:
 On the main table alone FeatureForge matches the hand-made features the
 winners used (credit / annuity is its first pick); the side tables are where
 the remaining gain is.
+
+Follow-ups on Home Credit (one-model judge, same 2 holdouts, AUC):
+
+| Columns | Holdout 0 | Holdout 1 | Mean |
+|---|---|---|---|
+| App + RelatedTables (with time-column pairs) | 0.7964 | 0.7988 | 0.7976 |
+| + status-split aggregates (`n_split=2`, 1,962 columns) | 0.7958 | 0.8004 | 0.7981 (noise; opt-in) |
+| + **child-row models** (`child_model_features`) | 0.7990 | 0.8019 | **0.8004** |
+
+`child_model_features` labels every child row (past loan, payment, card month)
+with its parent's target, fits a LightGBM on child rows with folds split by
+*parent*, and aggregates the out-of-fold predictions per parent (mean, max,
+min, std, most recent). It adds +0.28 AUC points on both holdouts over the
+aggregates and costs about 14 minutes for the five Home Credit tables. Total on
+Home Credit: 0.7656 -> 0.8004.
