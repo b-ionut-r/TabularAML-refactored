@@ -87,13 +87,15 @@ def _row_pairs(df: pd.DataFrame, num: Sequence[str], max_pairs: int) -> pd.DataF
 
 class RelatedTables:
     def __init__(self, children: Sequence[Child], stats=("mean", "max", "min", "sum", "std"),
-                 recent: int = 3, top_levels: int = 8, max_pairs: int = 12, row_pairs: bool = True):
+                 recent: int = 3, top_levels: int = 8, max_pairs: int = 12, row_pairs: bool = True,
+                 n_split: int = 0):
         self.children = list(children)
         self.stats = tuple(stats)
         self.recent = recent
         self.top_levels = top_levels
         self.max_pairs = max_pairs
         self.row_pairs = row_pairs
+        self.n_split = n_split
 
     def _flatten(self, ch: Child) -> pd.DataFrame:
         """The child table with its own children already aggregated onto it."""
@@ -141,6 +143,22 @@ class RelatedTables:
             a = r.groupby(key, sort=False)[dense].mean()
             a.columns = [f"{c}_last{self.recent}" for c in a.columns]
             out.append(a)
+        # Conditional aggregates: the same statistics within the main levels of a
+        # low-cardinality status column (active vs closed credits, approved vs
+        # refused applications).
+        splits = []
+        for c in cats:
+            vc = df[c].astype(str).value_counts(normalize=True)
+            if 2 <= len(vc) <= 6 and vc.iloc[0] < 0.9:
+                splits.append((vc.iloc[0], c, list(vc.index[:2])))
+        for _, c, levels in sorted(splits)[:self.n_split]:
+            s = df[c].astype(str).to_numpy()
+            for lv in levels:
+                sub = W.loc[s == lv, [key] + dense]
+                a = sub.groupby(key, sort=False)[dense].agg(["mean", "max", "sum"])
+                a.columns = [f"{c}={lv}:{v}_{st}" for v, st in a.columns]
+                cnt = sub.groupby(key, sort=False).size().rename(f"{c}={lv}:count")
+                out += [a, cnt.to_frame()]
         res = pd.concat(out, axis=1)
         res.columns = [_safe(f"{ch.name}:{c}") for c in res.columns]
         res = res.loc[:, ~res.columns.duplicated()]
@@ -161,3 +179,69 @@ class RelatedTables:
             if c in out:
                 out[c] = out[c].fillna(0)
         return out
+
+
+def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_folds: int = 5,
+                         seed: int = 0, max_rows: int = 3_000_000, rounds: int = 300,
+                         task: str = "binary") -> pd.DataFrame:
+    """Out-of-fold child-row models: every child row is labelled with its parent's
+    target, a LightGBM learns which past loans / payments / transactions look like
+    a positive parent, and its predictions are aggregated per parent (mean, max,
+    min, most recent). Folds split *parents*, so a training parent's features come
+    from a model that never saw its label; test parents use a model fitted on all
+    labelled parents.
+
+    ``y_by_key``: labels indexed by the parent key (training parents only).
+    Returns features indexed by parent key for training and ``test_keys`` parents.
+    """
+    import lightgbm as lgb
+
+    df = ch.df
+    key = ch.key
+    ids = {key, *ch.drop} | {g.key for g in ch.children}
+    feats = [c for c in df.columns if c not in ids]
+    X = df[feats].copy()
+    num = [c for c in feats if pd.api.types.is_numeric_dtype(X[c])]
+    if len(num) >= 2:
+        X = pd.concat([X, _row_pairs(df, num, 12).astype(np.float32)], axis=1)
+    for c in X.columns:
+        if not pd.api.types.is_numeric_dtype(X[c]):
+            X[c] = X[c].astype("category")
+    X.columns = [_safe(c) for c in X.columns]
+    X = X.loc[:, ~X.columns.duplicated()]
+    k = df[key].to_numpy()
+    train_keys = y_by_key.index.to_numpy()
+    rng = np.random.default_rng(seed)
+    fold_of = pd.Series(rng.permutation(len(train_keys)) % n_folds, index=train_keys)
+    row_fold = fold_of.reindex(k).to_numpy()            # NaN for test / unlabelled parents
+    row_y = y_by_key.reindex(k).to_numpy(dtype=float)
+    is_test = pd.Index(test_keys).get_indexer(k) >= 0
+    pred = np.full(len(df), np.nan)
+    P = dict(objective=task, learning_rate=0.1, num_leaves=63, min_data_in_leaf=200, feature_fraction=0.8,
+             bagging_fraction=0.8, bagging_freq=1, verbose=-1, seed=seed, num_threads=4)
+
+    def fit(rows):
+        if len(rows) > max_rows:
+            rows = rng.choice(rows, max_rows, replace=False)
+        return lgb.train(P, lgb.Dataset(X.iloc[rows], row_y[rows]), rounds)
+
+    labelled = np.flatnonzero(np.isfinite(row_fold))
+    for f in range(n_folds):
+        tr = labelled[row_fold[labelled] != f]
+        va = labelled[row_fold[labelled] == f]
+        if len(va):
+            pred[va] = fit(tr).predict(X.iloc[va])
+    te = np.flatnonzero(is_test)
+    if len(te):
+        pred[te] = fit(labelled).predict(X.iloc[te])
+    out = pd.DataFrame({key: k, "p": pred})
+    if ch.time is not None:
+        out["t"] = df[ch.time].to_numpy()
+    out = out[np.isfinite(out["p"])]
+    g = out.groupby(key, sort=False)["p"]
+    res = pd.DataFrame({"mean": g.mean(), "max": g.max(), "min": g.min(), "std": g.std()})
+    if ch.time is not None:
+        last = out.sort_values([key, "t"]).groupby(key, sort=False)["p"].last()
+        res["last"] = last
+    res.columns = [_safe(f"{ch.name}:model_{c}") for c in res.columns]
+    return res.astype(np.float32)
