@@ -944,6 +944,65 @@ class EventRecency(Spec):
         return r
 
 
+class LaggedTargetMean(Spec):
+    """Mean target of an entity's labelled rows in a trailing window that ends one
+    test horizon before the row: ``[t - lag - window, t - lag)``. Training and test
+    rows then see the same delay, so recent level shifts (a store's sales this
+    quarter) carry into the test period. Uses only strictly earlier rows, so no
+    out-of-fold scheme is needed."""
+    target_dep = True
+    time_safe = True
+
+    def __init__(self, keys: Sequence[str], time: str, window: float, lag: float):
+        super().__init__(list(keys) + [time])
+        self.window, self.lag = float(window), float(lag)
+        self.name = f"lagte__{'+'.join(keys)}__w{self.window:.6g}_l{self.lag:.6g}"
+
+    @property
+    def novelty_parents(self):
+        return [self.parents[-1]]
+
+    def _keys(self):
+        return self.parents[:-1]
+
+    def _pos(self, k, t):
+        R = self.t1_ - self.t0_ + 1.0
+        span, off = 6.0 * R, 2.5 * R - self.t0_
+        return k.astype(np.float64) * span + np.clip(t + off, 0.0, span - 1.0), span
+
+    def fit(self, df, y, ctx):
+        k = self._fit_codes(df)
+        t = df[self.parents[-1]].to_numpy(dtype=float)
+        y = np.asarray(y, dtype=float)
+        self.t0_, self.t1_ = float(np.nanmin(t)), float(np.nanmax(t))
+        ok = np.isfinite(t) & (k >= 0) & np.isfinite(y)
+        pos = self._pos(k[ok], t[ok])[0]
+        o = np.argsort(pos, kind="stable")
+        self.ref_ = pos[o]
+        self.csum_ = np.concatenate([[0.0], np.cumsum(y[ok][o])])
+        self.prior_ = float(np.mean(y[ok]))
+        return self
+
+    def transform(self, df, ctx):
+        k = self._codes(df)
+        t = df[self.parents[-1]].to_numpy(dtype=float)
+        q, span = self._pos(k, np.nan_to_num(t, nan=self.t0_))
+        block = np.floor(q / span) * span
+        hi_q = np.maximum(q - self.lag, block)
+        lo_q = np.maximum(q - self.lag - self.window, block)
+        hi = np.searchsorted(self.ref_, hi_q, side="left")
+        lo = np.searchsorted(self.ref_, lo_q, side="left")
+        n = (hi - lo).astype(float)
+        s = self.csum_[hi] - self.csum_[lo]
+        r = (s + TE_SMOOTHING * self.prior_) / (n + TE_SMOOTHING)
+        r[n == 0] = np.nan
+        r[~np.isfinite(t) | (k < 0)] = np.nan
+        return r
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        return self.fit(df, y, ctx).transform(df, ctx)
+
+
 class CrossLinearOOF(Spec):
     """Out-of-fold sparse linear model on one-hot keys and all their pairwise crosses.
 
@@ -1295,9 +1354,11 @@ class FeatureForge:
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
         Cap on features added in total.
-    nested_cv : bool
+    nested_cv : bool | "auto"
         Recompute target encodings inside each CV fold when ranking feature sets,
-        so search CV is not optimistic about sparse-key encodings.
+        so search CV is not optimistic about sparse-key encodings. "auto": on with
+        time-blocked search, where encodings fitted on random folds carry the
+        validation block's labels (IEEE-CIS latest window 0.948 -> 0.953).
     gate_subsets : bool
         Also offer each round's label-free features alone to the gate.
     fold_avg_te : bool
@@ -1313,6 +1374,11 @@ class FeatureForge:
         Numerics aggregated per entity; whether to add each row's place in its
         entity's history (time since previous / until next row, rows before it)
         when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    lagged_te : bool
+        With a time column and unlabeled rows later in time: an entity's (and
+        entity x flag's) mean target over a trailing window ending one test
+        horizon before each row. Off: on Rossmann the full-horizon lag made them
+        stale (hand-made features + these: RMSPE 0.122 -> 0.146).
     time_cv : bool
         With a time column, search CV uses contiguous time blocks as folds and
         screening is measured on the latest rows, so features that only
@@ -1364,9 +1430,10 @@ class FeatureForge:
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
                  evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
-                 gate_subsets: bool = False, nested_cv: bool = False, entities: bool = True,
+                 gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
+                 lagged_te: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1398,6 +1465,7 @@ class FeatureForge:
         self.family_nb = family_nb
         self.events = events
         self.time_cv = time_cv
+        self.lagged_te = lagged_te
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1550,7 +1618,7 @@ class FeatureForge:
         time_keys = {self.time_col_, *self.date_cols_} - {None}
 
         def add(spec):
-            if spec.target_dep and time_keys & set(spec.parents):
+            if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
                 return
             if spec.name not in existing:
                 existing.add(spec.name)
@@ -1729,6 +1797,21 @@ class FeatureForge:
                 for st in ("mean", "dev", "std", "nunique"):
                     add(GroupStat(e if len(e) > 1 else e[0], c, st))
 
+    def _lagged_target_candidates(self, W, ids, flags, add):
+        """Trailing-window target means per entity (and entity x flag), lagged by the
+        test horizon."""
+        t = self.time_col_
+        if self.horizon_ <= 0 or self.n_classes_ > 2 or not ids:
+            return
+        tw = W[t].to_numpy(dtype=float)
+        R = float(np.nanmax(tw) - np.nanmin(tw))
+        for f in (0.03, 0.1, 0.25):
+            w = R * f
+            for k in ids:
+                add(LaggedTargetMean([k], t, w, self.horizon_))
+                for fl in flags:
+                    add(LaggedTargetMean([k, fl], t, w, self.horizon_))
+
     def _event_candidates(self, W, imp, add, max_levels=4):
         """With a time column: time since / until each entity's last / next row with
         a given level of a low-cardinality column (promotions, holidays, closures)."""
@@ -1738,6 +1821,11 @@ class FeatureForge:
         ids = sorted(self.id_cols_, key=lambda c: -imp.get(c, 0.0))[:2]
         keysets = [[k] for k in ids] or [[]]
         WU = W if self.U_search_ is None else pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
+        if self.lagged_te and ids:
+            flags = [f for f in self.base_cols_ if f != t and f not in ids and f not in self.date_cols_
+                     and 2 <= W[f].nunique() <= 7
+                     and W.groupby(ids[0], sort=False)[f].nunique().mean() >= 1.5][:3]
+            self._lagged_target_candidates(W, ids[:2], flags, add)
         for f in self.base_cols_:
             if f == t or f in ids or f in self.date_cols_:
                 continue
@@ -2220,6 +2308,7 @@ class FeatureForge:
         idx = np.arange(n)
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
+        self.horizon_ = 0.0
         if self.time_col_ is not None:
             # Levels of the time column never recur later: no target maps over it (label-
             # free counts and group statistics per date still carry over to test dates).
@@ -2235,6 +2324,7 @@ class FeatureForge:
                 # peak just before it) that the real test period never sees.
                 tu = self._prep(X_unlabeled)[self.time_col_].to_numpy(dtype=float)
                 horizon = np.nanmax(tu) - np.nanmax(tx)
+                self.horizon_ = float(horizon) if np.isfinite(horizon) else 0.0
                 if np.isfinite(horizon) and horizon > 0:
                     n_h = int(np.sum(tx > np.nanmax(tx) - horizon))
                     n_gate = int(np.clip(n_h, 0.05 * n, n_gate))
@@ -2348,7 +2438,7 @@ class FeatureForge:
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
             nested = None
-            if self.nested_cv:
+            if self.nested_cv is True or (self.nested_cv == "auto" and self.time_col_ is not None and self.time_cv):
                 te_specs = [sp for sp in list(selected) + [spec_by_name[nm] for nm in survivors]
                             if isinstance(sp, TargetEnc)]
                 nested = {"specs": te_specs, "W": W}

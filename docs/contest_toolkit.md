@@ -417,7 +417,8 @@ early-stopped on the latest 6 weeks of training. RMSPE (the contest metric):
 | Raw + standard date fields | 0.1476 | 0.1258 |
 | Hand-made: date fields + days since / until promo, holiday, closure (reference) | 0.1140 | 0.1220 |
 | FeatureForge v15 | 0.1927 (worse; gate passed) | 0.1349 (gate rejected) |
-| **FeatureForge v17** | **0.1189** | **0.1279** |
+| FeatureForge v17 | 0.1189 | 0.1279 |
+| **FeatureForge v18** (nested target-encoding CV under time-blocked search) | **0.1201** | **0.1205** |
 
 What v17 adds, all generic:
 
@@ -445,8 +446,16 @@ What v17 adds, all generic:
 - `EntityLag` gains past / future window counts (rows of the entity within
   0.1%, 1% and 5% of the time span), opt-in with `entity_lags=True`.
 
-Cost on IEEE-CIS: the latest window reads 0.9479 with time-blocked search
-against 0.9522 before (one window, possibly noise; `time_cv=False` restores
-0.9522). Without time-blocked search, Rossmann window 1 ships a numeric target
+v17 cost IEEE-CIS: its latest window read 0.9479 with time-blocked search
+against 0.9522 before. The cause was target encodings fitted on random folds
+inside a time-blocked CV: training rows' encodings carried the validation
+block's labels. v18 recomputes them inside each fold whenever time-blocked
+search is on (`nested_cv="auto"`): IEEE-CIS latest window **0.9531**, Rossmann
+0.1201 / 0.1205 (mean 0.1203 vs 0.1234 for v17).
+
+Tried and left opt-in (`lagged_te=True`): per-store and store x flag mean
+target over a trailing window ending one test horizon before each row. On top
+of the hand-made features it made Rossmann worse (0.114 -> 0.124, 0.122 ->
+0.146): a full-horizon lag is too stale. Without time-blocked search, Rossmann window 1 ships a numeric target
 encoding of the date and lands at 0.172, so it stays on. The 7 structured
 benchmark tables (random holdouts, no time column) are unchanged.
