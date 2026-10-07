@@ -477,7 +477,8 @@ stopping split by user.
 | Raw pair columns (ids, aisle, department, next order's weekday / hour / days since prior) | 0.6748 | 0.6740 |
 | FeatureForge on the pair table alone | 0.6790 | 0.6765 |
 | **+ `RelatedTables`**, default settings (prior order lines by user x product, orders by user, order lines by product) | **0.8285** | **0.8286** |
-| + `RelatedTables` + FeatureForge | 0.8269 | 0.8252 |
+| + `RelatedTables` + FeatureForge v18 | 0.8269 | 0.8252 |
+| **+ `RelatedTables` + FeatureForge, grouped validation** | **0.8316** | **0.8310** |
 
 `RelatedTables` with no settings beyond naming each child table's key and time
 column takes AUC from 0.674 to 0.829 (log loss 0.304 -> 0.250). FeatureForge

@@ -1374,6 +1374,12 @@ class FeatureForge:
         Numerics aggregated per entity; whether to add each row's place in its
         entity's history (time since previous / until next row, rows before it)
         when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    group_col : str | "auto" | None
+        Column whose test values are new groups (users, patients). "auto": a
+        repeating integer / categorical column with under 20% of the unlabeled
+        rows' values seen in training. The gate, search folds, screening split
+        and out-of-fold encodings then split whole groups, and target maps over
+        that column are not generated.
     lagged_te : bool
         With a time column and unlabeled rows later in time: an entity's (and
         entity x flag's) mean target over a trailing window ending one test
@@ -1433,7 +1439,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto",
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1466,6 +1472,7 @@ class FeatureForge:
         self.events = events
         self.time_cv = time_cv
         self.lagged_te = lagged_te
+        self.group_col = group_col
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1483,6 +1490,13 @@ class FeatureForge:
         return os.cpu_count() if self.n_jobs in (-1, None) else max(1, self.n_jobs)
 
     def _folds(self, n_rows, y, k, seed):
+        g = getattr(self, "_groups", {}).get(n_rows)
+        if g is not None:
+            # Whole groups (users) per fold: test rows belong to unseen groups.
+            levels, codes = np.unique(g, return_inverse=True)
+            fold_of = np.random.default_rng(seed).permutation(len(levels)) % k
+            f = fold_of[codes]
+            return [(np.flatnonzero(f != i), np.flatnonzero(f == i)) for i in range(k)]
         if self.task_ == "regression":
             return list(KFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows)))
         return list(StratifiedKFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows), y))
@@ -1615,7 +1629,7 @@ class FeatureForge:
         existing = set(W.columns) | {sp.name for sp in selected}
         cands: List[Spec] = []
 
-        time_keys = {self.time_col_, *self.date_cols_} - {None}
+        time_keys = {self.time_col_, self.group_col_, *self.date_cols_} - {None}
 
         def add(spec):
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
@@ -2309,6 +2323,10 @@ class FeatureForge:
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
         self.horizon_ = 0.0
+        self._groups = {}
+        self.group_col_ = None if self.time_col_ is not None else self._detect_group(X, X_unlabeled)
+        if self.group_col_ is not None:
+            self._log(f"test rows are new {self.group_col_} groups: grouped gate, folds and screening")
         if self.time_col_ is not None:
             # Levels of the time column never recur later: no target maps over it (label-
             # free counts and group statistics per date still carry over to test dates).
@@ -2329,6 +2347,11 @@ class FeatureForge:
                     n_h = int(np.sum(tx > np.nanmax(tx) - horizon))
                     n_gate = int(np.clip(n_h, 0.05 * n, n_gate))
             idx_sel, idx_gate = np.sort(order[:n - n_gate]), np.sort(order[n - n_gate:])
+        elif self.gate_frac and n >= 200 and self.group_col_ is not None:
+            gx = X[self.group_col_].to_numpy()
+            levels, codes = np.unique(gx.astype(str) if gx.dtype == object else gx, return_inverse=True)
+            in_gate = np.random.default_rng(self.random_state).random(len(levels)) < self.gate_frac
+            idx_sel, idx_gate = np.flatnonzero(~in_gate[codes]), np.flatnonzero(in_gate[codes])
         elif self.gate_frac and n >= 200:
             try:
                 idx_sel, idx_gate = train_test_split(idx, test_size=self.gate_frac,
@@ -2342,6 +2365,9 @@ class FeatureForge:
 
         W = X.iloc[idx_sel].reset_index(drop=True)
         yW = y_np[idx_sel]
+        if self.group_col_ is not None:
+            gx = X[self.group_col_].astype(str).to_numpy()
+            self._groups = {len(W): gx[idx_sel], n: gx}
         self.U_search_ = None
         if X_unlabeled is not None:
             self.U_search_ = pd.concat([X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]], ignore_index=True)
@@ -2356,6 +2382,10 @@ class FeatureForge:
                                             stratify=yW if self.task_ != "regression" else None)
         except ValueError:
             idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
+        if self.group_col_ is not None:
+            f0 = self._folds(len(W), yW, 10, self.random_state + 3)
+            idx_b = np.sort(np.concatenate([va for _, va in f0[:3]]))
+            idx_a = np.setdiff1d(np.arange(len(W)), idx_b)
         if self.time_col_ is not None and self.time_cv:
             # Rows close in time share their period's level, so random folds reward
             # features that interpolate between neighbouring days. Contiguous time
@@ -2616,6 +2646,33 @@ class FeatureForge:
         for c in self.cat_cols_:
             X[c] = _as_str(X[c])
         return self._add_anchors(X)
+
+    def _detect_group(self, X, U):
+        """A column whose test values are (almost) all unseen in training while it
+        repeats within training: users, sessions or patients, when the test set holds
+        new ones. Validation must then split whole groups, and target maps over the
+        column cannot help."""
+        if self.group_col != "auto":
+            return self.group_col if self.group_col in X.columns else None
+        if U is None or len(U) < 50:
+            return None
+        Up = self._prep(U)
+        n, best, best_ov = len(X), None, 0.2
+        for c in X.columns:
+            if c not in Up.columns:
+                continue
+            nu = X[c].nunique()
+            if not (50 <= nu <= n / 2):
+                continue
+            if c not in self.cat_cols_:
+                x = X[c].to_numpy(dtype=float)
+                fin = x[np.isfinite(x)]
+                if len(fin) < 0.9 * n or np.any(fin != np.round(fin)):
+                    continue
+            ov = float(Up[c].isin(set(X[c].unique())).mean())
+            if ov < best_ov:
+                best, best_ov = c, ov
+        return best
 
     def _detect_time(self, X, U):
         if self.time_col != "auto":
