@@ -1003,6 +1003,160 @@ class LaggedTargetMean(Spec):
         return self.fit(df, y, ctx).transform(df, ctx)
 
 
+def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
+    """Free text: a string column of mostly distinct values written as several words
+    (titles, descriptions, comments), as opposed to codes, ids or category labels."""
+    if not _is_cat(s) or len(s) < 100:
+        return False
+    v = s.dropna().astype(str)
+    if len(v) > n_sample:
+        v = v.sample(n_sample, random_state=0)
+    if len(v) < 50 or v.nunique() < max(50, 0.05 * len(v)):
+        return False
+    # Several space-separated words, not one code made of letters and digits.
+    return (float(v.str.count(r"[^\W\d_]{2,}").mean()) >= 2.0
+            and float(v.str.split().str.len().mean()) >= 2.5)
+
+
+def _text_values(df, c) -> pd.Series:
+    return df[c].astype(str).where(df[c].astype(str) != "__NA__", "")
+
+
+class TextStats(Spec):
+    """How a free-text field is written: characters, words, digits, capitals,
+    punctuation, distinct-word share and emptiness. Label-free."""
+    n_out = 7
+
+    def __init__(self, col: str):
+        super().__init__([col])
+        self.name = f"txtstat__{col}"
+
+    def transform(self, df, ctx):
+        t = _text_values(df, self.parents[0])
+        n_ch = t.str.len().to_numpy(dtype=float)
+        words = t.str.lower().str.findall(r"\w+")
+        n_w = words.str.len().to_numpy(dtype=float)
+        n_u = words.map(lambda w: len(set(w))).to_numpy(dtype=float)
+        dig = t.str.count(r"\d").to_numpy(dtype=float)
+        up = t.str.count(r"[A-Z]").to_numpy(dtype=float)
+        pun = t.str.count(r"[^\w\s]").to_numpy(dtype=float)
+        den = np.maximum(n_ch, 1.0)
+        return np.column_stack([n_ch, n_w, dig / den, up / den, pun / den,
+                                n_u / np.maximum(n_w, 1.0), (n_ch == 0).astype(float)]).astype(np.float32)
+
+
+def _tfidf(kind: str, max_features: int):
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    if kind == "char":
+        return TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=3, max_features=max_features,
+                               sublinear_tf=True, dtype=np.float32)
+    return TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=max_features, sublinear_tf=True,
+                           token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
+
+
+class TextSVD(Spec):
+    """Latent semantic components of a free-text field: TF-IDF of words and word
+    pairs reduced by truncated SVD, fitted label-free on every row whose text is
+    known. Topic-like directions a tree can split on."""
+
+    def __init__(self, col: str, n_comp: int = 16, max_fit_rows: int = 200_000):
+        super().__init__([col])
+        self.n_out = n_comp
+        self.max_fit_rows = max_fit_rows
+        self.name = f"txtsvd__{col}"
+
+    def fit(self, df, y, ctx):
+        from sklearn.decomposition import TruncatedSVD
+        c = self.parents[0]
+        extra = getattr(ctx, "extra_rows", None)
+        t = _text_values(df, c)
+        if extra is not None and c in extra:
+            t = pd.concat([t, _text_values(extra, c)], ignore_index=True)
+        if len(t) > self.max_fit_rows:
+            t = t.sample(self.max_fit_rows, random_state=0)
+        self.vec_ = _tfidf("word", 50_000).fit(t)
+        T = self.vec_.transform(t)
+        self.n_out = int(min(self.n_out, max(1, T.shape[1] - 1)))
+        self.svd_ = TruncatedSVD(self.n_out, random_state=0, algorithm="randomized", n_iter=4).fit(T)
+        return self
+
+    def transform(self, df, ctx):
+        return self.svd_.transform(self.vec_.transform(_text_values(df, self.parents[0]))).astype(np.float32)
+
+
+class TextLinearOOF(Spec):
+    """Out-of-fold sparse linear model on the words (and character n-grams) of
+    free-text fields, optionally with one-hot keys alongside: the ridge / logistic
+    model behind most text-tabular contest wins (Mercari, Avito), as one column a
+    tree ensemble can use. Vocabularies are fitted label-free on every row whose
+    text is known; the model's training rows are encoded out of fold."""
+    target_dep = True
+
+    def __init__(self, cols: Sequence[str], n_classes: int, keys: Sequence[str] = (), label: str = "",
+                 chars: bool = True):
+        super().__init__(list(cols) + list(keys))
+        self.text_cols = list(cols)
+        self.keys = list(keys)
+        self.n_classes = n_classes
+        self.chars = chars
+        self.n_out = n_classes if n_classes > 2 else 1
+        self.name = f"txtlin__{label or '+'.join(cols)}"
+        self.novelty_parents = list(cols)
+
+    def _vocab(self, df, ctx):
+        extra = getattr(ctx, "extra_rows", None)
+        self.vecs_ = []
+        for c in self.text_cols:
+            t = _text_values(df, c)
+            if extra is not None and c in extra:
+                t = pd.concat([t, _text_values(extra, c)], ignore_index=True)
+            if len(t) > 300_000:
+                t = t.sample(300_000, random_state=0)
+            vs = [_tfidf("word", 200_000).fit(t)]
+            if self.chars and t.str.len().mean() <= 80:
+                vs.append(_tfidf("char", 100_000).fit(t))
+            self.vecs_.append(vs)
+        if self.keys:
+            from sklearn.preprocessing import OneHotEncoder
+            self.ohe_ = OneHotEncoder(handle_unknown="ignore", min_frequency=2, dtype=np.float32).fit(
+                df[self.keys].astype(str))
+
+    def _design(self, df):
+        from scipy import sparse
+        blocks = [v.transform(_text_values(df, c)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
+        if self.keys:
+            blocks.append(self.ohe_.transform(df[self.keys].astype(str)))
+        return sparse.hstack(blocks, format="csr")
+
+    def _query(self, A, y, B):
+        from sklearn.linear_model import LogisticRegression, Ridge
+        if self.n_classes == 0:
+            mu = y.mean()
+            return (Ridge(alpha=3.0, solver="sparse_cg").fit(A, y - mu).predict(B) + mu)[:, None]
+        if self.n_classes == 2:
+            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3).fit(A, y.astype(int))
+            return m.decision_function(B)[:, None]
+        Y = np.eye(self.n_classes)[y.astype(int)]
+        return Ridge(alpha=3.0, solver="sparse_cg").fit(A, Y - Y.mean(0)).predict(B) + Y.mean(0)
+
+    def fit(self, df, y, ctx):
+        self._vocab(df, ctx)
+        self.A_ = self._design(df)
+        self.y_ = np.asarray(y, dtype=float)
+        return self
+
+    def transform(self, df, ctx):
+        r = self._query(self.A_, self.y_, self._design(df))
+        return r[:, 0] if self.n_out == 1 else r
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        self.fit(df, y, ctx)
+        out = np.empty((len(df), self.n_out))
+        for tr, va in folds:
+            out[va] = self._query(self.A_[tr], self.y_[tr], self.A_[va])
+        return out[:, 0] if self.n_out == 1 else out
+
+
 class CrossLinearOOF(Spec):
     """Out-of-fold sparse linear model on one-hot keys and all their pairwise crosses.
 
@@ -1399,6 +1553,11 @@ class FeatureForge:
         add per-column out-of-fold target maps over (value bin, value count)
         and their sum, a naive-Bayes score. Off: it lowered Santander's AUC
         from 0.918 to 0.914 next to the label-free family counts.
+    text : bool
+        Free-text columns (strings of mostly distinct values, several words each:
+        titles, descriptions) get label-free writing statistics and TF-IDF SVD
+        topics, and an out-of-fold sparse linear model on their words and character
+        n-grams (alone, and all text plus one-hot keys) as candidates.
     time_col : str | "auto" | None
         Column that orders rows in time. When set, the gate holds out the most
         recent rows instead of a random sample, so features that only work
@@ -1439,7 +1598,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto",
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1473,6 +1632,7 @@ class FeatureForge:
         self.time_cv = time_cv
         self.lagged_te = lagged_te
         self.group_col = group_col
+        self.text = text
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1702,6 +1862,14 @@ class FeatureForge:
                 if len(W) <= 300_000:
                     ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
                     add(KNNTarget([la, lo], ks, self.n_classes_, f"geo_{la}"))
+            # Free text: how it is written, its topics, and a sparse linear model on its words.
+            for c in self.text_cols_:
+                add(TextStats(c))
+                add(TextSVD(c))
+                add(TextLinearOOF([c], self.n_classes_))
+            if self.text_cols_:
+                tk = [k for k in keys_rank if k in self.base_cols_ and W[k].nunique() > 2][:12]
+                add(TextLinearOOF(self.text_cols_, self.n_classes_, keys=tk, label="text+keys"))
             # Shrunken linear model over one-hot keys and all key pairs.
             lin_keys = [k for k in keys_rank if W[k].nunique() > 2]
             if len(lin_keys) >= 2 and len(W) <= 500_000:
@@ -2300,6 +2468,7 @@ class FeatureForge:
         for c in self.cat_cols_:
             X[c] = _as_str(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
+        self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
         # Native categorical splits on many-level columns overfit; frequency-rank codes
         # are the usual contest alternative. Which one wins is measured, not assumed.
         self.hc_cols_ = [c for c in self.cat_cols_ if X[c].nunique() > self.hc_threshold]
@@ -2314,6 +2483,9 @@ class FeatureForge:
                           if 2 <= X[c].nunique() <= (0.5 * len(X) if c in self.cat_cols_
                                                      else self.max_key_cardinality)]
         self.key_cols_ += [a[3] for a in self.anchors_]
+        self.key_cols_ = [c for c in self.key_cols_ if c not in self.text_cols_]
+        if self.text_cols_:
+            self._log(f"free text: {', '.join(self.text_cols_)}")
         self.ctx_ = Context(self.task_, self.n_classes_, self.random_state)
         self.ctx_.fold_avg_te = self.fold_avg_te
 
@@ -2659,7 +2831,7 @@ class FeatureForge:
         Up = self._prep(U)
         n, best, best_ov = len(X), None, 0.2
         for c in X.columns:
-            if c not in Up.columns:
+            if c not in Up.columns or c in self.text_cols_:
                 continue
             nu = X[c].nunique()
             if not (50 <= nu <= n / 2):
@@ -2708,7 +2880,7 @@ class FeatureForge:
         addresses, customer or store ids. Most levels first."""
         n, out = len(X), []
         for c in X.columns:
-            if c in getattr(self, "date_cols_", []):
+            if c in getattr(self, "date_cols_", []) or c in getattr(self, "text_cols_", []):
                 continue
             nu = X[c].nunique()
             if not (100 <= nu <= n / 5):

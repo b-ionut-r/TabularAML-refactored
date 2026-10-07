@@ -1,7 +1,10 @@
-"""M5 Forecasting - Accuracy ($100k, 2020): daily unit sales per item at Walmart stores. Slice: one store (CA_1),
+"""M5 Forecasting - Accuracy ($50k, 2020): daily unit sales per item at Walmart stores. Slice: one store (CA_1),
 the last 150 days before the holdout. Holdout: the last 28 days (the contest horizon, --win 0) or the 28 before.
 Calendar (events, SNAP) and weekly prices joined. Metric: RMSSE averaged over items (scale = mean squared
-day-to-day change over each item's history) and RMSE. Raw = the joined columns, date as a date."""
+day-to-day change over each item's history) and RMSE. Raw = the joined columns, date as a date. ``hand`` adds
+the classic hand-made M5 features: each item's sales means over 7 / 28 / 56 / 112 days and std over 28 days,
+all ending 28 days before the row (the horizon, so they exist for every test day), relative price and price
+momentum. ``hand_forge`` runs FeatureForge on top of them."""
 import sys, time, json, warnings, argparse
 warnings.filterwarnings('ignore'); from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np, pandas as pd, lightgbm as lgb
@@ -32,12 +35,35 @@ start = cal.loc[cal.d == ho_days[0], 'date'].iloc[0]
 tr = (L.date < start).to_numpy(); ho = ~tr
 def raw(df):
     df = df.copy(); df['date'] = (df['date'] - pd.Timestamp('2011-01-01')).dt.days.astype(float); return df
+def hand(df):
+    df = df.copy()
+    dix = cal.set_index('date').loc[df['date'], 'd'].str[2:].astype(int).to_numpy() - 1   # 0-based day index
+    row = pd.Index(s.id.values).get_indexer(rid_l)
+    H = np.nan_to_num(s[dcols[:last - 28]].to_numpy(dtype=float))      # sales known before the holdout
+    C = np.concatenate([np.zeros((len(H), 1)), np.cumsum(H, 1)], 1); C2 = np.concatenate([np.zeros((len(H), 1)), np.cumsum(H ** 2, 1)], 1)
+    end = np.minimum(dix - 28 + 1, H.shape[1])                            # window ends at day t-28 inclusive
+    for w in (7, 28, 56, 112):
+        st = np.maximum(end - w, 0); n_w = np.maximum(end - st, 1)
+        df[f'lag28_mean{w}'] = (C[row, end] - C[row, st]) / n_w
+        if w == 28:
+            m2 = (C2[row, end] - C2[row, st]) / n_w
+            df['lag28_std28'] = np.sqrt(np.maximum(m2 - df['lag28_mean28'] ** 2, 0))
+    g = df.groupby('item_id', observed=True)['sell_price']
+    df['price_rel'] = df['sell_price'] / g.transform('mean')
+    df['price_norm'] = df['sell_price'] / g.transform('max')
+    wk = pr[['item_id', 'wm_yr_wk', 'sell_price']].sort_values(['item_id', 'wm_yr_wk'])
+    wk['prev'] = wk.groupby('item_id')['sell_price'].shift(1)
+    prev = df[['item_id', 'wm_yr_wk']].astype({'item_id': str}).merge(wk.astype({'item_id': str}), on=['item_id', 'wm_yr_wk'], how='left')['prev'].to_numpy()
+    df['price_momentum'] = df['sell_price'].to_numpy() / prev
+    return df
+if a.arm.startswith('hand'):
+    rid_l = rid; L = hand(L)
 Xtr, Xho, ytr, yho = L[tr].reset_index(drop=True), L[ho].reset_index(drop=True), y_all[tr], y_all[ho]
 print('rows', len(L), 'train', len(Xtr), 'holdout', len(Xho), flush=True)
 t0 = time.time(); info = {}
-if a.arm == 'raw':
+if a.arm in ('raw', 'hand'):
     Xtr, Xho = raw(Xtr), raw(Xho)
-elif a.arm == 'forge':
+elif a.arm in ('forge', 'hand_forge'):
     from tabularaml.generate.forge import FeatureForge
     f = FeatureForge(task='regression', time_budget=a.budget, random_state=0, n_jobs=4, verbose=True, **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho)
     info = dict(n_added=len(f.new_columns_), gate=f.gate_passed_, time_col=f.time_col_, feats=f.new_columns_[:60])

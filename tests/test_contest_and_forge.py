@@ -241,3 +241,21 @@ def test_date_strings_become_calendar_fields():
     days = pd.DataFrame({"d": _to_days(s)})
     np.testing.assert_allclose(DatePart("d", "dow").transform(days, None)[:2], [4, 5])
     np.testing.assert_allclose(DatePart("d", "to_month_end").transform(days, None)[:2], [0, 30])
+
+
+def test_free_text_detection_and_word_model():
+    from sklearn.model_selection import KFold
+    from tabularaml.generate.forge import Context, TextLinearOOF, TextStats, _is_text
+    rng = np.random.default_rng(0)
+    words = np.array(["red", "blue", "leather", "wallet", "phone", "case", "vintage", "new", "used", "shoes"])
+    n = 600
+    text = pd.Series([" ".join(rng.choice(words, 5)) + f" item {i}" for i in range(n)])
+    y = text.str.contains("leather").to_numpy(dtype=float) * 2 + rng.normal(0, 0.1, n)
+    assert _is_text(text)
+    assert not _is_text(pd.Series(rng.choice(["A1", "B2", "C3"], n)))
+    assert not _is_text(pd.Series([f"id{i}" for i in range(n)]))
+    df = pd.DataFrame({"t": text})
+    assert TextStats("t").transform(df, None).shape == (n, 7)
+    folds = list(KFold(5, shuffle=True, random_state=0).split(df))
+    v = TextLinearOOF(["t"], 0, chars=False).fit_transform_oof(df, y, Context("regression", 0, 0), folds)
+    assert np.corrcoef(v, y)[0, 1] > 0.9

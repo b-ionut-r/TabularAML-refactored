@@ -529,7 +529,7 @@ weeks. Defaults, no settings.
 Neutral: on this pre-aggregated subset nothing FeatureForge proposes carries
 to later weeks, and the time-ordered gate returns the raw columns.
 
-## Blind run: M5 Forecasting - Accuracy (Kaggle 2020, $100k)
+## Blind run: M5 Forecasting - Accuracy (Kaggle 2020, $50k)
 
 `scripts/m5_bench.py` (data: Hugging Face `denephew/M5_Forecasting`). One
 store (CA_1, 3,049 items), the 150 days before each holdout, calendar
@@ -548,3 +548,73 @@ week. Columns whose test values are all new (week numbers beyond training)
 are now excluded from target maps like the time column; on M5 the week column
 overlaps the holdout's first week, so nothing changed. Trailing-window target
 means (`lagged_te=True`) were not selected.
+
+## Free text: Mercari Price Suggestion (Kaggle 2018, $100k)
+
+`scripts/mercari_bench.py` (data: Hugging Face
+`multabench/core-text-reg-mercari-marketplace`, 100k listings of the contest's
+training set). Random 80/20 holdouts, as the contest's test set; the holdout's
+features are the unlabeled rows. Metric: RMSLE of price (lower is better). The
+judge gets string columns as categoricals.
+
+| Columns | Seed 0 | Seed 1 | FE time |
+|---|---|---|---|
+| Raw | 0.5714 | 0.5754 | |
+| FeatureForge before text features (blind) | 0.5635 | 0.5754 (gate rejects) | 90-140 s |
+| **FeatureForge with text features (defaults)** | **0.4719** | **0.4740** | 550-575 s |
+
+-17.4% and -17.6%. Text columns are detected from the data (`text=True`): a
+string column of mostly distinct values written as several space-separated
+words (here `name` and `item_description`; not codes such as
+`AGRRES14DEL01` or category labels). Each gets:
+
+- `TextStats`: characters, words, digit / capital / punctuation shares,
+  distinct-word share, emptiness (label-free);
+- `TextSVD`: 16 TF-IDF (words and word pairs) SVD components, fitted on train
+  plus unlabeled rows (label-free);
+- `TextLinearOOF`: an out-of-fold ridge / logistic model on word 1-2-gram and,
+  for short texts, character 2-4-gram TF-IDF; plus one over all text columns
+  with one-hot keys (brand, category, condition), the sparse linear model behind
+  the Mercari winners' solutions, as one column.
+
+The gate kept all three kinds on both holdouts; the all-text model ranks first.
+Text columns are kept out of keys, ids and group detection.
+
+## Porto Seguro Safe Driver Prediction (Kaggle 2017, $25k)
+
+`scripts/porto_bench.py` (data: OpenML 42742, the full 595k-row training set).
+Stratified 80/20 holdouts; normalized Gini (higher is better).
+
+| Columns | Seed 0 | Seed 1 |
+|---|---|---|
+| Raw | 0.2594 | 0.2761 |
+| Hand-made (missing count, ps_car_13 x ps_reg_03, calc columns dropped) | 0.2607 | 0.2786 |
+| FeatureForge, defaults | **0.2648** | 0.2761 (gate rejects) |
+
+Small, as on the capped suite copy (+0.31% logloss): the anonymised columns
+carry little feature-engineering signal; the winners' margin came from
+denoising-autoencoder networks (modelling, out of scope; DAE features were
+neutral here earlier). On seed 0 the gain is the high-cardinality recode
+alone (no columns added).
+
+On the structured suite's sf_crime (the only suite table with a detected text
+column, `Address`: "800 Block of BRYANT ST"), text features turn a gate
+rejection into a held-out logloss gain on all three holdouts: 0.6700 / 0.6654 /
+0.6676 to 0.6655 / 0.6623 / 0.6630 (-0.6%). No other suite or contest table
+has a text column, so they are unchanged.
+
+## M5: room left versus classic hand-made features
+
+`scripts/m5_bench.py --arm hand`: each item's sales means over 7 / 28 / 56 / 112
+days and std over 28 days, all ending 28 days before the row, relative price and
+price momentum (the public M5 kernels' features).
+
+| Columns (RMSSE, lower is better) | Window 0 | Window 1 | Mean |
+|---|---|---|---|
+| Raw | 0.7821 | 0.7537 | 0.7679 |
+| Hand-made | 0.7711 | 0.7377 | 0.7544 |
+| Hand-made + FeatureForge | 0.7734 | 0.7422 | 0.7578 |
+| **FeatureForge alone, defaults (blind)** | 0.7756 | **0.7200** | **0.7478** |
+
+FeatureForge alone already beats the classic hand-made features on average, so
+those leave no room to automate on this slice.
