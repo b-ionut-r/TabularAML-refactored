@@ -595,6 +595,119 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
     return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
 
 
+class FamilyCount(Spec):
+    """Value frequencies of every column of a homogeneous family, as one block.
+
+    ``kind="count"``: how often each row's value occurs in its column (over every
+    row whose features are known). ``kind="mask"``: the value itself where it
+    repeats, NaN where it is unique. Santander-style anonymised tables hide
+    signal in whether a value is shared; each column alone adds little, the
+    whole block a lot, so the block is screened by summing per-column novel
+    gains (``paired``).
+    """
+    paired = True
+
+    def __init__(self, cols: Sequence[str], kind: str, label: str):
+        super().__init__(cols)
+        self.kind = kind
+        self.n_out = len(cols)
+        self.name = f"fam{kind}__{label}"
+
+    def out_names(self):
+        return [f"fam{self.kind}__{c}" for c in self.parents]
+
+    def fit(self, df, y, ctx):
+        self.vc_ = [df[c].value_counts() for c in self.parents]
+        return self
+
+    def transform(self, df, ctx):
+        out = np.empty((len(df), self.n_out), dtype=np.float32)
+        for j, (c, vc) in enumerate(zip(self.parents, self.vc_)):
+            cnt = df[c].map(vc).to_numpy(dtype=float)
+            if self.kind == "count":
+                out[:, j] = np.nan_to_num(cnt, nan=0.0)
+            else:
+                x = df[c].to_numpy(dtype=float)
+                out[:, j] = np.where(cnt > 1, x, np.nan)
+        return out
+
+
+class FamilyNB(Spec):
+    """Per-column target maps over (value band, how often the value occurs), for a
+    family of similar columns, plus their sum: a naive-Bayes score that treats
+    the columns as independent evidence (the Santander winners' model, as
+    features). Out-of-fold on training rows; frequencies use every row whose
+    features are known (``ctx.extra_rows``)."""
+    target_dep = True
+    paired = True
+
+    def __init__(self, cols: Sequence[str], label: str, n_bins: int = 32):
+        super().__init__(cols)
+        self.n_bins = n_bins
+        self.n_out = len(cols) + 1
+        self.name = f"famnb__{label}"
+
+    def out_names(self):
+        return [f"famnb__{c}" for c in self.parents] + [self.name + "__sum"]
+
+    def _cells(self, df):
+        cells = np.empty((len(df), len(self.parents)), dtype=np.int64)
+        for j, c in enumerate(self.parents):
+            x = df[c].to_numpy(dtype=float)
+            cnt = np.nan_to_num(df[c].map(self.vc_[j]).to_numpy(dtype=float), nan=1.0)
+            b = np.searchsorted(self.edges_[j], np.nan_to_num(x, nan=np.inf), side="right")
+            cells[:, j] = b * 3 + (np.clip(cnt, 1, 3).astype(np.int64) - 1)
+        return cells
+
+    def _prep(self, df, ctx):
+        extra = getattr(ctx, "extra_rows", None)
+        ref = df[self.parents] if extra is None else pd.concat([df[self.parents], extra[self.parents]], ignore_index=True)
+        self.vc_ = [ref[c].value_counts() for c in self.parents]
+        self.edges_ = [np.unique(np.nanquantile(ref[c].to_numpy(dtype=float), np.linspace(0, 1, self.n_bins + 1)[1:-1]))
+                       for c in self.parents]
+
+    def _table(self, cells, y):
+        size = (self.n_bins + 1) * 3
+        prior = float(np.mean(y))
+        tabs = []
+        for j in range(cells.shape[1]):
+            s = np.bincount(cells[:, j], y, minlength=size)
+            n = np.bincount(cells[:, j], minlength=size).astype(float)
+            m = (s + 20 * prior) / (n + 20)
+            if self.binary_:
+                m = np.clip(m, 1e-4, 1 - 1e-4)
+                pr = np.clip(prior, 1e-4, 1 - 1e-4)
+                tabs.append(np.log(m / (1 - m)) - np.log(pr / (1 - pr)))
+            else:
+                tabs.append(m - prior)
+        return np.stack(tabs, 1)
+
+    def _apply(self, cells, tab):
+        v = np.take_along_axis(tab, cells, axis=0)
+        return np.column_stack([v, v.sum(1)]).astype(np.float32)
+
+    def fit(self, df, y, ctx):
+        y = np.asarray(y, dtype=float)
+        self.binary_ = ctx.task == "binary"
+        self._prep(df, ctx)
+        self.tab_ = self._table(self._cells(df), y)
+        return self
+
+    def transform(self, df, ctx):
+        return self._apply(self._cells(df), self.tab_)
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        y = np.asarray(y, dtype=float)
+        self.binary_ = ctx.task == "binary"
+        self._prep(df, ctx)
+        cells = self._cells(df)
+        out = np.zeros((len(df), self.n_out), dtype=np.float32)
+        for tr, va in folds:
+            out[va] = self._apply(cells[va], self._table(cells[tr], y[tr]))
+        self.tab_ = self._table(cells, y)
+        return out
+
+
 class GroupStat(Spec):
     """Statistic of numeric ``num`` within groups of ``key``.
 
@@ -1067,6 +1180,11 @@ class FeatureForge:
         Numerics aggregated per entity; whether to add each row's place in its
         entity's history (time since previous / until next row, rows before it)
         when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    family_nb : bool
+        Within a family of 8+ similar numeric columns (Santander's var_0..199),
+        add per-column out-of-fold target maps over (value bin, value count)
+        and their sum, a naive-Bayes score. Off: it lowered Santander's AUC
+        from 0.918 to 0.914 next to the label-free family counts.
     time_col : str | "auto" | None
         Column that orders rows in time. When set, the gate holds out the most
         recent rows instead of a random sample, so features that only work
@@ -1106,6 +1224,7 @@ class FeatureForge:
                  evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
                  gate_subsets: bool = False, nested_cv: bool = False, entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
+                 family_nb: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1134,6 +1253,7 @@ class FeatureForge:
         self.time_col = time_col
         self.entity_nums = entity_nums
         self.entity_lags = entity_lags
+        self.family_nb = family_nb
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1298,6 +1418,13 @@ class FeatureForge:
                                                           "slope", "delta", "npos")
                 for st in stats:
                     add(RowStat(cols, st, stem))
+            for stem, cols in column_families(raw_num, min_size=8).items():
+                cols = [c for c in cols if W[c].nunique() > 20]
+                if len(cols) >= 8:
+                    add(FamilyCount(cols, "count", stem))
+                    add(FamilyCount(cols, "mask", stem))
+                    if self.family_nb and self.n_classes_ <= 2:
+                        add(FamilyNB(cols, stem))
             if len(raw_num) >= 3:
                 add(RowStat(raw_num, "nonzero", "all"))
                 if W[raw_num].isna().any().any():
@@ -1821,6 +1948,16 @@ class FeatureForge:
                   + ", ".join(f"{nm}={fit[nm]:.2g}" for nm in best[:4]))
         return {nm: out[nm] for nm in best}
 
+    def _spec_novelty(self, spec, v, probe, parent_gain):
+        """(gain, novel gain) of a candidate under the residual probe."""
+        if getattr(spec, "paired", False):
+            # Block of per-column transforms: each output against its own parent, summed.
+            gs = [probe(v[:, j]) for j in range(v.shape[1])]
+            nov = sum(max(g - self.novelty_slack * parent_gain.get(p, 0.0), 0.0) for g, p in zip(gs, spec.parents))
+            return sum(max(g, 0.0) for g in gs), nov
+        g = probe(v)
+        return g, g - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in spec.parents)
+
     def _screen(self, values: Dict[str, np.ndarray], specs: Dict[str, Spec], W: pd.DataFrame,
                 y, margin, idx_a, idx_b, keep: int, scores=None) -> List[str]:
         """Rank candidates by *novel* residual gain.
@@ -1837,8 +1974,7 @@ class FeatureForge:
         if missing:
             probe, parent_gain = self._probe_setup(W, y, margin)
             for name in missing:
-                g = probe(values[name])
-                scores[name] = (g, g - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in specs[name].parents))
+                scores[name] = self._spec_novelty(specs[name], values[name], probe, parent_gain)
         gains = {nm: g for nm, (g, _) in scores.items()}
         novelty = {nm: v for nm, (_, v) in scores.items()}
         ranked = sorted([nm for nm in novelty if nm in values], key=novelty.get, reverse=True)
@@ -1921,6 +2057,7 @@ class FeatureForge:
         self.U_search_ = None
         if X_unlabeled is not None:
             self.U_search_ = pd.concat([X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]], ignore_index=True)
+        self.ctx_.extra_rows = self.U_search_
         # Small tables get repeated CV so that selection is not driven by fold noise.
         n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
         folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
@@ -1965,8 +2102,7 @@ class FeatureForge:
             scores = {}
 
             def keep_fn(spec, v, out):
-                g = probe(v)
-                nov = g - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in spec.parents)
+                g, nov = self._spec_novelty(spec, v, probe, parent_gain)
                 scores[spec.name] = (g, nov)
                 if nov <= 0:
                     return False
@@ -2147,6 +2283,7 @@ class FeatureForge:
         if self.recode_:
             self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
         folds = self._folds(len(X), y, 5, self.random_state + 1)
+        self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy()
         U = None if U is None else U[self.raw_cols_].copy()
         for s in self.selected_:

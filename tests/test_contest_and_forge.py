@@ -211,3 +211,12 @@ def test_related_tables_aggregates_children_and_grandchildren():
     assert X["loans__kind_is_a"].iloc[0] == 0.5
     assert X["loans__pay__AMT_PAID_sum_sum"].iloc[0] == 13
     assert X["loans__DAYS_DUE_last1"].iloc[0] == -10
+
+
+def test_family_count_counts_and_masks_repeated_values():
+    from tabularaml.generate.forge import FamilyCount
+    df = pd.DataFrame({"v_0": [1., 1., 2., 3.], "v_1": [5., 6., 7., 7.]})
+    get = lambda kind: FamilyCount(["v_0", "v_1"], kind, "v").fit(df, None, None).transform(df, None)
+    np.testing.assert_allclose(get("count"), [[2, 1], [2, 1], [1, 2], [1, 2]])
+    np.testing.assert_allclose(get("mask"), [[1, np.nan], [1, np.nan], [np.nan, 7], [np.nan, 7]])
+    assert FamilyCount(["v_0", "v_1"], "count", "v").out_names() == ["famcount__v_0", "famcount__v_1"]

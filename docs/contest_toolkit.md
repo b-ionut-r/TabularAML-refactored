@@ -365,3 +365,38 @@ with its parent's target, fits a LightGBM on child rows with folds split by
 min, std, most recent). It adds +0.28 AUC points on both holdouts over the
 aggregates and costs about 14 minutes for the five Home Credit tables. Total on
 Home Credit: 0.7656 -> 0.8004.
+
+## Column families: Santander Customer Transaction Prediction (Kaggle 2019, $65k)
+
+200,000 labelled rows of 200 anonymous numeric columns (`var_0` .. `var_199`).
+The winning insight was that whether a value *repeats* in its column carries
+the signal, once the synthetic half of the test set is set aside. FeatureForge
+now finds this on its own: for any family of 8+ similarly named numeric
+columns it proposes two blocks, label-free, computed over every row whose
+features are known (training rows plus real test rows):
+
+- `famcount__*`: how often each row's value occurs in its column;
+- `fammask__*`: the value where it repeats, NaN where it is unique.
+
+Each column alone adds little, so a block is screened by the sum of its
+columns' novel gains. Protocol: two stratified 80/20 holdouts; the unlabelled
+rows given to FeatureForge are the holdout plus the 100,000 real test rows
+(synthetic test rows, those with no value unique to the test set, are dropped);
+one LightGBM judge; AUC.
+
+| Columns | Holdout 0 | Holdout 1 | Mean |
+|---|---|---|---|
+| Raw columns | 0.8958 | 0.8954 | 0.8956 |
+| FeatureForge before family blocks | 0.8959 | 0.8948 | 0.8954 |
+| Hand-built counts (reference) | 0.9053 | | |
+| Hand-built counts + masks (the winners' features, reference) | 0.9181 | | |
+| **FeatureForge with family blocks** | 0.9183 | 0.9183 | **0.9183** |
+
+FeatureForge matches the winners' hand-built features with no hints, and log
+loss drops 11%. About 1,300 s; about 400 columns added. On the benchmark
+tables where a family can trigger (Allstate, KDD Cup appetency and upselling,
+Fried, Pol) results are unchanged: the gate does not select the blocks there.
+
+Tried and left opt-in (`family_nb=True`): per-column out-of-fold target maps
+over (value band, value count) plus their sum, a naive-Bayes score. With the
+family blocks already present it lowered holdout 0 from 0.9183 to 0.9138.
