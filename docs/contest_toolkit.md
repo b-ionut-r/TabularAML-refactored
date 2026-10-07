@@ -528,3 +528,23 @@ weeks. Defaults, no settings.
 
 Neutral: on this pre-aggregated subset nothing FeatureForge proposes carries
 to later weeks, and the time-ordered gate returns the raw columns.
+
+## Blind run: M5 Forecasting - Accuracy (Kaggle 2020, $100k)
+
+`scripts/m5_bench.py` (data: Hugging Face `denephew/M5_Forecasting`). One
+store (CA_1, 3,049 items), the 150 days before each holdout, calendar
+(events, SNAP) and weekly prices joined; holdout = the last 28 days (the
+contest horizon) and the 28 before. Metric: RMSSE averaged over items (lower is
+better); one Tweedie LightGBM judge early-stopped on the latest 28 training
+days. Defaults, no settings; `date` is detected as time.
+
+| Columns | Window 0 | Window 1 |
+|---|---|---|
+| Raw | 0.7821 | 0.7537 |
+| **FeatureForge, defaults (blind)** | **0.7756** | **0.7200** |
+
+-0.8% and -4.5%. The picks are item-level target maps by price band and
+week. Columns whose test values are all new (week numbers beyond training)
+are now excluded from target maps like the time column; on M5 the week column
+overlaps the holdout's first week, so nothing changed. Trailing-window target
+means (`lagged_te=True`) were not selected.

@@ -1629,7 +1629,7 @@ class FeatureForge:
         existing = set(W.columns) | {sp.name for sp in selected}
         cands: List[Spec] = []
 
-        time_keys = {self.time_col_, self.group_col_, *self.date_cols_} - {None}
+        time_keys = {self.time_col_, self.group_col_, *self.date_cols_, *getattr(self, "time_like_", [])} - {None}
 
         def add(spec):
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
@@ -2681,6 +2681,7 @@ class FeatureForge:
             return None
         best, best_frac = None, 0.0
         Up = self._prep(U)
+        self.time_like_ = []
         for c in X.columns:
             if c in self.cat_cols_ or c not in Up.columns:
                 continue
@@ -2695,6 +2696,8 @@ class FeatureForge:
                 continue
             # Test rows later than (almost) every training row.
             frac = float(np.mean(u > np.nanquantile(x, 0.99)))
+            if frac > 0.9:
+                self.time_like_.append(c)  # week numbers, period ids: test levels are all new
             if frac > (0.9 if dense else 0.98) and (frac, c in self.date_cols_) > (best_frac, False):
                 best, best_frac = c, frac
         return best
