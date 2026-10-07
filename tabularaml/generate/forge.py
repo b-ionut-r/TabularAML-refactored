@@ -2680,15 +2680,22 @@ class FeatureForge:
         if U is None or len(U) < 50:
             return None
         best, best_frac = None, 0.0
+        Up = self._prep(U)
         for c in X.columns:
-            if c in self.cat_cols_ or c not in U.columns or X[c].nunique() < 0.05 * len(X):
+            if c in self.cat_cols_ or c not in Up.columns:
                 continue
-            x, u = X[c].to_numpy(dtype=float), U[c].to_numpy(dtype=float)
+            # Dates qualify at any granularity (many rows share a day); other numerics
+            # need many levels, or test values entirely beyond the training range.
+            nu = X[c].nunique()
+            dense = c in self.date_cols_ or nu >= 0.05 * len(X)
+            if not dense and nu < 20:
+                continue
+            x, u = X[c].to_numpy(dtype=float), Up[c].to_numpy(dtype=float)
             if np.isfinite(x).mean() < 0.99 or np.isfinite(u).mean() < 0.99:
                 continue
             # Test rows later than (almost) every training row.
             frac = float(np.mean(u > np.nanquantile(x, 0.99)))
-            if frac > 0.9 and frac > best_frac:
+            if frac > (0.9 if dense else 0.98) and (frac, c in self.date_cols_) > (best_frac, False):
                 best, best_frac = c, frac
         return best
 

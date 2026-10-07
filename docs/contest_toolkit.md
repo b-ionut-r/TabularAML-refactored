@@ -500,8 +500,31 @@ better; one LightGBM judge early-stopped on the latest 16 training days.
 |---|---|---|
 | Raw columns (date as a day number) | 0.8913 | 0.8761 |
 | Hand-made: store x item mean log sales over the last 7 / 14 / 28 / 56 days, lagged 16 days (reference) | 0.7545 | |
-| **FeatureForge, defaults (blind)** | **0.7431** | **0.7782** |
+| FeatureForge, defaults (blind) | 0.7431 | 0.7782 |
+| **FeatureForge, defaults, day-level dates detected as time** | **0.7488** | **0.7153** |
 
 FeatureForge cuts the error by 17% and 11% and beats the hand-made recent-sales
 features; its top picks are target maps of item and class, promotion
 deviations per item and calendar fields.
+
+The blind run exposed a detection gap: `time_col="auto"` required 5% distinct
+values, so a day-level date shared by thousands of rows was never recognised
+as time. Date columns now qualify at any granularity (other numerics need 20+
+levels and test values beyond 98% of training). With the time machinery on,
+Favorita's mean error drops further, 0.761 -> 0.732.
+
+## Blind run: Home Credit - Credit Risk Model Stability (Kaggle 2024, $105k)
+
+Public processed subset (Hugging Face `deburky/home-credit-credit-risk-model-stability`:
+522k loans, 43 columns already aggregated from the bureau tables, weeks
+50-91). Holdouts: the last 8 weeks and the 8 before, training on all earlier
+weeks. Defaults, no settings.
+
+| Columns | AUC, window 0 | AUC, window 1 |
+|---|---|---|
+| Raw | 0.8267 | 0.8067 |
+| FeatureForge, defaults (time not detected) | 0.8261 | 0.8075 |
+| FeatureForge, defaults (date detected as time) | 0.8267 (gate rejected: raw) | 0.8067 (gate rejected: raw) |
+
+Neutral: on this pre-aggregated subset nothing FeatureForge proposes carries
+to later weeks, and the time-ordered gate returns the raw columns.
