@@ -459,3 +459,28 @@ of the hand-made features it made Rossmann worse (0.114 -> 0.124, 0.122 ->
 0.146): a full-horizon lag is too stale. Without time-blocked search, Rossmann window 1 ships a numeric target
 encoding of the date and lands at 0.172, so it stays on. The 7 structured
 benchmark tables (random holdouts, no time column) are unchanged.
+
+## Order histories: Instacart Market Basket Analysis (Kaggle 2017, $25k)
+
+Which previously bought products does a user reorder in their next order?
+Rows are (user, product) pairs from the user's prior orders, labelled by the
+user's next ("train") order. Protocol (`scripts/instacart_bench.py`, data from
+the Hugging Face mirror `attik/Instacart-Market-Basket-Analysis` as parquet):
+15,000 users sampled from those with a train order (≈ 950k pairs, 10%
+positive); holdout = 20% of users, two seeds; one LightGBM judge with
+early stopping on held-out users. Leak check: every feature comes from prior
+orders only, never from the labelled order's items; holdouts and early
+stopping split by user.
+
+| Columns | Holdout 0 | Holdout 1 |
+|---|---|---|
+| Raw pair columns (ids, aisle, department, next order's weekday / hour / days since prior) | 0.6748 | 0.6740 |
+| FeatureForge on the pair table alone | 0.6790 | 0.6765 |
+| **+ `RelatedTables`**, default settings (prior order lines by user x product, orders by user, order lines by product) | **0.8285** | **0.8286** |
+| + `RelatedTables` + FeatureForge | 0.8269 | 0.8252 |
+
+`RelatedTables` with no settings beyond naming each child table's key and time
+column takes AUC from 0.674 to 0.829 (log loss 0.304 -> 0.250). FeatureForge
+on top makes it slightly worse: its gate and folds split rows at random, so
+target maps over `user_id` looked useful on users the search had seen, while
+the holdout users are new.
