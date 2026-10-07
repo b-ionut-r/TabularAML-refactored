@@ -220,3 +220,24 @@ def test_family_count_counts_and_masks_repeated_values():
     np.testing.assert_allclose(get("count"), [[2, 1], [2, 1], [1, 2], [1, 2]])
     np.testing.assert_allclose(get("mask"), [[1, np.nan], [1, np.nan], [np.nan, 7], [np.nan, 7]])
     assert FamilyCount(["v_0", "v_1"], "count", "v").out_names() == ["famcount__v_0", "famcount__v_1"]
+
+
+def test_event_recency_and_window_counts():
+    from tabularaml.generate.forge import EntityLag, EventRecency
+    df = pd.DataFrame({"k": [1, 1, 1, 1, 2, 2], "t": [0., 1, 2, 3, 0, 1], "f": [1, 0, 0, 1, 0, 1]})
+    get = lambda kind: EventRecency(["k"], "t", "f", 1.0, kind).fit(df, None, None).transform(df, None)
+    np.testing.assert_allclose(get("prev"), [np.nan, 1, 2, 3, np.nan, np.nan])
+    np.testing.assert_allclose(get("next"), [3, 2, 1, np.nan, 1, np.nan])
+    d = pd.DataFrame({"k": [1, 1, 1, 1, 2], "t": [0., 1, 2, 5, 1]})
+    win = lambda kind: EntityLag("k", "t", kind).fit(d, None, None).transform(d, None)
+    np.testing.assert_allclose(win("win2"), [0, 1, 2, 0, 0])
+    np.testing.assert_allclose(win("fwd2"), [2, 1, 0, 0, 0])
+
+
+def test_date_strings_become_calendar_fields():
+    from tabularaml.generate.forge import DatePart, _is_date_like, _to_days
+    s = pd.Series(["2015-07-31", "2015-08-01"] * 20)
+    assert _is_date_like(s)
+    days = pd.DataFrame({"d": _to_days(s)})
+    np.testing.assert_allclose(DatePart("d", "dow").transform(days, None)[:2], [4, 5])
+    np.testing.assert_allclose(DatePart("d", "to_month_end").transform(days, None)[:2], [0, 30])

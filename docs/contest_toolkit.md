@@ -400,3 +400,53 @@ Fried, Pol) results are unchanged: the gate does not select the blocks there.
 Tried and left opt-in (`family_nb=True`): per-column out-of-fold target maps
 over (value band, value count) plus their sum, a naive-Bayes score. With the
 family blocks already present it lowered holdout 0 from 0.9183 to 0.9138.
+
+## Dates, events and drift: Rossmann Store Sales (Kaggle 2015, $35k)
+
+1,115 stores, daily sales, a store table and a 48-day test period after the
+training data. Protocol: two time-ordered holdouts of the last 6 weeks
+(window 0 ends 2015-07-31, window 1 six weeks earlier); training rows are
+open days with sales, all earlier; FeatureForge also gets every row whose
+features are known (closed days, the holdout, the Kaggle test rows) as
+unlabeled rows; `Date` is passed as a date. Judge: one LightGBM on log sales,
+early-stopped on the latest 6 weeks of training. RMSPE (the contest metric):
+
+| Columns | Window 0 | Window 1 |
+|---|---|---|
+| Raw columns (store table joined, date as a day number) | 0.1288 | 0.1349 |
+| Raw + standard date fields | 0.1476 | 0.1258 |
+| Hand-made: date fields + days since / until promo, holiday, closure (reference) | 0.1140 | 0.1220 |
+| FeatureForge v15 | 0.1927 (worse; gate passed) | 0.1349 (gate rejected) |
+| **FeatureForge v17** | **0.1189** | **0.1279** |
+
+What v17 adds, all generic:
+
+- **Dates.** Datetime and ISO date-string columns become day numbers, and
+  calendar fields (weekday, day of month, month, year, day / week of year,
+  days to month end) become candidates.
+- **`EventRecency`.** With a time column: time since an entity's last row with
+  a given level of a low-cardinality column, and until its next one (days since
+  the store last closed, until the next state holiday, since the last promo).
+  Label-free, over every known row. Its novelty is measured against the flag
+  column, not the entity key: the key's own signal (a store's level) is not what
+  the feature re-expresses, and measuring against it hid every event feature.
+- **Time-blocked search.** When a time column is known, the search CV uses
+  contiguous time blocks as folds, and screening is measured on the latest rows.
+  Random folds let features that interpolate between neighbouring days win
+  (v15's search CV read 0.011 against 0.035 to 0.046 on later rows).
+- **Gate sized to the test horizon.** The time-ordered gate holds out the latest
+  rows covering the unlabeled rows' horizon, not 20% of the rows. On Rossmann,
+  20% was the 6 months after Christmas, where every raw model carries the
+  December peak forward; the gate then preferred sets that were worse later.
+  Early stopping inside the gate is time-ordered too.
+- **No target maps over time.** Target-dependent candidates keyed on the time or
+  a date column are not generated (v15 shipped `te__Date`); label-free counts
+  and group statistics per date still are.
+- `EntityLag` gains past / future window counts (rows of the entity within
+  0.1%, 1% and 5% of the time span), opt-in with `entity_lags=True`.
+
+Cost on IEEE-CIS: the latest window reads 0.9479 with time-blocked search
+against 0.9522 before (one window, possibly noise; `time_cv=False` restores
+0.9522). Without time-blocked search, Rossmann window 1 ships a numeric target
+encoding of the date and lands at 0.172, so it stays on. The 7 structured
+benchmark tables (random holdouts, no time column) are unchanged.

@@ -769,6 +769,11 @@ class EntityLag(Spec):
         self.kind = kind
         self.name = f"lag_{kind}__{'+'.join(keys)}__{time}"
 
+    @property
+    def novelty_parents(self):
+        # As for events: the entity key scopes the feature; it is not what it re-expresses.
+        return [self.parents[-1]]
+
     def _keys(self):
         return self.parents[:-1]
 
@@ -803,11 +808,139 @@ class EntityLag(Spec):
             r = np.where(lo > start, q - ref[np.maximum(lo - 1, 0)], np.nan)
         elif self.kind == "next":
             r = np.where(hi < end, ref[np.minimum(hi, len(self.ref_))] - q, np.nan)
+        elif self.kind.startswith(("win", "fwd")):
+            # Rows of the entity within ``w`` time units before (win) / after (fwd).
+            w = float(self.kind[3:])
+            if self.kind.startswith("win"):
+                r = (lo - np.maximum(np.searchsorted(self.ref_, q - w, side="left"), start)).astype(float)
+            else:
+                r = (np.minimum(np.searchsorted(self.ref_, q + w, side="right"), end) - hi).astype(float)
         else:  # "nth": earlier rows of the entity
             r = (lo - start).astype(float)
         bad = ~np.isfinite(t) | (k < 0)
         r = r.astype(float)
         r[bad] = np.nan
+        return r
+
+
+_DAY = 86400.0
+_DATE_PARTS = ("dow", "dom", "month", "year", "doy", "woy", "to_month_end")
+
+
+def _to_days(s: pd.Series) -> np.ndarray:
+    """Datetimes as float days since 1970-01-01 (NaN where missing)."""
+    d = pd.to_datetime(s, errors="coerce")
+    if getattr(d.dt, "tz", None) is not None:
+        d = d.dt.tz_localize(None)
+    v = d.to_numpy(dtype="datetime64[ns]").astype("int64").astype(float) / (_DAY * 1e9)
+    v[d.isna().to_numpy()] = np.nan
+    return v
+
+
+def _is_date_like(s: pd.Series) -> bool:
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return True
+    if not (s.dtype == object or pd.api.types.is_string_dtype(s)):
+        return False
+    sample = s.dropna().astype(str).head(500)
+    if len(sample) < 20 or not sample.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}").mean() > 0.95:
+        return False
+    return pd.to_datetime(sample, errors="coerce").notna().mean() > 0.95
+
+
+class DatePart(Spec):
+    """A calendar field of a date column (held internally as days since 1970)."""
+
+    def __init__(self, col: str, part: str):
+        super().__init__([col])
+        self.part = part
+        self.name = f"{part}__{col}"
+
+    def transform(self, df, ctx):
+        v = df[self.parents[0]].to_numpy(dtype=float)
+        ok = np.isfinite(v)
+        d = pd.to_datetime(np.where(ok, v, 0.0), unit="D")
+        if self.part == "dow":
+            r = d.dayofweek
+        elif self.part == "dom":
+            r = d.day
+        elif self.part == "month":
+            r = d.month
+        elif self.part == "year":
+            r = d.year
+        elif self.part == "doy":
+            r = d.dayofyear
+        elif self.part == "woy":
+            r = d.isocalendar().week.to_numpy()
+        else:  # days to the end of the month
+            r = d.days_in_month - d.day
+        r = np.asarray(r, dtype=float)
+        r[~ok] = np.nan
+        return r
+
+
+class EventRecency(Spec):
+    """Time since the entity's last row where ``flag == level``, or until its next
+    one (strictly before / after the row's own time). Rossmann-style calendar
+    features: days since the store's last promotion, until the next holiday,
+    since it last closed. Label-free; fitted over every row whose features are
+    known, so test-period events count, as in the contest."""
+
+    def __init__(self, keys: Sequence[str], time: str, flag: str, level, kind: str):
+        super().__init__(list(keys) + [time, flag])
+        self.level, self.kind = level, kind
+        tag = "+".join(keys) if keys else "all"
+        self.name = f"ev_{kind}__{flag}_{level}__{tag}"
+
+    @property
+    def novelty_parents(self):
+        # The entity key only scopes the event: an entity's own level (a store's
+        # usual sales) is no re-expression of when its promotions happen.
+        return [self.parents[-1]]
+
+    def _keys(self):
+        return self.parents[:-2]
+
+    def _key_codes(self, df, fit):
+        if not self._keys():
+            return np.zeros(len(df), dtype=np.int64)
+        return self._fit_codes(df) if fit else self._codes(df)
+
+    def _hit(self, df):
+        f = df[self.parents[-1]]
+        if isinstance(self.level, str):
+            return (_as_str(f) == self.level).to_numpy()
+        return (f.to_numpy(dtype=float) == self.level)
+
+    def _pos(self, k, t):
+        R = self.t1_ - self.t0_ + 1.0
+        span, off = 6.0 * R, 2.5 * R - self.t0_
+        return k.astype(np.float64) * span + np.clip(t + off, 0.0, span - 1.0), span
+
+    def fit(self, df, y, ctx):
+        k = self._key_codes(df, True)
+        t = df[self.parents[-2]].to_numpy(dtype=float)
+        self.t0_, self.t1_ = float(np.nanmin(t)), float(np.nanmax(t))
+        ok = np.isfinite(t) & (k >= 0) & self._hit(df)
+        self.ref_ = np.sort(self._pos(k[ok], t[ok])[0])
+        return self
+
+    def transform(self, df, ctx):
+        k = self._key_codes(df, False)
+        t = df[self.parents[-2]].to_numpy(dtype=float)
+        q, span = self._pos(k, np.nan_to_num(t, nan=self.t0_))
+        ref = np.append(self.ref_, np.inf)
+        block = np.floor(q / span) * span
+        if self.kind == "prev":
+            lo = np.searchsorted(self.ref_, q, side="left")
+            start = np.searchsorted(self.ref_, block, side="left")
+            r = np.where(lo > start, q - ref[np.maximum(lo - 1, 0)], np.nan)
+        else:
+            hi = np.searchsorted(self.ref_, q, side="right")
+            end = np.searchsorted(self.ref_, block + span, side="left")
+            r = np.where(hi < end, ref[np.minimum(hi, len(self.ref_))] - q, np.nan)
+        r = r.astype(float)
+        r[~np.isfinite(t) | (k < 0)] = np.nan
         return r
 
 
@@ -1180,6 +1313,15 @@ class FeatureForge:
         Numerics aggregated per entity; whether to add each row's place in its
         entity's history (time since previous / until next row, rows before it)
         when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    time_cv : bool
+        With a time column, search CV uses contiguous time blocks as folds and
+        screening is measured on the latest rows, so features that only
+        interpolate within a period are not selected.
+    events : bool
+        With a time column: time since / until each entity's last / next row
+        with a given level of a low-cardinality column (days since the last
+        promotion, until the next holiday). Date columns (datetime or ISO date
+        strings) are always expanded into calendar fields as candidates.
     family_nb : bool
         Within a family of 8+ similar numeric columns (Santander's var_0..199),
         add per-column out-of-fold target maps over (value bin, value count)
@@ -1224,7 +1366,7 @@ class FeatureForge:
                  evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
                  gate_subsets: bool = False, nested_cv: bool = False, entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
-                 family_nb: bool = False,
+                 family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1254,6 +1396,8 @@ class FeatureForge:
         self.entity_nums = entity_nums
         self.entity_lags = entity_lags
         self.family_nb = family_nb
+        self.events = events
+        self.time_cv = time_cv
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1403,7 +1547,11 @@ class FeatureForge:
         existing = set(W.columns) | {sp.name for sp in selected}
         cands: List[Spec] = []
 
+        time_keys = {self.time_col_, *self.date_cols_} - {None}
+
         def add(spec):
+            if spec.target_dep and time_keys & set(spec.parents):
+                return
             if spec.name not in existing:
                 existing.add(spec.name)
                 cands.append(spec)
@@ -1526,6 +1674,10 @@ class FeatureForge:
                         continue
                     for st in self.group_stats:
                         add(GroupStat(k, c, st))
+            for c in self.date_cols_:
+                for part in _DATE_PARTS:
+                    add(DatePart(c, part))
+            self._event_candidates(W, imp, add)
             self._entity_candidates(W, imp, top_num, add)
             self._interaction_candidates(W, add)
         else:
@@ -1563,7 +1715,10 @@ class FeatureForge:
         t = getattr(self, "time_col_", None)
         for e in ents:
             if self.entity_lags and t is not None and t not in e:
-                for kind in ("prev", "next", "nth"):
+                tw = W[t].to_numpy(dtype=float)
+                R = float(np.nanmax(tw) - np.nanmin(tw))
+                wins = [f"{p}{R * f:.6g}" for f in (0.001, 0.01, 0.05) for p in ("win", "fwd")] if R > 0 else []
+                for kind in ("prev", "next", "nth", *wins):
                     add(EntityLag(e if len(e) > 1 else e[0], t, kind))
             if len(e) > 1:
                 add(Count(list(e)))
@@ -1573,6 +1728,32 @@ class FeatureForge:
                     continue
                 for st in ("mean", "dev", "std", "nunique"):
                     add(GroupStat(e if len(e) > 1 else e[0], c, st))
+
+    def _event_candidates(self, W, imp, add, max_levels=4):
+        """With a time column: time since / until each entity's last / next row with
+        a given level of a low-cardinality column (promotions, holidays, closures)."""
+        t = getattr(self, "time_col_", None)
+        if t is None or not self.events:
+            return
+        ids = sorted(self.id_cols_, key=lambda c: -imp.get(c, 0.0))[:2]
+        keysets = [[k] for k in ids] or [[]]
+        WU = W if self.U_search_ is None else pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
+        for f in self.base_cols_:
+            if f == t or f in ids or f in self.date_cols_:
+                continue
+            vc = WU[f].value_counts(normalize=True)
+            if not 2 <= len(vc) <= 6:
+                continue
+            for keys in keysets:
+                # The flag must change within entities (not a fixed store attribute).
+                if keys and WU.groupby(keys[0], sort=False)[f].nunique().mean() < 1.5:
+                    continue
+                for lv, share in list(vc.items())[:max_levels]:
+                    if not 0.001 < share < 0.999:
+                        continue
+                    lv = lv if f in self.cat_cols_ else float(lv)
+                    for kind in ("prev", "next"):
+                        add(EventRecency(keys, t, f, lv, kind))
 
     def _cell_gain(self, cell, ncell, g, h, lam, fold, K, y, margin, base):
         """Cross-fitted Newton gain of a lookup table over integer cells."""
@@ -1956,7 +2137,8 @@ class FeatureForge:
             nov = sum(max(g - self.novelty_slack * parent_gain.get(p, 0.0), 0.0) for g, p in zip(gs, spec.parents))
             return sum(max(g, 0.0) for g in gs), nov
         g = probe(v)
-        return g, g - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in spec.parents)
+        parents = getattr(spec, "novelty_parents", None) or spec.parents
+        return g, g - self.novelty_slack * max(parent_gain.get(p, 0.0) for p in parents)
 
     def _screen(self, values: Dict[str, np.ndarray], specs: Dict[str, Spec], W: pd.DataFrame,
                 y, margin, idx_a, idx_b, keep: int, scores=None) -> List[str]:
@@ -2009,6 +2191,9 @@ class FeatureForge:
         else:
             self.classes_, y_np = np.unique(y.to_numpy(), return_inverse=True)
             self.n_classes_ = len(self.classes_)
+        self.date_cols_ = [c for c in X.columns if _is_date_like(X[c])]
+        for c in self.date_cols_:
+            X[c] = _to_days(X[c])
         self.cat_cols_ = [c for c in X.columns if _is_cat(X[c])]
         for c in self.cat_cols_:
             X[c] = _as_str(X[c])
@@ -2036,10 +2221,23 @@ class FeatureForge:
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
         if self.time_col_ is not None:
+            # Levels of the time column never recur later: no target maps over it (label-
+            # free counts and group statistics per date still carry over to test dates).
+            self.id_cols_ = [c for c in self.id_cols_ if c != self.time_col_]
             self._log(f"time-ordered gate on {self.time_col_}")
         if self.gate_frac and n >= 200 and self.time_col_ is not None:
-            order = np.argsort(X[self.time_col_].to_numpy(dtype=float), kind="stable")
+            tx = X[self.time_col_].to_numpy(dtype=float)
+            order = np.argsort(tx, kind="stable")
             n_gate = int(round(self.gate_frac * n))
+            if X_unlabeled is not None and self.time_col_ in X_unlabeled:
+                # Hold out the latest rows covering the test period's horizon: a gate
+                # that reaches much further back can hinge on one season (a holiday
+                # peak just before it) that the real test period never sees.
+                tu = self._prep(X_unlabeled)[self.time_col_].to_numpy(dtype=float)
+                horizon = np.nanmax(tu) - np.nanmax(tx)
+                if np.isfinite(horizon) and horizon > 0:
+                    n_h = int(np.sum(tx > np.nanmax(tx) - horizon))
+                    n_gate = int(np.clip(n_h, 0.05 * n, n_gate))
             idx_sel, idx_gate = np.sort(order[:n - n_gate]), np.sort(order[n - n_gate:])
         elif self.gate_frac and n >= 200:
             try:
@@ -2068,6 +2266,17 @@ class FeatureForge:
                                             stratify=yW if self.task_ != "regression" else None)
         except ValueError:
             idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
+        if self.time_col_ is not None and self.time_cv:
+            # Rows close in time share their period's level, so random folds reward
+            # features that interpolate between neighbouring days. Contiguous time
+            # blocks as folds, and screening measured on the latest rows, reward only
+            # what carries over to other periods, as the test period needs.
+            order = np.argsort(W[self.time_col_].to_numpy(dtype=float), kind="stable")
+            blocks = np.array_split(order, self.cv)
+            folds = [[(np.sort(np.concatenate(blocks[:i] + blocks[i + 1:])), np.sort(b))
+                      for i, b in enumerate(blocks)]]
+            n_b = int(round(0.3 * len(W)))
+            idx_a, idx_b = np.sort(order[:-n_b]), np.sort(order[-n_b:])
 
         selected: List[Spec] = []
         self.history_ = []
@@ -2232,6 +2441,12 @@ class FeatureForge:
                 Fg[col] = vg if np.ndim(vg) == 1 else vg[:, j]
         import lightgbm as lgb
         es_splits = [self._folds(len(Fs), ys, 5, self.random_state + 11 + k)[0] for k in range(self.gate_bags)]
+        if self.time_col_ is not None:
+            # Early-stop on the latest search rows too, so the gate's models are tuned
+            # for later periods as the competition's are.
+            order = np.argsort(Fs[self.time_col_].to_numpy(dtype=float), kind="stable")
+            n_va = max(1, len(order) // 5)
+            es_splits = [(np.sort(order[:-n_va]), np.sort(order[-n_va:]))] * self.gate_bags
 
         def gate_loss(cols, recode=None):
             # A bag of differently seeded / early-stopped models: one model's
@@ -2306,6 +2521,8 @@ class FeatureForge:
     # ------------------------------------------------------------- transform
     def _prep(self, X):
         X = X.reset_index(drop=True).copy()
+        for c in getattr(self, "date_cols_", []):
+            X[c] = _to_days(X[c])
         for c in self.cat_cols_:
             X[c] = _as_str(X[c])
         return self._add_anchors(X)
@@ -2334,6 +2551,8 @@ class FeatureForge:
         addresses, customer or store ids. Most levels first."""
         n, out = len(X), []
         for c in X.columns:
+            if c in getattr(self, "date_cols_", []):
+                continue
             nu = X[c].nunique()
             if not (100 <= nu <= n / 5):
                 continue
