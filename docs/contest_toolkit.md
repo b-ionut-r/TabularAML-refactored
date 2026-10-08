@@ -633,10 +633,29 @@ shipped defaults before text features. Mean of the two holdouts:
 | book-price | RMSE | 0.289 | 0.289 | **0.228** | -21% |
 | data-scientist-salary | logloss | 1.319 | 1.319 | **1.149** | -13% |
 | zomato-restaurants (rating) | RMSE | 0.119 | 0.090 | **0.085** | -29% (blind -24%) |
+| kickstarter-funding | logloss | 0.587 | 0.587 | **0.515** | -12% |
 | rotten-tomatoes | RMSE | 0.955 | 0.955 | 0.955 (gate rejects) | 0% |
 
-No table got worse. Text fields are cut to their first 1,500 characters before
+Seven of eight tables gain; none got worse. Text fields are cut to their first 1,500 characters before
 n-gram vectorising (`TEXT_CLIP`): zomato's 11,700-character review dumps took
 43 minutes uncut (0.0829 on the first holdout) and 22 minutes cut (0.0849).
 Runtime is the cost: 1-4 minutes on most tables, 22 minutes on wine-review (30
 classes make every later model 30 times larger) and zomato.
+
+## Blind run: Zillow Prize (Kaggle 2017-18, $1.2M total)
+
+`scripts/zillow_bench.py` (data: Hugging Face `Kun-05/ML-Zillow-Prize`, the
+contest zip). 168k sales of 2016-17 with that year's property table joined;
+target logerror; holdouts = 2017-07 to 09 and 2017-04 to 06, training on all
+earlier sales; MAE (lower is better).
+
+| Columns | Window 0 | Window 1 |
+|---|---|---|
+| Predict the training median | 0.06971 | 0.06857 |
+| Raw | 0.06908 | 0.06809 |
+| **FeatureForge, defaults (blind)** | **0.06889** | **0.06784** |
+
+-0.3% and -0.4%: about a third of what the raw model gains over a constant.
+logerror is mostly noise (Zillow's own model already used these columns); the
+contest was decided by fractions of a percent. Picks: kNN target means over
+the coordinates and over the top numerics, key-pair target maps.
