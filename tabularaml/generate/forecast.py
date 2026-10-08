@@ -165,7 +165,8 @@ class ForecastFeatures:
 
     def __init__(self, time_col="auto", entity="auto", max_cells: int = 40_000_000, log_target="auto",
                  max_groups: int = 6, max_covariates: int = 8, origins: str = "random", align_week: bool = True,
-                 random_state: int = 0, verbose: bool = True):
+                 long_season: bool = False, random_state: int = 0, verbose: bool = True):
+        self.long_season = long_season
         self.origins = origins
         self.align_week = align_week
         self.random_state = random_state
@@ -448,13 +449,22 @@ class ForecastFeatures:
         if self.season_:
             s = self.season_
             j0 = np.ceil(h / s).astype(np.int64)
-            vals = [E.at(kk, t - s * (j0 + i)) for i in range(8)]
+            n_same = 26 if self.long_season else 8
+            vals = [E.at(kk, t - s * (j0 + i)) for i in range(n_same)]
             V = np.vstack(vals)
             with np.errstate(invalid="ignore"), warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 F["fc_same1"] = V[0]
                 F["fc_same4"] = np.nanmean(V[:4], 0)
-                F["fc_same8"] = np.nanmean(V, 0)
+                F["fc_same8"] = np.nanmean(V[:8], 0)
+                if self.long_season:
+                    # Half a year of the same weekday: a stable weekday profile for short,
+                    # noisy series, and its spread.
+                    F["fc_same26"] = np.nanmean(V, 0)
+                    F["fc_same26_med"] = np.nanmedian(V, 0)
+                    F["fc_same26_std"] = np.nanstd(V, 0)
+                    F["fc_same_rel"] = F["fc_same26"] - E.mean(kk, o - 7 * n_same, o)[0]
+                V = V[:8]
                 if self.intermittent_:
                     Vn = np.where(V > 0, V, np.nan)
                     F["fc_same8_nz"] = np.nanmean(Vn, 0)

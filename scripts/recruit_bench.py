@@ -21,7 +21,7 @@ import numpy as np, pandas as pd, lightgbm as lgb
 ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_argument('--win', type=int, default=0)
 ap.add_argument('--budget', type=float, default=900); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/recruit/'); ap.add_argument('--log', default='recruit.jsonl')
-ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--shuffle', action='store_true'); ap.add_argument('--kw', default='{}')
 a = ap.parse_args()
 D = Path(a.data)
 v = pd.read_csv(D / 'air_visit_data.csv')
@@ -39,13 +39,17 @@ if a.shuffle:
     ytr = np.random.default_rng(0).permutation(ytr)
 t0 = time.time(); info = {}
 fmt = lambda df: df.assign(visit_date=df.visit_date.dt.strftime('%Y-%m-%d'))
-if a.arm == 'raw':
+if a.arm in ('raw', 'fc'):
     si = pd.read_csv(D / 'air_store_info.csv'); di = pd.read_csv(D / 'date_info.csv').rename(columns={'calendar_date': 'visit_date'})
     def raw(df):
-        df = fmt(df[['air_store_id', 'visit_date']]).merge(si, on='air_store_id', how='left').merge(di, on='visit_date', how='left')
-        df['visit_date'] = (pd.to_datetime(df.visit_date) - pd.Timestamp('2016-01-01')).dt.days.astype(float)
-        return df
+        return fmt(df[['air_store_id', 'visit_date']]).merge(si, on='air_store_id', how='left').merge(di, on='visit_date', how='left')
     Xtr, Xg = raw(trv), raw(grid)
+    if a.arm == 'fc':
+        # Forecasting family alone (tabularaml/generate/forecast.py) on top of the raw columns.
+        from tabularaml.generate.forecast import forecast_features
+        Ftr, Fg, ff = forecast_features(Xtr, ytr, Xg, **json.loads(a.kw))
+        Xtr, Xg = pd.concat([Xtr, Ftr], axis=1), pd.concat([Xg, Fg], axis=1)
+        info = dict(n_fc=Ftr.shape[1])
 else:
     tmp = Path(tempfile.mkdtemp())
     tr_csv = fmt(trv[['air_store_id', 'visit_date']]).assign(visitors=np.expm1(ytr))
