@@ -14,6 +14,7 @@ import numpy as np, pandas as pd, lightgbm as lgb
 ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_argument('--seed', type=int, default=0)
 ap.add_argument('--budget', type=float, default=900); ap.add_argument('--kw', default='{}'); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/cat/'); ap.add_argument('--log', default='cat.jsonl'); ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--hand-feats', default='bom_weight,bom_wmax,bom_n,bom_qty,n_specs,inv_qty', help='hand-made features kept (ablation)')
 a = ap.parse_args()
 D = Path(a.data)
 tr = pd.read_csv(D / 'train_set.csv')
@@ -31,6 +32,7 @@ if a.arm.startswith('hand'):
     tr['bom_qty'] = np.nansum(np.column_stack([tr[f'quantity_{k}'] for k in range(1, 9)]), 1)
     tr['n_specs'] = sum(tr[f'spec{k}'].notna() for k in range(1, 11)).astype(float)
     tr['inv_qty'] = 1 / tr['quantity'].clip(lower=1)
+    tr = tr.drop(columns=[c for c in ('bom_weight', 'bom_wmax', 'bom_n', 'bom_qty', 'n_specs', 'inv_qty') if c not in a.hand_feats.split(',')])
 ta = tr['tube_assembly_id'].to_numpy()
 u = np.unique(ta); ho_ta = set(np.random.default_rng(a.seed).choice(u, int(0.2 * len(u)), replace=False))
 ho = np.array([t in ho_ta for t in ta]); itr = ~ho
