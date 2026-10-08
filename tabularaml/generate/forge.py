@@ -1728,6 +1728,12 @@ class FeatureForge:
     task : "regression" | "binary" | "multiclass" | None
     log_target : bool
         Search on ``log1p(y)`` (use for RMSLE-scored regression).
+    max_search_rows : int | None
+        Search on at most this many training rows (the latest on time-ordered data, whole
+        groups when test rows are new entities, else a random sample); the rest still
+        count in label-free statistics, and the output is computed on every row. Large or
+        wide tables get fewer (not below 100k): one CV fit, timed on a 20k-row sample, is
+        kept to an eighth of ``time_budget``.
     time_budget : float
         Wall-clock budget in seconds for the search. A round starts only while two CV fits
         (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
@@ -1827,6 +1833,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
+                 max_search_rows: Optional[int] = 300_000,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1863,6 +1870,7 @@ class FeatureForge:
         self.text = text
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
+        self.max_search_rows = max_search_rows
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -1875,7 +1883,8 @@ class FeatureForge:
             print(f"[FeatureForge {time.time() - self._t0:6.1f}s] {msg}", flush=True)
 
     def _time_left(self) -> float:
-        return self.time_budget - (time.time() - self._t0)
+        deadline = getattr(self, "_deadline", None) or self._t0 + self.time_budget
+        return deadline - time.time()
 
     def _threads(self) -> int:
         import os
@@ -2454,8 +2463,14 @@ class FeatureForge:
         if getattr(self, "WU_", None) is not None:
             WU = self.WU_
         spent: Dict[str, list] = {}
+        # No family of candidates may take over a third of the time left for building them
+        # (a few slow ones, neighbour features on large tables, otherwise starve the rest).
+        fam_cap = max(self._time_left() - 4 * getattr(self, "_cv_s", 0.0), 0.0) / 3 * max(1, self._threads())
+        capped = set()
 
         def compute(s):
+            if type(s).__name__ in capped:
+                return None
             t_s = time.time()
             try:
                 if s.target_dep:
@@ -2477,16 +2492,29 @@ class FeatureForge:
                 st = spent.setdefault(type(s).__name__, [0, 0.0])
                 st[0] += 1
                 st[1] += time.time() - t_s
+                if self.time_budget and st[1] > fam_cap and type(s).__name__ not in capped:
+                    capped.add(type(s).__name__)
+                    self._log(f"budget: {type(s).__name__} candidates took {st[1]:.0f}s; the rest of them skipped")
 
         n_threads = max(1, self._threads())
         batch = 4 * n_threads
+        # Cheap candidates first: one of each family is built and timed, then the rest go
+        # family by family from the cheapest per candidate.
+        fams: Dict[str, list] = {}
+        for sp in specs:
+            fams.setdefault(type(sp).__name__, []).append(sp)
+        firsts = [g[0] for g in fams.values()]
+        n_first = len(firsts)
+        specs = list(firsts)
         with ThreadPoolExecutor(n_threads) as pool:
-            for i in range(0, len(specs), batch):
+            i = 0
+            while i < len(specs):
                 # Leave room in the budget for at least one CV fit of the screened candidates.
                 if self._time_left() < getattr(self, "_cv_s", 0.0):
-                    self._log(f"budget: screened {i} of {len(specs)} candidates")
+                    self._log(f"budget: built {i} of {sum(map(len, fams.values()))} candidates")
                     break
-                chunk = specs[i:i + batch]
+                end = n_first if i < n_first else i + batch
+                chunk = specs[i:end]
                 for s, r in zip(chunk, pool.map(compute, chunk)):
                     if r is None:
                         _release(s)
@@ -2496,6 +2524,10 @@ class FeatureForge:
                         _release(s)
                         continue
                     out[s.name] = v
+                i = end
+                if i == n_first:
+                    cost = lambda f: spent.get(f, [1, 0.0])[1] / max(spent.get(f, [1, 0.0])[0], 1)
+                    specs += [sp for f in sorted(fams, key=cost) for sp in fams[f][1:]]
         _CODE_CACHE.clear()  # factorised keys of large frames add up to gigabytes
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
@@ -2790,6 +2822,7 @@ class FeatureForge:
         contest trick. Target statistics only ever use labeled rows.
         """
         self._t0 = time.time()
+        self._deadline = None
         X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
         self.n_synthetic_ = 0
@@ -2887,13 +2920,44 @@ class FeatureForge:
         else:
             idx_sel, idx_gate = idx, np.array([], dtype=int)
 
+        # Large tables: the search runs on the latest rows (time-ordered data), whole random
+        # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
+        # budget for several rounds; the rows left out still feed label-free statistics.
+        idx_out = np.array([], dtype=int)
+        m = self.max_search_rows or len(idx_sel)
+        n_probe = 20_000
+        if len(idx_sel) > 2 * n_probe and self.time_budget:
+            # Wide tables too: time one CV on a sample and size the search so that one CV fit
+            # takes at most an eighth of the budget (rows scale the fit time about linearly).
+            pr = np.sort(np.random.default_rng(self.random_state).choice(idx_sel, n_probe, replace=False))
+            t = time.time()
+            self._cv(self._model_frame(X.iloc[pr].reset_index(drop=True)), y_np[pr],
+                     [self._folds(n_probe, y_np[pr], self.cv, self.random_state)])
+            per_row = (time.time() - t) / n_probe
+            m = min(m, max(100_000, int(self.time_budget / 8 / per_row)))
+        if len(idx_sel) > m:
+            rng = np.random.default_rng(self.random_state)
+            if self.time_col_ is not None:
+                keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
+            elif self.group_col_ is not None:
+                g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                perm = rng.permutation(g.max() + 1)
+                r = perm[g]
+                keep = idx_sel[np.argsort(r, kind="stable")[:m]]
+            else:
+                keep = rng.choice(idx_sel, m, replace=False)
+            keep = np.sort(keep)
+            idx_out = np.setdiff1d(idx_sel, keep)
+            self._log(f"search on {m} of {len(idx_sel)} rows")
+            idx_sel = keep
         W = X.iloc[idx_sel].reset_index(drop=True)
         yW = y_np[idx_sel]
         if self.group_col_ is not None:
             gx = X[self.group_col_].astype(str).to_numpy()
             self._groups = {len(W): gx[idx_sel], n: gx}
         self.U_search_ = self.WU_ = None
-        self._wu_src = None if X_unlabeled is None else (X, idx_gate, X_unlabeled)
+        extra = np.concatenate([idx_out, idx_gate]).astype(int)
+        self._wu_src = None if X_unlabeled is None and not len(idx_out) else (X, extra, X_unlabeled)
         self.ctx_.extra_rows = None
         # Small tables get repeated CV so that selection is not driven by fold noise.
         n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
@@ -2949,7 +3013,13 @@ class FeatureForge:
         for r in range(self.n_rounds):
             if len(selected) >= self.max_new_features:
                 break
-            if self._time_left() < 2 * self._cv_s:
+            # The first round always gets room for ten CV fits (building, screening and the
+            # prefix ladder); later rounds start only while two fit in the budget.
+            self._deadline = None
+            if r == 0 and self._time_left() < 10 * self._cv_s:
+                self._deadline = time.time() + 10 * self._cv_s
+                self._log(f"budget: first round given {10 * self._cv_s:.0f}s (ten CV fits)")
+            if r > 0 and self._time_left() < 2 * self._cv_s:
                 self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
                           f"search stops")
                 break
@@ -3078,6 +3148,7 @@ class FeatureForge:
             self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f}")
             cur_loss = best_loss
 
+        self._deadline = None
         self.search_cv_loss_ = cur_loss
         self.selected_ = selected
         # Candidate values of the last round can be gigabytes on large tables.
@@ -3121,7 +3192,7 @@ class FeatureForge:
         self.U_search_ = self.WU_ = None
         if on and getattr(self, "_wu_src", None) is not None:
             X, idx_gate, U = self._wu_src
-            self.WU_ = pd.concat([W[self.raw_cols_], X.iloc[idx_gate], self._prep(U)[self.raw_cols_]],
+            self.WU_ = pd.concat([W[self.raw_cols_], X.iloc[idx_gate]] + ([] if U is None else [self._prep(U)[self.raw_cols_]]),
                                  ignore_index=True)
             self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
         self.ctx_.extra_rows = self.U_search_
