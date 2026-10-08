@@ -271,3 +271,17 @@ def test_asof_features_use_only_earlier_events():
     np.testing.assert_allclose(F["ev__v_mean"].to_numpy()[:2], [10, 20])
     np.testing.assert_allclose(F["ev__v_last2"].to_numpy()[:2], [10, 25])
     assert np.isnan(F["ev__v_mean"].to_numpy()[2])
+
+
+def test_synthetic_unlabeled_rows_detected():
+    from tabularaml.generate.forge import synthetic_rows
+    rng = np.random.default_rng(0)
+    cols = [f"v{i}" for i in range(30)]
+    X = pd.DataFrame(rng.normal(size=(3000, 30)).round(4), columns=cols)
+    real = pd.DataFrame(rng.normal(size=(1500, 30)).round(4), columns=cols)
+    # Fake rows: every value copied from some real unlabeled row (Santander 2019's test file).
+    fake = pd.DataFrame({c: rng.choice(real[c].to_numpy(), 1500) for c in cols})
+    U = pd.concat([real, fake], ignore_index=True)
+    m = synthetic_rows(X, U)
+    assert m[1500:].all() and m[:1500].mean() < 0.02
+    assert not synthetic_rows(X, real).any()

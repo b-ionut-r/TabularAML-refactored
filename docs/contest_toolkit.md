@@ -397,6 +397,20 @@ loss drops 11%. About 1,300 s; about 400 columns added. On the benchmark
 tables where a family can trigger (Allstate, KDD Cup appetency and upselling,
 Fried, Pol) results are unchanged: the gate does not select the blocks there.
 
+**Kaggle private leaderboard (audit, 2026-10-08).** Scored as a late submission
+on the full contest data with `scripts/contest_features.py` at defaults and all
+200,000 test rows as unlabeled rows: raw 0.8979 public / 0.8954 private,
+FeatureForge 0.8985 / 0.8972, so +0.002 instead of the holdouts' +0.023. The
+held-out protocol above had the synthetic test rows removed by hand; the
+pipeline counted them, and since synthetic rows copy real test values, the
+test rows' counts were distributed unlike the training rows'. FeatureForge now
+removes such rows itself (`synthetic_rows`, `drop_synthetic=True`): an
+unlabeled row none of whose continuous values is unique among all known rows,
+flagged only when at least 90% of labelled rows do have a unique value and
+the unlabeled set lacks one clearly more often. On Santander it flags exactly
+the 100,000 rows the public rule finds; on IEEE-CIS, Home Credit and the 16
+suite tables checked it flags none. The resubmission is pending.
+
 Tried and left opt-in (`family_nb=True`): per-column out-of-fold target maps
 over (value band, value count) plus their sum, a naive-Bayes score. With the
 family blocks already present it lowered holdout 0 from 0.9183 to 0.9138.
@@ -610,6 +624,10 @@ rejection into a held-out logloss gain on all three holdouts: 0.6700 / 0.6654 /
 0.6676 to 0.6655 / 0.6623 / 0.6630 (-0.6%). No other suite or contest table
 has a text column, so they are unchanged.
 
+On Kaggle's private leaderboard (full data, late submission, audit 2026-10-08)
+FeatureForge added nothing to Porto Seguro (raw 0.279 public / 0.284 private),
+in line with the small held-out gain.
+
 ## M5: room left versus classic hand-made features
 
 `scripts/m5_bench.py --arm hand`: each item's sales means over 7 / 28 / 56 / 112
@@ -690,7 +708,11 @@ into extra rows when it caught more than 50 mosquitoes, so more rows per date
 and species means more mosquitoes and more virus. The contest's test file was
 built the same way (this was the contest's well-known leak), so the feature
 does score there, but it measures how the files were assembled, not the
-mosquitoes; it is not counted as a genuine gain. On 2011 (two training
+mosquitoes; it is not counted as a genuine gain. With the split rows merged
+back (`--dedup`), FeatureForge adds nothing on either holdout (gate keeps raw:
+0.668 on 2013, 0.750 on 2011), so the whole 2013 gain was that artifact. On
+Kaggle's private leaderboard (full data, late submission) FeatureForge also
+added nothing: raw 0.726 public / 0.694 private. On 2011 (two training
 years) the gate finds nothing that carries over. Trailing weather means hurt
 with three or fewer training seasons.
 
@@ -735,3 +757,42 @@ switches it on by itself when the main table has several rows per child key and
 a time column comparable to the child's. FeatureForge then detects the new
 installations (grouped validation) and adds differences of event-code shares
 (attempts minus completions) and title-conditioned target maps of them.
+
+## Text and rescuers: PetFinder.my Adoption Prediction (Kaggle 2019, $25k)
+
+`scripts/petfinder_bench.py` (data: GitHub `antoinewg/PetFinder`). Holdout:
+20% of rescuers (`RescuerID` groups; the contest's test pets come from other
+rescuers), two seeds; unlabeled rows = holdout plus the contest's test rows.
+Metric: quadratic weighted kappa, cut at the training class shares of the
+predictions, and in brackets with cut-points fit on training rows only.
+
+| Columns | Seed 0 | Seed 1 | Mean |
+|---|---|---|---|
+| Raw | 0.392 (0.392) | 0.344 (0.340) | 0.368 (0.366) |
+| **FeatureForge, defaults (description as free text)** | **0.400** (0.397) | **0.357** (0.363) | **0.379** (0.380) |
+| FeatureForge, training labels shuffled (control) | 0.007 | | |
+
+A small gain (+0.011 QWK); 1-2 min. RescuerID is detected as the group column.
+
+## Lookup tables and slots: Caterpillar Tube Pricing (Kaggle 2015, $30k)
+
+`scripts/cat_bench.py`: 20% of tube assemblies held out, two seeds; RMSLE.
+The contest has 21 files: quotes, tube attributes, a bill of materials with
+numbered component slots (`component_id_1..8`, `quantity_1..8`) and one
+attribute table per component type. `scripts/contest_features.py` now joins
+them unaided: one-to-one tables as columns, and tables whose key values fill
+main-table columns as lookups (`lookup_features`: attributes summed, maxed and
+averaged over a slot family, weighted by the paired quantities).
+
+| Columns | Seed 0 | Seed 1 |
+|---|---|---|
+| Constant | 0.823 | |
+| Raw quote columns | 0.2275 | 0.2401 |
+| FeatureForge on the quote table (slot features on) | 0.2275 (gate keeps raw) | 0.2401 (gate keeps raw) |
+| Hand-made tube and component features (reference) | 0.2194 | 0.2354 |
+| **contest_features.py on all 21 tables** | **0.2243** | pending |
+| Same, training labels shuffled (control) | 0.8243 | |
+
+The lookup joins give -1.4% on seed 0; FeatureForge's own search adds nothing
+on top (the gate keeps the joined columns). Hand-made features still win.
+

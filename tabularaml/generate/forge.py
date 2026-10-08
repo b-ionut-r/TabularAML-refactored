@@ -596,6 +596,30 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
     return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
 
 
+def synthetic_rows(X: pd.DataFrame, U: pd.DataFrame, min_rate: float = 0.9, min_cols: int = 20) -> np.ndarray:
+    """Unlabeled rows that look generated from other rows' values (Santander 2019's
+    fake test rows): no value of theirs is unique among all known rows, while
+    almost every labelled row has one. Label-free; only tables with many
+    continuous columns qualify, and only when the unlabeled set has clearly more
+    such rows than the labelled set. Returns a boolean mask over ``U``'s rows."""
+    none = np.zeros(len(U), dtype=bool)
+    cols = [c for c in X.columns if c in U.columns and pd.api.types.is_float_dtype(X[c])
+            and pd.api.types.is_numeric_dtype(U[c]) and X[c].nunique() >= 0.05 * len(X)]
+    if len(cols) < min_cols or len(U) < 1000:
+        return none
+    ux, uu = np.zeros(len(X), dtype=bool), np.zeros(len(U), dtype=bool)
+    for c in cols:
+        a, b = X[c].to_numpy(dtype=float), U[c].to_numpy(dtype=float)
+        _, inv, cnt = np.unique(np.concatenate([a, b]), return_inverse=True, return_counts=True)
+        once = cnt[inv] == 1
+        ux |= once[:len(a)]
+        uu |= once[len(a):]
+    r_x, miss_u = ux.mean(), 1.0 - uu.mean()
+    if r_x < min_rate or miss_u < 2 * (1.0 - r_x) + 0.05:
+        return none
+    return ~uu
+
+
 class FamilyCount(Spec):
     """Value frequencies of every column of a homogeneous family, as one block.
 
@@ -1722,7 +1746,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1757,6 +1781,7 @@ class FeatureForge:
         self.lagged_te = lagged_te
         self.group_col = group_col
         self.text = text
+        self.drop_synthetic = drop_synthetic
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -2577,6 +2602,14 @@ class FeatureForge:
         self._t0 = time.time()
         X = X.reset_index(drop=True).copy()
         y = pd.Series(np.asarray(y))
+        self.n_synthetic_ = 0
+        if X_unlabeled is not None and self.drop_synthetic:
+            fake = synthetic_rows(X, X_unlabeled)
+            if fake.any():
+                self.n_synthetic_ = int(fake.sum())
+                self._log(f"unlabeled rows: {self.n_synthetic_} of {len(fake)} look synthetic "
+                          "(no value unique among all rows); left out of label-free statistics")
+                X_unlabeled = X_unlabeled[~fake]
         if self.task is None:
             from tabularaml.contest.solver import infer_task
             self.task_ = infer_task(y)
