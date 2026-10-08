@@ -165,7 +165,7 @@ class ForecastFeatures:
 
     def __init__(self, time_col="auto", entity="auto", max_cells: int = 40_000_000, log_target="auto",
                  max_groups: int = 6, max_covariates: int = 8, origins: str = "random", align_week: bool = True,
-                 long_season: bool = False, random_state: int = 0, verbose: bool = True):
+                 long_season: bool = True, random_state: int = 0, verbose: bool = True):
         self.long_season = long_season
         self.origins = origins
         self.align_week = align_week

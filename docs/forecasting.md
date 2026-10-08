@@ -51,6 +51,30 @@ next event (until is cut at the origin plus the longest horizon, the end of what
 shows), and the entity's recent target difference between event and non-event days. Calendar
 fields of the date. Covariates are label-free and read from every row, the test file included.
 
+## Unseen contests (run blind with the defaults above, then after one generic change)
+
+Walmart Store Sales (weekly; Hugging Face mirror `large-traversaal/Walmart-sales`;
+`scripts/walmart_bench.py`, last 39 weeks / 39 before, rows of the test file's columns with the
+store and features tables joined; WMAE, holidays weigh 5) and Recruit Restaurant Visitor
+Forecasting (daily; the contest files from a GitHub mirror; `scripts/recruit_bench.py`, last 39 days
+/ 39 before, the full store x day grid as the test file lists it; RMSLE). Kaggle refuses these
+downloads here (rules not accepted).
+
+| Contest | Raw | Blind: family | Blind: full pipeline | After the change | Build |
+|---|---|---|---|---|---|
+| Walmart (WMAE) | 3038 / 3935 | **1676 / 2639** | 1651 (window 0) | 1676 / 2639 (weekly: unaffected) | 6-9 s (pipeline 27 min) |
+| Recruit (RMSLE) | 0.5305 / 0.5233 | 0.5188 / 0.5209 | 0.5249 (window 0) | **0.5153 / 0.5191** | 5-7 s |
+
+Shuffled labels: Walmart 13420 (constant 13421), Recruit 0.8326 (constant 0.8326).
+Recruit's full pipeline (reservations as of each date + FeatureForge) is worse than the family
+alone; the earlier pipeline without the family scored 0.546 / 0.537.
+
+The change (`long_season`, now on): half a year of same-weekday values (mean, median, spread, and
+the weekday's level against the entity's), a stable weekday profile for short noisy series. On the
+earlier contests: Rossmann 0.1079 / 0.1019 -> 0.1060 / 0.1006, Favorita 0.6776 / 0.6693 ->
+0.6789 / 0.6702, M5 0.7506 / 0.7124 -> 0.7510 / 0.7187 (M5's judge stops after ~50 trees and moves
+by this much between runs), Walmart unchanged.
+
 ## Results (held-out windows built like each contest's test file; same judges as the benches)
 
 | Contest (metric) | Raw | Earlier best | Forecast family | Build time |
