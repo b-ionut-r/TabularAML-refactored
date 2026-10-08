@@ -40,8 +40,24 @@ CONTESTS = {
                   metric="gini", folds="kfold"),
     "ross": dict(slug="rossmann-store-sales", target="Sales", id="Id", task="regression", metric="rmspe",
                  folds="time", dates=["Date"], log_target=True, closed_zero="Open"),
+    # Rossmann again, FeatureForge with only the gate's family fallback (gate_families) on; same prepared files.
+    "ross_gf": dict(slug="rossmann-store-sales", target="Sales", id="Id", task="regression", metric="rmspe",
+                    folds="time", dates=["Date"], log_target=True, closed_zero="Open", raw="ross"),
+    # Rossmann with the forecasting family (branch claude/forecasting-features-9ob67a, worktree): features are
+    # built on every training day (closed days too, for recency); the judge then trains on open days with sales.
+    "ross_fc": dict(slug="rossmann-store-sales", target="Sales", id="Id", task="regression", metric="rmspe",
+                    folds="time", dates=["Date"], log_target=True, closed_zero="Open", raw="ross",
+                    repo="/tmp/claude-0/wt_fc", fit_pos=True),
     "ieee": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
                  folds="time"),
+    # Full IEEE-CIS (590k x 434) runs FeatureForge out of memory on 15 GB: latest 40% of training rows, whole test.
+    "ieee40": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
+                   folds="time", raw="ieee"),
+    # Forecasting contests: a recent window of training days (both arms), the whole test horizon.
+    "m5": dict(slug="m5-forecasting-accuracy", target="sales", id="Id", task="regression", metric="rmse",
+               folds="time", dates=["date"], writer="m5", lr=0.1, repo="/tmp/claude-0/wt_fc"),
+    "fav": dict(slug="favorita-grocery-sales-forecasting", target="unit_sales", id="id", task="regression",
+                metric="rmse_log", folds="time", dates=["date"], log_target=True, lr=0.1, repo="/tmp/claude-0/wt_fc"),
     "hc": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                folds="kfold", child_models=True),
     "sct": dict(slug="santander-customer-transaction-prediction", target="target", id="ID_code", task="binary",
@@ -50,7 +66,7 @@ CONTESTS = {
 
 
 def download(c: str) -> Path:
-    d = ROOT / c / "raw"
+    d = ROOT / CONTESTS[c].get("raw", c) / "raw"
     if (d / ".done").exists():
         return d
     d.mkdir(parents=True, exist_ok=True)
@@ -114,7 +130,75 @@ def prep_hc(d: Path):
     return tr, te, tables
 
 
-PREP = {"wnv": prep_wnv, "porto": prep_csv, "sct": prep_csv, "ross": prep_ross, "ieee": prep_ieee, "hc": prep_hc}
+def prep_ieee40(d: Path):
+    tr, te, t = prep_ieee(d)
+    return tr.iloc[int(0.6 * len(tr)):].reset_index(drop=True), te, t
+
+
+M5_DAYS = 120  # training window: the last 120 days before the 28-day evaluation horizon
+
+
+def prep_m5(d: Path, n_days: int = M5_DAYS):
+    s = pd.read_csv(d / "sales_train_evaluation.csv")
+    cal = pd.read_csv(d / "calendar.csv")
+    pr = pd.read_csv(d / "sell_prices.csv")
+    keys = ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    days = [f"d_{i}" for i in range(1942 - n_days, 1942)]
+    tr = s[keys + days].melt(id_vars=keys, var_name="d", value_name="sales")
+    te = s[keys].merge(pd.DataFrame({"d": [f"d_{i}" for i in range(1942, 1970)]}), how="cross")
+    calc = ["d", "date", "wm_yr_wk", "event_name_1", "event_type_1", "event_name_2", "event_type_2",
+            "snap_CA", "snap_TX", "snap_WI"]
+    out = []
+    for df in (tr, te):
+        df = df.merge(cal[calc], on="d", how="left").merge(pr, on=["store_id", "item_id", "wm_yr_wk"], how="left")
+        df["F"] = df["d"].str[2:].astype(int) - 1941
+        out.append(df)
+    tr, te = out
+    tr = tr[tr.sell_price.notna()]  # not on sale yet
+    te["Id"] = te["id"] + "|" + te["F"].astype(str)
+    tr = tr.drop(columns=["id", "d", "F"]).sort_values(["date", "store_id", "item_id"]).reset_index(drop=True)
+    te = te.drop(columns=["id", "d", "F"])
+    return tr, te, {}
+
+
+FAV_DAYS = 14  # training window: the last 14 days before the test's 16 days, as a full store x item grid
+
+
+def prep_fav(d: Path, n_days: int = FAV_DAYS):
+    it, st = pd.read_csv(d / "items.csv"), pd.read_csv(d / "stores.csv")
+    oil = pd.read_csv(d / "oil.csv")
+    te = pd.read_csv(d / "test.csv").drop(columns=["onpromotion"])
+    start = (pd.Timestamp(te.date.min()) - pd.Timedelta(days=n_days)).strftime("%Y-%m-%d")
+    parts = []
+    for ch in pd.read_csv(d / "train.csv", chunksize=5_000_000, usecols=["date", "store_nbr", "item_nbr", "unit_sales"]):
+        ch = ch[ch.date >= start]
+        if len(ch):
+            parts.append(ch)
+    sales = pd.concat(parts, ignore_index=True)
+    # The train file lists only rows with sales: rebuild the grid of the test's store x item pairs, zero-filled.
+    # onpromotion is dropped: in train it is recorded only on days with sales (the audit's finding).
+    pairs = te[["store_nbr", "item_nbr"]].drop_duplicates()
+    dates = pd.DataFrame({"date": sorted(sales.date.unique())})
+    tr = pairs.merge(dates, how="cross").merge(sales, on=["date", "store_nbr", "item_nbr"], how="left")
+    tr["unit_sales"] = tr["unit_sales"].fillna(0).clip(lower=0)
+    out = []
+    for df in (tr, te):
+        df = df.merge(it, on="item_nbr", how="left").merge(st, on="store_nbr", how="left").merge(oil, on="date", how="left")
+        out.append(df)
+    tr, te = out
+    tr = tr.sort_values(["date", "store_nbr", "item_nbr"]).reset_index(drop=True)
+    return tr, te, {}
+
+
+def prep_ross_all(d: Path):
+    st = pd.read_csv(d / "store.csv")
+    tr = pd.read_csv(d / "train.csv", dtype={"StateHoliday": str}).drop(columns=["Customers"])
+    te = pd.read_csv(d / "test.csv", dtype={"StateHoliday": str})
+    tr = tr.merge(st, on="Store", how="left").sort_values(["Date", "Store"]).reset_index(drop=True)
+    return tr, te.merge(st, on="Store", how="left"), {}
+
+
+PREP = {"ross_fc": prep_ross_all, "m5": prep_m5, "fav": prep_fav, "ieee40": prep_ieee40, "wnv": prep_wnv, "porto": prep_csv, "sct": prep_csv, "ross": prep_ross, "ieee": prep_ieee, "hc": prep_hc}
 
 
 def to_compact(df: pd.DataFrame) -> pd.DataFrame:
@@ -139,10 +223,45 @@ def cmd_prep(c: str):
     print(f"prep {c}: train {tr.shape} test {te.shape} tables {[ (k, v.shape) for k, v in tables.items()]}")
 
 
+FC_HISTORY = {"m5": 450, "fav": 112}  # days of labelled history the forecasting family reads (memory-bound)
+
+
+def cmd_fcfeats(c: str):
+    """Forecasting family only (PR #3's ForecastFeatures), for panels too large for FeatureForge's search:
+    features are computed from a long labelled history, then the training rows are cut to the raw arm's
+    window, so both arms train on the same rows."""
+    cfg = CONTESTS[c]
+    sys.path.insert(0, cfg["repo"])
+    from tabularaml.generate.forecast import ForecastFeatures
+    t0 = time.time()
+    tr, te, _ = PREP[c](download(c), FC_HISTORY[c])
+    if cfg["id"] not in tr.columns:
+        tr.insert(0, cfg["id"], -np.arange(1, len(tr) + 1))
+    to_compact(tr), to_compact(te)
+    y = tr.pop(cfg["target"]).to_numpy()
+    raw_tr = pd.read_parquet(ROOT / c / "prep" / "train.parquet", columns=[cfg["dates"][0]])
+    first = raw_tr[cfg["dates"][0]].min()
+    win = (tr[cfg["dates"][0]] >= first).to_numpy()
+    feat_cols = [x for x in tr.columns if x != cfg["id"]]
+    ff = ForecastFeatures().fit(tr[feat_cols], np.log1p(y) if cfg.get("log_target") else y, te[feat_cols])
+    assert ff.active_, "forecasting family did not switch on"
+    Ftr = ff.transform(tr.loc[win, feat_cols].reset_index(drop=True))
+    Fte = ff.transform(te[feat_cols])
+    out_tr = pd.concat([tr[win].reset_index(drop=True), Ftr.reset_index(drop=True)], axis=1)
+    out_tr[cfg["target"]] = y[win]
+    out_te = pd.concat([te.reset_index(drop=True), Fte.reset_index(drop=True)], axis=1)
+    o = ROOT / c / "fcfeats"
+    o.mkdir(parents=True, exist_ok=True)
+    out_tr.to_parquet(o / "train_features.parquet")
+    out_te.to_parquet(o / "test_features.parquet")
+    print(f"forecast family: {Ftr.shape[1]} columns, {win.sum()} of {len(tr)} history rows kept, {time.time() - t0:.0f}s")
+
+
 def cmd_feats(c: str, budget: float, extra: list[str]):
     cfg, p = CONTESTS[c], ROOT / c / "prep"
     tables = json.load(open(p / "tables.json"))
-    cmd = [sys.executable, str(REPO / "scripts" / "contest_features.py"), "--train", str(p / "train.parquet"),
+    repo = Path(cfg.get("repo", REPO))
+    cmd = [sys.executable, str(repo / "scripts" / "contest_features.py"), "--train", str(p / "train.parquet"),
            "--test", str(p / "test.parquet"), "--target", cfg["target"], "--id", cfg["id"],
            "--task", cfg["task"], "--budget", str(budget), "--out-dir", str(ROOT / c / "feats")]
     if cfg.get("log_target"):
@@ -152,7 +271,7 @@ def cmd_feats(c: str, budget: float, extra: list[str]):
     for t in tables:
         cmd += ["--table", f"{t}={p / (t + '.parquet')}"]
     t0 = time.time()
-    subprocess.run(cmd + extra, check=True, cwd=REPO)
+    subprocess.run(cmd + extra, check=True, cwd=repo)
     json.dump(dict(feats_s=round(time.time() - t0)), open(ROOT / c / "feats" / "time.json", "w"))
 
 
@@ -175,7 +294,8 @@ def judge(Xtr, y, Xte, cfg, groups=None, seeds=(0, 1, 2)):
     import lightgbm as lgb
     from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
     obj = "binary" if cfg["task"] == "binary" else "regression"
-    P = dict(objective=obj, learning_rate=0.03, num_leaves=63, min_child_samples=50, feature_fraction=0.6,
+    # learning rate 0.1 on the multi-million-row forecasting tables (both arms alike)
+    P = dict(objective=obj, learning_rate=cfg.get("lr", 0.03), num_leaves=63, min_child_samples=50, feature_fraction=0.6,
              bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, cat_smooth=20, num_threads=4, verbose=-1)
     yt = np.log1p(y) if cfg.get("log_target") else y
     oof, pte = np.zeros(len(Xtr)), np.zeros(len(Xte))
@@ -211,6 +331,10 @@ def score(metric, y, p):
     if metric == "rmspe":  # y, p on the log1p scale (log_target)
         y, p = np.expm1(y), np.expm1(p)
         return float(np.sqrt(np.mean(((y - p) / y) ** 2)))
+    if metric == "rmse":
+        return float(np.sqrt(np.mean((y - p) ** 2)))
+    if metric == "rmse_log":  # y, p already on the log1p scale
+        return float(np.sqrt(np.mean((y - p) ** 2)))
     raise ValueError(metric)
 
 
@@ -219,8 +343,9 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
     if arm == "raw":
         tr, te = pd.read_parquet(ROOT / c / "prep" / "train.parquet"), pd.read_parquet(ROOT / c / "prep" / "test.parquet")
     else:
-        tr = pd.read_parquet(ROOT / c / "feats" / "train_features.parquet")
-        te = pd.read_parquet(ROOT / c / "feats" / "test_features.parquet")
+        sub = "fcfeats" if arm == "fc" else "feats"
+        tr = pd.read_parquet(ROOT / c / sub / "train_features.parquet")
+        te = pd.read_parquet(ROOT / c / sub / "test_features.parquet")
     y = tr.pop(cfg["target"]).to_numpy()
     ids = te[cfg["id"]].to_numpy()
     Xtr = tr.drop(columns=[cfg["id"]], errors="ignore")
@@ -230,6 +355,9 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
     if gone:
         print(f"dropped {len(gone)} columns: {gone}")
     Xte = Xte[Xtr.columns]
+    if cfg.get("fit_pos"):  # score-relevant training rows only (RMSPE skips zero sales)
+        keep = y > 0
+        Xtr, y = Xtr[keep].reset_index(drop=True), y[keep]
     groups = None
     if cfg["folds"] == "group:year":
         groups = pd.to_datetime(Xtr["Date"].astype(str)).dt.year.to_numpy()
@@ -244,7 +372,16 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
     tag = arm + ("_" + "-".join(drop) if drop else "")
     out = ROOT / c / "subs"
     out.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({cfg["id"]: ids, cfg["target"]: pte}).to_csv(out / f"{tag}.csv", index=False)
+    sub = pd.DataFrame({cfg["id"]: ids, cfg["target"]: pte})
+    if cfg.get("writer") == "m5":  # wide: id, F1..F28; validation rows (public board) left at 0
+        sub[["id", "F"]] = sub["Id"].str.split("|", expand=True)
+        w = sub.pivot(index="id", columns="F", values=cfg["target"])
+        w = w[[str(k) for k in range(1, 29)]]
+        w.columns = [f"F{k}" for k in range(1, 29)]
+        v = w.copy() * 0
+        v.index = v.index.str.replace("_evaluation", "_validation")
+        sub = pd.concat([v, w]).reset_index()
+    sub.to_csv(out / f"{tag}.csv", index=False)
     res = dict(contest=c, arm=tag, cv=round(cv, 5), n_feat=Xtr.shape[1], judge_s=round(time.time() - t0))
     print("RESULT", json.dumps(res))
     with open(ROOT / "results.jsonl", "a") as f:
@@ -259,7 +396,7 @@ def cmd_submit(c: str, arm: str, msg: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["prep", "feats", "fit", "submit"])
+    ap.add_argument("cmd", choices=["prep", "feats", "fcfeats", "fit", "submit"])
     ap.add_argument("--contest", required=True, choices=sorted(CONTESTS))
     ap.add_argument("--arm", default="raw")
     ap.add_argument("--budget", type=float, default=900)
@@ -268,6 +405,8 @@ def main():
     a, extra = ap.parse_known_args()
     if a.cmd == "prep":
         cmd_prep(a.contest)
+    elif a.cmd == "fcfeats":
+        cmd_fcfeats(a.contest)
     elif a.cmd == "feats":
         cmd_feats(a.contest, a.budget, extra)
     elif a.cmd == "fit":
