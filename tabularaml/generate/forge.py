@@ -1018,8 +1018,14 @@ def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
             and float(v.str.split().str.len().mean()) >= 2.5)
 
 
-def _text_values(df, c) -> pd.Series:
-    return df[c].astype(str).where(df[c].astype(str) != "__NA__", "")
+def _text_values(df, c, clip: Optional[int] = None) -> pd.Series:
+    t = df[c].astype(str)
+    t = t.where(t != "__NA__", "")
+    # Long fields (review dumps) cost n-gram time quadratically in nothing but their tails.
+    return t if clip is None else t.str.slice(0, clip)
+
+
+TEXT_CLIP = 1500
 
 
 class TextStats(Spec):
@@ -1069,9 +1075,9 @@ class TextSVD(Spec):
         from sklearn.decomposition import TruncatedSVD
         c = self.parents[0]
         extra = getattr(ctx, "extra_rows", None)
-        t = _text_values(df, c)
+        t = _text_values(df, c, TEXT_CLIP)
         if extra is not None and c in extra:
-            t = pd.concat([t, _text_values(extra, c)], ignore_index=True)
+            t = pd.concat([t, _text_values(extra, c, TEXT_CLIP)], ignore_index=True)
         if len(t) > self.max_fit_rows:
             t = t.sample(self.max_fit_rows, random_state=0)
         self.vec_ = _tfidf("word", 50_000).fit(t)
@@ -1081,7 +1087,7 @@ class TextSVD(Spec):
         return self
 
     def transform(self, df, ctx):
-        return self.svd_.transform(self.vec_.transform(_text_values(df, self.parents[0]))).astype(np.float32)
+        return self.svd_.transform(self.vec_.transform(_text_values(df, self.parents[0], TEXT_CLIP))).astype(np.float32)
 
 
 class TextLinearOOF(Spec):
@@ -1107,9 +1113,9 @@ class TextLinearOOF(Spec):
         extra = getattr(ctx, "extra_rows", None)
         self.vecs_ = []
         for c in self.text_cols:
-            t = _text_values(df, c)
+            t = _text_values(df, c, TEXT_CLIP)
             if extra is not None and c in extra:
-                t = pd.concat([t, _text_values(extra, c)], ignore_index=True)
+                t = pd.concat([t, _text_values(extra, c, TEXT_CLIP)], ignore_index=True)
             if len(t) > 300_000:
                 t = t.sample(300_000, random_state=0)
             vs = [_tfidf("word", 200_000).fit(t)]
@@ -1123,7 +1129,7 @@ class TextLinearOOF(Spec):
 
     def _design(self, df):
         from scipy import sparse
-        blocks = [v.transform(_text_values(df, c)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
+        blocks = [v.transform(_text_values(df, c, TEXT_CLIP)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
         if self.keys:
             blocks.append(self.ohe_.transform(df[self.keys].astype(str)))
         return sparse.hstack(blocks, format="csr")

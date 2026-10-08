@@ -618,3 +618,25 @@ price momentum (the public M5 kernels' features).
 
 FeatureForge alone already beats the classic hand-made features on average, so
 those leave no room to automate on this slice.
+
+### Text features on public text-tabular tables
+
+`scripts/text_bench.py` on MulTaBench tables (Hugging Face `multabench/*`; up to
+50k rows; two random 80/20 holdouts; RMSE or logloss, lower is better). Blind =
+shipped defaults before text features. Mean of the two holdouts:
+
+| Table | Metric | Raw | Blind | Text features | Change vs raw |
+|---|---|---|---|---|---|
+| fake-job-posting | logloss | 0.154 | 0.154 | **0.070** | -55% |
+| wine-review (variety, 30 classes) | logloss | 1.648 | 1.648 | **0.641** | -61% |
+| women-clothing-review (rating) | logloss | 0.894 | 0.894 | **0.689** | -23% |
+| book-price | RMSE | 0.289 | 0.289 | **0.228** | -21% |
+| data-scientist-salary | logloss | 1.319 | 1.319 | **1.149** | -13% |
+| zomato-restaurants (rating) | RMSE | 0.119 | 0.090 | **0.085** | -29% (blind -24%) |
+| rotten-tomatoes | RMSE | 0.955 | 0.955 | 0.955 (gate rejects) | 0% |
+
+No table got worse. Text fields are cut to their first 1,500 characters before
+n-gram vectorising (`TEXT_CLIP`): zomato's 11,700-character review dumps took
+43 minutes uncut (0.0829 on the first holdout) and 22 minutes cut (0.0849).
+Runtime is the cost: 1-4 minutes on most tables, 22 minutes on wine-review (30
+classes make every later model 30 times larger) and zomato.
