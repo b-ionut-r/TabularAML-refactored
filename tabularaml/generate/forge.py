@@ -1651,7 +1651,9 @@ class FeatureForge:
     log_target : bool
         Search on ``log1p(y)`` (use for RMSLE-scored regression).
     time_budget : float
-        Soft wall-clock budget in seconds for the whole search.
+        Wall-clock budget in seconds for the search. A round starts only while two CV fits
+        (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
+        fit's time left; the base CV fit, the gate and the final out-of-fold fits always run.
     n_rounds : int
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
@@ -2316,7 +2318,11 @@ class FeatureForge:
         if getattr(self, "U_search_", None) is not None:
             WU = pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
             raw = set(self.raw_cols_)
-        for s in specs:
+        for i, s in enumerate(specs):
+            # Leave room in the budget for at least one CV fit of the screened candidates.
+            if i % 20 == 0 and self._time_left() < getattr(self, "_cv_s", 0.0):
+                self._log(f"budget: screened {i} of {len(specs)} candidates")
+                break
             try:
                 if s.target_dep:
                     v = s.fit_transform_oof(W, y, self.ctx_, folds)
@@ -2758,7 +2764,10 @@ class FeatureForge:
         self.history_ = []
         self._nested_cache = {}
         Wm = self._model_frame(W)
+        t_cv = time.time()
         margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
+        # One CV fit's duration: the search stops when fewer than two are left in the budget.
+        self._cv_s = time.time() - t_cv
         if self.n_interactions:
             self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
         self.base_cv_loss_ = cur_loss
@@ -2775,7 +2784,11 @@ class FeatureForge:
                   f"cols={X.shape[1]} base CV loss={cur_loss:.6f}")
 
         for r in range(self.n_rounds):
-            if self._time_left() <= 0 or len(selected) >= self.max_new_features:
+            if len(selected) >= self.max_new_features:
+                break
+            if self._time_left() < 2 * self._cv_s:
+                self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
+                          f"search stops")
                 break
             values = joint = None  # release the previous round's candidates first
             cands = self._generate(W, imp, selected, r)
@@ -2834,6 +2847,11 @@ class FeatureForge:
             # (a single pairwise interaction) down the split-gain order.
             novel_rank = sorted(survivors, key=lambda nm: -self._last_novelty.get(nm, 0.0))
             orders = [("gain", rank, (3, 6, 12, 25, 50, 80)), ("novelty", novel_rank, (3, 6, 12))]
+            # Label-free prefixes too: when target statistics do not carry over (their honest,
+            # past-only encodings lose), they top the gain order and would sink every prefix.
+            free_rank = [nm for nm in rank if not spec_by_name[nm].target_dep]
+            if self.past_te and self.time_col_ is not None and 0 < len(free_rank) < len(rank):
+                orders.append(("label-free", free_rank, (6, 25)))
             best_k, best_loss, best_fit, best_rank = 0, cur_loss, None, rank
             tried = set()
             for label, order, steps in orders:
@@ -2844,7 +2862,7 @@ class FeatureForge:
                     if k <= 0:
                         continue
                     key = frozenset(order[:k])
-                    if key in tried:
+                    if key in tried or (tried and self._time_left() < self._cv_s):
                         continue
                     tried.add(key)
                     cols = list(Wm.columns) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
@@ -2852,8 +2870,6 @@ class FeatureForge:
                     self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
                     if loss_k < best_loss:
                         best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
-                    if self._time_left() < 0:
-                        break
             rank = best_rank
             if best_k == 0 or (cur_loss - best_loss) / cur_loss < self.min_rel_gain:
                 self._log(f"round {r + 1}: no prefix beats current CV loss by {self.min_rel_gain:.2%}; stopping")
