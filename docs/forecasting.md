@@ -75,6 +75,20 @@ earlier contests: Rossmann 0.1079 / 0.1019 -> 0.1060 / 0.1006, Favorita 0.6776 /
 0.6789 / 0.6702, M5 0.7506 / 0.7124 -> 0.7510 / 0.7187 (M5's judge stops after ~50 trees and moves
 by this much between runs), Walmart unchanged.
 
+### Web Traffic Time Series Forecasting (Kaggle 2017, $25k)
+
+Monash archive copy (Zenodo 4656080; page names replaced by ids, so no project / access / agent groups);
+`scripts/webtraffic_bench.py`: 5,000 random pages, the last 500 days before a cut, then a 2-day gap and
+62 days of every page (stage 2's layout; days without a value are not scored); SMAPE.
+
+| Windows | Raw | Blind: family | + trailing medians (`medians=True`, opt-in) | Build |
+|---|---|---|---|---|
+| last / 64 days earlier | 40.40 / 40.53 | **38.16 / 37.10** | 38.03 / 37.08 | 45-60 s |
+
+Shuffled labels 121.10 (constant 121.11). Medians moved SMAPE by 0.1-0.3%, within noise, so they stay
+off and the shipped defaults (and every earlier number) are unchanged. The test horizon starting at 3
+(the gap) is handled by the same per-row origins.
+
 ## Results (held-out windows built like each contest's test file; same judges as the benches)
 
 | Contest (metric) | Raw | Earlier best | Forecast family | Build time |

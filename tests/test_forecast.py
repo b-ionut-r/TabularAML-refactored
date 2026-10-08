@@ -30,7 +30,7 @@ def test_switches_on_and_off():
 
 def test_no_own_or_later_labels():
     X, y, U = _panel()
-    f = ForecastFeatures(verbose=False).fit(X, y, U)
+    f = ForecastFeatures(verbose=False, medians=True).fit(X, y, U)
     F = f.transform(X)
     p = f._periods(X)
     assert np.all(F["fc_h"].to_numpy() >= 1)
@@ -40,7 +40,7 @@ def test_no_own_or_later_labels():
         later = (p >= p[i]) & (X.store.to_numpy() == X.store[i])
         y2[later] = y2[later] * 10 + 1000          # own and later labels of the entity changed
         y2[p >= p[i]] = y2[p >= p[i]] * 3          # and every later label of any entity
-        F2 = ForecastFeatures(verbose=False).fit(X, y2, U).transform(X.iloc[[i]])
+        F2 = ForecastFeatures(verbose=False, medians=True).fit(X, y2, U).transform(X.iloc[[i]])
         a, b = F.iloc[[i]].to_numpy(), F2.to_numpy()
         assert np.allclose(np.nan_to_num(a, nan=-1), np.nan_to_num(b, nan=-1), rtol=1e-5), X.iloc[i]
 

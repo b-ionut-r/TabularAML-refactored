@@ -142,6 +142,19 @@ class _Panel:
             m = s / np.maximum(c, 1)
             return np.where(c > 1, np.sqrt(np.maximum(s2 / np.maximum(c, 1) - m * m, 0)), np.nan)
 
+    def medians(self, w: int, chunk_cells: int = 20_000_000) -> np.ndarray:
+        """Median over the trailing ``w`` periods ending at each period (NaN-aware), (keys, periods)."""
+        E, P = self.Y.shape
+        out = np.full((E, P), np.nan, dtype=np.float32)
+        pad = np.concatenate([np.full((E, w - 1), np.nan), self.Y], 1).astype(np.float32)
+        step = max(1, chunk_cells // max(P * w, 1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for i in range(0, E, step):
+                win = np.lib.stride_tricks.sliding_window_view(pad[i:i + step], w, axis=1)
+                out[i:i + step] = np.nanmedian(win, axis=2)
+        return out
+
     def at(self, k, q):
         ok = (q >= 0) & (q < self.P)
         r = np.full(len(k), np.nan)
@@ -165,8 +178,9 @@ class ForecastFeatures:
 
     def __init__(self, time_col="auto", entity="auto", max_cells: int = 40_000_000, log_target="auto",
                  max_groups: int = 6, max_covariates: int = 8, origins: str = "random", align_week: bool = True,
-                 long_season: bool = True, random_state: int = 0, verbose: bool = True):
+                 long_season: bool = True, medians: bool = False, random_state: int = 0, verbose: bool = True):
         self.long_season = long_season
+        self.medians = medians
         self.origins = origins
         self.align_week = align_week
         self.random_state = random_state
@@ -294,6 +308,7 @@ class ForecastFeatures:
 
     def fit(self, X: pd.DataFrame, y, X_unlabeled: Optional[pd.DataFrame] = None):
         self.active_ = False
+        self.__dict__.pop("med_", None)
         if X_unlabeled is None or len(X_unlabeled) < 20:
             self.reason_ = "no unlabeled rows"
             self._log(self.reason_)
@@ -437,6 +452,13 @@ class ForecastFeatures:
             F[f"fc_mean{w}"] = E.mean(kk, o - w, o)[0]
         wm = W[4] if len(W) > 4 else W[-1]
         F[f"fc_std{wm}"] = E.std(kk, o - wm, o)
+        if self.medians:
+            # Medians resist the spikes that dominate trailing means of bursty series (page views).
+            if not hasattr(self, "med_"):
+                self.med_ = {w: E.medians(w) for w in W[2:6]}
+            qo = np.clip(o, 0, E.P - 1)
+            for w, M in self.med_.items():
+                F[f"fc_med{w}"] = np.where(o >= 0, M[kk, qo], np.nan)
         if self.intermittent_:
             m, c = E.mean(kk, o - wm, o)
             nzm, cnz = E.mean(kk, o - wm, o, nz=True)
