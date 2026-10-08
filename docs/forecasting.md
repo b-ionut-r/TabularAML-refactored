@@ -125,6 +125,21 @@ walk, and a tree model predicting the level cannot place 3,135 counties' levels 
 judge from the last known value (`--base`, LightGBM's starting score, a modelling choice outside this family)
 scores 3.29 / 3.00, with early stopping after one tree: the features carry nothing beyond persistence here.
 
+### GEFCom2012 load track (Kaggle 2012, $7.5k): hourly load, no temperatures for the test week
+
+The organiser's files (GEFCom2012.zip); `scripts/gefcom12_bench.py`: 20 zones, the week after a cut, scored with the
+contest's WRMSE (zones weight 1, their sum weight 20). Window 0 is the contest's own forecast week (2008-07-01 .. 07,
+scored with the published solution, horizons 19-186 hours as in the contest); windows 1-8 are the 8 full weeks before
+it. Temperatures are left out because the contest week had none.
+
+| Weeks | Raw (mean WRMSE) | Blind (shipped defaults) | Build |
+|---|---|---|---|
+| contest week | 150,477 | **104,836** | 12 s |
+| all 9 weeks | 165,012 | **153,440** (6% lower geometric mean; better on 5 of 9) | 12 s |
+
+Shuffled labels 738,105 (per-zone constant 735,627). No change followed: week-ahead load without temperatures swings
+with the weather, and single weeks move by up to 35% either way, so a change could not be judged within noise.
+
 ## Results (held-out windows built like each contest's test file; same judges as the benches)
 
 | Contest (metric) | Raw | Earlier best | Forecast family | Build time |
