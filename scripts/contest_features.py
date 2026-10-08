@@ -18,6 +18,7 @@ rows count (``asof_features``). Writes ``train_features.parquet`` and ``test_fea
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -121,6 +122,7 @@ def main():
     ap.add_argument("--top-related", type=int, default=200,
                     help="related-table columns handed to FeatureForge's search (all are kept in the output)")
     ap.add_argument("--out-dir", default="features")
+    ap.add_argument("--forge-kw", default="{}", help="JSON of extra FeatureForge arguments")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -211,7 +213,7 @@ def main():
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
         Xtr = both[list(Xtr.columns) + top]
         Xte = pd.concat([Xte.reset_index(drop=True), rel_te[top]], axis=1)
-    forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target).fit(Xtr, y, X_unlabeled=Xte)
+    forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **json.loads(a.forge_kw)).fit(Xtr, y, X_unlabeled=Xte)
     out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
     if rel_tr is not None:
         rest = [c for c in rel_tr.columns if c not in out_tr.columns]
