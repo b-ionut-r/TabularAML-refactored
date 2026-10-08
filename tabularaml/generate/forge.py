@@ -1650,6 +1650,10 @@ class FeatureForge:
     task : "regression" | "binary" | "multiclass" | None
     log_target : bool
         Search on ``log1p(y)`` (use for RMSLE-scored regression).
+    max_search_rows : int | None
+        Search on at most this many training rows (the latest on time-ordered data, whole
+        groups when test rows are new entities, else a random sample); the rest still
+        count in label-free statistics, and the output is computed on every row.
     time_budget : float
         Wall-clock budget in seconds for the search. A round starts only while two CV fits
         (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
@@ -1749,6 +1753,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
+                 max_search_rows: Optional[int] = 300_000,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1785,6 +1790,7 @@ class FeatureForge:
         self.text = text
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
+        self.max_search_rows = max_search_rows
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -2725,6 +2731,26 @@ class FeatureForge:
         else:
             idx_sel, idx_gate = idx, np.array([], dtype=int)
 
+        # Large tables: the search runs on the latest rows (time-ordered data), whole random
+        # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
+        # budget for several rounds; the rows left out still feed label-free statistics.
+        idx_out = np.array([], dtype=int)
+        m = self.max_search_rows
+        if m and len(idx_sel) > m:
+            rng = np.random.default_rng(self.random_state)
+            if self.time_col_ is not None:
+                keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
+            elif self.group_col_ is not None:
+                g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                perm = rng.permutation(g.max() + 1)
+                r = perm[g]
+                keep = idx_sel[np.argsort(r, kind="stable")[:m]]
+            else:
+                keep = rng.choice(idx_sel, m, replace=False)
+            keep = np.sort(keep)
+            idx_out = np.setdiff1d(idx_sel, keep)
+            self._log(f"search on {m} of {len(idx_sel)} rows")
+            idx_sel = keep
         W = X.iloc[idx_sel].reset_index(drop=True)
         yW = y_np[idx_sel]
         if self.group_col_ is not None:
@@ -2732,7 +2758,10 @@ class FeatureForge:
             self._groups = {len(W): gx[idx_sel], n: gx}
         self.U_search_ = None
         if X_unlabeled is not None:
-            self.U_search_ = pd.concat([X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]], ignore_index=True)
+            self.U_search_ = pd.concat([X.iloc[idx_out], X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]],
+                                       ignore_index=True)
+        elif len(idx_out):
+            self.U_search_ = X.iloc[np.concatenate([idx_out, idx_gate])].reset_index(drop=True)
         self.ctx_.extra_rows = self.U_search_
         # Small tables get repeated CV so that selection is not driven by fold noise.
         n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))

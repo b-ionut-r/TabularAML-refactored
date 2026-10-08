@@ -309,3 +309,15 @@ def test_forge_search_respects_small_budget():
     # No search round fits in the budget: base CV, then straight to the output.
     assert ff.history_ == [] and ff.selected_ == []
     assert time.time() - t0 < 60
+
+
+def test_forge_search_subsample_keeps_output_on_every_row():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.normal(size=(6000, 4)), columns=list("abcd"))
+    X["t"] = np.arange(len(X), dtype=float)
+    y = X.a * X.b + rng.normal(size=len(X)) * 0.1
+    U = X.iloc[:500].assign(t=X.t.iloc[:500] + 6000)
+    f = FeatureForge(task="regression", time_budget=60, n_rounds=1, n_jobs=1, verbose=False,
+                     time_col="t", max_search_rows=2000).fit(X, y, X_unlabeled=U)
+    assert len(f.transform_train(X)) == len(X) and len(f.transform(U)) == len(U)
+    assert any("a" in c and "b" in c for c in f.new_columns_)
