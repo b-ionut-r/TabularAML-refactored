@@ -2326,11 +2326,20 @@ class FeatureForge:
         if getattr(self, "U_search_", None) is not None:
             WU = pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
             raw = set(self.raw_cols_)
+        # No family of candidates may take over a third of the time left for building them
+        # (a few slow ones, neighbour features on large tables, otherwise starve the rest).
+        cv_s = getattr(self, "_cv_s", 0.0)
+        fam_cap = max(self._time_left() - 4 * cv_s, 0.0) / 3
+        fam_t, capped = {}, set()
         for i, s in enumerate(specs):
             # Leave room in the budget for at least one CV fit of the screened candidates.
-            if i % 20 == 0 and self._time_left() < getattr(self, "_cv_s", 0.0):
+            if i % 20 == 0 and self._time_left() < cv_s:
                 self._log(f"budget: screened {i} of {len(specs)} candidates")
                 break
+            fam = type(s).__name__
+            if fam in capped:
+                continue
+            t_s = time.time()
             try:
                 if s.target_dep:
                     v = s.fit_transform_oof(W, y, self.ctx_, folds)
@@ -2340,6 +2349,11 @@ class FeatureForge:
                     v = s.fit(W, y, self.ctx_).transform(W, self.ctx_)
             except Exception:
                 continue
+            finally:
+                fam_t[fam] = fam_t.get(fam, 0.0) + time.time() - t_s
+                if self.time_budget and fam_t[fam] > fam_cap and fam not in capped:
+                    capped.add(fam)
+                    self._log(f"budget: {fam} candidates took {fam_t[fam]:.0f}s; the rest of them skipped")
             v = np.asarray(v, dtype=np.float32)
             v2 = v if v.ndim == 2 else v[:, None]
             col = v2[:, 0]
