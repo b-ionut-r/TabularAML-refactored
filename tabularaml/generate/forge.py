@@ -1746,7 +1746,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1784,6 +1784,7 @@ class FeatureForge:
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
         self.gate_families = gate_families
+        self.past_te = past_te
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1811,6 +1812,19 @@ class FeatureForge:
         if self.task_ == "regression":
             return list(KFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows)))
         return list(StratifiedKFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows), y))
+
+    def _te_folds(self, X: pd.DataFrame, y, seed, k: int = 8):
+        """Folds for out-of-fold target statistics. On time-ordered data each block of rows
+        is encoded from earlier blocks only (the first from the next one), as test rows are
+        encoded from the past: random folds hand a row its own period's labels through
+        neighbouring days, so models learn to trust encodings that the test period cannot
+        match (Rossmann's store target maps: search CV better, later weeks 57% worse)."""
+        t = getattr(self, "time_col_", None)
+        if t is None or not self.time_cv or self.past_te is False or t not in X.columns:
+            return self._folds(len(X), y, 5, seed)
+        order = np.argsort(X[t].to_numpy(dtype=float), kind="stable")
+        blocks = [np.sort(b) for b in np.array_split(order, k)]
+        return [(blocks[1], blocks[0])] + [(np.sort(np.concatenate(blocks[:i])), blocks[i]) for i in range(1, k)]
 
     def _model_frame(self, X: pd.DataFrame, recode: Optional[bool] = None) -> pd.DataFrame:
         """Model view of a frame: categoricals as ``category`` dtype, or, when the
@@ -1891,7 +1905,7 @@ class FeatureForge:
         if ck not in self._nested_cache:
             import copy
             s = copy.copy(spec)
-            inner = self._folds(len(tr), y[tr], 5, self.random_state + 7)
+            inner = self._te_folds(W.iloc[tr], y[tr], self.random_state + 7)
             vt = s.fit_transform_oof(W.iloc[tr].reset_index(drop=True), y[tr], self.ctx_, inner)
             vv = s.transform(W.iloc[va].reset_index(drop=True), self.ctx_)
             self._nested_cache[ck] = (np.asarray(vt, dtype=np.float32), np.asarray(vv, dtype=np.float32))
@@ -2717,7 +2731,7 @@ class FeatureForge:
         # Small tables get repeated CV so that selection is not driven by fold noise.
         n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
         folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
-        te_folds = self._folds(len(W), yW, 5, self.random_state + 1)
+        te_folds = self._te_folds(W, yW, self.random_state + 1)
         # Screening split (A trains the residual boosters, B measures them).
         try:
             idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
@@ -3063,7 +3077,7 @@ class FeatureForge:
     def _fit_full(self, X, y, U=None):
         if self.recode_:
             self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
-        folds = self._folds(len(X), y, 5, self.random_state + 1)
+        folds = self._te_folds(X, y, self.random_state + 1)
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy()
         U = None if U is None else U[self.raw_cols_].copy()
