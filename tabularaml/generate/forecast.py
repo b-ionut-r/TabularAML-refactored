@@ -47,6 +47,14 @@ def _to_days(s: pd.Series) -> np.ndarray:
     return v
 
 
+def _months(days: np.ndarray) -> np.ndarray:
+    """Calendar month index (year * 12 + month) of day numbers."""
+    d = pd.to_datetime(pd.Series(days), unit="D")
+    m = (d.dt.year * 12 + d.dt.month - 1).to_numpy(dtype=float)
+    m[d.isna().to_numpy()] = np.nan
+    return m
+
+
 def _is_date(s: pd.Series) -> bool:
     if pd.api.types.is_datetime64_any_dtype(s):
         return True
@@ -217,10 +225,15 @@ class ForecastFeatures:
             return "timestamps finer than hourly"
         if step < 1 - 1e-9:
             step = 1 / 24
+        # Monthly: one date per calendar month, periods counted in months (28-31 days apart).
+        self.monthly_ = bool(27.5 <= step <= 31.5 and len(np.unique(_months(ut))) == len(ut))
+        if self.monthly_:
+            step = 30.4375
         self.time_col_, self.step_ = tc, step
         A = pd.concat([X[cols], U[cols]], ignore_index=True)
         n = len(A)
-        per = np.round((np.concatenate([tx, tu]) - np.nanmin(ut)) / step)
+        per = (_months(np.concatenate([tx, tu])) - _months(ut[:1])[0] if self.monthly_
+               else np.round((np.concatenate([tx, tu]) - np.nanmin(ut)) / step))
         cand = []
         for c in cols:
             if c == tc:
@@ -294,6 +307,8 @@ class ForecastFeatures:
 
     # ------------------------------------------------------------ fitting
     def _periods(self, df):
+        if getattr(self, "monthly_", False):
+            return _months(_to_days(df[self.time_col_])) - self.m0_
         return np.round((_to_days(df[self.time_col_]) - self.t0_) / self.step_)
 
     def _keys(self, df, cols, vocab):
@@ -340,6 +355,7 @@ class ForecastFeatures:
         tx = _to_days(X[self.time_col_])
         tu = _to_days(X_unlabeled[self.time_col_])
         self.t0_ = float(np.nanmin(np.concatenate([tx, tu])))
+        self.m0_ = float(_months(np.array([self.t0_]))[0])
         px, pu = self._periods(X), self._periods(X_unlabeled)
         self.T_ = int(np.nanmax(px))
         h = pu - self.T_
@@ -395,7 +411,7 @@ class ForecastFeatures:
             self.windows_, self.season_, self.year_ = (1, 3, 7, 14, 28, 56, 112, 364), 7, 364
         elif abs(self.step_ - 7) < 1e-9:
             self.windows_, self.season_, self.year_ = (1, 2, 4, 8, 13, 26, 52), None, 52
-        elif 28 <= self.step_ <= 31:
+        elif self.monthly_:
             self.windows_, self.season_, self.year_ = (1, 2, 3, 6, 12), None, 12
         else:
             self.windows_, self.season_, self.year_ = (1, 2, 4, 8, 16), None, None
@@ -454,6 +470,10 @@ class ForecastFeatures:
             F["fc_woy"] = dt.isocalendar().week.to_numpy().astype(float)
             F["fc_month"] = dt.month.to_numpy()
             F["fc_year"] = dt.year.to_numpy()
+        elif self.monthly_:
+            m = self.m0_ + p_abs
+            F["fc_month"] = np.mod(m, 12) + 1
+            F["fc_year"] = np.floor(m / 12)
         E = self.ent_
         W = self.windows_
         for w in W:

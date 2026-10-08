@@ -71,3 +71,23 @@ def test_hourly_no_own_or_later_labels():
         F2 = ForecastFeatures(verbose=False, log_target=False).fit(X, y2, U).transform(X.iloc[[i]])
         assert np.allclose(np.nan_to_num(F.iloc[[i]].to_numpy(), nan=-1), np.nan_to_num(F2.to_numpy(), nan=-1), rtol=1e-5)
     assert f.transform(U)["fc_sameday1"].notna().mean() > 0.9
+
+
+def test_monthly_periods_and_no_own_or_later_labels():
+    rng = np.random.default_rng(3)
+    ms = pd.date_range("2018-01-01", periods=48, freq="MS")
+    df = pd.DataFrame([(e, t) for e in range(30) for t in ms], columns=["county", "month"])
+    y = 5 + df.county * 0.1 + np.arange(len(df)) % 48 * 0.05 + rng.normal(0, 0.1, len(df))
+    df["month"] = df.month.dt.strftime("%Y-%m-%d")
+    tr = (df.month < "2021-07-01").to_numpy()
+    X, U, y = df[tr].reset_index(drop=True), df[~tr].reset_index(drop=True), y[tr].to_numpy()
+    f = ForecastFeatures(verbose=False, log_target=False).fit(X, y, U)
+    assert f.active_ and f.monthly_ and (f.hmin_, f.hmax_) == (1, 6)
+    assert np.array_equal(np.unique(np.diff(np.unique(f._periods(df)))), [1])
+    F = f.transform(X)
+    p = f._periods(X)
+    for i in rng.choice(len(X), 10, replace=False):
+        y2 = y.copy()
+        y2[p >= p[i]] = y2[p >= p[i]] * 5 + 100
+        F2 = ForecastFeatures(verbose=False, log_target=False).fit(X, y2, U).transform(X.iloc[[i]])
+        assert np.allclose(np.nan_to_num(F.iloc[[i]].to_numpy(), nan=-1), np.nan_to_num(F2.to_numpy(), nan=-1), rtol=1e-5)

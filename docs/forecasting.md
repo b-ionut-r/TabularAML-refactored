@@ -10,7 +10,8 @@ builds those automatically. `scripts/contest_features.py` runs it before Feature
 
 From the data's structure only:
 
-- a date column (datetime or ISO date strings), daily or coarser;
+- a date column (datetime or ISO date strings): hourly, daily, weekly or monthly (one date per calendar month,
+  counted in months);
 - unlabeled rows (the test file) lying after the last labelled date (95%+ of them);
 - an entity key: the smallest set of code columns (1-3) under which (key, date) is unique,
   with rows repeating over time (a store, store x item).
@@ -104,6 +105,25 @@ Shuffled labels 1.7195 (constant 1.7192). The change: hourly timestamps switch t
 same hour of the week as the season (26 weeks of it), the same hour on the latest 1 / 7 days, hour and
 weekday fields, windows from 1 hour to 52 weeks, and training origins aligned to the test origin's hour of
 the week. Daily and weekly data take the same code path as before (M5 reproduces 0.75098 exactly).
+
+### GoDaddy Microbusiness Density Forecasting (Kaggle 2023, $60k): monthly data
+
+The contest's train and revealed-test months (2019-08 .. 2022-12, 3,135 counties, census columns joined by year)
+from the public Kaggle dataset `jjithin/business-density`; `scripts/godaddy_bench.py`: every county for the next
+6 months after a cut (window 0 ends on 2022-12, window 1 six months earlier); SMAPE of the density.
+
+| Windows | Raw | Blind (shipped defaults) | Calendar months | Last known value | Build |
+|---|---|---|---|---|---|
+| last 6 months / 6 before | 5.65 / 12.71 | 3.69 / 3.94 | **3.53 / 3.84** | 3.25 / 2.99 | 2 s |
+
+Shuffled labels 55.02 (constant 55.04). Blind, the family switched on but counted periods as 28 days (the
+shortest gap between month starts), so months drifted. The change counts one period per calendar month when
+every date falls in its own month; other cadences take the old path (M5 0.75098 and Walmart 1676 reproduce).
+
+Neither the raw columns nor the features beat carrying the last value forward: the density is close to a random
+walk, and a tree model predicting the level cannot place 3,135 counties' levels that precisely. Starting the
+judge from the last known value (`--base`, LightGBM's starting score, a modelling choice outside this family)
+scores 3.29 / 3.00, with early stopping after one tree: the features carry nothing beyond persistence here.
 
 ## Results (held-out windows built like each contest's test file; same judges as the benches)
 
