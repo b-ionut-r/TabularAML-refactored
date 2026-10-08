@@ -197,10 +197,13 @@ def main():
             rel_tr = pd.concat([rel_tr, Fa.iloc[:len(tr)].reset_index(drop=True)], axis=1)
             rel_te = pd.concat([rel_te, Fa.iloc[len(tr):].reset_index(drop=True)], axis=1)
         print(f"related tables: {rel_tr.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)
+        del A, both_main, children, keyed
 
     Xtr = tr.drop(columns=[a.id]) if a.id else tr
     Xte = te.drop(columns=[a.id]) if a.id else te
     Xte = Xte[Xtr.columns]
+    n_main = tr.shape[1]
+    del tr, te  # a second copy of both tables is gigabytes on IEEE-CIS
     if rel_tr is not None:
         # The search sees the related columns a quick model uses most; all are written out.
         import lightgbm as lgb
@@ -214,6 +217,7 @@ def main():
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
         Xtr = both[list(Xtr.columns) + top]
         Xte = pd.concat([Xte.reset_index(drop=True), rel_te[top]], axis=1)
+        del both, b
     forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **json.loads(a.forge_kw)).fit(Xtr, y, X_unlabeled=Xte)
     out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
     if rel_tr is not None:
@@ -228,7 +232,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     out_tr.to_parquet(out / "train_features.parquet")
     out_te.to_parquet(out / "test_features.parquet")
-    print(f"done in {time.time() - t0:.0f}s: {out_tr.shape[1] - tr.shape[1] - 1} columns added -> {out}/")
+    print(f"done in {time.time() - t0:.0f}s: {out_tr.shape[1] - n_main - 1} columns added -> {out}/")
 
 
 if __name__ == "__main__":

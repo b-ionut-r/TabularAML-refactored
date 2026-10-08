@@ -76,17 +76,41 @@ class Context:
         self.seed = seed
 
 
+# Each column of a frame is factorised once (codes + levels in order of appearance);
+# vocabularies and combined key codes are then built from its few levels instead of
+# re-hashing a million strings for every candidate that uses the column.
+_COL_CACHE: dict = {}
+
+
+def _col_codes(df: pd.DataFrame, c: str):
+    hit = _COL_CACHE.get((id(df), c))
+    if hit is not None and hit[0]() is df and hit[3] == len(df):
+        return hit[1], hit[2]
+    codes, levels = pd.factorize(_key_values(df[c]))
+    levels = pd.Index(levels)
+    codes = codes.astype(np.int32) if len(levels) < 2 ** 31 else codes
+    import weakref
+    if len(_COL_CACHE) > 1024:
+        _COL_CACHE.clear()
+    try:
+        _COL_CACHE[(id(df), c)] = (weakref.ref(df), codes, levels, len(df))
+    except TypeError:
+        pass
+    return codes, levels
+
+
 def _fit_vocab(df: pd.DataFrame, cols: Sequence[str]) -> List[pd.Index]:
-    return [pd.Index(pd.unique(_key_values(df[c]))) for c in cols]
+    return [_col_codes(df, c)[1] for c in cols]
 
 
 def _codes(df: pd.DataFrame, cols: Sequence[str], vocabs: List[pd.Index]) -> np.ndarray:
     """Combined int64 code of key columns; values unseen at fit time get their own code."""
     out = np.zeros(len(df), dtype=np.int64)
     for c, vocab in zip(cols, vocabs):
-        idx = vocab.get_indexer(_key_values(df[c]))
-        idx[idx < 0] = len(vocab)
-        out = out * (len(vocab) + 1) + idx
+        codes, levels = _col_codes(df, c)
+        pos = vocab.get_indexer(levels)  # each of the frame's levels in the vocabulary
+        pos[pos < 0] = len(vocab)
+        out = out * (len(vocab) + 1) + pos[codes]
     return out
 
 
@@ -512,9 +536,7 @@ class _MixedCodes:
                 out = out * (len(e) + 2) + idx
             else:
                 vocab = next(vocabs)
-                idx = vocab.get_indexer(_key_values(df[c]))
-                idx[idx < 0] = len(vocab)
-                out = out * (len(vocab) + 1) + idx
+                out = out * (len(vocab) + 1) + _codes(df, [c], [vocab])
         return out
 
 
@@ -550,7 +572,15 @@ class RowStat(Spec):
         self.name = f"row_{stat}__{label}"
 
     def transform(self, df, ctx):
-        M = df[self.parents].to_numpy(dtype=float)
+        # Row blocks: a wide family over a large frame (IEEE-CIS's 339 V columns over a
+        # million rows) is gigabytes as one float64 matrix, plus the nan-function copies.
+        step = max(1, 2_000_000 // max(len(self.parents), 1))
+        if len(df) <= step:
+            return self._stat(df[self.parents].to_numpy(dtype=float))
+        return np.concatenate([self._stat(df[self.parents].iloc[i:i + step].to_numpy(dtype=float))
+                               for i in range(0, len(df), step)])
+
+    def _stat(self, M):
         with np.errstate(all="ignore"):
             if self.stat == "sum":
                 return np.nansum(M, axis=1)
@@ -1856,7 +1886,7 @@ class FeatureForge:
     def _lgb_params(self, lr=0.1, threads=None, **kw):
         p = dict(_lgb_objective(self.task_, self.n_classes_), learning_rate=lr, num_leaves=31,
                  min_data_in_leaf=20, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-                 lambda_l2=1.0, verbosity=-1, seed=self.random_state,
+                 lambda_l2=1.0, verbosity=-1, seed=self.random_state, data_random_seed=self.random_state,
                  num_threads=threads or self._threads(), max_cat_to_onehot=8)
         p.update(kw)
         return p
@@ -1868,6 +1898,39 @@ class FeatureForge:
         b = lgb.train(self._lgb_params(lr), dtr, rounds, valid_sets=[dva],
                       callbacks=[lgb.early_stopping(es, verbose=False)])
         return b
+
+    @staticmethod
+    def _lgb_matrix(X: pd.DataFrame):
+        """Float32 matrix of a model frame, categoricals as their codes (missing -> NaN, as
+        LightGBM's pandas path encodes them), and the categorical column positions."""
+        M = np.empty((len(X), X.shape[1]), dtype=np.float32)
+        cats = []
+        for j, c in enumerate(X.columns):
+            s = X[c]
+            if isinstance(s.dtype, pd.CategoricalDtype):
+                cats.append(j)
+                k = s.cat.codes.to_numpy()
+                M[:, j] = np.where(k < 0, np.nan, k)
+            else:
+                M[:, j] = s.to_numpy(dtype=np.float32, na_value=np.nan)
+        return M, cats
+
+    def _lgb_data(self, X: pd.DataFrame, y, lr=0.1):
+        """One binned LightGBM dataset for a whole frame; folds train on its row subsets.
+        Binning once per frame instead of once per fold, from a float32 matrix instead of
+        float64 copies of each fold, is most of the search's memory and a fifth of its time."""
+        import lightgbm as lgb
+        M, cats = self._lgb_matrix(X)
+        D = lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr),
+                        free_raw_data=False).construct()
+        return M, D
+
+    def _fit_eval_rows(self, D, tr, va, lr=0.1, rounds=2000, es=50):
+        """``_fit_eval`` on row subsets of a dataset built by ``_lgb_data``."""
+        import lightgbm as lgb
+        dtr, dva = D.subset(np.sort(tr)), D.subset(np.sort(va))
+        return lgb.train(self._lgb_params(lr), dtr, rounds, valid_sets=[dva],
+                         callbacks=[lgb.early_stopping(es, verbose=False)])
 
     @staticmethod
     def _mine_paths(booster, names, pairs, triples, max_trees=300):
@@ -1925,11 +1988,21 @@ class FeatureForge:
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
         imp = pd.Series(0.0, index=X.columns)
         losses = []
+        specs = [sp for sp in (nested or {}).get("specs", []) if sp.out_names()[0] in X.columns]
+        M = D = None
+        if not specs:
+            M, D = self._lgb_data(X, y, lr)
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
             for f_i, (tr, va) in enumerate(folds):
+                if D is not None:
+                    b = self._fit_eval_rows(D, tr, va, lr=lr)
+                    oof[va] = b.predict(M[va], num_iteration=b.best_iteration, raw_score=True)
+                    imp += pd.Series(b.feature_importance("gain"), index=X.columns)
+                    if mine:
+                        self._mine_paths(b, list(X.columns), self.pair_gain_, self.triple_gain_)
+                    continue
                 Xtr, Xva = X.iloc[tr], X.iloc[va]
-                specs = [sp for sp in (nested or {}).get("specs", []) if sp.out_names()[0] in X.columns]
                 if specs:
                     Xtr, Xva = Xtr.copy(), Xva.copy()
                     for sp in specs:
@@ -2180,7 +2253,7 @@ class FeatureForge:
             return
         ids = sorted(self.id_cols_, key=lambda c: -imp.get(c, 0.0))[:2]
         keysets = [[k] for k in ids] or [[]]
-        WU = W if self.U_search_ is None else pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
+        WU = W if self.WU_ is None else self.WU_
         if self.lagged_te and ids:
             flags = [f for f in self.base_cols_ if f != t and f not in ids and f not in self.date_cols_
                      and 2 <= W[f].nunique() <= 7
@@ -2315,14 +2388,16 @@ class FeatureForge:
         # Label-free statistics (counts, group statistics, ...) over every row whose
         # features are known: search rows plus gate and unlabeled rows, as at the end.
         WU = None
-        if getattr(self, "U_search_", None) is not None:
-            WU = pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
+        if getattr(self, "WU_", None) is not None:
+            WU = self.WU_
             raw = set(self.raw_cols_)
+        spent: Dict[str, list] = {}
         for i, s in enumerate(specs):
             # Leave room in the budget for at least one CV fit of the screened candidates.
             if i % 20 == 0 and self._time_left() < getattr(self, "_cv_s", 0.0):
                 self._log(f"budget: screened {i} of {len(specs)} candidates")
                 break
+            t_s = time.time()
             try:
                 if s.target_dep:
                     v = s.fit_transform_oof(W, y, self.ctx_, folds)
@@ -2332,6 +2407,10 @@ class FeatureForge:
                     v = s.fit(W, y, self.ctx_).transform(W, self.ctx_)
             except Exception:
                 continue
+            finally:
+                st = spent.setdefault(type(s).__name__, [0, 0.0])
+                st[0] += 1
+                st[1] += time.time() - t_s
             v = np.asarray(v, dtype=np.float32)
             v2 = v if v.ndim == 2 else v[:, None]
             col = v2[:, 0]
@@ -2342,6 +2421,9 @@ class FeatureForge:
                 continue
             out[s.name] = v
         _CODE_CACHE.clear()  # factorised keys of large frames add up to gigabytes
+        _COL_CACHE.clear()
+        top = sorted(spent.items(), key=lambda kv: -kv[1][1])[:6]
+        self._log("  materialised: " + ", ".join(f"{k} {n}x {t:.0f}s" for k, (n, t) in top))
         return out
 
     # ------------------------------------------------------------ screening
@@ -2730,9 +2812,14 @@ class FeatureForge:
         if self.group_col_ is not None:
             gx = X[self.group_col_].astype(str).to_numpy()
             self._groups = {len(W): gx[idx_sel], n: gx}
-        self.U_search_ = None
+        self.U_search_ = self.WU_ = None
         if X_unlabeled is not None:
-            self.U_search_ = pd.concat([X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]], ignore_index=True)
+            # Search rows, then gate and unlabeled rows: every row whose raw features are known,
+            # built once for the label-free statistics of all rounds (the rows beyond the search
+            # rows are a view, not a second copy).
+            self.WU_ = pd.concat([W[self.raw_cols_], X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]],
+                                 ignore_index=True)
+            self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
         self.ctx_.extra_rows = self.U_search_
         # Small tables get repeated CV so that selection is not driven by fold noise.
         n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
@@ -2831,7 +2918,9 @@ class FeatureForge:
                 for j, col in enumerate(spec_by_name[nm].out_names()):
                     v = values[nm]
                     joint[col] = v if v.ndim == 1 else v[:, j]
-            b = self._fit_eval(joint.iloc[idx_a], yW[idx_a], joint.iloc[idx_b], yW[idx_b])
+            Mj, Dj = self._lgb_data(joint, yW)
+            b = self._fit_eval_rows(Dj, idx_a, idx_b)
+            del Mj, Dj
             gain = pd.Series(b.feature_importance("gain"), index=joint.columns)
             rank = sorted(survivors, key=lambda nm: -sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()))
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
@@ -2916,8 +3005,10 @@ class FeatureForge:
                 self.anchors_ = []
 
         # Refit every spec's statistics on all training rows.
-        self.U_search_ = None
+        self.U_search_ = self.WU_ = None
         self._fit_full(X, y_np, None if X_unlabeled is None else self._prep(X_unlabeled))
+        _CODE_CACHE.clear()
+        _COL_CACHE.clear()
         self.elapsed_ = time.time() - self._t0
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
         return self
@@ -3002,12 +3093,13 @@ class FeatureForge:
         def gate_loss(cols, recode=None):
             # A bag of differently seeded / early-stopped models: one model's
             # randomness otherwise flips keep-or-drop decisions on small gates.
-            A, G = self._model_frame(Fs[cols], recode), self._model_frame(Fg[cols], recode)
+            A, D = self._lgb_data(self._model_frame(Fs[cols], recode), ys, lr=0.05)
+            G, _ = self._lgb_matrix(self._model_frame(Fg[cols], recode))
             margin = 0.0
             for k, (tr, va) in enumerate(es_splits):
-                b = self._fit_eval(A.iloc[tr], ys[tr], A.iloc[va], ys[va], lr=0.05, es=100)
+                b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
                 # Refit on all search rows at the early-stopped size, then score the gate rows.
-                full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), lgb.Dataset(A, ys),
+                full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
             return _row_loss(self.task_, yg, margin)
