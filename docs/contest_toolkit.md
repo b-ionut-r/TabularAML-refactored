@@ -329,6 +329,11 @@ with `python scripts/ieee_fraud.py`.
 
 ## Related tables: Home Credit Default Risk (Kaggle 2018, $70k)
 
+**Kaggle private leaderboard (late submission, 2026-10-08).** `scripts/contest_features.py`
+at defaults with the five child tables, same bagged LightGBM for both arms: raw
+application table 0.750 public / 0.747 private, FeatureForge 0.800 / 0.794
+(+0.047 private; 68-minute feature build).
+
 `tabularaml.generate.relational.RelatedTables` aggregates child tables (and
 their children) onto the main table: within-row differences and ratios of
 same-unit columns (days late = paid day minus due day, paid / owed), then per
