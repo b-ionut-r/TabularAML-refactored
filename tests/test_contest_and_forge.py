@@ -297,3 +297,15 @@ def test_match_features_count_only_earlier_same_value_rows():
     assert F["tx__same_brand__all__n"].tolist() == [2, 0]  # customer 2's rows are on / after the date
     assert F["tx__same_brand__30d__n"].tolist() == [1, 0]
     assert F["tx__same_brand__all__amount_sum"].tolist() == [3.0, 0.0]
+
+
+def test_forge_search_respects_small_budget():
+    import time
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.normal(size=(20000, 8)), columns=[f"x{i}" for i in range(8)])
+    y = X.x0 / (X.x1.abs() + 0.5) + rng.normal(size=len(X)) * 0.1
+    t0 = time.time()
+    ff = FeatureForge(task="regression", time_budget=0.5, n_jobs=1, verbose=False).fit(X, y)
+    # No search round fits in the budget: base CV, then straight to the output.
+    assert ff.history_ == [] and ff.selected_ == []
+    assert time.time() - t0 < 60
