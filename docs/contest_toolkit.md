@@ -409,7 +409,9 @@ unlabeled row none of whose continuous values is unique among all known rows,
 flagged only when at least 90% of labelled rows do have a unique value and
 the unlabeled set lacks one clearly more often. On Santander it flags exactly
 the 100,000 rows the public rule finds; on IEEE-CIS, Home Credit and the 16
-suite tables checked it flags none. The resubmission is pending.
+suite tables checked it flags none. Resubmitted with the fix (ad001f8):
+FeatureForge 0.9205 public / 0.9176 private against raw 0.8979 / 0.8954,
++0.022 on the private board as the holdouts predicted; 28-minute feature build.
 
 Tried and left opt-in (`family_nb=True`): per-column out-of-fold target maps
 over (value band, value count) plus their sum, a naive-Bayes score. With the
