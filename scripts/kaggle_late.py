@@ -57,7 +57,10 @@ CONTESTS = {
     "m5": dict(slug="m5-forecasting-accuracy", target="sales", id="Id", task="regression", metric="rmse",
                folds="time", dates=["date"], writer="m5", lr=0.1, repo="/tmp/claude-0/wt_fc"),
     "fav": dict(slug="favorita-grocery-sales-forecasting", target="unit_sales", id="id", task="regression",
-                metric="rmse_log", folds="time", dates=["date"], log_target=True, lr=0.1, repo="/tmp/claude-0/wt_fc"),
+                metric="rmse_log", folds="time", dates=["date"], log_target=True, lr=0.1, max_rounds=1500, repo="/tmp/claude-0/wt_fc"),
+    # Full IEEE-CIS with the memory-lean FeatureForge (branch claude/faster-featureforge-e7d8eu, worktree).
+    "ieee_big": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
+                     folds="time", raw="ieee", repo="/tmp/claude-0/wt_big"),
     "hc": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                folds="kfold", child_models=True),
     "sct": dict(slug="santander-customer-transaction-prediction", target="target", id="ID_code", task="binary",
@@ -223,7 +226,7 @@ def cmd_prep(c: str):
     print(f"prep {c}: train {tr.shape} test {te.shape} tables {[ (k, v.shape) for k, v in tables.items()]}")
 
 
-FC_HISTORY = {"m5": 450, "fav": 112}  # days of labelled history the forecasting family reads (memory-bound)
+FC_HISTORY = {"m5": 450, "fav": 56}  # fav: 112 days ran out of memory (23.6M rows)  # days of labelled history the forecasting family reads (memory-bound)
 
 
 def cmd_fcfeats(c: str):
@@ -301,7 +304,7 @@ def judge(Xtr, y, Xte, cfg, groups=None, seeds=(0, 1, 2)):
     oof, pte = np.zeros(len(Xtr)), np.zeros(len(Xte))
     if cfg["folds"] == "time":  # early stop on the latest 15% of rows (rows sorted by time), refit per seed
         n = int(0.85 * len(Xtr))
-        b = lgb.train(dict(P, seed=0), lgb.Dataset(Xtr.iloc[:n], yt[:n]), 10000,
+        b = lgb.train(dict(P, seed=0), lgb.Dataset(Xtr.iloc[:n], yt[:n]), cfg.get("max_rounds", 10000),
                       valid_sets=[lgb.Dataset(Xtr.iloc[n:], yt[n:])], callbacks=[lgb.early_stopping(200, verbose=False)])
         oof[n:] = b.predict(Xtr.iloc[n:], num_iteration=b.best_iteration)
         for s in seeds:
@@ -367,6 +370,8 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
     cv = score(cfg["metric"], np.log1p(y[m]) if cfg.get("log_target") else y[m], oof[m])
     if cfg.get("log_target"):
         pte = np.expm1(pte).clip(0)
+    if cfg["task"] == "regression" and y.min() >= 0:  # non-negative target: no negative forecasts
+        pte = pte.clip(0)
     if cfg.get("closed_zero"):
         pte[te[cfg["closed_zero"]].to_numpy() == 0] = 0
     tag = arm + ("_" + "-".join(drop) if drop else "")
