@@ -58,6 +58,25 @@ def _is_date(s: pd.Series) -> bool:
     return pd.to_datetime(v, errors="coerce").notna().mean() > 0.95
 
 
+def _canon(s: pd.Series) -> pd.Series:
+    """Values as text, numbers read alike whether int or float (1 and 1.0; train and test
+    files often differ only in that)."""
+    if isinstance(s.dtype, pd.CategoricalDtype) or s.dtype == object:
+        num = pd.to_numeric(s.astype(object), errors="coerce")
+        if num.notna().sum() == s.notna().sum():
+            s = num
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+        return pd.Series(np.where(s.isna(), None, s.astype(float).astype(str)), index=s.index, dtype=object)
+    return s.astype(object).where(s.notna(), None).astype(str).where(s.notna(), None)
+
+
+def _keytext(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
+    key = _canon(df[cols[0]]).fillna("\x00")
+    for c in cols[1:]:
+        key = key + "\x1f" + _canon(df[c]).fillna("\x00")
+    return key
+
+
 def _codes(s: pd.Series) -> np.ndarray:
     return pd.factorize(s.astype(str) if isinstance(s.dtype, pd.CategoricalDtype) else s, use_na_sentinel=True)[0]
 
@@ -252,7 +271,7 @@ class ForecastFeatures:
             rate = 1 - vc.iloc[0]
             if rate < 0.001 or rate > 0.6:
                 continue
-            covs.append((rate, c, s.astype(str).value_counts().index[0]))
+            covs.append((rate, c, _canon(s).value_counts().index[0]))
         self.covariates_ = [(c, m) for _, c, m in sorted(covs, key=lambda t: -t[0])][: self.max_covariates]
         return None
 
@@ -263,13 +282,13 @@ class ForecastFeatures:
     def _keys(self, df, cols, vocab):
         if not cols:
             return np.zeros(len(df), dtype=np.int64)
-        key = df[cols].astype(str).agg("\x1f".join, axis=1) if len(cols) > 1 else df[cols[0]].astype(str)
+        key = _keytext(df, cols)
         return vocab.get_indexer(key)
 
     def _vocab(self, df, cols):
         if not cols:
             return None
-        key = df[cols].astype(str).agg("\x1f".join, axis=1) if len(cols) > 1 else df[cols[0]].astype(str)
+        key = _keytext(df, cols)
         return pd.Index(pd.unique(key))
 
     def fit(self, X: pd.DataFrame, y, X_unlabeled: Optional[pd.DataFrame] = None):
@@ -296,7 +315,7 @@ class ForecastFeatures:
         self.masked_ = []
         zero = np.isfinite(y) & (y == 0)
         for c, mode in self.covariates_:
-            ev = (X[c].astype(str) != mode).to_numpy() & X[c].notna().to_numpy()
+            ev = (_canon(X[c]) != mode).to_numpy() & X[c].notna().to_numpy()
             if ev.sum() >= 20 and zero[ev].mean() >= 0.99 and ev[zero].mean() >= 0.3:
                 self.masked_.append(c)
                 yt = np.where(ev, np.nan, yt)
@@ -338,7 +357,7 @@ class ForecastFeatures:
         oka = np.isfinite(pa) & (pa >= 0) & (ka >= 0)
         self.cov_ = []
         for c, mode in self.covariates_:
-            ev = (A[c].astype(str) != mode).to_numpy() & A[c].notna().to_numpy()
+            ev = (_canon(A[c]) != mode).to_numpy() & A[c].notna().to_numpy()
             M = np.zeros((ne, Pn), dtype=np.int8)       # 0 unknown, 1 no event, 2 event
             M[ka[oka], pa[oka].astype(np.int64)] = np.where(ev[oka], 2, 1)
             pos = np.flatnonzero((M == 2).ravel()).astype(np.int64)   # entity * Pn + period, sorted
