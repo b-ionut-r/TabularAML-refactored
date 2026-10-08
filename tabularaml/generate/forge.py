@@ -1746,7 +1746,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1782,6 +1782,9 @@ class FeatureForge:
         self.group_col = group_col
         self.text = text
         self.drop_synthetic = drop_synthetic
+        self.parity_check = parity_check
+        self.gate_families = gate_families
+        self.past_te = past_te
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1809,6 +1812,19 @@ class FeatureForge:
         if self.task_ == "regression":
             return list(KFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows)))
         return list(StratifiedKFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows), y))
+
+    def _te_folds(self, X: pd.DataFrame, y, seed, k: int = 8):
+        """Folds for out-of-fold target statistics. On time-ordered data each block of rows
+        is encoded from earlier blocks only (the first from the next one), as test rows are
+        encoded from the past: random folds hand a row its own period's labels through
+        neighbouring days, so models learn to trust encodings that the test period cannot
+        match (Rossmann's store target maps: search CV better, later weeks 57% worse)."""
+        t = getattr(self, "time_col_", None)
+        if t is None or not self.time_cv or self.past_te is False or t not in X.columns:
+            return self._folds(len(X), y, 5, seed)
+        order = np.argsort(X[t].to_numpy(dtype=float), kind="stable")
+        blocks = [np.sort(b) for b in np.array_split(order, k)]
+        return [(blocks[1], blocks[0])] + [(np.sort(np.concatenate(blocks[:i])), blocks[i]) for i in range(1, k)]
 
     def _model_frame(self, X: pd.DataFrame, recode: Optional[bool] = None) -> pd.DataFrame:
         """Model view of a frame: categoricals as ``category`` dtype, or, when the
@@ -1889,7 +1905,7 @@ class FeatureForge:
         if ck not in self._nested_cache:
             import copy
             s = copy.copy(spec)
-            inner = self._folds(len(tr), y[tr], 5, self.random_state + 7)
+            inner = self._te_folds(W.iloc[tr], y[tr], self.random_state + 7)
             vt = s.fit_transform_oof(W.iloc[tr].reset_index(drop=True), y[tr], self.ctx_, inner)
             vv = s.transform(W.iloc[va].reset_index(drop=True), self.ctx_)
             self._nested_cache[ck] = (np.asarray(vt, dtype=np.float32), np.asarray(vv, dtype=np.float32))
@@ -1940,8 +1956,14 @@ class FeatureForge:
 
         time_keys = {self.time_col_, self.group_col_, *self.date_cols_, *getattr(self, "time_like_", [])} - {None}
 
+        time_cols = {self.time_col_, *self.date_cols_} - {None}
+
         def add(spec):
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
+                return
+            # A group's statistic of the date itself (deviation of a row's date from its group's
+            # mean date) only tracks where the group sits in time; it drifts by construction.
+            if isinstance(spec, GroupStat) and spec.parents[-1] in time_cols:
                 return
             if spec.name not in existing:
                 existing.add(spec.name)
@@ -2709,7 +2731,7 @@ class FeatureForge:
         # Small tables get repeated CV so that selection is not driven by fold noise.
         n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
         folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
-        te_folds = self._folds(len(W), yW, 5, self.random_state + 1)
+        te_folds = self._te_folds(W, yW, self.random_state + 1)
         # Screening split (A trains the residual boosters, B measures them).
         try:
             idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
@@ -2857,6 +2879,9 @@ class FeatureForge:
         values = joint = cands = None
         import gc
         gc.collect()
+        if self.parity_check and X_unlabeled is not None and len(idx_gate) and self.selected_:
+            self.selected_ = selected = self._parity_filter(X.iloc[idx_gate].reset_index(drop=True),
+                                                            self._prep(X_unlabeled)[self.raw_cols_], self.selected_)
         self.gate_passed_ = None
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
@@ -2880,6 +2905,60 @@ class FeatureForge:
         self.elapsed_ = time.time() - self._t0
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
         return self
+
+    def _parity_filter(self, G, U, specs, max_rows=50_000):
+        """Drop features distributed differently on the unlabeled rows (the test file) than on
+        the latest labelled rows: a missing rate that differs by over 0.2, or a two-sample KS
+        statistic above max(0.5, twice the largest of the raw columns' own). "Days until the
+        next holiday" is known for training rows but missing near the end of a test period;
+        counts over a test file built differently from the training file drift the same way.
+        Later specs that use a dropped spec's output are dropped with it."""
+        rng = np.random.default_rng(self.random_state)
+        if len(G) > max_rows:
+            G = G.iloc[np.sort(rng.choice(len(G), max_rows, replace=False))].reset_index(drop=True)
+        if len(U) > max_rows:
+            U = U.iloc[np.sort(rng.choice(len(U), max_rows, replace=False))].reset_index(drop=True)
+        G, U = G.copy(), U.copy()
+
+        def ks(a, b):
+            a, b = a[np.isfinite(a)], b[np.isfinite(b)]
+            if len(a) < 20 or len(b) < 20:
+                return 0.0
+            grid = np.unique(np.concatenate([a, b]))
+            fa = np.searchsorted(np.sort(a), grid, side="right") / len(a)
+            fb = np.searchsorted(np.sort(b), grid, side="right") / len(b)
+            return float(np.max(np.abs(fa - fb)))
+
+        raw_ks = [ks(G[c].to_numpy(dtype=float), U[c].to_numpy(dtype=float)) for c in self.raw_cols_
+                  if c not in self.cat_cols_ and c != self.time_col_ and c not in getattr(self, "date_cols_", [])
+                  and pd.api.types.is_numeric_dtype(G[c])]
+        limit = max(0.5, 2 * float(np.max(raw_ks))) if raw_ks else 0.5
+        kept, dropped = [], []
+        for s in specs:
+            try:
+                vg, vu = s.transform(G, self.ctx_), s.transform(U, self.ctx_)
+            except KeyError:  # built on a dropped spec's output
+                dropped.append((s.name, "parent dropped"))
+                continue
+            vg = np.asarray(vg, dtype=float).reshape(len(G), -1)
+            vu = np.asarray(vu, dtype=float).reshape(len(U), -1)
+            bad = None
+            for j in range(vg.shape[1]):
+                d_na = abs(np.isnan(vg[:, j]).mean() - np.isnan(vu[:, j]).mean())
+                k = ks(vg[:, j], vu[:, j])
+                if d_na > 0.2 or k > limit:
+                    bad = f"missing {np.isnan(vg[:, j]).mean():.2f} vs {np.isnan(vu[:, j]).mean():.2f}, KS {k:.2f}"
+                    break
+            if bad:
+                dropped.append((s.name, bad))
+                continue
+            kept.append(s)
+            for j, col in enumerate(s.out_names()):
+                G[col], U[col] = vg[:, j], vu[:, j]
+        for name, why in dropped:
+            self._log(f"parity: dropped {name} ({why} on latest labelled vs unlabeled rows)")
+        self.parity_dropped_ = [d[0] for d in dropped]
+        return kept
 
     def _gate(self, X, y, idx_sel, idx_gate, W):
         """Score raw vs. engineered feature sets on the held-out gate rows.
@@ -2948,12 +3027,57 @@ class FeatureForge:
             self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
+        if best_set is None and self.gate_families:
+            best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
         return best_set, raw_l, best_l
+
+    def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
+        """When the whole set fails the gate, drop feature families (target encodings, group
+        statistics, event recencies, ...) one at a time, each time the one whose removal helps
+        the gate rows most, and keep the best remaining set if it clears the gate by one more
+        standard error than usual (the families were chosen on the gate rows). One family
+        that does not carry over to later periods, e.g. Rossmann's target encodings, no
+        longer sinks the others."""
+        def fam(sp):
+            return type(sp).__name__
+
+        def closed(specs):
+            # Keep only specs whose inputs are raw columns or outputs of kept specs.
+            have = set(self.raw_cols_)
+            out = []
+            for sp in specs:
+                if all(p in have for p in sp.parents):
+                    out.append(sp)
+                    have.update(sp.out_names())
+            return out
+
+        def score(specs):
+            rows = gate_loss(self.raw_cols_ + [c for sp in specs for c in sp.out_names()])
+            d = raw_rows - rows
+            lo, hi = np.quantile(d, [0.01, 0.99])
+            dw = np.clip(d, lo, hi)
+            return float(rows.mean()), float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
+
+        cur = closed(list(self.selected_))
+        while len({fam(sp) for sp in cur}) > 1:
+            trials = []
+            for f in sorted({fam(sp) for sp in cur}):
+                rest = closed([sp for sp in cur if fam(sp) != f])
+                if rest:
+                    trials.append((score(rest), f, rest))
+            if not trials:
+                break
+            (l, z), f, rest = min(trials, key=lambda t: t[0][0])
+            self._log(f"  gate without {f}: loss={l:.6f} vs raw {raw_rows.mean():.6f} (z={z:+.2f}, need {z_needed + 1:.2f})")
+            cur = rest
+            if l < best_l and z >= z_needed + 1:
+                best_set, best_l = list(cur), l
+        return best_set, best_l
 
     def _fit_full(self, X, y, U=None):
         if self.recode_:
             self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
-        folds = self._folds(len(X), y, 5, self.random_state + 1)
+        folds = self._te_folds(X, y, self.random_state + 1)
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy()
         U = None if U is None else U[self.raw_cols_].copy()

@@ -329,6 +329,11 @@ with `python scripts/ieee_fraud.py`.
 
 ## Related tables: Home Credit Default Risk (Kaggle 2018, $70k)
 
+**Kaggle private leaderboard (late submission, 2026-10-08).** `scripts/contest_features.py`
+at defaults with the five child tables, same bagged LightGBM for both arms: raw
+application table 0.750 public / 0.747 private, FeatureForge 0.800 / 0.794
+(+0.047 private; 68-minute feature build).
+
 `tabularaml.generate.relational.RelatedTables` aggregates child tables (and
 their children) onto the main table: within-row differences and ratios of
 same-unit columns (days late = paid day minus due day, paid / owed), then per
@@ -409,7 +414,9 @@ unlabeled row none of whose continuous values is unique among all known rows,
 flagged only when at least 90% of labelled rows do have a unique value and
 the unlabeled set lacks one clearly more often. On Santander it flags exactly
 the 100,000 rows the public rule finds; on IEEE-CIS, Home Credit and the 16
-suite tables checked it flags none. The resubmission is pending.
+suite tables checked it flags none. Resubmitted with the fix (ad001f8):
+FeatureForge 0.9205 public / 0.9176 private against raw 0.8979 / 0.8954,
++0.022 on the private board as the holdouts predicted; 28-minute feature build.
 
 Tried and left opt-in (`family_nb=True`): per-column out-of-fold target maps
 over (value band, value count) plus their sum, a naive-Bayes score. With the
@@ -790,9 +797,9 @@ averaged over a slot family, weighted by the paired quantities).
 | Raw quote columns | 0.2275 | 0.2401 |
 | FeatureForge on the quote table (slot features on) | 0.2275 (gate keeps raw) | 0.2401 (gate keeps raw) |
 | Hand-made tube and component features (reference) | 0.2194 | 0.2354 |
-| **contest_features.py on all 21 tables** | **0.2243** | pending |
+| **contest_features.py on all 21 tables** | **0.2243** | **0.2389** |
 | Same, training labels shuffled (control) | 0.8243 | |
 
-The lookup joins give -1.4% on seed 0; FeatureForge's own search adds nothing
+The lookup joins give -1.4% / -0.5% (mean 0.2316 vs 0.2338 raw, 5-10 min); FeatureForge's own search adds nothing
 on top (the gate keeps the joined columns). Hand-made features still win.
 

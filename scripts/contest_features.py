@@ -18,6 +18,7 @@ rows count (``asof_features``). Writes ``train_features.parquet`` and ``test_fea
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -29,16 +30,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
-                                             lookup_features)
+                                             lookup_features, match_features)
 
 TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
 
 
 def read(path: str) -> pd.DataFrame:
-    df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)
+    df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path, low_memory=False)
     for c in df.columns:
         if df[c].dtype == object:
-            df[c] = df[c].astype("category")
+            # Mixed 0 / "0" (pandas reads a CSV column chunk by chunk) become one level.
+            df[c] = df[c].where(df[c].isna(), df[c].astype(str)).astype("category")
         elif df[c].dtype == np.float64:
             df[c] = df[c].astype(np.float32)
     return df
@@ -64,6 +66,35 @@ def parse_table(spec: str, main: pd.DataFrame, id_col: str | None) -> Child:
     drop = [c for c in df.columns if c != key and (c.upper().startswith(("SK_ID", "ID_")) or c.lower().endswith("_id"))]
     print(f"table {name}: {df.shape}, key={key}, time={tcol}, ignored ids={drop}", flush=True)
     return Child(name, df, key=key, time=tcol, drop=[c for c in drop if c != key])
+
+
+def date_col(df: pd.DataFrame) -> str | None:
+    """The first text column holding calendar dates (2013-04-22, 2016-01-01 19:00:00)."""
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        v = df[c].dropna().astype(str).head(1000)
+        if len(v) and v.str.match(r"^\d{4}-\d{2}-\d{2}").mean() > 0.95:
+            return c
+    return None
+
+
+def match_cols(main: pd.DataFrame, ch: Child) -> list[str]:
+    """Code columns a child shares with the main table besides the key (category, brand, company):
+    integer or text codes with 20+ levels whose main-table values mostly occur in the child."""
+    out = []
+    for c in ch.df.columns:
+        if c == ch.key or c == ch.time or c in ch.drop or c not in main.columns or any(h in c.lower() for h in TIME_HINTS):
+            continue
+        s = ch.df[c]
+        if pd.api.types.is_float_dtype(s) and not np.all(np.mod(s.dropna().to_numpy()[:10000], 1) == 0):
+            continue
+        if s.nunique() < 20:
+            continue
+        vals = pd.unique(main[c].dropna().astype(str))
+        if len(vals) and np.isin(vals, pd.unique(s.dropna().astype(str))).mean() >= 0.5:
+            out.append(c)
+    return out
 
 
 def main_time(main: pd.DataFrame, ch: Child, given: str | None) -> str | None:
@@ -92,6 +123,7 @@ def main():
     ap.add_argument("--top-related", type=int, default=200,
                     help="related-table columns handed to FeatureForge's search (all are kept in the output)")
     ap.add_argument("--out-dir", default="features")
+    ap.add_argument("--forge-kw", default="{}", help="JSON of extra FeatureForge arguments")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -141,6 +173,22 @@ def main():
                 Fk[c] = Fk[c].fillna(0)
             A.insert(0, Fk)
         rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
+        # Child rows that also share the main row's code values (a customer's purchases of the
+        # offer's brand), counted before the main row's date when both tables carry dates.
+        mt = date_col(both_main)
+        for ch in keyed + [ch for ch in children if ch.name in asof]:
+            cols = match_cols(both_main, ch)
+            if not cols:
+                continue
+            ct = ch.time if ch.time is not None else date_col(ch.df.drop(columns=[ch.key]))
+            if both_main[ch.key].duplicated().any() and (mt is None or ct is None):
+                continue  # repeated keys without dates could match a row's own later events
+            chm = Child(ch.name, ch.df, key=ch.key, time=ct, drop=ch.drop)
+            t = time.time()
+            Mf = match_features(both_main, ch.key, chm, cols, main_time=mt if ct is not None else None)
+            print(f"table {ch.name}: same-{'/'.join(cols)} matches{' before ' + mt if mt and ct else ''}: "
+                  f"{Mf.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+            A.append(Mf)
         for lk in lookups:
             L = lookup_features(both_main, lk.df, lk.key, lk.name)
             print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
@@ -166,7 +214,7 @@ def main():
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
         Xtr = both[list(Xtr.columns) + top]
         Xte = pd.concat([Xte.reset_index(drop=True), rel_te[top]], axis=1)
-    forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target).fit(Xtr, y, X_unlabeled=Xte)
+    forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **json.loads(a.forge_kw)).fit(Xtr, y, X_unlabeled=Xte)
     out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
     if rel_tr is not None:
         rest = [c for c in rel_tr.columns if c not in out_tr.columns]

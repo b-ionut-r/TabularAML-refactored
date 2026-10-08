@@ -414,3 +414,47 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
     res.columns = [_safe(c) for c in res.columns]
     keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
     return res[keep].astype(np.float32)
+
+
+def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
+                   main_time: Optional[str] = None, windows: Sequence[int] = (30, 90, 180)) -> pd.DataFrame:
+    """Child rows of the same key that also share a main row's value in other columns.
+
+    A customer's purchases in the offer's category, from its company, of its brand (Acquire
+    Valued Shoppers); a user's past orders of the row's product. For every column the child
+    shares with the main table besides the key: the number of matching child rows and the sum
+    of each numeric child column over them, all-time and, when the main row has a date and the
+    child a time, over the last ``windows`` days before that date (child rows dated on or after
+    it are left out). One output row per main row; label-free.
+    """
+    out = pd.DataFrame(index=main.index)
+    df = ch.df
+    nums = [c for c in df.columns if c not in (key, ch.time) and c not in cols and c not in ch.drop
+            and pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 2][:4]
+    t_child = t_main = None
+    if main_time is not None and ch.time is not None:
+        t_child = pd.to_datetime(df[ch.time].astype(str), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
+        t_main = pd.to_datetime(main[main_time].astype(str), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
+    rows = pd.DataFrame({"__r": np.arange(len(main)), key: main[key].to_numpy()})
+    for c in cols:
+        rows[c] = main[c].to_numpy()
+        j = df[[key, c] + nums].copy()
+        if t_child is not None:
+            j["__t"] = t_child
+        m = rows[["__r", key, c]].merge(j, on=[key, c], how="inner")
+        if t_child is not None:
+            m["__age"] = t_main[m["__r"].to_numpy()] - m["__t"].to_numpy()
+            m = m[m["__age"] > 0]
+        spans = [("all", None)] + ([(f"{w}d", w) for w in windows] if t_child is not None else [])
+        for lab, w in spans:
+            mm = m if w is None else m[m["__age"] <= w]
+            g = mm.groupby("__r")
+            base = f"{ch.name}__same_{_safe(c)}__{lab}"
+            out[base + "__n"] = g.size().reindex(np.arange(len(main))).fillna(0).to_numpy(dtype=np.float32)
+            for v in nums:
+                out[f"{base}__{_safe(v)}_sum"] = g[v].sum().reindex(np.arange(len(main))).fillna(0).to_numpy(dtype=np.float32)
+        if t_child is not None:
+            last = m.groupby("__r")["__age"].min().reindex(np.arange(len(main)))
+            out[f"{ch.name}__same_{_safe(c)}__days_since"] = last.to_numpy(dtype=np.float32)
+        del m, j
+    return out

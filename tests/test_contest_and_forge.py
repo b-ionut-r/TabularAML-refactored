@@ -285,3 +285,15 @@ def test_synthetic_unlabeled_rows_detected():
     m = synthetic_rows(X, U)
     assert m[1500:].all() and m[:1500].mean() < 0.02
     assert not synthetic_rows(X, real).any()
+
+
+def test_match_features_count_only_earlier_same_value_rows():
+    from tabularaml.generate.relational import Child, match_features
+    main = pd.DataFrame({"id": [1, 2], "brand": [10, 20], "offerdate": ["2013-04-10", "2013-04-10"]})
+    tx = pd.DataFrame({"id": [1, 1, 1, 2, 2], "brand": [10, 10, 30, 20, 20],
+                       "date": ["2013-04-01", "2013-01-01", "2013-04-02", "2013-04-10", "2013-04-20"],
+                       "amount": [1.0, 2.0, 4.0, 8.0, 16.0]})
+    F = match_features(main, "id", Child("tx", tx, key="id", time="date"), ["brand"], main_time="offerdate", windows=(30,))
+    assert F["tx__same_brand__all__n"].tolist() == [2, 0]  # customer 2's rows are on / after the date
+    assert F["tx__same_brand__30d__n"].tolist() == [1, 0]
+    assert F["tx__same_brand__all__amount_sum"].tolist() == [3.0, 0.0]
