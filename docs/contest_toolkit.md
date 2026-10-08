@@ -680,3 +680,29 @@ On 2013 FeatureForge beats every hand-made set (picks: counts per date x heat
 x species, precipitation spread per weather code). On 2011 (two training
 years) the gate finds nothing that carries over. Trailing weather means hurt
 with three or fewer training seasons.
+
+## Event logs: Data Science Bowl 2019 (Kaggle, $160k)
+
+`scripts/dsb_bench.py` (data: Hugging Face `pytorch-lifestream/datascience-bowl2019`).
+Main rows: the 17,690 labelled assessments (installation, title, world, start
+time); child: 11.3M game events (event_data JSON left out). Holdout: 20% of
+installations (the contest's test children are new), two seeds. Metric:
+quadratic weighted kappa with thresholds matching the training class shares.
+
+| Columns | Seed 0 | Seed 1 | Mean |
+|---|---|---|---|
+| Raw (assessment title, world, start) | 0.431 | 0.431 | 0.431 |
+| FeatureForge on raw (blind) | 0.431 (gate rejects) | 0.431 | 0.431 |
+| As-of event aggregations | 0.544 | 0.576 | 0.560 |
+| **As-of + FeatureForge** | **0.583** | **0.604** | **0.594** |
+
+`asof_features` (tabularaml/generate/relational.py) aggregates a child event
+table as of each main row: only the same key's events strictly before the
+row's time. Count, time since first / last event, mean / sum / max / min / std
+of numerics and their mean over the last 5 / 20 events, shares of frequent
+levels (and counts over the last 5), distinct levels; prefix sums over the
+child sorted by (key, time), 60 s for 11.3M events. `scripts/contest_features.py`
+switches it on by itself when the main table has several rows per child key and
+a time column comparable to the child's. FeatureForge then detects the new
+installations (grouped validation) and adds differences of event-code shares
+(attempts minus completions) and title-conditioned target maps of them.

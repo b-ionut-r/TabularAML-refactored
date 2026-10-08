@@ -10,7 +10,10 @@ Features only; train any AutoML (AutoGluon, ...) on the outputs.
 Each ``--table name=path[:key[:time]]`` is a child table. The key defaults to the
 main table's id column (or the one column it shares with the main table); the
 time column defaults to the first column named like a date or a day/month
-count. Writes ``train_features.parquet`` and ``test_features.parquet``.
+count. When the main table has several rows per key (assessments of a player,
+orders of a user) and a time column comparable to the child's (the same name,
+or ``--time``), the child is aggregated as of each main row: only its earlier
+rows count (``asof_features``). Writes ``train_features.parquet`` and ``test_features.parquet``.
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
-from tabularaml.generate.relational import Child, RelatedTables, child_model_features  # noqa: E402
+from tabularaml.generate.relational import Child, RelatedTables, asof_features, child_model_features  # noqa: E402
 
 TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
 
@@ -59,6 +62,17 @@ def parse_table(spec: str, main: pd.DataFrame, id_col: str | None) -> Child:
     return Child(name, df, key=key, time=tcol, drop=[c for c in drop if c != key])
 
 
+def main_time(main: pd.DataFrame, ch: Child, given: str | None) -> str | None:
+    """The main table's column that is comparable with the child's time column."""
+    if given:
+        return given
+    if ch.time in main.columns:
+        return ch.time
+    cands = [c for c in main.columns if pd.api.types.is_numeric_dtype(main[c])
+             and any(h in c.lower() for h in TIME_HINTS)]
+    return cands[0] if len(cands) == 1 else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True)
@@ -66,6 +80,7 @@ def main():
     ap.add_argument("--target", required=True)
     ap.add_argument("--id", default=None)
     ap.add_argument("--table", action="append", default=[], help="name=path[:key[:time]]")
+    ap.add_argument("--time", default=None, help="main-table time column for as-of aggregation (default: auto)")
     ap.add_argument("--child-models", action="store_true", help="add out-of-fold child-row model features")
     ap.add_argument("--task", default=None, choices=["regression", "binary", "multiclass"])
     ap.add_argument("--budget", type=float, default=900, help="FeatureForge time budget (s)")
@@ -82,19 +97,35 @@ def main():
     rel_tr = rel_te = None
     if a.table:
         children = [parse_table(s, tr, a.id) for s in a.table]
-        F = RelatedTables(children).features()
+        both_main = pd.concat([tr, te[[c for c in tr.columns if c in te.columns]]], ignore_index=True)
+        asof = {ch.name: main_time(tr, ch, a.time) for ch in children
+                if ch.time is not None and ch.key in tr.columns and tr[ch.key].duplicated().any()}
+        asof = {k: v for k, v in asof.items() if v is not None}
+        keyed = [ch for ch in children if ch.name not in asof]
+        F = RelatedTables(keyed).features() if keyed else pd.DataFrame(index=pd.Index([], name=a.id))
+        A = []
+        for ch in children:
+            if ch.name in asof:
+                print(f"table {ch.name}: as of {asof[ch.name]} per main row", flush=True)
+                A.append(asof_features(both_main, ch.key, asof[ch.name], ch))
         if a.child_models:
             task = a.task or ("binary" if y.nunique() == 2 else "regression")
             obj = "binary" if task == "binary" else "regression"
             yk = pd.Series(y.to_numpy(), index=ids_tr)
-            for ch in children:
+            for ch in keyed:  # as-of children would see later rows' outcomes
                 t = time.time()
                 F = F.join(child_model_features(ch, yk, ids_te, task=obj), how="outer")
                 print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
-        rel_tr, rel_te = F.reindex(ids_tr).reset_index(drop=True), F.reindex(ids_te).reset_index(drop=True)
+        if a.id is None or not keyed:
+            rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
+        else:
+            rel_tr, rel_te = F.reindex(ids_tr).reset_index(drop=True), F.reindex(ids_te).reset_index(drop=True)
+        for Fa in A:
+            rel_tr = pd.concat([rel_tr, Fa.iloc[:len(tr)].reset_index(drop=True)], axis=1)
+            rel_te = pd.concat([rel_te, Fa.iloc[len(tr):].reset_index(drop=True)], axis=1)
         for c in [c for c in F.columns if c.endswith("__count")]:
             rel_tr[c], rel_te[c] = rel_tr[c].fillna(0), rel_te[c].fillna(0)
-        print(f"related tables: {F.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)
+        print(f"related tables: {rel_tr.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)
 
     Xtr = tr.drop(columns=[a.id]) if a.id else tr
     Xte = te.drop(columns=[a.id]) if a.id else te

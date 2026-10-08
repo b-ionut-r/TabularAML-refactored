@@ -245,3 +245,97 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
         res["last"] = last
     res.columns = [_safe(f"{ch.name}:model_{c}") for c in res.columns]
     return res.astype(np.float32)
+
+
+def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Sequence[int] = (5, 20),
+                  top_levels: int = 12, stats: Sequence[str] = ("mean", "sum", "max", "min", "std")) -> pd.DataFrame:
+    """Aggregations of a child event table as of each main row's time: only child rows of
+    the same key strictly before ``main[time]`` count, so a main row with several labelled
+    moments per entity (assessments of a player, orders of a user) sees exactly the
+    history available then, as a test row will.
+
+    Per main row: number of earlier events, time since the first and the last; mean /
+    sum / max / min / std of each numeric child column over all earlier events and the
+    mean over the last ``recent`` ones; share of earlier events at each frequent level of
+    each categorical column, their count over the last ``recent[0]``, and the number of
+    distinct levels seen. Computed with prefix sums over the child sorted by (key, time),
+    so the cost is O((rows + events) log) whatever the number of main rows per key.
+    Returns a frame aligned with ``main``'s rows. Label-free.
+    """
+    df = ch.df
+    keys = pd.Index(pd.unique(main[key]))
+    ck = keys.get_indexer(df[key])
+    keep = ck >= 0
+    df, ck = df.loc[keep], ck[keep]
+    ct = df[ch.time].to_numpy(dtype=float)
+    mk = keys.get_indexer(main[key])
+    mt = main[time].to_numpy(dtype=float)
+    # Positions in the child sorted by (key, time): a time rank over child and main times
+    # makes the pair one sortable integer.
+    allt = np.unique(np.concatenate([ct[np.isfinite(ct)], mt[np.isfinite(mt)]]))
+    big = len(allt) + 2
+    crank = np.searchsorted(allt, ct) + 1
+    order = np.lexsort((crank, ck))
+    cs = ck[order].astype(np.int64) * big + crank[order]
+    q = mk.astype(np.int64) * big + (np.searchsorted(allt, mt) + 1)
+    p = np.searchsorted(cs, q, side="left")                   # first event at or after the row's time
+    lo = np.searchsorted(cs, mk.astype(np.int64) * big, side="left")
+    n = (p - lo).astype(np.float64)
+    has = n > 0
+    out = {}
+    pre = _safe(ch.name)
+    out[f"{pre}__n"] = n
+    ts = ct[order]
+    with np.errstate(all="ignore"):
+        out[f"{pre}__since_last"] = np.where(has, mt - ts[np.maximum(p - 1, 0)], np.nan)
+        out[f"{pre}__since_first"] = np.where(has, mt - ts[np.minimum(lo, len(ts) - 1)], np.nan)
+
+    def prefix(v):
+        return np.concatenate([[0.0], np.cumsum(v, dtype=np.float64)])
+
+    def window(S, a, b):
+        return S[b] - S[a]
+
+    ids = {key, ch.time, *ch.drop}
+    feats = [c for c in df.columns if c not in ids]
+    cats = [c for c in feats if df[c].dtype == object or isinstance(df[c].dtype, pd.CategoricalDtype)
+            or pd.api.types.is_string_dtype(df[c]) or df[c].dtype == bool]
+    num = [c for c in feats if c not in cats and pd.api.types.is_numeric_dtype(df[c])]
+    blk = ck[order]
+    for c in num:
+        x = df[c].to_numpy(dtype=float)[order]
+        ok = np.isfinite(x)
+        xz = np.where(ok, x, 0.0)
+        S, S2, N = prefix(xz), prefix(xz ** 2), prefix(ok.astype(float))
+        m = window(N, lo, p)
+        with np.errstate(all="ignore"):
+            mean = window(S, lo, p) / m
+            if "mean" in stats:
+                out[f"{pre}__{c}_mean"] = mean
+            if "sum" in stats:
+                out[f"{pre}__{c}_sum"] = window(S, lo, p)
+            if "std" in stats:
+                out[f"{pre}__{c}_std"] = np.sqrt(np.maximum(window(S2, lo, p) / m - mean ** 2, 0))
+            for k in recent:
+                a = np.maximum(lo, p - k)
+                out[f"{pre}__{c}_last{k}"] = window(S, a, p) / window(N, a, p)
+        for st, fn in (("max", np.fmax), ("min", np.fmin)):
+            if st in stats:
+                s = pd.Series(np.where(ok, x, np.nan))
+                cum = (s.groupby(blk).cummax() if st == "max" else s.groupby(blk).cummin()).to_numpy()
+                out[f"{pre}__{c}_{st}"] = np.where(has, cum[np.maximum(p - 1, 0)], np.nan)
+    for c in cats:
+        s = df[c].astype(str).to_numpy()[order]
+        for lv in pd.Series(s).value_counts().index[:top_levels]:
+            S = prefix((s == lv).astype(float))
+            with np.errstate(all="ignore"):
+                out[f"{pre}__{c}={lv}_share"] = window(S, lo, p) / n
+            a = np.maximum(lo, p - recent[0])
+            out[f"{pre}__{c}={lv}_last{recent[0]}"] = window(S, a, p)
+        first = ~pd.DataFrame({"k": blk, "v": s}).duplicated().to_numpy()
+        out[f"{pre}__{c}_nunique"] = window(prefix(first.astype(float)), lo, p)
+    res = pd.DataFrame(out, index=main.index)
+    res.columns = [_safe(c) for c in res.columns]
+    res = res.loc[:, ~res.columns.duplicated()]
+    keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
+    return res[keep].astype(np.float32)

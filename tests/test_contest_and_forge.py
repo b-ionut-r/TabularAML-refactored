@@ -259,3 +259,15 @@ def test_free_text_detection_and_word_model():
     folds = list(KFold(5, shuffle=True, random_state=0).split(df))
     v = TextLinearOOF(["t"], 0, chars=False).fit_transform_oof(df, y, Context("regression", 0, 0), folds)
     assert np.corrcoef(v, y)[0, 1] > 0.9
+
+
+def test_asof_features_use_only_earlier_events():
+    from tabularaml.generate.relational import Child, asof_features
+    ev = pd.DataFrame({"u": ["a", "a", "a", "b"], "t": [1, 2, 5, 1], "v": [10.0, 20.0, 30.0, 1.0],
+                       "k": ["x", "y", "x", "x"]})
+    main = pd.DataFrame({"u": ["a", "a", "b", "c"], "t": [2, 6, 1, 9]})
+    F = asof_features(main, "u", "t", Child("ev", ev, key="u", time="t"), recent=(1, 2))
+    np.testing.assert_allclose(F["ev__n"], [1, 3, 0, 0])
+    np.testing.assert_allclose(F["ev__v_mean"].to_numpy()[:2], [10, 20])
+    np.testing.assert_allclose(F["ev__v_last2"].to_numpy()[:2], [10, 25])
+    assert np.isnan(F["ev__v_mean"].to_numpy()[2])
