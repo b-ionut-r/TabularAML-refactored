@@ -168,6 +168,19 @@ def X_nunique(df: pd.DataFrame, c: str) -> int:
 # Feature specs
 # ============================================================================
 
+def _trim_heap() -> None:
+    """Hand freed heap memory back to the OS. After thousands of candidate arrays are built
+    and dropped on several threads, glibc keeps the freed space in its arenas, and the
+    process holds gigabytes it no longer uses through the model fits that follow."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
 def _release(spec) -> None:
     """Drop a candidate's fitted state (attributes ending in ``_``). Thousands of candidates
     per round each holding lookup tables over a million rows (counts of a near-unique value,
@@ -2777,7 +2790,7 @@ class FeatureForge:
         contest trick. Target statistics only ever use labeled rows.
         """
         self._t0 = time.time()
-        X = X.reset_index(drop=True).copy()
+        X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
         self.n_synthetic_ = 0
         if X_unlabeled is not None and self.drop_synthetic:
@@ -2973,6 +2986,7 @@ class FeatureForge:
                     cands.append(sp)
                     values[nm] = v
             self._set_wu(W, on=False)
+            _trim_heap()
             self._log(f"round {r + 1}: {len(cands)} candidates generated, {len(scores)} valid")
             if not values:
                 break
@@ -2981,6 +2995,8 @@ class FeatureForge:
                                      keep=keep, scores=scores)
             for nm in set(values) - set(survivors):
                 _release(spec_by_name[nm])
+            n_values = len(values)
+            values = {nm: values[nm] for nm in survivors}
             if not survivors:
                 break
             # Joint model ranks survivors by split gain alongside current features.
@@ -3057,7 +3073,7 @@ class FeatureForge:
                     v = values[s.name]
                     W[col] = v if v.ndim == 1 else v[:, j]
             margin, imp = best_fit[0], best_fit[1]
-            self.history_.append(dict(round=r + 1, n_candidates=len(values), n_added=best_k,
+            self.history_.append(dict(round=r + 1, n_candidates=n_values, n_added=best_k,
                                       cv_loss_before=cur_loss, cv_loss_after=best_loss))
             self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f}")
             cur_loss = best_loss
@@ -3066,8 +3082,7 @@ class FeatureForge:
         self.selected_ = selected
         # Candidate values of the last round can be gigabytes on large tables.
         values = cands = Mw = None
-        import gc
-        gc.collect()
+        _trim_heap()
         if self.parity_check and X_unlabeled is not None and len(idx_gate) and self.selected_:
             self.selected_ = selected = self._parity_filter(X.iloc[idx_gate].reset_index(drop=True),
                                                             self._prep(X_unlabeled)[self.raw_cols_], self.selected_)
@@ -3306,7 +3321,7 @@ class FeatureForge:
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
-        X = X.reset_index(drop=True).copy()
+        X = X.reset_index(drop=True)
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
