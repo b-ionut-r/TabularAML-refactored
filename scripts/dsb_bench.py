@@ -6,6 +6,15 @@ Child: the 11.3M game events (without the event_data JSON). Holdout: 20% of inst
 contest's test set is new children), two seeds. Metric: quadratic weighted kappa of the regression
 output cut at thresholds matching the training class shares (the usual contest decoding), and RMSE.
 
+Test-file parity: the contest's test file holds each new child's history up to one randomly chosen
+assessment, and only that assessment is scored. So the held-out children enter FeatureForge (as unlabeled
+rows) with one random assessment each, and QWK is the mean over ``--draws`` random draws of one assessment
+per held-out child (``qwk``). Cut-points: ``qwk`` cuts at the training class shares of the test predictions
+(label-free, as contest kernels did); ``qwk_trcut`` uses cut-points fit on training rows only (the early-
+stopping model's predictions on its validation children, cut at the training class shares); ``qwk_all``
+scores every held-out assessment (the earlier, optimistic protocol). ``--shuffle`` permutes the training
+labels (a leakage control: every arm must then land near 0).
+
 Arms: ``raw`` (assessment title, world, start time), ``asof`` (+ event-log aggregations as of each
 assessment's start: only the child's earlier events), ``forge`` / ``asof_forge`` (+ FeatureForge).
 """
@@ -17,6 +26,7 @@ from sklearn.metrics import cohen_kappa_score
 ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_argument('--seed', type=int, default=0)
 ap.add_argument('--budget', type=float, default=1200); ap.add_argument('--kw', default='{}'); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/dsb/'); ap.add_argument('--log', default='dsb.jsonl')
+ap.add_argument('--draws', type=int, default=20); ap.add_argument('--shuffle', action='store_true')
 a = ap.parse_args()
 D = Path(a.data)
 lab = pd.read_csv(D / 'train_labels.csv.gz')
@@ -57,10 +67,18 @@ if a.arm.startswith('asof'):
     del evc; gc.collect()
 del ev; gc.collect()
 Xtr, Xho, ytr, yho = X[tr].reset_index(drop=True), X[ho].reset_index(drop=True), y[tr], y[ho]
+if a.shuffle:
+    ytr = np.random.default_rng(0).permutation(ytr)
+# One random assessment per held-out child, per draw (row positions within Xho).
+ho_codes = pd.factorize(Xho['installation_id'].astype(str))[0]
+def draw(k):
+    r = np.random.default_rng(1000 * a.seed + k).random(len(Xho))
+    return np.sort(pd.DataFrame({'c': ho_codes, 'r': r}).sort_values('r').drop_duplicates('c').index.to_numpy())
+picks = [draw(k) for k in range(a.draws)]
 if a.arm.endswith('forge'):
     from tabularaml.generate.forge import FeatureForge
     f = FeatureForge(task='regression', time_budget=a.budget, random_state=a.seed, n_jobs=4, verbose=True,
-                     **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho)
+                     **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho.iloc[picks[0]].reset_index(drop=True))
     info.update(n_added=len(f.new_columns_), gate=f.gate_passed_, group_col=f.group_col_, time_col=f.time_col_, feats=f.new_columns_[:30])
     Xtr, Xho = f.transform_train(Xtr), f.transform(Xho)
 fe_t = time.time() - t0
@@ -77,8 +95,11 @@ b = lgb.train(P, lgb.Dataset(Xtr[~va], ytr[~va]), 10000, valid_sets=[lgb.Dataset
               callbacks=[lgb.early_stopping(200, verbose=False)])
 p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xho)
 share = np.cumsum(np.bincount(ytr.astype(int), minlength=4) / len(ytr))[:3]
-cuts = np.quantile(p, share)
-qwk = cohen_kappa_score(yho.astype(int), np.digitize(p, cuts), weights='quadratic')
-res = dict(arm=a.arm + a.tag, seed=a.seed, qwk=float(qwk), rmse=float(np.sqrt(np.mean((p - yho) ** 2))), best_it=b.best_iteration,
+tr_cuts = np.quantile(b.predict(Xtr[va]), share)
+kap = lambda yy, pp, cuts: cohen_kappa_score(yy.astype(int), np.digitize(pp, cuts), weights='quadratic')
+qwk_draw = [kap(yho[i], p[i], np.quantile(p[i], share)) for i in picks]
+qwk_trcut = [kap(yho[i], p[i], tr_cuts) for i in picks]
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, qwk=float(np.mean(qwk_draw)),
+           qwk_sd=float(np.std(qwk_draw)), qwk_trcut=float(np.mean(qwk_trcut)), qwk_all=float(kap(yho, p, np.quantile(p, share))), rmse=float(np.sqrt(np.mean((p - yho) ** 2))), best_it=b.best_iteration,
            fe_s=round(fe_t), total_s=round(time.time() - t0), n_tr=len(Xtr), n_ho=len(Xho), n_cols=Xtr.shape[1], **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')

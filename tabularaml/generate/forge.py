@@ -38,6 +38,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+import warnings
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 
 TE_SMOOTHING = 20.0
@@ -705,6 +706,123 @@ class FamilyNB(Spec):
         for tr, va in folds:
             out[va] = self._apply(cells[va], self._table(cells[tr], y[tr]))
         self.tab_ = self._table(cells, y)
+        return out
+
+
+def slot_families(df: pd.DataFrame, cat_cols: Sequence[str]) -> List[tuple]:
+    """Categorical column families that hold one multi-valued field in numbered slots
+    (``component_id_1..8``, ``spec1..10``), each with its paired numeric family on the
+    same slot numbers when there is one (``quantity_1..8``)."""
+    import re
+    cats = column_families([c for c in df.columns if c in cat_cols])
+    nums = column_families([c for c in df.columns if c not in cat_cols])
+    idx = lambda c: re.match(r"^.*?(\d+)$", str(c)).group(1)
+    out = []
+    for stem, cols in cats.items():
+        # Slots of one field fill left to right (later slots mostly empty) and share their
+        # values; a family of distinct anonymised variables (cat1..cat116) does neither.
+        na = [df[c].isna().mean() + (_as_str(df[c]) == "__NA__").mean() for c in cols]
+        if na[-1] < na[0] + 0.2:
+            continue
+        sets = [set(pd.unique(df[c].dropna().astype(str))) - {"__NA__"} for c in cols[:3]]
+        if len(sets[0]) < 5 or len(sets[0] & sets[1]) < 0.2 * min(len(sets[0]), len(sets[1]) or 1):
+            continue
+        slots = [idx(c) for c in cols]
+        pair = next((v for v in nums.values() if [idx(c) for c in v] == slots), None)
+        out.append((stem, cols, pair))
+    return out
+
+
+def _slot_values(df, cols) -> np.ndarray:
+    v = np.column_stack([_as_str(df[c]).to_numpy() for c in cols])
+    return np.where(np.isin(v, ["__NA__", "nan", "None", "NA", ""]), None, v)
+
+
+class SlotBag(Spec):
+    """A multi-valued field stored in numbered slots, as a bag: number of filled slots,
+    and how many times (or how much, with a paired quantity family) each frequent
+    value occurs across the slots, whatever slot it sits in. Label-free."""
+
+    def __init__(self, cols: Sequence[str], weights: Optional[Sequence[str]], label: str, top: int = 16):
+        super().__init__(list(cols) + list(weights or []))
+        self.cols, self.weights, self.top = list(cols), list(weights or []), top
+        self.name = f"slotbag__{label}"
+        self.n_out = 1 + top
+
+    def out_names(self):
+        return [f"{self.name}_n"] + [f"{self.name}_{k}" for k in range(self.n_out - 1)]
+
+    def fit(self, df, y, ctx):
+        extra = getattr(ctx, "extra_rows", None)
+        ref = df if extra is None else pd.concat([df[self.parents], extra[self.parents]], ignore_index=True)
+        v = _slot_values(ref, self.cols).ravel()
+        vc = pd.Series(v[v != None]).value_counts()  # noqa: E711
+        self.levels_ = list(vc.index[:self.top])  # fewer than ``top``: the rest stay zero
+        return self
+
+    def transform(self, df, ctx):
+        V = _slot_values(df, self.cols)
+        W = (np.column_stack([df[c].to_numpy(dtype=float) for c in self.weights]) if self.weights
+             else np.ones(V.shape))
+        W = np.nan_to_num(W, nan=1.0)
+        out = [(V != None).sum(1).astype(float)]  # noqa: E711
+        for lv in self.levels_:
+            out.append(((V == lv) * W).sum(1))
+        out += [np.zeros(len(V))] * (self.n_out - len(out))
+        return np.column_stack(out).astype(np.float32)
+
+
+class SlotTE(Spec):
+    """Target maps of the values of a slot family, learned across all slots (each row's
+    target counts once for every value it holds), then summarised per row: mean, max,
+    min and (quantity-)weighted sum over its filled slots. Out-of-fold on training rows."""
+    target_dep = True
+    n_out = 4
+
+    def __init__(self, cols: Sequence[str], weights: Optional[Sequence[str]], label: str):
+        super().__init__(list(cols) + list(weights or []))
+        self.cols, self.weights = list(cols), list(weights or [])
+        self.name = f"slotte__{label}"
+
+    def _table(self, V, y):
+        rows = np.repeat(np.arange(len(V)), V.shape[1])
+        v = V.ravel()
+        ok = v != None  # noqa: E711
+        f = pd.DataFrame({"v": v[ok], "y": np.asarray(y, dtype=float)[rows[ok]]})
+        g = f.groupby("v")["y"].agg(["sum", "size"])
+        prior = float(np.mean(y))
+        return (g["sum"] + TE_SMOOTHING * prior) / (g["size"] + TE_SMOOTHING), prior
+
+    def _apply(self, V, W, tab, prior):
+        E = tab.reindex(V.ravel()).to_numpy(dtype=float).reshape(V.shape)
+        E = np.where(V == None, np.nan, np.where(np.isnan(E), prior, E))  # noqa: E711
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return np.column_stack([np.nanmean(E, 1), np.nanmax(E, 1), np.nanmin(E, 1),
+                                    np.nansum(np.nan_to_num(E - prior) * W, 1)])
+
+    def _vw(self, df):
+        V = _slot_values(df, self.cols)
+        W = (np.nan_to_num(np.column_stack([df[c].to_numpy(dtype=float) for c in self.weights]), nan=1.0)
+             if self.weights else np.ones(V.shape))
+        return V, W
+
+    def fit(self, df, y, ctx):
+        V, _ = self._vw(df)
+        self.tab_, self.prior_ = self._table(V, y)
+        return self
+
+    def transform(self, df, ctx):
+        V, W = self._vw(df)
+        return self._apply(V, W, self.tab_, self.prior_)
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        V, W = self._vw(df)
+        y = np.asarray(y, dtype=float)
+        out = np.full((len(df), self.n_out), np.nan)
+        for tr, va in folds:
+            out[va] = self._apply(V[va], W[va], *self._table(V[tr], y[tr]))
+        self.fit(df, y, ctx)
         return out
 
 
@@ -1821,6 +1939,11 @@ class FeatureForge:
                     add(FamilyCount(cols, "mask", stem))
                     if self.family_nb and self.n_classes_ <= 2:
                         add(FamilyNB(cols, stem))
+            # Multi-valued fields stored in numbered slots (components, specs, items).
+            for stem, cols, pair in slot_families(W[self.base_cols_], self.cat_cols_):
+                add(SlotBag(cols, pair, stem))
+                if self.n_classes_ <= 2:
+                    add(SlotTE(cols, pair, stem))
             if len(raw_num) >= 3:
                 add(RowStat(raw_num, "nonzero", "all"))
                 if W[raw_num].isna().any().any():

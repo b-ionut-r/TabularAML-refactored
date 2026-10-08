@@ -28,7 +28,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
-from tabularaml.generate.relational import Child, RelatedTables, asof_features, child_model_features  # noqa: E402
+from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
+                                             lookup_features)
 
 TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
 
@@ -52,7 +53,10 @@ def parse_table(spec: str, main: pd.DataFrame, id_col: str | None) -> Child:
         shared = [c for c in df.columns if c in main.columns]
         key = id_col if id_col in df.columns else (shared[0] if len(shared) == 1 else None)
     if key is None:
-        raise SystemExit(f"--table {name}: give the key column explicitly (name=path:key)")
+        # No shared column: a lookup table (components, products) whose first column's values
+        # appear in main-table columns, possibly numbered slots (component_id_1..8).
+        print(f"table {name}: {df.shape}, lookup on {df.columns[0]}", flush=True)
+        return Child(name, df, key=df.columns[0], drop=["__lookup__"])
     tcol = parts[2] if len(parts) > 2 else next(
         (c for c in df.columns if c != key and pd.api.types.is_numeric_dtype(df[c])
          and any(h in c.lower() for h in TIME_HINTS)), None)
@@ -83,6 +87,7 @@ def main():
     ap.add_argument("--time", default=None, help="main-table time column for as-of aggregation (default: auto)")
     ap.add_argument("--child-models", action="store_true", help="add out-of-fold child-row model features")
     ap.add_argument("--task", default=None, choices=["regression", "binary", "multiclass"])
+    ap.add_argument("--log-target", action="store_true", help="search on log1p(target) (RMSLE-scored contests)")
     ap.add_argument("--budget", type=float, default=900, help="FeatureForge time budget (s)")
     ap.add_argument("--top-related", type=int, default=200,
                     help="related-table columns handed to FeatureForge's search (all are kept in the output)")
@@ -97,34 +102,52 @@ def main():
     rel_tr = rel_te = None
     if a.table:
         children = [parse_table(s, tr, a.id) for s in a.table]
+        lookups = [ch for ch in children if "__lookup__" in ch.drop]
+        children = [ch for ch in children if ch not in lookups]
+        # One row per key: attributes of the main row (a tube's dimensions, its bill of
+        # materials), joined as columns before anything is aggregated or looked up.
+        for ch in [ch for ch in children if ch.key in tr.columns and not ch.df[ch.key].duplicated().any()]:
+            cols = [c for c in ch.df.columns if c == ch.key or c not in tr.columns]
+            tr = tr.merge(ch.df[cols], on=ch.key, how="left")
+            te = te.merge(ch.df[cols], on=ch.key, how="left")
+            children.remove(ch)
+            print(f"table {ch.name}: one row per {ch.key}, joined as columns", flush=True)
         both_main = pd.concat([tr, te[[c for c in tr.columns if c in te.columns]]], ignore_index=True)
         asof = {ch.name: main_time(tr, ch, a.time) for ch in children
                 if ch.time is not None and ch.key in tr.columns and tr[ch.key].duplicated().any()}
         asof = {k: v for k, v in asof.items() if v is not None}
         keyed = [ch for ch in children if ch.name not in asof]
-        F = RelatedTables(keyed).features() if keyed else pd.DataFrame(index=pd.Index([], name=a.id))
+        F = pd.DataFrame()
         A = []
         for ch in children:
             if ch.name in asof:
                 print(f"table {ch.name}: as of {asof[ch.name]} per main row", flush=True)
                 A.append(asof_features(both_main, ch.key, asof[ch.name], ch))
-        if a.child_models:
+        if a.child_models and keyed:
             task = a.task or ("binary" if y.nunique() == 2 else "regression")
             obj = "binary" if task == "binary" else "regression"
-            yk = pd.Series(y.to_numpy(), index=ids_tr)
             for ch in keyed:  # as-of children would see later rows' outcomes
+                if not tr[ch.key].is_unique:
+                    continue  # labels per key are ambiguous when the key repeats
                 t = time.time()
-                F = F.join(child_model_features(ch, yk, ids_te, task=obj), how="outer")
+                yk = pd.Series(y.to_numpy(), index=tr[ch.key].to_numpy())
+                M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)
+                A.append(M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
                 print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
-        if a.id is None or not keyed:
-            rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
-        else:
-            rel_tr, rel_te = F.reindex(ids_tr).reset_index(drop=True), F.reindex(ids_te).reset_index(drop=True)
+        for ch in keyed:
+            Fk = RelatedTables([ch]).features()
+            Fk = Fk.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
+            for c in [c for c in Fk.columns if c.endswith("__count")]:
+                Fk[c] = Fk[c].fillna(0)
+            A.insert(0, Fk)
+        rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
+        for lk in lookups:
+            L = lookup_features(both_main, lk.df, lk.key, lk.name)
+            print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
+            A.append(L)
         for Fa in A:
             rel_tr = pd.concat([rel_tr, Fa.iloc[:len(tr)].reset_index(drop=True)], axis=1)
             rel_te = pd.concat([rel_te, Fa.iloc[len(tr):].reset_index(drop=True)], axis=1)
-        for c in [c for c in F.columns if c.endswith("__count")]:
-            rel_tr[c], rel_te[c] = rel_tr[c].fillna(0), rel_te[c].fillna(0)
         print(f"related tables: {rel_tr.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)
 
     Xtr = tr.drop(columns=[a.id]) if a.id else tr
@@ -134,13 +157,16 @@ def main():
         # The search sees the related columns a quick model uses most; all are written out.
         import lightgbm as lgb
         both = pd.concat([Xtr.reset_index(drop=True), rel_tr], axis=1)
+        for c in both.columns:
+            if not (pd.api.types.is_numeric_dtype(both[c]) or isinstance(both[c].dtype, pd.CategoricalDtype)):
+                both[c] = both[c].astype(str).astype("category")
         b = lgb.train(dict(objective="binary" if y.nunique() == 2 else "regression", learning_rate=0.1,
-                           num_leaves=31, feature_fraction=0.5, verbose=-1), lgb.Dataset(both, y), 300)
+                           num_leaves=31, feature_fraction=0.5, verbose=-1), lgb.Dataset(both, np.log1p(y) if a.log_target else y), 300)
         gain = pd.Series(b.feature_importance("gain"), index=both.columns)[rel_tr.columns]
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
         Xtr = both[list(Xtr.columns) + top]
         Xte = pd.concat([Xte.reset_index(drop=True), rel_te[top]], axis=1)
-    forge = FeatureForge(task=a.task, time_budget=a.budget).fit(Xtr, y, X_unlabeled=Xte)
+    forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target).fit(Xtr, y, X_unlabeled=Xte)
     out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
     if rel_tr is not None:
         rest = [c for c in rel_tr.columns if c not in out_tr.columns]

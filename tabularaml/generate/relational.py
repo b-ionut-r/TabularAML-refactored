@@ -339,3 +339,78 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
     res = res.loc[:, ~res.columns.duplicated()]
     keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
     return res[keep].astype(np.float32)
+
+
+def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str,
+                    min_overlap: float = 0.5) -> pd.DataFrame:
+    """Attributes of a lookup table (one row per ``key`` value: components, products,
+    stores) attached to every main column whose values are keys of the table. A single
+    column gets the attributes as they are; a family of numbered slot columns
+    (``component_id_1..8``) gets, per numeric attribute, the sum (weighted by the paired
+    quantity family when there is one), max and mean over the filled slots, and the
+    count of each frequent categorical attribute level. Label-free.
+    """
+    from tabularaml.generate.forge import column_families
+    tab = table.drop_duplicates(key).set_index(key)
+    keys = set(tab.index.astype(str))
+    num = [c for c in tab.columns if pd.api.types.is_numeric_dtype(tab[c])]
+    cat = [c for c in tab.columns if c not in num and 2 <= tab[c].nunique() <= 30]
+
+    def hits(cols):
+        # The columns hold the table's keys: most of their values are keys, or (a table
+        # covering one kind of component among many) most of the table's keys occur in them.
+        v = pd.concat([main[c].dropna().astype(str) for c in cols])
+        if len(v) == 0:
+            return False
+        seen = set(pd.unique(v))
+        return v.isin(keys).mean() >= min_overlap or len(keys & seen) >= max(3, min_overlap * len(keys))
+
+    str_cols = [c for c in main.columns if not pd.api.types.is_numeric_dtype(main[c])]
+    # A slot family (component_id_1..8) is tested and used as a whole.
+    cand = []
+    fam_all = column_families(str_cols)
+    for cols in fam_all.values():
+        if hits(cols):
+            cand += cols
+    in_any = {c for cols in fam_all.values() for c in cols}
+    cand += [c for c in str_cols if c not in in_any and hits([c])]
+    if not cand:
+        return pd.DataFrame(index=main.index)
+    fams = column_families(cand)
+    in_fam = {c for cols in fams.values() for c in cols}
+    nfam = column_families([c for c in main.columns if pd.api.types.is_numeric_dtype(main[c])])
+    out = {}
+    T = tab.copy()
+    T.index = T.index.astype(str)
+    for c in [c for c in cand if c not in in_fam]:
+        A = T.reindex(main[c].astype(str).to_numpy())
+        for a in num:
+            out[f"{name}__{c}__{a}"] = A[a].to_numpy(dtype=float)
+        for a in cat:
+            out[f"{name}__{c}__{a}_code"] = pd.factorize(A[a])[0].astype(float)
+    import re
+    idx = lambda c: re.match(r"^.*?(\d+)$", str(c)).group(1)
+    for stem, cols in fams.items():
+        pair = next((v for v in nfam.values() if [idx(x) for x in v] == [idx(x) for x in cols]), None)
+        V = np.column_stack([main[c].astype(str).where(main[c].notna(), None).to_numpy() for c in cols])
+        filled = np.column_stack([main[c].notna().to_numpy() for c in cols])
+        Q = (np.nan_to_num(np.column_stack([main[c].to_numpy(dtype=float) for c in pair]), nan=0.0)
+             if pair else filled.astype(float))
+        for a in num:
+            M = T[a].reindex(V.ravel()).to_numpy(dtype=float).reshape(V.shape)
+            M = np.where(filled, M, np.nan)
+            with np.errstate(all="ignore"):
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    out[f"{name}__{stem}__{a}_sum"] = np.nansum(M * Q, 1)
+                    out[f"{name}__{stem}__{a}_max"] = np.nanmax(M, 1)
+                    out[f"{name}__{stem}__{a}_mean"] = np.nanmean(M, 1)
+        for a in cat:
+            L = T[a].reindex(V.ravel()).to_numpy().reshape(V.shape)
+            for lv in pd.Series(L[filled]).value_counts().index[:8]:
+                out[f"{name}__{stem}__{a}={lv}"] = ((L == lv) & filled).astype(float).__mul__(Q).sum(1)
+    res = pd.DataFrame(out, index=main.index)
+    res.columns = [_safe(c) for c in res.columns]
+    keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
+    return res[keep].astype(np.float32)

@@ -64,6 +64,7 @@ def main():
     ap.add_argument("--frac", type=float, default=0.4, help="most recent fraction of the 590k rows to use")
     ap.add_argument("--budget", type=float, default=900)
     ap.add_argument("--forge-kw", default="{}")
+    ap.add_argument("--shuffle", action="store_true", help="leakage control: permute the training labels")
     ap.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "ieee_fraud")
     a = ap.parse_args()
     df = load(a.cache)
@@ -73,6 +74,8 @@ def main():
     n = int(0.8 * len(df))
     Xtr, Xte = df.iloc[:n].reset_index(drop=True), df.iloc[n:].reset_index(drop=True)
     ytr, yte = y.iloc[:n].reset_index(drop=True), y.iloc[n:].reset_index(drop=True)
+    if a.shuffle:
+        ytr = pd.Series(np.random.default_rng(0).permutation(ytr.to_numpy()))
     p = judge(Xtr.copy(), ytr, Xte.copy())
     print(f"raw    AUC={roc_auc_score(yte, p):.4f} logloss={log_loss(yte, p):.5f}", flush=True)
     t0 = time.time()

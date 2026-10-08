@@ -9,7 +9,7 @@ ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_
 ap.add_argument('--users', type=int, default=15000); ap.add_argument('--budget', type=float, default=1200)
 ap.add_argument('--kw', default='{}'); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/instacart/', help='folder with the competition files as parquet')
-ap.add_argument('--log', default='instacart.jsonl')
+ap.add_argument('--log', default='instacart.jsonl'); ap.add_argument('--shuffle', action='store_true')
 a = ap.parse_args()
 D = a.data
 orders = pd.read_parquet(D + 'orders.parquet')
@@ -47,7 +47,24 @@ if 'rel' in a.arm:
     print('related', F.shape, round(time.time() - t0), flush=True)
     for k, cols in (('up', [c for c in F.columns if c.startswith('up__')]), ('user_id', [c for c in F.columns if c.startswith('user__')]), ('product_id', [c for c in F.columns if c.startswith('prod__')])):
         X = X.join(F.loc[:, cols].reindex(pairs[k].to_numpy()).reset_index(drop=True))
+if 'asof' in a.arm:
+    # The same children aggregated as of each row's order (asof_features), as contest_features.py does
+    # when the main key repeats; product-level history stays keyed (no comparable time).
+    from tabularaml.generate.relational import Child, RelatedTables, asof_features
+    M = pairs[['up', 'user_id', 'order_number']].reset_index(drop=True)
+    uo = prior_o[['order_id', 'user_id', 'order_number', 'order_dow', 'order_hour_of_day', 'days_since_prior_order', 'day']].merge(
+        op.groupby('order_id').agg(basket=('product_id', 'size'), basket_reorder=('reordered', 'mean')).reset_index(), on='order_id').drop(columns=['order_id'])
+    parts = [asof_features(M, 'up', 'order_number', Child('up', op[['up', 'order_number', 'add_to_cart_order', 'reordered', 'order_dow', 'order_hour_of_day', 'days_since_prior_order', 'day']], key='up', time='order_number')),
+             asof_features(M, 'user_id', 'order_number', Child('user', uo, key='user_id', time='order_number'))]
+    Fp = RelatedTables([Child('prod', op[['product_id', 'add_to_cart_order', 'reordered', 'order_number', 'days_since_prior_order']], key='product_id')]).features()
+    parts.append(Fp.reindex(pairs['product_id'].to_numpy()).reset_index(drop=True))
+    X = pd.concat([X.reset_index(drop=True)] + parts, axis=1)
+    print('asof', X.shape, round(time.time() - t0), flush=True)
+if 'text' in a.arm:
+    X['product_name'] = pairs['product_id'].map(pd.read_parquet(D + 'products.parquet').set_index('product_id')['product_name']).to_numpy()
 Xtr, Xho, ytr, yho = X[~ho].reset_index(drop=True), X[ho].reset_index(drop=True), y[~ho], y[ho]
+if a.shuffle:  # leakage control: permuted training labels
+    ytr = np.random.default_rng(0).permutation(ytr)
 if 'forge' in a.arm:
     from tabularaml.generate.forge import FeatureForge
     f = FeatureForge(task='binary', time_budget=a.budget, random_state=a.seed, n_jobs=4, verbose=True, **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho)
@@ -60,5 +77,5 @@ utr = pairs.user_id.to_numpy()[~ho]; uu = np.unique(utr); va_u = np.random.defau
 va = np.isin(utr, va_u)
 b = lgb.train(P, lgb.Dataset(Xtr[~va], ytr[~va]), 5000, valid_sets=[lgb.Dataset(Xtr[va], ytr[va])], callbacks=[lgb.early_stopping(100, verbose=False)])
 p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xho)
-res = dict(arm=a.arm + a.tag, seed=a.seed, auc=roc_auc_score(yho, p), logloss=log_loss(yho, p), n_cols=Xtr.shape[1], best_it=b.best_iteration, fe_s=round(fe_t), total_s=round(time.time() - t0), **info)
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, auc=roc_auc_score(yho, p), logloss=log_loss(yho, p), n_cols=Xtr.shape[1], best_it=b.best_iteration, fe_s=round(fe_t), total_s=round(time.time() - t0), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')

@@ -14,6 +14,7 @@ from sklearn.metrics import roc_auc_score
 ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_argument('--win', type=int, default=0)
 ap.add_argument('--budget', type=float, default=600); ap.add_argument('--kw', default='{}'); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/wnv/'); ap.add_argument('--log', default='wnv.jsonl')
+ap.add_argument('--dedup', action='store_true', help='merge the rows the files split per 50 mosquitoes (removes the file-construction signal)')
 a = ap.parse_args()
 D = Path(a.data)
 tr = pd.read_csv(D / 'train.csv')
@@ -21,6 +22,9 @@ w = pd.read_csv(D / 'weatherOld.csv'); w = w[w.Station == 1].drop(columns=['Stat
 for c in w.columns:
     if c not in ('Date', 'CodeSum'):
         w[c] = pd.to_numeric(w[c].replace({'T': '0.005', 'M': np.nan, '-': np.nan}), errors='coerce')
+if a.dedup:
+    tr = tr.groupby([c for c in tr.columns if c not in ('NumMosquitos', 'WnvPresent')], as_index=False, sort=False).agg(
+        NumMosquitos=('NumMosquitos', 'sum'), WnvPresent=('WnvPresent', 'max'))
 df = tr.merge(w, on='Date', how='left').drop(columns=['NumMosquitos'])
 y = df.pop('WnvPresent').to_numpy()
 yr = df['Date'].str[:4].astype(int)
@@ -70,6 +74,6 @@ last = (pd.Timestamp('2007-01-01') + pd.to_timedelta(ytr_year, 'D')).year == (pd
 b = lgb.train(P, lgb.Dataset(Xtr[~last], ytr[~last]), 5000, valid_sets=[lgb.Dataset(Xtr[last], ytr[last])],
               callbacks=[lgb.early_stopping(200, verbose=False)])
 p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xho)
-res = dict(arm=a.arm + a.tag, win=a.win, auc=roc_auc_score(yho, p), best_it=b.best_iteration, fe_s=round(fe_t),
+res = dict(arm=a.arm + a.tag + ('_dedup' if a.dedup else ''), win=a.win, auc=roc_auc_score(yho, p), best_it=b.best_iteration, fe_s=round(fe_t),
            total_s=round(time.time() - t0), n_tr=len(Xtr), n_ho=len(Xho), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')

@@ -677,7 +677,13 @@ from the test set). Holdouts: 2013 (training on 2007-11) and 2011 (training on
 | **FeatureForge, defaults (blind)** | **0.754** | 0.687 (gate rejects) |
 
 On 2013 FeatureForge beats every hand-made set (picks: counts per date x heat
-x species, precipitation spread per weather code). On 2011 (two training
+x species, precipitation spread per weather code). **File-construction
+artifact:** the count pick works because the contest's files split a trap test
+into extra rows when it caught more than 50 mosquitoes, so more rows per date
+and species means more mosquitoes and more virus. The contest's test file was
+built the same way (this was the contest's well-known leak), so the feature
+does score there, but it measures how the files were assembled, not the
+mosquitoes; it is not counted as a genuine gain. On 2011 (two training
 years) the gate finds nothing that carries over. Trailing weather means hurt
 with three or fewer training seasons.
 
