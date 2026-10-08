@@ -32,8 +32,26 @@ def raw(X):
     for c in X.columns:
         if X[c].dtype == object: X[c] = X[c].astype('category')
     return X
+def hand(Xtr, Xho, parts):
+    """Hand-made features of top public kernels: rows per (date, trap, species) over all rows with
+    known features (the contest's 'duplicate rows' signal), calendar week, trailing weather means."""
+    A = pd.concat([Xtr, Xho], ignore_index=True)
+    if 'dup' in parts:
+        A['n_dup'] = A.groupby(['Date', 'Trap', 'Species'])['Trap'].transform('size').astype(float)
+    if 'cal' in parts:
+        dt = pd.to_datetime(A['Date']); A['week'] = dt.dt.isocalendar().week.astype(float); A['doy'] = dt.dt.dayofyear.astype(float)
+    if 'roll' in parts:
+        wd = w.copy(); wd['Date'] = pd.to_datetime(wd['Date']); wd = wd.set_index('Date').sort_index()
+        num = ['Tmax', 'Tmin', 'Tavg', 'DewPoint', 'WetBulb', 'PrecipTotal', 'AvgSpeed']
+        for k in (7, 14, 28):
+            r = wd[num].rolling(f'{k}D').mean().add_suffix(f'_r{k}')
+            A = A.merge(r.reset_index().assign(Date=lambda d: d['Date'].dt.strftime('%Y-%m-%d')), on='Date', how='left')
+    return A.iloc[:len(Xtr)].reset_index(drop=True), A.iloc[len(Xtr):].reset_index(drop=True)
+if a.arm.startswith('hand'):
+    parts = a.arm.split('_')[1:] or ['dup', 'cal', 'roll']
+    Xtr, Xho = hand(Xtr, Xho, parts)
 t0 = time.time(); info = {}
-if a.arm == 'forge':
+if a.arm == 'forge' or a.arm.endswith('_forge'):
     from tabularaml.generate.forge import FeatureForge
     f = FeatureForge(task='binary', time_budget=a.budget, random_state=0, n_jobs=4, verbose=True,
                      **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho)

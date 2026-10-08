@@ -659,3 +659,24 @@ earlier sales; MAE (lower is better).
 logerror is mostly noise (Zillow's own model already used these columns); the
 contest was decided by fractions of a percent. Picks: kNN target means over
 the coordinates and over the top numerics, key-pair target maps.
+
+## Blind run: West Nile Virus Prediction (Kaggle 2015, $40k)
+
+`scripts/wnv_bench.py` (data: GitHub `apnorton/ml-project`, the contest files).
+Trap tests with station-1 weather joined by date; NumMosquitos dropped (absent
+from the test set). Holdouts: 2013 (training on 2007-11) and 2011 (training on
+2007-09); AUC.
+
+| Columns | 2013 | 2011 |
+|---|---|---|
+| Raw | 0.698 | 0.687 |
+| Hand-made: rows per (date, trap, species) | 0.702 | 0.704 |
+| Hand-made: week and day of year | 0.713 | 0.704 |
+| Hand-made: trailing 7/14/28-day weather means | 0.630 | 0.670 |
+| Hand-made: all three | 0.617 | 0.677 |
+| **FeatureForge, defaults (blind)** | **0.754** | 0.687 (gate rejects) |
+
+On 2013 FeatureForge beats every hand-made set (picks: counts per date x heat
+x species, precipitation spread per weather code). On 2011 (two training
+years) the gate finds nothing that carries over. Trailing weather means hurt
+with three or fewer training seasons.
