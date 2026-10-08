@@ -2837,6 +2837,8 @@ class FeatureForge:
                       f"-> {'PASS' if self.gate_passed_ else 'REJECT'}")
             if not self.gate_passed_:
                 self.selected_ = []
+                dropped = {a[3] for a in self.anchors_}
+                self.raw_cols_ = [c for c in self.raw_cols_ if c not in dropped]
                 self.anchors_ = []
 
         # Refit every spec's statistics on all training rows.

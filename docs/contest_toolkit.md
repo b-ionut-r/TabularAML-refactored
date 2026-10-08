@@ -488,30 +488,37 @@ the holdout users are new.
 
 ## Blind run: Corporación Favorita Grocery Sales Forecasting (Kaggle 2018, $30k)
 
-Run with the shipped defaults and no contest-specific settings (the
-generalization check). Slice: stores 44, 45 and 47, 2017-05-01 to 2017-08-15,
-zero-filled store x item x day grid (1.1M rows), item and store tables joined,
+`scripts/favorita_bench.py`, shipped defaults, no contest-specific settings.
+Slice: stores 44, 45 and 47 from 2017-05-01, item and store tables joined,
 `date` passed as a date. Holdout: the last 16 days (the contest's horizon) and
-the 16 days before; unlabeled rows = every row from the holdout start on.
-Target log1p(sales); metric NWRMSLE (perishables weighted 1.25), lower is
-better; one LightGBM judge early-stopped on the latest 16 training days.
+the 16 days before; the holdout's rows are the unlabeled rows. Target
+log1p(sales); metric NWRMSLE (perishables weighted 1.25), lower is better; one
+LightGBM judge early-stopped on the latest 16 training days.
+
+**Test-file parity (audit, 2026-10-08).** The contest's train file lists only
+days with a sale, its test file every store x item x day with its promotion
+flag. The holdout is therefore the full grid of the store x item pairs sold
+before the holdout, and `onpromotion` is left out (known only on sale days, it
+would mark which grid rows sold). An earlier version built the grid from pairs
+seen inside the holdout too and kept the flag; its numbers (0.891 / 0.876 raw,
+0.749 / 0.715 FeatureForge) are withdrawn.
 
 | Columns | Window 0 | Window 1 |
 |---|---|---|
-| Raw columns (date as a day number) | 0.8913 | 0.8761 |
-| Hand-made: store x item mean log sales over the last 7 / 14 / 28 / 56 days, lagged 16 days (reference) | 0.7545 | |
-| FeatureForge, defaults (blind) | 0.7431 | 0.7782 |
-| **FeatureForge, defaults, day-level dates detected as time** | **0.7488** | **0.7153** |
+| Constant (training mean) | 1.2214 | 1.2486 |
+| Raw columns (date as a day number) | 0.9087 | 0.8697 |
+| **FeatureForge, defaults (blind)** | **0.7845** | **0.7388** |
+| FeatureForge, training labels shuffled (control) | 1.2215 | |
 
-FeatureForge cuts the error by 17% and 11% and beats the hand-made recent-sales
-features; its top picks are target maps of item and class, promotion
-deviations per item and calendar fields.
+FeatureForge cuts the error by 14% and 15% (16-19 min of feature search on
+0.8-0.9M rows); top picks are item target maps, item and store target maps
+per perishable flag, and item deviations within family. With shuffled training
+labels both raw and FeatureForge land on the constant, so no held-out label
+reaches the features.
 
-The blind run exposed a detection gap: `time_col="auto"` required 5% distinct
-values, so a day-level date shared by thousands of rows was never recognised
-as time. Date columns now qualify at any granularity (other numerics need 20+
-levels and test values beyond 98% of training). With the time machinery on,
-Favorita's mean error drops further, 0.761 -> 0.732.
+`time_col="auto"` counts date columns as time at any granularity (other
+numerics need 20+ levels and test values beyond 98% of training); a day-level
+date shared by thousands of rows was missed before.
 
 ## Blind run: Home Credit - Credit Risk Model Stability (Kaggle 2024, $105k)
 
@@ -693,14 +700,30 @@ with three or fewer training seasons.
 Main rows: the 17,690 labelled assessments (installation, title, world, start
 time); child: 11.3M game events (event_data JSON left out). Holdout: 20% of
 installations (the contest's test children are new), two seeds. Metric:
-quadratic weighted kappa with thresholds matching the training class shares.
+quadratic weighted kappa.
+
+**Test-file parity (audit, 2026-10-08).** The contest's test file holds each
+new child's history up to one random assessment, and only that one is scored.
+So the held-out children enter FeatureForge with one random assessment each,
+and QWK is the mean over 20 random draws of one assessment per held-out child
+(sd over draws about 0.02). Cut-points: at the training class shares of the
+test predictions (label-free, as contest kernels did), and, in brackets,
+fit on training rows only. The earlier protocol scored every held-out
+assessment, which favours children with long histories (0.594 for as-of +
+FeatureForge); it is withdrawn.
 
 | Columns | Seed 0 | Seed 1 | Mean |
 |---|---|---|---|
-| Raw (assessment title, world, start) | 0.431 | 0.431 | 0.431 |
-| FeatureForge on raw (blind) | 0.431 (gate rejects) | 0.431 | 0.431 |
-| As-of event aggregations | 0.544 | 0.576 | 0.560 |
-| **As-of + FeatureForge** | **0.583** | **0.604** | **0.594** |
+| Raw (assessment title, world, start) | 0.386 (0.398) | 0.370 (0.377) | 0.378 (0.388) |
+| As-of event aggregations | 0.535 (0.542) | 0.533 (0.535) | 0.534 (0.539) |
+| **As-of + FeatureForge** | **0.553** (0.552) | **0.538** (0.520) | **0.546** (0.536) |
+| As-of + FeatureForge, training labels shuffled (control) | -0.001 | | |
+
+The contest's winners scored about 0.57 on the private leaderboard with
+hand-built event features and the event_data JSON, which this table leaves out;
+0.546 is short of that. As-of aggregation takes 70 s, FeatureForge 2-3 min.
+With shuffled labels the score is at chance, so no held-out label reaches the
+features.
 
 `asof_features` (tabularaml/generate/relational.py) aggregates a child event
 table as of each main row: only the same key's events strictly before the
