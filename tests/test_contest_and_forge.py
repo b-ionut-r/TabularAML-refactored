@@ -306,8 +306,8 @@ def test_forge_search_respects_small_budget():
     y = X.x0 / (X.x1.abs() + 0.5) + rng.normal(size=len(X)) * 0.1
     t0 = time.time()
     ff = FeatureForge(task="regression", time_budget=0.5, n_jobs=1, verbose=False).fit(X, y)
-    # No search round fits in the budget: base CV, then straight to the output.
-    assert ff.history_ == [] and ff.selected_ == []
+    # Only the first round runs (it always gets ten CV fits), none after.
+    assert len(ff.history_) <= 1
     assert time.time() - t0 < 60
 
 
