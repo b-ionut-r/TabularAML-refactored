@@ -790,9 +790,9 @@ averaged over a slot family, weighted by the paired quantities).
 | Raw quote columns | 0.2275 | 0.2401 |
 | FeatureForge on the quote table (slot features on) | 0.2275 (gate keeps raw) | 0.2401 (gate keeps raw) |
 | Hand-made tube and component features (reference) | 0.2194 | 0.2354 |
-| **contest_features.py on all 21 tables** | **0.2243** | pending |
+| **contest_features.py on all 21 tables** | **0.2243** | **0.2389** |
 | Same, training labels shuffled (control) | 0.8243 | |
 
-The lookup joins give -1.4% on seed 0; FeatureForge's own search adds nothing
+The lookup joins give -1.4% / -0.5% (mean 0.2316 vs 0.2338 raw, 5-10 min); FeatureForge's own search adds nothing
 on top (the gate keeps the joined columns). Hand-made features still win.
 
