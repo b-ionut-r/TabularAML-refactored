@@ -2834,6 +2834,11 @@ class FeatureForge:
             # (a single pairwise interaction) down the split-gain order.
             novel_rank = sorted(survivors, key=lambda nm: -self._last_novelty.get(nm, 0.0))
             orders = [("gain", rank, (3, 6, 12, 25, 50, 80)), ("novelty", novel_rank, (3, 6, 12))]
+            # Label-free prefixes too: when target statistics do not carry over (their honest,
+            # past-only encodings lose), they top the gain order and would sink every prefix.
+            free_rank = [nm for nm in rank if not spec_by_name[nm].target_dep]
+            if self.past_te and self.time_col_ is not None and 0 < len(free_rank) < len(rank):
+                orders.append(("label-free", free_rank, (6, 25)))
             best_k, best_loss, best_fit, best_rank = 0, cur_loss, None, rank
             tried = set()
             for label, order, steps in orders:
