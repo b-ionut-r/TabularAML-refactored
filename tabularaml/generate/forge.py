@@ -1653,7 +1653,9 @@ class FeatureForge:
     max_search_rows : int | None
         Search on at most this many training rows (the latest on time-ordered data, whole
         groups when test rows are new entities, else a random sample); the rest still
-        count in label-free statistics, and the output is computed on every row.
+        count in label-free statistics, and the output is computed on every row. Large or
+        wide tables get fewer (not below 100k): one CV fit, timed on a 20k-row sample, is
+        kept to an eighth of ``time_budget``.
     time_budget : float
         Wall-clock budget in seconds for the search. A round starts only while two CV fits
         (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
@@ -2735,8 +2737,18 @@ class FeatureForge:
         # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
         # budget for several rounds; the rows left out still feed label-free statistics.
         idx_out = np.array([], dtype=int)
-        m = self.max_search_rows
-        if m and len(idx_sel) > m:
+        m = self.max_search_rows or len(idx_sel)
+        n_probe = 20_000
+        if len(idx_sel) > 2 * n_probe and self.time_budget:
+            # Wide tables too: time one CV on a sample and size the search so that one CV fit
+            # takes at most an eighth of the budget (rows scale the fit time about linearly).
+            pr = np.sort(np.random.default_rng(self.random_state).choice(idx_sel, n_probe, replace=False))
+            t = time.time()
+            self._cv(self._model_frame(X.iloc[pr].reset_index(drop=True)), y_np[pr],
+                     [self._folds(n_probe, y_np[pr], self.cv, self.random_state)])
+            per_row = (time.time() - t) / n_probe
+            m = min(m, max(100_000, int(self.time_budget / 8 / per_row)))
+        if len(idx_sel) > m:
             rng = np.random.default_rng(self.random_state)
             if self.time_col_ is not None:
                 keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
