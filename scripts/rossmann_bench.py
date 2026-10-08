@@ -33,7 +33,7 @@ if a.shuffle:
 te = ho.drop(columns=['Sales']).assign(Id=np.arange(1, len(ho) + 1))[['Id', 'Store', 'DayOfWeek', 'Date', 'Open', 'Promo', 'StateHoliday', 'SchoolHoliday']]
 t0 = time.time(); info = {}
 if a.arm == 'raw':
-    Xtr, Xte = tr.merge(st, on='Store', how='left'), te.merge(st, on='Store', how='left')
+    Xtr, Xte = tr.merge(st, on='Store', how='left'), te.drop(columns=['Id']).merge(st, on='Store', how='left')
     ytr_all = Xtr.pop('Sales').to_numpy(dtype=float)
 else:
     tmp = Path(a.keep) if a.keep else Path(tempfile.mkdtemp())

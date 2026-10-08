@@ -1746,7 +1746,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1783,6 +1783,7 @@ class FeatureForge:
         self.text = text
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
+        self.gate_families = gate_families
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1941,8 +1942,14 @@ class FeatureForge:
 
         time_keys = {self.time_col_, self.group_col_, *self.date_cols_, *getattr(self, "time_like_", [])} - {None}
 
+        time_cols = {self.time_col_, *self.date_cols_} - {None}
+
         def add(spec):
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
+                return
+            # A group's statistic of the date itself (deviation of a row's date from its group's
+            # mean date) only tracks where the group sits in time; it drifts by construction.
+            if isinstance(spec, GroupStat) and spec.parents[-1] in time_cols:
                 return
             if spec.name not in existing:
                 existing.add(spec.name)
@@ -3006,7 +3013,52 @@ class FeatureForge:
             self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
+        if best_set is None and self.gate_families:
+            best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
         return best_set, raw_l, best_l
+
+    def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
+        """When the whole set fails the gate, drop feature families (target encodings, group
+        statistics, event recencies, ...) one at a time, each time the one whose removal helps
+        the gate rows most, and keep the best remaining set if it clears the gate by one more
+        standard error than usual (the families were chosen on the gate rows). One family
+        that does not carry over to later periods, e.g. Rossmann's target encodings, no
+        longer sinks the others."""
+        def fam(sp):
+            return type(sp).__name__
+
+        def closed(specs):
+            # Keep only specs whose inputs are raw columns or outputs of kept specs.
+            have = set(self.raw_cols_)
+            out = []
+            for sp in specs:
+                if all(p in have for p in sp.parents):
+                    out.append(sp)
+                    have.update(sp.out_names())
+            return out
+
+        def score(specs):
+            rows = gate_loss(self.raw_cols_ + [c for sp in specs for c in sp.out_names()])
+            d = raw_rows - rows
+            lo, hi = np.quantile(d, [0.01, 0.99])
+            dw = np.clip(d, lo, hi)
+            return float(rows.mean()), float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
+
+        cur = closed(list(self.selected_))
+        while len({fam(sp) for sp in cur}) > 1:
+            trials = []
+            for f in sorted({fam(sp) for sp in cur}):
+                rest = closed([sp for sp in cur if fam(sp) != f])
+                if rest:
+                    trials.append((score(rest), f, rest))
+            if not trials:
+                break
+            (l, z), f, rest = min(trials, key=lambda t: t[0][0])
+            self._log(f"  gate without {f}: loss={l:.6f} vs raw {raw_rows.mean():.6f} (z={z:+.2f}, need {z_needed + 1:.2f})")
+            cur = rest
+            if l < best_l and z >= z_needed + 1:
+                best_set, best_l = list(cur), l
+        return best_set, best_l
 
     def _fit_full(self, X, y, U=None):
         if self.recode_:
