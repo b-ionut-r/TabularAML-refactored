@@ -36,10 +36,11 @@ TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
 
 
 def read(path: str) -> pd.DataFrame:
-    df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path)
+    df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path, low_memory=False)
     for c in df.columns:
         if df[c].dtype == object:
-            df[c] = df[c].astype("category")
+            # Mixed 0 / "0" (pandas reads a CSV column chunk by chunk) become one level.
+            df[c] = df[c].where(df[c].isna(), df[c].astype(str)).astype("category")
         elif df[c].dtype == np.float64:
             df[c] = df[c].astype(np.float32)
     return df
