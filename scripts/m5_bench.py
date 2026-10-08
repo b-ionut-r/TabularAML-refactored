@@ -63,6 +63,12 @@ print('rows', len(L), 'train', len(Xtr), 'holdout', len(Xho), flush=True)
 t0 = time.time(); info = {}
 if a.arm in ('raw', 'hand'):
     Xtr, Xho = raw(Xtr), raw(Xho)
+elif a.arm in ('fc', 'hand_fc'):
+    # Forecasting family alone (tabularaml/generate/forecast.py) on top of the raw (or hand) columns.
+    from tabularaml.generate.forecast import forecast_features
+    Ftr, Fho, ff = forecast_features(Xtr, ytr, Xho, **json.loads(a.kw))
+    Xtr, Xho = pd.concat([raw(Xtr), Ftr], axis=1), pd.concat([raw(Xho), Fho], axis=1)
+    info = dict(n_fc=Ftr.shape[1])
 elif a.arm in ('forge', 'hand_forge'):
     from tabularaml.generate.forge import FeatureForge
     f = FeatureForge(task='regression', time_budget=a.budget, random_state=0, n_jobs=4, verbose=True, **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho)

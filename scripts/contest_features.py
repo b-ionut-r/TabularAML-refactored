@@ -124,6 +124,10 @@ def main():
                     help="related-table columns handed to FeatureForge's search (all are kept in the output)")
     ap.add_argument("--out-dir", default="features")
     ap.add_argument("--forge-kw", default="{}", help="JSON of extra FeatureForge arguments")
+    ap.add_argument("--forecast", default="auto", choices=["auto", "off"],
+                    help="forecasting family (tabularaml/generate/forecast.py): on when the data has a date, "
+                         "repeating entity keys and test rows after the training period")
+    ap.add_argument("--forecast-kw", default="{}", help="JSON of extra ForecastFeatures arguments")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -201,6 +205,15 @@ def main():
     Xtr = tr.drop(columns=[a.id]) if a.id else tr
     Xte = te.drop(columns=[a.id]) if a.id else te
     Xte = Xte[Xtr.columns]
+    if a.forecast == "auto":
+        from tabularaml.generate.forecast import ForecastFeatures
+        t = time.time()
+        ff = ForecastFeatures(**json.loads(a.forecast_kw)).fit(Xtr, y.to_numpy(), Xte)
+        if ff.active_:
+            Ftr, Fte = ff.transform(Xtr), ff.transform(Xte)
+            Xtr = pd.concat([Xtr.reset_index(drop=True), Ftr.reset_index(drop=True)], axis=1)
+            Xte = pd.concat([Xte.reset_index(drop=True), Fte.reset_index(drop=True)], axis=1)
+            print(f"forecast: {Ftr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
     if rel_tr is not None:
         # The search sees the related columns a quick model uses most; all are written out.
         import lightgbm as lgb

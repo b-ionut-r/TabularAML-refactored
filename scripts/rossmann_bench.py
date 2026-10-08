@@ -17,12 +17,14 @@ ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_
 ap.add_argument('--log-target', action='store_true'); ap.add_argument('--budget', type=float, default=900)
 ap.add_argument('--tag', default=''); ap.add_argument('--data', default='data/rossmann/'); ap.add_argument('--log', default='rossmann.jsonl')
 ap.add_argument('--shuffle', action='store_true'); ap.add_argument('--keep', default='', help='keep the output directory here')
-ap.add_argument('--forge-kw', default='{}')
+ap.add_argument('--forge-kw', default='{}'); ap.add_argument('--win', type=int, default=0, help='holdout ends 48 x win days before the last day')
 a = ap.parse_args()
 D = Path(a.data)
 tr = pd.read_csv(D / 'train.csv', dtype={'StateHoliday': str}).drop(columns=['Customers'])
 st = pd.read_csv(D / 'store.csv')
 d = pd.to_datetime(tr.Date)
+if a.win:
+    tr = tr[d <= d.max() - pd.Timedelta(days=48 * a.win)].reset_index(drop=True); d = pd.to_datetime(tr.Date)
 start = d.max() - pd.Timedelta(days=47)
 ho = tr[d >= start].reset_index(drop=True)
 tr = tr[d < start].reset_index(drop=True)
@@ -32,9 +34,15 @@ if a.shuffle:
     tr['Sales'] = np.random.default_rng(0).permutation(tr.Sales.to_numpy())
 te = ho.drop(columns=['Sales']).assign(Id=np.arange(1, len(ho) + 1))[['Id', 'Store', 'DayOfWeek', 'Date', 'Open', 'Promo', 'StateHoliday', 'SchoolHoliday']]
 t0 = time.time(); info = {}
-if a.arm == 'raw':
+if a.arm in ('raw', 'fc'):
     Xtr, Xte = tr.merge(st, on='Store', how='left'), te.drop(columns=['Id']).merge(st, on='Store', how='left')
     ytr_all = Xtr.pop('Sales').to_numpy(dtype=float)
+    if a.arm == 'fc':
+        # Forecasting family alone (tabularaml/generate/forecast.py) on top of the raw columns.
+        from tabularaml.generate.forecast import forecast_features
+        Ftr, Fte, ff = forecast_features(Xtr, ytr_all, Xte, **json.loads(a.forge_kw))
+        Xtr, Xte = pd.concat([Xtr, Ftr], axis=1), pd.concat([Xte, Fte], axis=1)
+        info = dict(n_cols=Xtr.shape[1], n_fc=Ftr.shape[1])
 else:
     tmp = Path(a.keep) if a.keep else Path(tempfile.mkdtemp())
     tmp.mkdir(parents=True, exist_ok=True)
@@ -64,6 +72,6 @@ b = lgb.train(P, lgb.Dataset(Xf[~va], yf[~va]), 10000, valid_sets=[lgb.Dataset(X
 p = np.expm1(lgb.train(P, lgb.Dataset(Xf, yf), int(b.best_iteration * 1.1) + 1).predict(Xte))
 s = ho.Sales.to_numpy(dtype=float); m = s > 0
 rmspe = float(np.sqrt(np.mean(((s[m] - p[m]) / s[m]) ** 2)))
-res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), rows=a.rows, log_target=a.log_target, rmspe=rmspe, best_it=b.best_iteration,
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), win=a.win, rows=a.rows, log_target=a.log_target, rmspe=rmspe, best_it=b.best_iteration,
            fe_s=round(fe_t), total_s=round(time.time() - t0), n_tr=len(Xtr), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')
