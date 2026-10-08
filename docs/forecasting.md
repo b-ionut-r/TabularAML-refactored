@@ -140,6 +140,22 @@ it. Temperatures are left out because the contest week had none.
 Shuffled labels 738,105 (per-zone constant 735,627). No change followed: week-ahead load without temperatures swings
 with the weather, and single weeks move by up to 35% either way, so a change could not be judged within noise.
 
+### Enefit: Predict Energy Behavior of Prosumers (Kaggle 2024, $50k): hourly, weather-driven
+
+The contest files from a public Kaggle copy (`artisusxiren/predict-energy-behavior-of-prosumers`);
+`scripts/enefit_bench.py`: 138 series (prediction unit x production / consumption), each row with its day's client
+capacity and the county mean of the day-ahead weather forecast, as the contest served them; labels end two days
+before the first test day; MAE.
+
+| Test days (horizon) | Raw | Blind (shipped defaults) | Build |
+|---|---|---|---|
+| 2023-05-31, one day (25-48 h, the contest's) | 62.31 | **58.02** | 60 s |
+| 2023-05-28, one day (25-48 h) | 86.83 | **69.39** | 60 s |
+| 2023-05-25 .. 31, a week (25-192 h) | **86.28** | 87.36 | 60 s |
+
+Shuffled labels 396.41 (per-series median 396.52). At the contest's horizon the family cuts MAE by 7% and 20%; a week
+ahead the weather forecast and capacity carry the signal and the family adds nothing. No change followed.
+
 ## Results (held-out windows built like each contest's test file; same judges as the benches)
 
 | Contest (metric) | Raw | Earlier best | Forecast family | Build time |
