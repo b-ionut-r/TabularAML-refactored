@@ -51,3 +51,23 @@ def test_test_rows_use_training_labels_only():
     Fu = f.transform(U)
     assert np.all(Fu["fc_h"].to_numpy() == f._periods(U) - f.T_)
     assert Fu["fc_mean7"].notna().all()
+
+
+def test_hourly_no_own_or_later_labels():
+    rng = np.random.default_rng(2)
+    ts = pd.date_range("2020-01-01", periods=24 * 60 + 24 * 14, freq="h")
+    df = pd.DataFrame([(e, t) for e in range(8) for t in ts], columns=["meter", "ts"])
+    y = 10 + 5 * np.sin(df.ts.dt.hour / 24 * 2 * np.pi) + df.meter + rng.normal(0, 1, len(df))
+    df["ts"] = df.ts.dt.strftime("%Y-%m-%d %H:%M:%S")
+    tr = (df.ts < str(ts[24 * 60])).to_numpy()
+    X, U, y = df[tr].reset_index(drop=True), df[~tr].reset_index(drop=True), y[tr].to_numpy()
+    f = ForecastFeatures(verbose=False, log_target=False).fit(X, y, U)
+    assert f.active_ and f.step_ == 1 / 24 and f.hmax_ == 24 * 14
+    F = f.transform(X)
+    p = f._periods(X)
+    for i in rng.choice(len(X), 10, replace=False):
+        y2 = y.copy()
+        y2[p >= p[i]] = y2[p >= p[i]] * 5 + 100
+        F2 = ForecastFeatures(verbose=False, log_target=False).fit(X, y2, U).transform(X.iloc[[i]])
+        assert np.allclose(np.nan_to_num(F.iloc[[i]].to_numpy(), nan=-1), np.nan_to_num(F2.to_numpy(), nan=-1), rtol=1e-5)
+    assert f.transform(U)["fc_sameday1"].notna().mean() > 0.9

@@ -89,6 +89,22 @@ Shuffled labels 121.10 (constant 121.11). Medians moved SMAPE by 0.1-0.3%, withi
 off and the shipped defaults (and every earlier number) are unchanged. The test horizon starting at 3
 (the gap) is handled by the same per-row origins.
 
+### ASHRAE Great Energy Predictor III (Kaggle 2019, $25k): hourly data
+
+The contest's source, Building Data Genome 2 (github.com/buds-lab/building-data-genome-project-2), electricity
+meters; `scripts/ashrae_bench.py`: 300 random buildings with readings in both years (two samples), trained on
+2016, scored on every 2017 hour of the same buildings (the contest scored the following years), weather
+joined as the test file had it; RMSLE of the reading.
+
+| Building sample | Raw | Blind (shipped defaults) | Hourly support | Build |
+|---|---|---|---|---|
+| seed 0 / seed 1 | 0.7043 / 0.5614 | 0.7043 / - (family off: "sub-daily timestamps") | **0.6682 / 0.5211** | 140 s |
+
+Shuffled labels 1.7195 (constant 1.7192). The change: hourly timestamps switch the family on, with the
+same hour of the week as the season (26 weeks of it), the same hour on the latest 1 / 7 days, hour and
+weekday fields, windows from 1 hour to 52 weeks, and training origins aligned to the test origin's hour of
+the week. Daily and weekly data take the same code path as before (M5 reproduces 0.75098 exactly).
+
 ## Results (held-out windows built like each contest's test file; same judges as the benches)
 
 | Contest (metric) | Raw | Earlier best | Forecast family | Build time |

@@ -213,8 +213,10 @@ class ForecastFeatures:
         ut = np.unique(np.concatenate([tx[np.isfinite(tx)], tu[np.isfinite(tu)]]))
         d = np.diff(ut)
         step = float(np.min(d[d > 0])) if np.any(d > 0) else 1.0
+        if step < 1 / 24 - 1e-9:
+            return "timestamps finer than hourly"
         if step < 1 - 1e-9:
-            return "sub-daily timestamps"
+            step = 1 / 24
         self.time_col_, self.step_ = tc, step
         A = pd.concat([X[cols], U[cols]], ignore_index=True)
         n = len(A)
@@ -279,7 +281,7 @@ class ForecastFeatures:
             x = _codes(s)
             if (pd.Series(x).groupby(k).nunique() > 1).mean() < 0.2:
                 continue  # static attribute
-            if step == 1 and (pd.Series(x).groupby(dow).nunique() <= 1).all():
+            if step <= 1 and (pd.Series(x).groupby(dow).nunique() <= 1).all():
                 continue  # a weekday name
             vc = pd.Series(x).value_counts(normalize=True)
             mode = vc.index[0]
@@ -343,9 +345,10 @@ class ForecastFeatures:
         h = pu - self.T_
         self.hmin_, self.hmax_ = int(max(1, np.nanmin(h))), int(np.nanmax(h))
         self.L_ = self.hmax_ - self.hmin_ + 1
-        if self.step_ == 1:
-            # Whole weeks, so every training origin falls on the test origin's weekday.
-            self.L_ = int(np.ceil(self.L_ / 7) * 7)
+        # Whole weeks, so every training origin falls on the test origin's weekday (and hour).
+        self.align_ = 7 if self.step_ == 1 else 168 if self.step_ < 1 else None
+        if self.align_:
+            self.L_ = int(np.ceil(self.L_ / self.align_) * self.align_)
         self.P_ = int(np.nanmax(np.concatenate([px, pu]))) + 1
         A = pd.concat([X, X_unlabeled[[c for c in X.columns if c in X_unlabeled.columns]]], ignore_index=True)
         self.ent_vocab_ = self._vocab(A, self.entity_)
@@ -386,7 +389,9 @@ class ForecastFeatures:
             self.cov_.append((c, mode, pos, Se, Ce))
             del evy
         self.n_ent_, self.Pn_ = ne, Pn
-        if self.step_ == 1:
+        if self.step_ < 1:  # hourly: same hour of the week as the season, a day as a second one
+            self.windows_, self.season_, self.year_ = (1, 3, 24, 72, 168, 336, 672, 2016, 8736), 168, 8736
+        elif self.step_ == 1:
             self.windows_, self.season_, self.year_ = (1, 3, 7, 14, 28, 56, 112, 364), 7, 364
         elif abs(self.step_ - 7) < 1e-9:
             self.windows_, self.season_, self.year_ = (1, 2, 4, 8, 13, 26, 52), None, 52
@@ -415,9 +420,9 @@ class ForecastFeatures:
             z *= np.uint64(0x94D049BB133111EB)
             z ^= z >> np.uint64(29)
             hr = self.hmin_ + (z % np.uint64(self.hmax_ - self.hmin_ + 1)).astype(np.int64)
-            if self.step_ == 1 and self.align_week:
-                # Same weekday as the test origin: h' = h + ((t - T) - h) mod 7 shift.
-                hr = hr + np.mod((p - self.T_) - hr, 7)
+            if self.align_ and self.align_week:
+                # Same weekday (hour of the week) as the test origin.
+                hr = hr + np.mod((p - self.T_) - hr, self.align_)
             return np.where(p > self.T_, self.T_, p - hr)
         d = self.T_ - p
         k = np.ceil((self.hmin_ + d) / self.L_)
@@ -440,7 +445,10 @@ class ForecastFeatures:
         if self.step_ <= 7:
             # Calendar fields of the target date (lag features are read against them).
             dt = pd.to_datetime(self.t0_ + p_abs * self.step_, unit="D")
-            if self.step_ == 1:
+            if self.step_ < 1:
+                F["fc_hour"] = dt.hour.to_numpy()
+                F["fc_dow"] = dt.dayofweek.to_numpy()
+            if self.step_ <= 1:
                 F["fc_dom"] = dt.day.to_numpy()
                 F["fc_doy"] = dt.dayofyear.to_numpy()
             F["fc_woy"] = dt.isocalendar().week.to_numpy().astype(float)
@@ -485,8 +493,14 @@ class ForecastFeatures:
                     F["fc_same26"] = np.nanmean(V, 0)
                     F["fc_same26_med"] = np.nanmedian(V, 0)
                     F["fc_same26_std"] = np.nanstd(V, 0)
-                    F["fc_same_rel"] = F["fc_same26"] - E.mean(kk, o - 7 * n_same, o)[0]
+                    F["fc_same_rel"] = F["fc_same26"] - E.mean(kk, o - s * n_same, o)[0]
                 V = V[:8]
+                if self.step_ < 1:
+                    # The same hour on the latest days known.
+                    jd = np.ceil(h / 24).astype(np.int64)
+                    Vd = np.vstack([E.at(kk, t - 24 * (jd + i)) for i in range(7)])
+                    F["fc_sameday1"] = Vd[0]
+                    F["fc_sameday7"] = np.nanmean(Vd, 0)
                 if self.intermittent_:
                     Vn = np.where(V > 0, V, np.nan)
                     F["fc_same8_nz"] = np.nanmean(Vn, 0)
