@@ -321,3 +321,25 @@ def test_forge_search_subsample_keeps_output_on_every_row():
                      time_col="t", max_search_rows=2000).fit(X, y, X_unlabeled=U)
     assert len(f.transform_train(X)) == len(X) and len(f.transform(U)) == len(U)
     assert any("a" in c and "b" in c for c in f.new_columns_)
+
+
+def test_pair_scan_finds_hidden_difference_of_near_duplicate_columns():
+    # Loan Default's golden feature: two near-identical huge columns whose small difference
+    # decides the label, hidden among many other near-duplicate pairs.
+    from tabularaml.generate.pairscan import scan_pairs
+    rng = np.random.default_rng(0)
+    n = 6000
+    base = rng.lognormal(15, 1, size=(n, 6))
+    X = {}
+    for j in range(6):
+        X[f"a{j}"] = base[:, j]
+        X[f"b{j}"] = base[:, j] + rng.normal(0, 50, n)
+    d = rng.normal(0, 1, n)
+    X["b3"] = X["a3"] + 50 * d
+    W = pd.DataFrame(X)
+    y = (d + 0.3 * rng.normal(size=n) > 1).astype(float)
+    margin = np.full(n, np.log(y.mean() / (1 - y.mean())))
+    p = 1 / (1 + np.exp(-margin))
+    loss = lambda m, rows: float(np.mean(np.logaddexp(0, m) - y[rows] * m))
+    out = scan_pairs(W, list(W.columns), [], p - y, p * (1 - p), loss, margin, top=3)
+    assert out and {out[0][1], out[0][2]} == {"a3", "b3"} and out[0][0] == "sub"

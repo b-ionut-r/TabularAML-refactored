@@ -123,6 +123,9 @@ def main():
     ap.add_argument("--top-related", type=int, default=200,
                     help="related-table columns handed to FeatureForge's search (all are kept in the output)")
     ap.add_argument("--out-dir", default="features")
+    ap.add_argument("--related-cache", default=None,
+                    help="directory to save the related-table features to, or load them from when present "
+                         "(arms that differ only in FeatureForge settings share them)")
     ap.add_argument("--forge-kw", default="{}", help="JSON of extra FeatureForge arguments")
     a = ap.parse_args()
 
@@ -132,7 +135,12 @@ def main():
     ids_tr = tr[a.id].to_numpy() if a.id else np.arange(len(tr))
     ids_te = te[a.id].to_numpy() if a.id else np.arange(len(tr), len(tr) + len(te))
     rel_tr = rel_te = None
-    if a.table:
+    cache = Path(a.related_cache) if a.related_cache else None
+    if cache is not None and (cache / "rel_train.parquet").exists():
+        rel_tr, rel_te = pd.read_parquet(cache / "rel_train.parquet"), pd.read_parquet(cache / "rel_test.parquet")
+        tr, te = pd.read_parquet(cache / "main_train.parquet"), pd.read_parquet(cache / "main_test.parquet")
+        print(f"related tables: {rel_tr.shape[1]} columns from {cache}", flush=True)
+    elif a.table:
         children = [parse_table(s, tr, a.id) for s in a.table]
         lookups = [ch for ch in children if "__lookup__" in ch.drop]
         children = [ch for ch in children if ch not in lookups]
@@ -197,6 +205,12 @@ def main():
             rel_tr = pd.concat([rel_tr, Fa.iloc[:len(tr)].reset_index(drop=True)], axis=1)
             rel_te = pd.concat([rel_te, Fa.iloc[len(tr):].reset_index(drop=True)], axis=1)
         print(f"related tables: {rel_tr.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)
+        if cache is not None:
+            cache.mkdir(parents=True, exist_ok=True)
+            rel_tr.to_parquet(cache / "rel_train.parquet")
+            rel_te.to_parquet(cache / "rel_test.parquet")
+            tr.to_parquet(cache / "main_train.parquet")  # with any one-row-per-key tables joined
+            te.to_parquet(cache / "main_test.parquet")
 
     Xtr = tr.drop(columns=[a.id]) if a.id else tr
     Xte = te.drop(columns=[a.id]) if a.id else te

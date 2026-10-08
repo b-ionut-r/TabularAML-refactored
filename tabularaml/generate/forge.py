@@ -1727,6 +1727,10 @@ class FeatureForge:
         titles, descriptions) get label-free writing statistics and TF-IDF SVD
         topics, and an out-of-fold sparse linear model on their words and character
         n-grams (alone, and all text plus one-hot keys) as candidates.
+    pair_scan : bool
+        Score differences and ratios of every pair among the 60 strongest numerics and of
+        every closely related pair (rank correlation >= 0.9) on a 20k-row sample, and offer
+        the best dozen as candidates (Loan Default's f528 - f527: AUC 0.735 -> 0.998).
     time_col : str | "auto" | None
         Column that orders rows in time. When set, the gate holds out the most
         recent rows instead of a random sample, so features that only work
@@ -1769,7 +1773,7 @@ class FeatureForge:
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
-                 random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
+                 pair_scan: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
         self.time_budget = time_budget
@@ -1810,6 +1814,7 @@ class FeatureForge:
         self.family_time_share = family_time_share
         self.gate_families = gate_families
         self.past_te = past_te
+        self.pair_scan = pair_scan
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -2129,6 +2134,8 @@ class FeatureForge:
             for c in self.date_cols_:
                 for part in _DATE_PARTS:
                     add(DatePart(c, part))
+            for op, a, b, _ in getattr(self, "wide_pairs_", []):
+                add(Arith(op, a, b))
             self._event_candidates(W, imp, add)
             self._entity_candidates(W, imp, top_num, add)
             self._interaction_candidates(W, add)
@@ -2293,6 +2300,23 @@ class FeatureForge:
                 triples[t] = self._cell_gain(ab * sizes[c] + codes[c], sizes[a] * sizes[b] * sizes[c], *args) \
                     - max(pairs[(a, b)] + max(one[a], one[b], 0.0), 0.0)
         return ({k: v for k, v in pairs.items() if v > 0}, {k: v for k, v in triples.items() if v > 0})
+
+    def _wide_pairs(self, W, y, margin, imp):
+        """Differences and ratios from a vectorised scan of all strong and closely related
+        numeric pairs (``pairscan``); Loan Default's f528 - f527 sits outside the top columns."""
+        budget = min(120.0, 0.1 * self._time_left())
+        if self.n_classes_ > 2 or budget < 1:
+            return []
+        from .pairscan import scan_pairs
+        num = [c for c in self.raw_cols_ if c not in self.cat_cols_ and c in W.columns]
+        strong = [c for c in imp.sort_values(ascending=False).index if c in num][:60]
+        g, h = self._grad_hess(y, margin)
+        t = time.time()
+        out = scan_pairs(W, num, strong, g, h, lambda m, rows: _loss(self.task_, y[rows], m), margin,
+                         time_budget=budget, seed=self.random_state)
+        self._log(f"pair scan: {len(num)} numerics, {time.time() - t:.0f}s -> "
+                  + (", ".join(f"{a} {op} {b} ({v:.4f})" for op, a, b, v in out[:6]) or "nothing"))
+        return out
 
     def _interaction_candidates(self, W, add):
         """Turn tree-path interactions into explicit features of every applicable family."""
@@ -2875,6 +2899,7 @@ class FeatureForge:
             break
         if self.n_interactions:
             self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
+        self.wide_pairs_ = self._wide_pairs(W, yW, margin, imp) if self.pair_scan else []
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
             self._fit_rank_maps(W)
@@ -3349,22 +3374,28 @@ class FeatureForge:
         def is_int(v):
             f = v[np.isfinite(v)]
             return len(f) > 0 and not np.any(f != np.round(f))
-        times = [c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0]
+        # Wide anonymous tables have hundreds of time-like columns: try the most distinct
+        # ones, within a minute (Loan Default's 700 columns took hours otherwise).
+        times = sorted([c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0],
+                       key=lambda c: -X[c].nunique())[:20]
+        t_stop = time.time() + 60
         deltas = sorted([c for c in num if is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
                         key=lambda c: -X[c].nunique())[:80]
         ids = []
         for c in self.id_cols_[:3]:
             v = S[c]
-            ids.append(pd.factorize(v)[0].astype(np.int64) if c in self.cat_cols_
-                       else np.nan_to_num(v.to_numpy(dtype=float), nan=-1).astype(np.int64))
+            ids.append(pd.factorize(v)[0].astype(np.int64))
         def n_pairs(idc, v):
             ok = np.isfinite(v)
             if ok.sum() < 0.3 * len(v):
                 return 0
-            code = idc[ok] * (1 << 32) + (v[ok].astype(np.int64) - int(v[ok].min()))
+            # Codes, not values: columns of huge magnitude overflow int64.
+            code = idc[ok] * (1 << 32) + pd.factorize(v[ok])[0].astype(np.int64)
             return len(np.unique(code))
         found = []
         for t in times:
+            if time.time() > t_stop:
+                break
             tv = vals[t]
             for s in (1, 60, 3600, 86400, 604800):
                 span = (np.nanmax(tv) - np.nanmin(tv)) / s
