@@ -3011,13 +3011,16 @@ class FeatureForge:
             Mw = (*self._lgb_matrix(self._model_frame(W)), list(W.columns))
             if attempt == 0 and self.time_budget and len(W) > 150_000:
                 # A CV fit on 50k rows, scaled up, flags tables where one full fit would
-                # take hours before paying for it.
+                # take hours before paying for it. Scaling up overstates the full fit (its
+                # fixed costs do not grow with rows: 132s estimated against 94s measured on
+                # IEEE-CIS's 472k rows), so it only acts when the estimate is twice over;
+                # otherwise the full fit's measured time below decides.
                 pr = np.sort(np.random.default_rng(self.random_state).choice(len(W), 50_000, replace=False))
                 t_p = time.time()
                 self._cv(None, yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)],
                          mat=(Mw[0][pr], Mw[1], Mw[2]))
                 est = (time.time() - t_p) * len(W) / 50_000
-                if 16 * est > 2 * self.time_budget:
+                if 16 * est > 4 * self.time_budget:
                     m_cap = max(100_000, int(len(W) * 2 * self.time_budget / (16 * est) * 0.8))
                     if m_cap < len(W):
                         self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
