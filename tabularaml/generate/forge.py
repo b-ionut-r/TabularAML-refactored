@@ -2855,8 +2855,8 @@ class FeatureForge:
                 t_p = time.time()
                 self._cv(Wm.iloc[pr], yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)])
                 est = (time.time() - t_p) * len(W) / 50_000
-                if 16 * est > 2 * self.time_budget:
-                    m_cap = max(100_000, int(len(W) * 2 * self.time_budget / (16 * est) * 0.8))
+                if 16 * est > 3 * self.time_budget:
+                    m_cap = max(100_000, int(len(W) * 3 * self.time_budget / (16 * est) * 0.8))
                     if m_cap < len(W):
                         self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
                         continue
@@ -2864,9 +2864,9 @@ class FeatureForge:
             margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
             # One CV fit's duration: the search stops when fewer than two are left in the budget.
             self._cv_s = time.time() - t_cv
-            # The first round is promised sixteen CV fits; when they would take more than twice
+            # The first round is promised sixteen CV fits; when they would take more than three times
             # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
-            room = 2 * self.time_budget
+            room = 3 * self.time_budget
             if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
                 m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
                 if m_cap < len(W):
@@ -2895,7 +2895,7 @@ class FeatureForge:
             # screening and the prefix ladder); later rounds start only while ten fit in the budget.
             self._deadline = None
             if r == 0 and self._time_left() < 16 * self._cv_s:
-                floor = min(16 * self._cv_s, 2 * self.time_budget)
+                floor = min(16 * self._cv_s, 3 * self.time_budget)
                 self._deadline = time.time() + floor
                 self._log(f"budget: first round given {floor:.0f}s")
             if r > 0 and self._time_left() < 10 * self._cv_s:
