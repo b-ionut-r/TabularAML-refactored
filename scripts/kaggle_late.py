@@ -85,6 +85,12 @@ CONTESTS = {
                 metric="auc", folds="kfold"),
 }
 
+# Final single variant: PR #2 at 44deab3 (all families merged, on from the data's structure). Same prep and judge.
+FINAL_REPO = "/tmp/claude-0/wt_final"
+for _c, _base in [("hc", "hc"), ("sct", "sct"), ("ross", "ross_fc"), ("m5", "m5"), ("fav", "fav"), ("wnv", "wnv"),
+                  ("porto", "porto")]:
+    CONTESTS[f"{_c}_final"] = dict(CONTESTS[_base], raw=CONTESTS[_base].get("raw", _base), repo=FINAL_REPO, base=_base)
+
 
 def download(c: str) -> Path:
     d = ROOT / CONTESTS[c].get("raw", c) / "raw"
@@ -255,7 +261,8 @@ def cmd_fcfeats(c: str):
     sys.path.insert(0, cfg["repo"])
     from tabularaml.generate.forecast import ForecastFeatures
     t0 = time.time()
-    tr, te, _ = PREP[c](download(c), FC_HISTORY[c])
+    base = cfg.get("base", c)
+    tr, te, _ = PREP[base](download(c), FC_HISTORY[base])
     if cfg["id"] not in tr.columns:
         tr.insert(0, cfg["id"], -np.arange(1, len(tr) + 1))
     to_compact(tr), to_compact(te)
