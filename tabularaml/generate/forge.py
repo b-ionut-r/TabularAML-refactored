@@ -1729,7 +1729,7 @@ class FeatureForge:
         n-grams (alone, and all text plus one-hot keys) as candidates.
     pair_scan : bool
         Score differences and ratios of every pair among the 60 strongest numerics and of
-        every closely related pair (rank correlation >= 0.9) on a 20k-row sample, and offer
+        every closely related pair (rank correlation >= 0.9) on a 20k-row sample (5% of the budget), and offer
         the best dozen as candidates (Loan Default's f528 - f527: AUC 0.735 -> 0.998).
     time_col : str | "auto" | None
         Column that orders rows in time. When set, the gate holds out the most
@@ -2304,7 +2304,7 @@ class FeatureForge:
     def _wide_pairs(self, W, y, margin, imp):
         """Differences and ratios from a vectorised scan of all strong and closely related
         numeric pairs (``pairscan``); Loan Default's f528 - f527 sits outside the top columns."""
-        budget = min(120.0, 0.1 * self._time_left())
+        budget = min(120.0, 0.05 * self._time_left())
         if self.n_classes_ > 2 or budget < 1:
             return []
         from .pairscan import scan_pairs

@@ -51,13 +51,13 @@ def _gains(M: np.ndarray, g: np.ndarray, h: np.ndarray, fold: np.ndarray, K: int
 def scan_pairs(W: pd.DataFrame, num_cols: Sequence[str], strong: Sequence[str], g: np.ndarray,
                h: np.ndarray, loss_fn, margin: np.ndarray, *, n_rows: int = 20_000, min_corr: float = 0.9,
                max_pairs: int = 20_000, top: int = 12, chunk: int = 512, time_budget: float = 120.0,
-               seed: int = 0) -> List[Tuple[str, str, str, float]]:
+               min_rel_gain: float = 1e-3, seed: int = 0) -> List[Tuple[str, str, str, float]]:
     """Rank ``(op, a, b)`` difference / ratio pairs by novel residual gain.
 
     ``g``, ``h`` and ``margin`` are the current model's gradients, hessians and margin on the
     rows of ``W`` (binary / regression: 1-D). ``loss_fn(margin)`` returns the mean loss on a
-    subsample's labels. Returns at most ``top`` tuples ``(op, a, b, novel_gain)`` with positive
-    novel gain, best first; ``op`` is ``"sub"`` or ``"div"`` (``a / b``).
+    subsample's labels. Returns at most ``top`` tuples ``(op, a, b, novel_gain)`` whose novel gain
+    exceeds ``min_rel_gain`` times the current loss, best first; ``op`` is ``"sub"`` or ``"div"`` (``a / b``).
     """
     t0 = time.time()
     rng = np.random.default_rng(seed + 11)
@@ -110,7 +110,9 @@ def scan_pairs(W: pd.DataFrame, num_cols: Sequence[str], strong: Sequence[str], 
                 gain = _gains(V, g, h, fold, K, lam, n_bins, loss, base, margin) - pmax
                 for (i, j), v in zip(P, gain):
                     scores[(op, cols[i], cols[j])] = float(v)
-    best = sorted((k for k in scores if scores[k] > 0), key=scores.get, reverse=True)
+    # A pair must cut the loss by at least ``min_rel_gain`` of it: on Home Credit the best pair
+    # gained 1e-5 and only took the place of search time.
+    best = sorted((k for k in scores if scores[k] > min_rel_gain * base), key=scores.get, reverse=True)
     out, used = [], {}
     for op, a, b in best:
         # One op per pair, and no column in more than three kept pairs (near-copies of one
