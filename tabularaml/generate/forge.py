@@ -1740,6 +1740,8 @@ class FeatureForge:
         groups when test rows are new entities, else a random sample); the rest still
         count in label-free statistics, and the output is computed on every row. Off by
         default: a 300k cap lost M5's and Favorita's gains.
+    family_time_share : float
+        Largest share of the candidate-building time one family may take (1 disables).
     gate_by_period : bool
         On time-ordered data, test the gate's paired improvement with each period (gate
         time value, or one of 30 time blocks) as one observation instead of each row; rows
@@ -1844,7 +1846,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1883,6 +1885,7 @@ class FeatureForge:
         self.parity_check = parity_check
         self.max_search_rows = max_search_rows
         self.gate_by_period = gate_by_period
+        self.family_time_share = family_time_share
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -2483,8 +2486,11 @@ class FeatureForge:
         spent: Dict[str, list] = {}
         # No family of candidates may take over a third of the time left for building them
         # (a few slow ones, neighbour features on large tables, otherwise starve the rest).
-        reserve = 8 * getattr(self, "_cv_s", 0.0)  # screening, the joint ranking fit and the prefix ladder
-        fam_cap = max(self._time_left() - reserve, 0.0) / 3 * max(1, self._threads())
+        # Screening, the joint ranking fit and the prefix ladder: eight CV fits, at most half
+        # the time left (when the first round's time is capped by the budget).
+        reserve = min(8 * getattr(self, "_cv_s", 0.0), 0.5 * max(self._time_left(), 0.0))
+        # Thread time: candidates are built on ``_threads()`` threads at once.
+        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share * max(1, self._threads())
         capped = set()
 
         def compute(s):
@@ -2944,67 +2950,91 @@ class FeatureForge:
         # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
         # budget for several rounds; the rows left out still feed label-free statistics.
         idx_out = np.array([], dtype=int)
-        m = self.max_search_rows or len(idx_sel)
-        if len(idx_sel) > m:
-            rng = np.random.default_rng(self.random_state)
-            if self.time_col_ is not None:
-                keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
-            elif self.group_col_ is not None:
-                g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
-                perm = rng.permutation(g.max() + 1)
-                r = perm[g]
-                keep = idx_sel[np.argsort(r, kind="stable")[:m]]
-            else:
-                keep = rng.choice(idx_sel, m, replace=False)
-            keep = np.sort(keep)
-            idx_out = np.setdiff1d(idx_sel, keep)
-            self._log(f"search on {m} of {len(idx_sel)} rows")
-            idx_sel = keep
-        W = X.iloc[idx_sel].reset_index(drop=True)
-        yW = y_np[idx_sel]
-        if self.group_col_ is not None:
-            gx = X[self.group_col_].astype(str).to_numpy()
-            self._groups = {len(W): gx[idx_sel], n: gx}
-        self.U_search_ = self.WU_ = None
-        extra = np.concatenate([idx_out, idx_gate]).astype(int)
-        self._wu_src = None if X_unlabeled is None and not len(idx_out) else (X, extra, X_unlabeled)
-        self.ctx_.extra_rows = None
-        # Small tables get repeated CV so that selection is not driven by fold noise.
-        n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
-        folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
-        te_folds = self._te_folds(W, yW, self.random_state + 1)
-        # Screening split (A trains the residual boosters, B measures them).
-        try:
-            idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
-                                            stratify=yW if self.task_ != "regression" else None)
-        except ValueError:
-            idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
-        if self.group_col_ is not None:
-            f0 = self._folds(len(W), yW, 10, self.random_state + 3)
-            idx_b = np.sort(np.concatenate([va for _, va in f0[:3]]))
-            idx_a = np.setdiff1d(np.arange(len(W)), idx_b)
-        if self.time_col_ is not None and self.time_cv:
-            # Rows close in time share their period's level, so random folds reward
-            # features that interpolate between neighbouring days. Contiguous time
-            # blocks as folds, and screening measured on the latest rows, reward only
-            # what carries over to other periods, as the test period needs.
-            order = np.argsort(W[self.time_col_].to_numpy(dtype=float), kind="stable")
-            blocks = np.array_split(order, self.cv)
-            folds = [[(np.sort(np.concatenate(blocks[:i] + blocks[i + 1:])), np.sort(b))
-                      for i, b in enumerate(blocks)]]
-            n_b = int(round(0.3 * len(W)))
-            idx_a, idx_b = np.sort(order[:-n_b]), np.sort(order[-n_b:])
+        m_cap = None
+        for attempt in range(3):
+            m = m_cap or self.max_search_rows or len(idx_sel)
+            if len(idx_sel) > m:
+                rng = np.random.default_rng(self.random_state)
+                if self.time_col_ is not None:
+                    keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
+                elif self.group_col_ is not None:
+                    g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                    perm = rng.permutation(g.max() + 1)
+                    r = perm[g]
+                    keep = idx_sel[np.argsort(r, kind="stable")[:m]]
+                else:
+                    keep = rng.choice(idx_sel, m, replace=False)
+                keep = np.sort(keep)
+                idx_out = np.union1d(idx_out, np.setdiff1d(idx_sel, keep))
+                self._log(f"search on {m} of {len(idx_sel)} rows")
+                idx_sel = keep
+            W = X.iloc[idx_sel].reset_index(drop=True)
+            yW = y_np[idx_sel]
+            if self.group_col_ is not None:
+                gx = X[self.group_col_].astype(str).to_numpy()
+                self._groups = {len(W): gx[idx_sel], n: gx}
+            self.U_search_ = self.WU_ = None
+            extra = np.concatenate([idx_out, idx_gate]).astype(int)
+            self._wu_src = None if X_unlabeled is None and not len(idx_out) else (X, extra, X_unlabeled)
+            self.ctx_.extra_rows = None
+            # Small tables get repeated CV so that selection is not driven by fold noise.
+            n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
+            folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
+            te_folds = self._te_folds(W, yW, self.random_state + 1)
+            # Screening split (A trains the residual boosters, B measures them).
+            try:
+                idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
+                                                stratify=yW if self.task_ != "regression" else None)
+            except ValueError:
+                idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
+            if self.group_col_ is not None:
+                f0 = self._folds(len(W), yW, 10, self.random_state + 3)
+                idx_b = np.sort(np.concatenate([va for _, va in f0[:3]]))
+                idx_a = np.setdiff1d(np.arange(len(W)), idx_b)
+            if self.time_col_ is not None and self.time_cv:
+                # Rows close in time share their period's level, so random folds reward
+                # features that interpolate between neighbouring days. Contiguous time
+                # blocks as folds, and screening measured on the latest rows, reward only
+                # what carries over to other periods, as the test period needs.
+                order = np.argsort(W[self.time_col_].to_numpy(dtype=float), kind="stable")
+                blocks = np.array_split(order, self.cv)
+                folds = [[(np.sort(np.concatenate(blocks[:i] + blocks[i + 1:])), np.sort(b))
+                          for i, b in enumerate(blocks)]]
+                n_b = int(round(0.3 * len(W)))
+                idx_a, idx_b = np.sort(order[:-n_b]), np.sort(order[-n_b:])
 
-        selected: List[Spec] = []
-        self.history_ = []
-        self._nested_cache = {}
-        # The model's view of the search rows as one float32 matrix (``_lgb_matrix``), with
-        # its categorical positions and column names; rounds append the chosen features.
-        Mw = (*self._lgb_matrix(self._model_frame(W)), list(W.columns))
-        t_cv = time.time()
-        margin, cur_loss, imp = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw)
-        # One CV fit's duration: the search stops when fewer than two are left in the budget.
-        self._cv_s = time.time() - t_cv
+            selected: List[Spec] = []
+            self.history_ = []
+            self._nested_cache = {}
+            # The model's view of the search rows as one float32 matrix (``_lgb_matrix``), with
+            # its categorical positions and column names; rounds append the chosen features.
+            Mw = (*self._lgb_matrix(self._model_frame(W)), list(W.columns))
+            if attempt == 0 and self.time_budget and len(W) > 150_000:
+                # A CV fit on 50k rows, scaled up, flags tables where one full fit would
+                # take hours before paying for it.
+                pr = np.sort(np.random.default_rng(self.random_state).choice(len(W), 50_000, replace=False))
+                t_p = time.time()
+                self._cv(None, yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)],
+                         mat=(Mw[0][pr], Mw[1], Mw[2]))
+                est = (time.time() - t_p) * len(W) / 50_000
+                if 16 * est > 2 * self.time_budget:
+                    m_cap = max(100_000, int(len(W) * 2 * self.time_budget / (16 * est) * 0.8))
+                    if m_cap < len(W):
+                        self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
+                        continue
+            t_cv = time.time()
+            margin, cur_loss, imp = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw)
+            # One CV fit's duration: the search stops when fewer than two are left in the budget.
+            self._cv_s = time.time() - t_cv
+            # The first round is promised sixteen CV fits; when they would take more than twice
+            # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
+            room = 2 * self.time_budget
+            if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
+                m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
+                if m_cap < len(W):
+                    self._log(f"budget: one CV fit takes {self._cv_s:.0f}s on {len(W)} rows; searching fewer rows")
+                    continue
+            break
         if self.n_interactions:
             self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
         self.base_cv_loss_ = cur_loss
@@ -3027,8 +3057,9 @@ class FeatureForge:
             # screening and the prefix ladder); later rounds start only while ten fit in the budget.
             self._deadline = None
             if r == 0 and self._time_left() < 16 * self._cv_s:
-                self._deadline = time.time() + 16 * self._cv_s
-                self._log(f"budget: first round given {16 * self._cv_s:.0f}s (sixteen CV fits)")
+                floor = min(16 * self._cv_s, 2 * self.time_budget)
+                self._deadline = time.time() + floor
+                self._log(f"budget: first round given {floor:.0f}s")
             if r > 0 and self._time_left() < 10 * self._cv_s:
                 self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
                           f"search stops")
@@ -3091,6 +3122,7 @@ class FeatureForge:
             for c, v in new:
                 Mj[:, jpos[c]] = v
             cats_j = set(Mw[1])
+            Mw = None  # its columns lead the joint matrix
             import lightgbm as lgb
             Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params(),
                              free_raw_data=False).construct()
