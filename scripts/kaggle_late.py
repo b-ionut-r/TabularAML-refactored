@@ -78,6 +78,9 @@ CONTESTS = {
     # IEEE-CIS reference: winners' public hand features (PR #4 b69cd34, scripts/ieee_hand_kaggle.py), no FeatureForge.
     "ieee_hand": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
                       folds="time", raw="ieee", repo="/tmp/claude-0/wt_hand"),
+    # Full IEEE-CIS v5: PR #4 at 02e276f (later-period drift fix, PR #2 head merged), search on the latest 260k rows.
+    "ieee_v5": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
+                    folds="time", raw="ieee", repo="/tmp/claude-0/wt_v5"),
     # Home Credit v2: PR #2 head 14f8a21 (prefix-ladder budget fix 27f9514); same 5 child tables and judge as "hc".
     "hc2": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                 folds="kfold", child_models=True, raw="hc", repo="/tmp/claude-0/wt_pr2"),
