@@ -1649,6 +1649,10 @@ def _expr_eval(t, df):
         return a / np.where(b == 0, np.nan, b)
 
 
+# Features computed from a row's own values only (no other rows enter them).
+_SAME_ROW = (Arith, RowStat, Digits, Rotate, Expr, DatePart, TextStats, GeoPair)
+
+
 class FeatureForge:
     """Residual-guided automated feature engineering.
 
@@ -1662,6 +1666,12 @@ class FeatureForge:
         groups when test rows are new entities, else a random sample); the rest still
         count in label-free statistics, and the output is computed on every row. Off by
         default: a 300k cap lost M5's and Favorita's gains.
+    label_echo : bool
+        Find columns that carry earlier rows' labels (running means or counts of past
+        answers in an event log: within an entity, the next row's change tracks this row's
+        label) and keep them, and features built on them, out of every cross-row feature
+        (group statistics, counts, encodings, neighbours, anchors). Such statistics would
+        hand each row its own label through the entity's later rows.
     family_time_share : float
         Largest share of the candidate-building time one family may take (1 disables).
     gate_by_period : bool
@@ -1768,7 +1778,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1808,6 +1818,7 @@ class FeatureForge:
         self.max_search_rows = max_search_rows
         self.gate_by_period = gate_by_period
         self.family_time_share = family_time_share
+        self.label_echo = label_echo
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -1983,9 +1994,16 @@ class FeatureForge:
         time_keys = {self.time_col_, self.group_col_, *self.date_cols_, *getattr(self, "time_like_", [])} - {None}
 
         time_cols = {self.time_col_, *self.date_cols_} - {None}
+        echo = set(getattr(self, "echo_cols_", ()))
+        for sp in selected:
+            if echo & set(sp.parents):
+                echo |= set(sp.out_names()) | {sp.name}
 
         def add(spec):
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
+                return
+            # Label-echo columns (and features built on them) only in same-row features.
+            if echo and echo & set(spec.parents) and not isinstance(spec, _SAME_ROW):
                 return
             # A group's statistic of the date itself (deviation of a row's date from its group's
             # mean date) only tracks where the group sits in time; it drifts by construction.
@@ -2725,6 +2743,9 @@ class FeatureForge:
         self.rank_maps_ = {}
         self.base_cols_ = list(X.columns)
         self.id_cols_ = self._id_columns(X)
+        self.echo_cols_ = self._label_echo_cols(X, y_np) if self.label_echo else set()
+        if self.echo_cols_:
+            self._log(f"label-echo columns (kept out of cross-row features): {sorted(self.echo_cols_)}")
         self.anchors_ = self._find_anchors(X) if self.entities else []
         X = self._add_anchors(X)
         self.raw_cols_ = list(X.columns)
@@ -2855,8 +2876,8 @@ class FeatureForge:
                 t_p = time.time()
                 self._cv(Wm.iloc[pr], yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)])
                 est = (time.time() - t_p) * len(W) / 50_000
-                if 16 * est > 2 * self.time_budget:
-                    m_cap = max(100_000, int(len(W) * 2 * self.time_budget / (16 * est) * 0.8))
+                if 16 * est > 3 * self.time_budget:
+                    m_cap = max(100_000, int(len(W) * 3 * self.time_budget / (16 * est) * 0.8))
                     if m_cap < len(W):
                         self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
                         continue
@@ -2864,9 +2885,9 @@ class FeatureForge:
             margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
             # One CV fit's duration: the search stops when fewer than two are left in the budget.
             self._cv_s = time.time() - t_cv
-            # The first round is promised sixteen CV fits; when they would take more than twice
+            # The first round is promised sixteen CV fits; when they would take more than three times
             # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
-            room = 2 * self.time_budget
+            room = 3 * self.time_budget
             if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
                 m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
                 if m_cap < len(W):
@@ -2895,7 +2916,7 @@ class FeatureForge:
             # screening and the prefix ladder); later rounds start only while ten fit in the budget.
             self._deadline = None
             if r == 0 and self._time_left() < 16 * self._cv_s:
-                floor = min(16 * self._cv_s, 2 * self.time_budget)
+                floor = min(16 * self._cv_s, 3 * self.time_budget)
                 self._deadline = time.time() + floor
                 self._log(f"budget: first round given {floor:.0f}s")
             if r > 0 and self._time_left() < 10 * self._cv_s:
@@ -3308,6 +3329,45 @@ class FeatureForge:
         return best
 
     # ------------------------------------------------------------- entities
+    def _label_echo_cols(self, X, y, min_corr=0.2):
+        """Columns that carry earlier rows' labels: within an entity (ID-like column, rows in
+        file order, which event logs keep chronological), the change from a row to the next
+        row tracks the first row's label, as a running mean or count of past answers does.
+        Statistics over an entity's other rows would hand a row its own label through the
+        later rows' values, so these columns stay out of every cross-row feature."""
+        if y is None or self.n_classes_ > 2 or not self.id_cols_:
+            return set()
+        yv = np.asarray(y, dtype=float)
+        echo = set()
+        num = [c for c in X.columns if c not in self.cat_cols_ and c not in self.id_cols_]
+        for k in self.id_cols_[:3]:
+            g = pd.factorize(X[k])[0]
+            same = np.zeros(len(X), dtype=bool)
+            same[:-1] = (g[1:] == g[:-1]) & (g[:-1] >= 0)
+            if same.sum() < 200:
+                continue
+            for c in num:
+                if c in echo:
+                    continue
+                v = X[c].to_numpy(dtype=float)
+                d = np.full(len(v), np.nan)
+                d[:-1] = v[1:] - v[:-1]
+                m = same & np.isfinite(d) & np.isfinite(yv)
+                if m.sum() < 200 or np.std(d[m]) == 0 or np.std(yv[m]) == 0:
+                    continue
+                r = np.corrcoef(d[m], yv[m])[0, 1]
+                if not (np.isfinite(r) and abs(r) >= min_corr):
+                    continue
+                # Control: a calendar or other periodic column moves with the next row's label
+                # as much as with this one's; a running statistic of past labels does not.
+                y1 = np.full(len(yv), np.nan)
+                y1[:-1] = yv[1:]
+                m1 = m & np.isfinite(y1)
+                r1 = np.corrcoef(d[m1], y1[m1])[0, 1] if m1.sum() >= 200 and np.std(y1[m1]) > 0 else 0.0
+                if not np.isfinite(r1) or abs(r) >= 3 * abs(r1):
+                    echo.add(c)
+        return echo
+
     def _id_columns(self, X, cap=8):
         """Integer or categorical columns with many levels that repeat: card numbers,
         addresses, customer or store ids. Most levels first."""
@@ -3350,7 +3410,7 @@ class FeatureForge:
             f = v[np.isfinite(v)]
             return len(f) > 0 and not np.any(f != np.round(f))
         times = [c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0]
-        deltas = sorted([c for c in num if is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
+        deltas = sorted([c for c in num if c not in getattr(self, "echo_cols_", ()) and is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
                         key=lambda c: -X[c].nunique())[:80]
         ids = []
         for c in self.id_cols_[:3]:
