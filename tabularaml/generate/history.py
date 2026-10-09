@@ -82,7 +82,7 @@ def event_log_features(main: pd.DataFrame, ch: Child, outcome: str, time: str, i
     yv = pd.to_numeric(df[outcome], errors="coerce").to_numpy(dtype=float)
     if outcome_values is not None:
         yv = np.where(np.isin(yv, list(outcome_values)), yv, np.nan)
-    pre = _safe(f"{ch.name}:{outcome}")
+    pre = _safe(f"{ch.name}:{outcome}:hist")   # apart from asof_features' own column names
     out = {}
     order, lo, p = _sorted_index(ek, et, mk, mt)
     ys, ts = yv[order], et[order]

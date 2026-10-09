@@ -39,3 +39,41 @@ level). With held-out answers hidden instead, training rows still leak this way 
 falls to 0.622 / 0.563 against raw 0.612 / 0.618. Any main table with repeated keys and an as-of child holding the
 target (DSB 2019's event logs too) is exposed. Cross-row statistics on such tables would need to read earlier rows
 only, or label-derived as-of columns kept out of them; that is FeatureForge's code, left to the feature thread.
+
+## After the fix (PR #2 bb533a9, `label_echo`) and with outcome history
+
+Riiid, earlier answers revealed (`--reveal`), 5k students per sample, AUC:
+
+| Run | Sample 0 | Sample 1 | Build |
+|---|---|---|---|
+| Raw | 0.612 | 0.618 | |
+| Blind, before the fix (leak) | 0.922 | 0.922 | 26 min |
+| **Blind, with the fix** | **0.753** | **0.763** | 7-27 min |
+| Blind + `--history auto` (outcome history) | **0.766** | **0.768** | +3 s for the history, 27-31 min in all |
+| Shuffled labels and log answers (with the fix; + history) | 0.522; 0.514 | | |
+| Raw columns, shuffled labels (noise floor of a near-empty model) | 0.511 | | |
+
+Outcome history (`event_log_features` in `tabularaml/generate/history.py`, on with `--history auto` when an as-of
+log carries the target column): the student's earlier outcomes (count, mean, the last 5 / 20 / 100, the last five
+one by one), time since the latest, 3rd and 10th latest event, and the student's earlier attempts on the same
+question (count, mean, time since). Only events at strictly earlier timestamps count, so a bundle's answers stay
+hidden from each other (`tests/test_history.py`). The label-echo detector flags the overall columns but not the
+lags 2-5 or the same-question mean; FeatureForge could still group on those.
+
+The winners' 0.82 also used the question metadata (`questions.csv`: part, tags; not in this copy), every student's
+full history (these samples hold 5k of 394k students, so the question difficulty is estimated from 1M answers
+instead of 100M), and sequence models (modelling).
+
+## DSB 2019 audit (same split as the toolkit's table)
+
+| Run | Seed 0 | Seed 1 |
+|---|---|---|
+| As-of aggregations | 0.535 | 0.533 |
+| + FeatureForge (as before the fix) | 0.553 | 0.538 |
+| + FeatureForge, each draw's assessments transformed alone (no later held-out rows visible) | 0.553 | 0.538 |
+| + FeatureForge without group statistics or entities | 0.539 | 0.533 |
+| Shuffled labels | -0.001 | |
+| Assessment attempt codes shuffled in the history | 0.510 | |
+
+The held-out number does not depend on later rows, so 0.546 holds as a held-out score. Group statistics carry most
+of FeatureForge's gain here.
