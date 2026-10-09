@@ -17,28 +17,15 @@ from sklearn.metrics import roc_auc_score
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ieee_fraud import judge, load  # noqa: E402
 
-ap = argparse.ArgumentParser()
-ap.add_argument("--frac", type=float, default=1.0); ap.add_argument("--arm", default="hand")
-ap.add_argument("--shuffle", action="store_true"); ap.add_argument("--log", default="ieee_hand.jsonl")
-ap.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "ieee_fraud")
-ap.add_argument("--forge-kw", default=None, help="also run FeatureForge on top (JSON kwargs)")
-ap.add_argument("--budget", type=float, default=900)
-ap.add_argument("--ablate", default="", help="comma list: noagg, nofe, keepids, nodnorm")
-a = ap.parse_args()
-df = load(a.cache)
-df = df.iloc[int(len(df) * (1 - a.frac)):].reset_index(drop=True)
-y = df.pop("isFraud"); df = df.drop(columns=["TransactionID"])
-n = int(0.8 * len(df))
-t0 = time.time()
-abl = set(filter(None, a.ablate.split(",")))
-if a.arm == "hand":
+def hand_features(df: pd.DataFrame, abl=frozenset()) -> pd.DataFrame:
+    """The winners' recipe on one frame of training and test rows (label-free; no target column)."""
     X = df.copy()
     day = np.floor(X.TransactionDT / 86400)
     for c in ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D10", "D11", "D12", "D13", "D14", "D15"]:
         X[c + "n"] = day - X[c]
     X["cents"] = (X.TransactionAmt - np.floor(X.TransactionAmt)).astype(np.float32)
-    s = lambda c: X[c].astype(str)
-    X["uid"] = s("card1") + "_" + s("addr1") + "_" + X["D1n"].astype(str)
+    s = lambda c: X[c].astype(str).fillna("nan")  # missing values are their own key value, as in the winners' pandas
+    X["uid"] = s("card1") + "_" + s("addr1") + "_" + s("D1n")
     X["card1_addr1"] = s("card1") + "_" + s("addr1")
     X["card1_addr1_P"] = X["card1_addr1"] + "_" + s("P_emaildomain")
     for c in [] if "nofe" in abl else ["addr1", "card1", "card2", "card3", "P_emaildomain", "R_emaildomain", "card1_addr1",
@@ -60,47 +47,129 @@ if a.arm == "hand":
     X = X.drop(columns=["uid", "card1_addr1", "card1_addr1_P"] + ([] if "keepids" in abl else ["D1n", "TransactionDT"]))
     if "nodnorm" in abl:
         X = X.drop(columns=[c for c in X.columns if c.endswith("n") and c[:-1] in df.columns and c.startswith("D") and c != "D1n"])
-    df = X
-if a.arm == "profile":
-    # The generic block alone, with the key FeatureForge discovers (card1, addr1, day - D1) and
-    # numerics in a raw model's importance order: how much of the hand gain it carries.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from tabularaml.generate.profile import ClientProfile
-    import lightgbm as lgb
-    X = df.copy()
-    X["anchor"] = np.floor(X.TransactionDT / 86400) - X.D1
-    Xm = X.iloc[:n].copy()
-    for c in Xm.columns:
-        if not pd.api.types.is_numeric_dtype(Xm[c]):
-            Xm[c] = Xm[c].astype("category")
-    b = lgb.train(dict(objective="binary", learning_rate=0.1, num_leaves=63, verbose=-1, num_threads=4, feature_fraction=0.5),
-                  lgb.Dataset(Xm, y.iloc[:n]), 200)
-    imp = pd.Series(b.feature_importance("gain"), index=Xm.columns).sort_values(ascending=False)
-    num = [c for c in imp.index if pd.api.types.is_numeric_dtype(X[c]) and c not in ("card1", "addr1", "anchor", "TransactionDT")
-           and X[c].nunique() > 2][:120]
-    cat = [c for c in imp.index if not pd.api.types.is_numeric_dtype(X[c]) and 2 < X[c].nunique()][:16]
-    reb = [("TransactionDT", 86400.0, d) for d in ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D10", "D11", "D12", "D13", "D14", "D15"]]
-    keys = [["card1", "addr1", "anchor"]] + ([["card1", "anchor"]] if "two" in abl else [])
-    blocks = []
-    for k in keys:
-        sp = ClientProfile(k, num, cat, reb).fit(X)
-        blocks.append(pd.DataFrame(sp.transform(X), columns=sp.out_names()))
-    df = pd.concat([X] + blocks, axis=1)
-    if "dropids" in abl:
-        df = df.drop(columns=["anchor", "TransactionDT"])
-fe_s = time.time() - t0
-Xtr, Xte = df.iloc[:n].reset_index(drop=True), df.iloc[n:].reset_index(drop=True)
-ytr, yte = y.iloc[:n].reset_index(drop=True), y.iloc[n:].reset_index(drop=True)
-if a.shuffle:
-    ytr = pd.Series(np.random.default_rng(0).permutation(ytr.to_numpy()))
-info = {}
-if a.forge_kw is not None:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from tabularaml.generate.forge import FeatureForge
-    f = FeatureForge(task="binary", time_budget=a.budget, n_jobs=4, **json.loads(a.forge_kw)).fit(Xtr, ytr, X_unlabeled=Xte)
-    Xtr, Xte = f.transform_train(Xtr), f.transform(Xte)
-    info = dict(n_added=len(f.new_columns_)); fe_s = time.time() - t0
-p = judge(Xtr.copy(), ytr, Xte.copy())
-res = dict(arm=a.arm + ("-" + a.ablate if a.ablate else "") + ("+forge" if a.forge_kw is not None else "") + ("_shuffled" if a.shuffle else ""), frac=a.frac,
-           ncol=Xtr.shape[1], auc=roc_auc_score(yte, p), fe_s=round(fe_s), total_s=round(time.time() - t0), **info)
-print("RESULT", json.dumps(res), flush=True); open(a.log, "a").write(json.dumps(res) + "\n")
+    return X
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--frac", type=float, default=1.0); ap.add_argument("--arm", default="hand")
+    ap.add_argument("--shuffle", action="store_true"); ap.add_argument("--log", default="ieee_hand.jsonl")
+    ap.add_argument("--cache", type=Path, default=Path.home() / ".cache" / "ieee_fraud")
+    ap.add_argument("--forge-kw", default=None, help="also run FeatureForge on top (JSON kwargs)")
+    ap.add_argument("--budget", type=float, default=900)
+    ap.add_argument("--split", default="latest", help="latest: last 20%% of rows held out; gap:T,G: train on days < T, "
+                    "skip G days, hold out the rest (the real test began a month after training ended and ran six months)")
+    ap.add_argument("--forge-cache", default=None, help="directory: save FeatureForge's output there, or load it when present")
+    ap.add_argument("--drop", default="", help="comma list of column prefixes dropped before judging (ablations)")
+    ap.add_argument("--ablate", default="", help="comma list: noagg, nofe, keepids, nodnorm")
+    a = ap.parse_args()
+    df = load(a.cache)
+    df = df.iloc[int(len(df) * (1 - a.frac)):].reset_index(drop=True)
+    y = df.pop("isFraud"); df = df.drop(columns=["TransactionID"])
+    n = int(0.8 * len(df))
+    if a.split.startswith("gap:"):
+        T, G = map(float, a.split[4:].split(","))
+        day = df.TransactionDT.to_numpy() / 86400
+        keep = (day < T) | (day >= T + G)
+        df, y = df[keep].reset_index(drop=True), y[keep].reset_index(drop=True)
+        n = int((day[keep] < T).sum())
+    t0 = time.time()
+    abl = set(filter(None, a.ablate.split(",")))
+    if a.arm == "hand":
+        df = hand_features(df, abl)
+    if a.arm == "profile":
+        # The generic block alone, with the key FeatureForge discovers (card1, addr1, day - D1) and
+        # numerics in a raw model's importance order: how much of the hand gain it carries.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from tabularaml.generate.profile import ClientProfile
+        import lightgbm as lgb
+        X = df.copy()
+        X["anchor"] = np.floor(X.TransactionDT / 86400) - X.D1
+        Xm = X.iloc[:n].copy()
+        for c in Xm.columns:
+            if not pd.api.types.is_numeric_dtype(Xm[c]):
+                Xm[c] = Xm[c].astype("category")
+        b = lgb.train(dict(objective="binary", learning_rate=0.1, num_leaves=63, verbose=-1, num_threads=4, feature_fraction=0.5),
+                      lgb.Dataset(Xm, y.iloc[:n]), 200)
+        imp = pd.Series(b.feature_importance("gain"), index=Xm.columns).sort_values(ascending=False)
+        num = [c for c in imp.index if pd.api.types.is_numeric_dtype(X[c]) and c not in ("card1", "addr1", "anchor", "TransactionDT")
+               and X[c].nunique() > 2][:120]
+        cat = [c for c in imp.index if not pd.api.types.is_numeric_dtype(X[c]) and 2 < X[c].nunique()][:16]
+        reb = [("TransactionDT", 86400.0, d) for d in ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D10", "D11", "D12", "D13", "D14", "D15"]]
+        keys = [["card2", "card1", "anchor"] if "ffkey" in abl else ["card1", "addr1", "anchor"]] + ([["card1", "anchor"]] if "two" in abl else [])
+        blocks = []
+        for k in keys:
+            sp = ClientProfile(k, num, cat, reb).fit(X)
+            blocks.append(pd.DataFrame(sp.transform(X), columns=sp.out_names()))
+        df = pd.concat([X] + blocks, axis=1)
+        if "dropids" in abl:
+            df = df.drop(columns=["anchor", "TransactionDT"])
+    if "te" in abl:  # out-of-fold target encoding of the client id, as FeatureForge builds it
+        raw = load(a.cache)
+        raw = raw.iloc[int(len(raw) * (1 - a.frac)):].reset_index(drop=True)
+        if a.split.startswith("gap:"):
+            raw = raw[keep].reset_index(drop=True)
+        u = (raw.card1.astype(str).fillna("nan") + "_" + raw.addr1.astype(str).fillna("nan") + "_"
+             + (np.floor(raw.TransactionDT / 86400) - raw.D1).astype(str).fillna("nan")).to_numpy()
+        yv, prior, w = y.to_numpy(dtype=float), float(y.iloc[:n].mean()), 20.0
+        def enc(fit_idx, at_idx):
+            st = pd.DataFrame({"u": u[fit_idx], "y": yv[fit_idx]}).groupby("u")["y"].agg(["sum", "count"])
+            m = (st["sum"] + prior * w) / (st["count"] + w)
+            return pd.Series(u[at_idx]).map(m).fillna(prior).to_numpy(dtype=np.float32)
+        te = np.empty(len(u), dtype=np.float32)
+        blocks = np.array_split(np.arange(n), 5)  # time-ordered blocks of the training rows
+        for b in blocks:
+            te[b] = enc(np.setdiff1d(np.arange(n), b), b)
+        te[n:] = enc(np.arange(n), np.arange(n, len(u)))
+        df = df.copy()
+        df["te_uid"] = te
+    fe_s = time.time() - t0
+    Xtr, Xte = df.iloc[:n].reset_index(drop=True), df.iloc[n:].reset_index(drop=True)
+    ytr, yte = y.iloc[:n].reset_index(drop=True), y.iloc[n:].reset_index(drop=True)
+    if "tc" in abl:  # time-consistency filter: drop columns that alone score below chance later in time
+        import lightgbm as lgb
+        m1, m2 = int(0.6 * len(Xtr)), int(0.8 * len(Xtr))
+        drop = []
+        for c in Xtr.columns:
+            x = Xtr[[c]]
+            if not pd.api.types.is_numeric_dtype(x[c]):
+                x = x.astype(str).astype("category")
+            yy = ytr.to_numpy()
+            if yy[m2:].min() == yy[m2:].max():
+                continue
+            b = lgb.train(dict(objective="binary", learning_rate=0.1, num_leaves=7, min_child_samples=200, verbose=-1,
+                               num_threads=4), lgb.Dataset(x.iloc[:m1], yy[:m1]), 50)
+            if roc_auc_score(yy[m2:], b.predict(x.iloc[m2:])) < 0.5:
+                drop.append(c)
+        print(f"time consistency: dropped {len(drop)}: {drop[:40]}", flush=True)
+        Xtr, Xte = Xtr.drop(columns=drop), Xte.drop(columns=drop)
+    if a.shuffle:
+        ytr = pd.Series(np.random.default_rng(0).permutation(ytr.to_numpy()))
+    info = {}
+    if a.forge_kw is not None:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from tabularaml.generate.forge import FeatureForge
+        fc = Path(a.forge_cache) if a.forge_cache else None
+        if fc is not None and (fc / "train.parquet").exists():
+            Xtr, Xte = pd.read_parquet(fc / "train.parquet"), pd.read_parquet(fc / "test.parquet")
+            info = {}
+        else:
+            f = FeatureForge(task="binary", time_budget=a.budget, n_jobs=4, **json.loads(a.forge_kw)).fit(Xtr, ytr, X_unlabeled=Xte)
+            Xtr, Xte = f.transform_train(Xtr), f.transform(Xte)
+            info = dict(n_added=len(f.new_columns_)); fe_s = time.time() - t0
+            if fc is not None:
+                fc.mkdir(parents=True, exist_ok=True)
+                Xtr.to_parquet(fc / "train.parquet"); Xte.to_parquet(fc / "test.parquet")
+    if a.drop:
+        pre = tuple(a.drop.split(","))
+        keep_cols = [c for c in Xtr.columns if not c.startswith(pre)]
+        Xtr, Xte = Xtr[keep_cols], Xte[keep_cols]
+        info["dropped"] = a.drop
+    p = judge(Xtr.copy(), ytr, Xte.copy())
+    res = dict(split=a.split, arm=a.arm + ("-" + a.ablate if a.ablate else "") + ("+forge" if a.forge_kw is not None else "") + ("_shuffled" if a.shuffle else "") + ("-drop:" + a.drop if a.drop else ""), frac=a.frac,
+               ncol=Xtr.shape[1], auc=roc_auc_score(yte, p), fe_s=round(fe_s), total_s=round(time.time() - t0), **info)
+    print("RESULT", json.dumps(res), flush=True); open(a.log, "a").write(json.dumps(res) + "\n")
+
+
+if __name__ == "__main__":
+    main()
