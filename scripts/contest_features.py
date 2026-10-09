@@ -109,6 +109,44 @@ def main_time(main: pd.DataFrame, ch: Child, given: str | None) -> str | None:
     return cands[0] if len(cands) == 1 else None
 
 
+def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
+    """Keep child-row models only when they add to the aggregates: a quick 3-fold LightGBM on
+    training rows with and without them (Home Credit +0.28 AUC points; on Elo they cost
+    hours and lowered the score, the card-level label being noise for each transaction)."""
+    import lightgbm as lgb
+    from sklearn.model_selection import KFold, StratifiedKFold
+    t = time.time()
+    base = pd.concat([main.reset_index(drop=True)] + rel, axis=1)
+    full = pd.concat([base] + cm, axis=1)
+    for X in (base, full):
+        for c in X.columns:
+            if not (pd.api.types.is_numeric_dtype(X[c]) or isinstance(X[c].dtype, pd.CategoricalDtype)):
+                X[c] = X[c].astype(str).astype("category")
+    yv = y.to_numpy(dtype=float)
+    rows = np.arange(len(yv))
+    if len(rows) > max_rows:
+        rows = np.sort(np.random.default_rng(seed).choice(rows, max_rows, replace=False))
+    binary = (task or ("binary" if y.nunique() == 2 else "regression")) == "binary"
+    P = dict(objective="binary" if binary else "regression", learning_rate=0.1, num_leaves=31,
+             min_child_samples=50, feature_fraction=0.5, verbose=-1, num_threads=4, seed=seed)
+    split = (StratifiedKFold(3, shuffle=True, random_state=seed).split(rows, yv[rows]) if binary
+             else KFold(3, shuffle=True, random_state=seed).split(rows))
+    gains = []
+    for fi, vi in split:
+        fi, vi = rows[fi], rows[vi]
+        loss = []
+        for X in (base, full):
+            b = lgb.train(P, lgb.Dataset(X.iloc[fi], yv[fi]), 1000, valid_sets=[lgb.Dataset(X.iloc[vi], yv[vi])],
+                          callbacks=[lgb.early_stopping(50, verbose=False)])
+            loss.append(b.best_score["valid_0"]["binary_logloss" if binary else "l2"])
+        gains.append((loss[0] - loss[1]) / loss[0])
+    keep = float(np.mean(gains)) > 0.001 and sum(g > 0 for g in gains) >= 2
+    print(f"child models: {100 * np.mean(gains):+.2f}% CV loss over the aggregates "
+          f"({', '.join(f'{100 * g:+.2f}%' for g in gains)}) -> {'kept' if keep else 'dropped'} "
+          f"in {time.time() - t:.0f}s", flush=True)
+    return keep
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True)
@@ -185,6 +223,7 @@ def main():
                                             outcome_values=sorted(pd.unique(y.dropna())))
                     print(f"table {ch.name}: outcome history (item={item}), {El.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
                     A.append(El)
+        cm_frames = []
         if a.child_models and keyed:
             task = a.task or ("binary" if y.nunique() == 2 else "regression")
             obj = "binary" if task == "binary" else "regression"
@@ -194,7 +233,9 @@ def main():
                 t = time.time()
                 yk = pd.Series(y.to_numpy(), index=tr[ch.key].to_numpy())
                 M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)
-                A.append(M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
+                M = M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
+                A.append(M)
+                cm_frames.append(M)
                 print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
         for ch in keyed:
             Fk = RelatedTables([ch]).features()
@@ -228,6 +269,13 @@ def main():
             L = lookup_features(both_main, lk.df, lk.key, lk.name)
             print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
             A.append(L)
+        if cm_frames:
+            ids_cm = {id(M) for M in cm_frames}
+            rest = [Fa for Fa in A if id(Fa) not in ids_cm]
+            if not child_models_help(tr.drop(columns=[c for c in (a.id, a.target) if c and c in tr.columns]),
+                                     [Fa.iloc[:len(tr)].reset_index(drop=True) for Fa in rest],
+                                     [M.iloc[:len(tr)].reset_index(drop=True) for M in cm_frames], y, a.task):
+                A = rest
         for Fa in A:
             rel_tr = pd.concat([rel_tr, Fa.iloc[:len(tr)].reset_index(drop=True)], axis=1)
             rel_te = pd.concat([rel_te, Fa.iloc[len(tr):].reset_index(drop=True)], axis=1)
