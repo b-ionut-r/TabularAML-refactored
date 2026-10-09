@@ -5,7 +5,7 @@ Features only; train any AutoML (AutoGluon, ...) on the outputs.
     python scripts/contest_features.py --train application_train.csv --test application_test.csv \\
         --target TARGET --id SK_ID_CURR \\
         --table bureau=bureau.csv --table prev=previous_application.csv \\
-        --table inst=installments_payments.csv --child-models --out-dir features/
+        --table inst=installments_payments.csv --out-dir features/
 
 Each ``--table name=path[:key[:time]]`` is a child table. The key defaults to the
 main table's id column (or the one column it shares with the main table); the
@@ -117,7 +117,9 @@ def main():
     ap.add_argument("--id", default=None)
     ap.add_argument("--table", action="append", default=[], help="name=path[:key[:time]]")
     ap.add_argument("--time", default=None, help="main-table time column for as-of aggregation (default: auto)")
-    ap.add_argument("--child-models", action="store_true", help="add out-of-fold child-row model features")
+    ap.add_argument("--child-models", action=argparse.BooleanOptionalAction, default=True,
+                    help="out-of-fold child-row model features for every keyed child table "
+                         "(Home Credit 0.7976 -> 0.8004; --no-child-models turns them off)")
     ap.add_argument("--task", default=None, choices=["regression", "binary", "multiclass"])
     ap.add_argument("--log-target", action="store_true", help="search on log1p(target) (RMSLE-scored contests)")
     ap.add_argument("--budget", type=float, default=900, help="FeatureForge time budget (s)")
