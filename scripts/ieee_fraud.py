@@ -84,6 +84,7 @@ def main():
     p = judge(A, ytr, B)
     print(f"forge  AUC={roc_auc_score(yte, p):.4f} logloss={log_loss(yte, p):.5f} "
           f"({len(f.new_columns_)} features, {time.time() - t0:.0f}s)")
+    print("features:", ", ".join(f.new_columns_), flush=True)
 
 
 if __name__ == "__main__":

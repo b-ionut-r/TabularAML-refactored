@@ -76,17 +76,54 @@ class Context:
         self.seed = seed
 
 
+# Each column of a frame is factorised once (codes + levels in order of appearance);
+# vocabularies and combined key codes are then built from its few levels instead of
+# re-hashing a million strings for every candidate that uses the column.
+_COL_CACHE: dict = {}
+# Caches are capped by size, oldest entries out first: on a million-row frame a few
+# hundred cached code arrays are gigabytes.
+_CACHE_BYTES = 1 << 30
+_CACHE_LOCK = __import__("threading").Lock()
+
+
+def _cache_put(cache: dict, key, df, *entry):
+    import weakref
+    try:
+        ref = weakref.ref(df)
+    except TypeError:
+        return
+    size = sum(getattr(e, "nbytes", 0) for e in entry)
+    with _CACHE_LOCK:
+        cache[key] = (ref, *entry, len(df), size)
+        total = sum(v[-1] for v in cache.values())
+        while total > _CACHE_BYTES and len(cache) > 1:
+            old = cache.pop(next(iter(cache)))
+            total -= old[-1]
+
+
+def _col_codes(df: pd.DataFrame, c: str):
+    hit = _COL_CACHE.get((id(df), c))
+    if hit is not None and hit[0]() is df and hit[3] == len(df):
+        return hit[1], hit[2]
+    codes, levels = pd.factorize(_key_values(df[c]))
+    levels = pd.Index(levels)
+    codes = codes.astype(np.int32) if len(levels) < 2 ** 31 else codes
+    _cache_put(_COL_CACHE, (id(df), c), df, codes, levels)
+    return codes, levels
+
+
 def _fit_vocab(df: pd.DataFrame, cols: Sequence[str]) -> List[pd.Index]:
-    return [pd.Index(pd.unique(_key_values(df[c]))) for c in cols]
+    return [_col_codes(df, c)[1] for c in cols]
 
 
 def _codes(df: pd.DataFrame, cols: Sequence[str], vocabs: List[pd.Index]) -> np.ndarray:
     """Combined int64 code of key columns; values unseen at fit time get their own code."""
     out = np.zeros(len(df), dtype=np.int64)
     for c, vocab in zip(cols, vocabs):
-        idx = vocab.get_indexer(_key_values(df[c]))
-        idx[idx < 0] = len(vocab)
-        out = out * (len(vocab) + 1) + idx
+        codes, levels = _col_codes(df, c)
+        pos = vocab.get_indexer(levels)  # each of the frame's levels in the vocabulary
+        pos[pos < 0] = len(vocab)
+        out = out * (len(vocab) + 1) + pos[codes]
     return out
 
 
@@ -104,13 +141,23 @@ def _code_cache_get(df, cols):
 
 
 def _code_cache_put(df, cols, vocabs, codes):
-    import weakref
-    if len(_CODE_CACHE) > 512:
-        _CODE_CACHE.clear()
-    try:
-        _CODE_CACHE[(id(df), tuple(cols))] = (weakref.ref(df), vocabs, codes, len(df))
-    except TypeError:
-        pass
+    _cache_put(_CODE_CACHE, (id(df), tuple(cols)), df, vocabs, codes)
+
+
+_GROUP_CACHE: dict = {}
+
+
+def _grouper(df, cols, k):
+    """``k`` (combined key codes of ``df[cols]``) as a categorical over its sorted distinct
+    values: group statistics of many columns by the same key hash the key once instead of
+    once per statistic. Groups, their order and the rows in each are those of ``groupby(k)``."""
+    hit = _GROUP_CACHE.get((id(df), tuple(cols)))
+    if hit is not None and hit[0]() is df and hit[3] == len(df):
+        return hit[1], hit[2]
+    codes, levels = pd.factorize(k, sort=True)
+    g = pd.Categorical.from_codes(codes.astype(np.int32), categories=pd.Index(levels), validate=False)
+    _cache_put(_GROUP_CACHE, (id(df), tuple(cols)), df, g, levels)
+    return g, levels
 
 
 def X_nunique(df: pd.DataFrame, c: str) -> int:
@@ -120,6 +167,27 @@ def X_nunique(df: pd.DataFrame, c: str) -> int:
 # ============================================================================
 # Feature specs
 # ============================================================================
+
+def _trim_heap() -> None:
+    """Hand freed heap memory back to the OS. After thousands of candidate arrays are built
+    and dropped on several threads, glibc keeps the freed space in its arenas, and the
+    process holds gigabytes it no longer uses through the model fits that follow."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _release(spec) -> None:
+    """Drop a candidate's fitted state (attributes ending in ``_``). Thousands of candidates
+    per round each holding lookup tables over a million rows (counts of a near-unique value,
+    an entity's sorted event times) add up to gigabytes; rejected ones are never used again."""
+    for a in [a for a in vars(spec) if a.endswith("_") and not a.startswith("_")]:
+        delattr(spec, a)
+
 
 class Spec:
     """A generated feature. ``transform`` returns an (n,) or (n, k) float array."""
@@ -512,9 +580,7 @@ class _MixedCodes:
                 out = out * (len(e) + 2) + idx
             else:
                 vocab = next(vocabs)
-                idx = vocab.get_indexer(_key_values(df[c]))
-                idx[idx < 0] = len(vocab)
-                out = out * (len(vocab) + 1) + idx
+                out = out * (len(vocab) + 1) + _codes(df, [c], [vocab])
         return out
 
 
@@ -550,7 +616,15 @@ class RowStat(Spec):
         self.name = f"row_{stat}__{label}"
 
     def transform(self, df, ctx):
-        M = df[self.parents].to_numpy(dtype=float)
+        # Row blocks: a wide family over a large frame (IEEE-CIS's 339 V columns over a
+        # million rows) is gigabytes as one float64 matrix, plus the nan-function copies.
+        step = max(1, 2_000_000 // max(len(self.parents), 1))
+        if len(df) <= step:
+            return self._stat(df[self.parents].to_numpy(dtype=float))
+        return np.concatenate([self._stat(df[self.parents].iloc[i:i + step].to_numpy(dtype=float))
+                               for i in range(0, len(df), step)])
+
+    def _stat(self, M):
         with np.errstate(all="ignore"):
             if self.stat == "sum":
                 return np.nansum(M, axis=1)
@@ -594,6 +668,13 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
             fam.setdefault(m.group(1), []).append(c)
             idx[c] = int(m.group(2))
     return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
+
+
+def _block_z(d, blocks):
+    """One-sided z of the mean paired difference with each block (period) as one observation."""
+    m = np.bincount(blocks, weights=d) / np.maximum(np.bincount(blocks), 1)
+    m = m[np.bincount(blocks) > 0]
+    return float(m.mean() / (m.std(ddof=1) / np.sqrt(len(m)) + 1e-300))
 
 
 def synthetic_rows(X: pd.DataFrame, U: pd.DataFrame, min_rate: float = 0.9, min_cols: int = 20) -> np.ndarray:
@@ -871,20 +952,24 @@ class GroupStat(Spec):
     def fit(self, df, y, ctx):
         k = self._fit_codes(df)
         v = pd.Series(df[self.parents[-1]].to_numpy(dtype=float))
-        g = v.groupby(k)
+        cat, levels = _grouper(df, self._keys(), k)
+        g = v.groupby(cat, observed=True)
+
+        def by_key(a):
+            return pd.Series(a.to_numpy(), index=levels)
         if self.stat == "nunique":
-            self.a_ = g.nunique()
+            self.a_ = by_key(g.nunique())
         elif self.stat in ("mean", "dev"):
-            self.a_ = g.mean()
+            self.a_ = by_key(g.mean())
         elif self.stat == "std":
-            self.a_ = g.std()
+            self.a_ = by_key(g.std())
         elif self.stat == "min":
-            self.a_ = g.min()
+            self.a_ = by_key(g.min())
         elif self.stat == "max":
-            self.a_ = g.max()
+            self.a_ = by_key(g.max())
         elif self.stat == "z":
-            self.a_ = g.mean()
-            self.b_ = g.std()
+            self.a_ = by_key(g.mean())
+            self.b_ = by_key(g.std())
         return self
 
     def transform(self, df, ctx):
@@ -1650,10 +1735,22 @@ class FeatureForge:
     task : "regression" | "binary" | "multiclass" | None
     log_target : bool
         Search on ``log1p(y)`` (use for RMSLE-scored regression).
+    max_search_rows : int | None
+        Search on at most this many training rows (the latest on time-ordered data, whole
+        groups when test rows are new entities, else a random sample); the rest still
+        count in label-free statistics, and the output is computed on every row. Off by
+        default: a 300k cap lost M5's and Favorita's gains.
+    family_time_share : float
+        Largest share of the candidate-building time one family may take (1 disables).
+    gate_by_period : bool
+        On time-ordered data, test the gate's paired improvement with each period (gate
+        time value, or one of 30 time blocks) as one observation instead of each row; rows
+        of one period share its shocks. The period-level z is logged either way.
     time_budget : float
-        Wall-clock budget in seconds for the search. A round starts only while two CV fits
-        (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
-        fit's time left; the base CV fit, the gate and the final out-of-fold fits always run.
+        Wall-clock budget in seconds for the search. The first round always gets sixteen
+        CV fits (timed on the base fit), eight of them kept for screening and the prefix
+        ladder; later rounds start only while ten fit in the budget. Cheap candidate
+        families are built first. The base fit, the gate and the final fits always run.
     n_rounds : int
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
@@ -1708,6 +1805,15 @@ class FeatureForge:
         titles, descriptions) get label-free writing statistics and TF-IDF SVD
         topics, and an out-of-fold sparse linear model on their words and character
         n-grams (alone, and all text plus one-hot keys) as candidates.
+    pair_scan : bool
+        Score differences and ratios of every pair among the 60 strongest numerics and of
+        every closely related pair (rank correlation >= 0.9) on a 20k-row sample (5% of the budget), and offer
+        the best dozen as candidates (Loan Default's f528 - f527: AUC 0.735 -> 0.998).
+    profiles : bool
+        With a hidden client id (ID-like columns plus an anchor), one candidate block per
+        client key: per-client mean / std of up to 120 numerics and of every re-based
+        "days since" column, distinct counts of categoricals, and row counts, label-free
+        over all known rows (``profile.ClientProfile``).
     time_col : str | "auto" | None
         Column that orders rows in time. When set, the gate holds out the most
         recent rows instead of a random sample, so features that only work
@@ -1749,7 +1855,8 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
+                 pair_scan: bool = True, profiles: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
         self.time_budget = time_budget
@@ -1785,8 +1892,13 @@ class FeatureForge:
         self.text = text
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
+        self.max_search_rows = max_search_rows
+        self.gate_by_period = gate_by_period
+        self.family_time_share = family_time_share
         self.gate_families = gate_families
         self.past_te = past_te
+        self.pair_scan = pair_scan
+        self.profiles = profiles
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -1797,7 +1909,8 @@ class FeatureForge:
             print(f"[FeatureForge {time.time() - self._t0:6.1f}s] {msg}", flush=True)
 
     def _time_left(self) -> float:
-        return self.time_budget - (time.time() - self._t0)
+        deadline = getattr(self, "_deadline", None) or self._t0 + self.time_budget
+        return deadline - time.time()
 
     def _threads(self) -> int:
         import os
@@ -1856,7 +1969,7 @@ class FeatureForge:
     def _lgb_params(self, lr=0.1, threads=None, **kw):
         p = dict(_lgb_objective(self.task_, self.n_classes_), learning_rate=lr, num_leaves=31,
                  min_data_in_leaf=20, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-                 lambda_l2=1.0, verbosity=-1, seed=self.random_state,
+                 lambda_l2=1.0, verbosity=-1, seed=self.random_state, data_random_seed=self.random_state,
                  num_threads=threads or self._threads(), max_cat_to_onehot=8)
         p.update(kw)
         return p
@@ -1868,6 +1981,39 @@ class FeatureForge:
         b = lgb.train(self._lgb_params(lr), dtr, rounds, valid_sets=[dva],
                       callbacks=[lgb.early_stopping(es, verbose=False)])
         return b
+
+    @staticmethod
+    def _lgb_matrix(X: pd.DataFrame):
+        """Float32 matrix of a model frame, categoricals as their codes (missing -> NaN, as
+        LightGBM's pandas path encodes them), and the categorical column positions."""
+        M = np.empty((len(X), X.shape[1]), dtype=np.float32)
+        cats = []
+        for j, c in enumerate(X.columns):
+            s = X[c]
+            if isinstance(s.dtype, pd.CategoricalDtype):
+                cats.append(j)
+                k = s.cat.codes.to_numpy()
+                M[:, j] = np.where(k < 0, np.nan, k)
+            else:
+                M[:, j] = s.to_numpy(dtype=np.float32, na_value=np.nan)
+        return M, cats
+
+    def _lgb_data(self, X: pd.DataFrame, y, lr=0.1):
+        """One binned LightGBM dataset for a whole frame; folds train on its row subsets.
+        Binning once per frame instead of once per fold, from a float32 matrix instead of
+        float64 copies of each fold, is most of the search's memory and a fifth of its time."""
+        import lightgbm as lgb
+        M, cats = self._lgb_matrix(X)
+        D = lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr),
+                        free_raw_data=False).construct()
+        return M, D
+
+    def _fit_eval_rows(self, D, tr, va, lr=0.1, rounds=2000, es=50):
+        """``_fit_eval`` on row subsets of a dataset built by ``_lgb_data``."""
+        import lightgbm as lgb
+        dtr, dva = D.subset(np.sort(tr)), D.subset(np.sort(va))
+        return lgb.train(self._lgb_params(lr), dtr, rounds, valid_sets=[dva],
+                         callbacks=[lgb.early_stopping(es, verbose=False)])
 
     @staticmethod
     def _mine_paths(booster, names, pairs, triples, max_trees=300):
@@ -1913,35 +2059,57 @@ class FeatureForge:
             self._nested_cache[ck] = (np.asarray(vt, dtype=np.float32), np.asarray(vv, dtype=np.float32))
         return self._nested_cache[ck]
 
-    def _cv(self, X: pd.DataFrame, y, repeats, lr=0.1, mine=False, nested=None):
+    def _cv(self, X: Optional[pd.DataFrame], y, repeats, lr=0.1, mine=False, nested=None, mat=None):
         """Repeated K-fold: OOF raw margins (averaged over repeats), mean loss, summed gain importance.
 
         ``nested`` maps target-encoding specs to the frame they were built on;
         their columns are then recomputed per fold from the fold's training rows.
+        ``mat``: the frame as ``(float32 matrix, categorical positions, column names)``,
+        used instead of ``X`` (then None); an optional fourth item picks the matrix's
+        columns, so no full copy of the selected columns is kept.
         """
-        n = len(X)
+        import lightgbm as lgb
+        M, cats, cols, *pick = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
+        pick = pick[0] if pick else None
+
+        def rows(r):
+            return M[r] if pick is None else M[np.ix_(r, pick)]
+        n = len(M)
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
-        imp = pd.Series(0.0, index=X.columns)
+        imp = pd.Series(0.0, index=cols)
         losses = []
+        pos = {c: j for j, c in enumerate(cols)}
+        specs = [sp for sp in (nested or {}).get("specs", []) if sp.out_names()[0] in pos]
+        D = None
+        if not specs:
+            # One binned dataset; folds train on its row subsets. The raw matrix is not kept:
+            # validation rows are read from ``M`` again.
+            D = lgb.Dataset(M if pick is None else M[:, pick], np.asarray(y), categorical_feature=cats,
+                            params=self._lgb_params(lr)).construct()
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
             for f_i, (tr, va) in enumerate(folds):
-                Xtr, Xva = X.iloc[tr], X.iloc[va]
-                specs = [sp for sp in (nested or {}).get("specs", []) if sp.out_names()[0] in X.columns]
-                if specs:
-                    Xtr, Xva = Xtr.copy(), Xva.copy()
+                if D is not None:
+                    b = self._fit_eval_rows(D, tr, va, lr=lr)
+                    Mva = rows(va)
+                else:
+                    Mtr, Mva = rows(tr), rows(va)
                     for sp in specs:
                         vt, vv = self._nested_values(sp, nested["W"], y, (r_i, f_i), tr, va)
                         for j, col in enumerate(sp.out_names()):
-                            Xtr[col] = vt if vt.ndim == 1 else vt[:, j]
-                            Xva[col] = vv if vv.ndim == 1 else vv[:, j]
-                b = self._fit_eval(Xtr, y[tr], Xva, y[va], lr=lr)
-                oof[va] = b.predict(Xva, num_iteration=b.best_iteration, raw_score=True)
-                imp += pd.Series(b.feature_importance("gain"), index=X.columns)
+                            Mtr[:, pos[col]] = vt if vt.ndim == 1 else vt[:, j]
+                            Mva[:, pos[col]] = vv if vv.ndim == 1 else vv[:, j]
+                    dtr = lgb.Dataset(Mtr, y[tr], categorical_feature=cats, free_raw_data=False)
+                    dva = lgb.Dataset(Mva, y[va], reference=dtr)
+                    b = lgb.train(self._lgb_params(lr), dtr, 2000, valid_sets=[dva],
+                                  callbacks=[lgb.early_stopping(50, verbose=False)])
+                    del Mtr, dtr, dva
+                oof[va] = b.predict(Mva, num_iteration=b.best_iteration, raw_score=True)
+                imp += pd.Series(b.feature_importance("gain"), index=cols)
                 if mine:
-                    self._mine_paths(b, list(X.columns), self.pair_gain_, self.triple_gain_)
+                    self._mine_paths(b, cols, self.pair_gain_, self.triple_gain_)
             losses.append(_loss(self.task_, y, oof))
             oof_mean += oof / len(repeats)
         return oof_mean, float(np.mean(losses)), imp
@@ -2105,6 +2273,8 @@ class FeatureForge:
             for c in self.date_cols_:
                 for part in _DATE_PARTS:
                     add(DatePart(c, part))
+            for op, a, b, _ in getattr(self, "wide_pairs_", []):
+                add(Arith(op, a, b))
             self._event_candidates(W, imp, add)
             self._entity_candidates(W, imp, top_num, add)
             self._interaction_candidates(W, add)
@@ -2140,6 +2310,21 @@ class FeatureForge:
         for _, _, _, a in self.anchors_:
             ents += [(k, a) for k in ids[:3]]
             ents += [(k1, k2, a) for k1, k2 in combinations(ids[:3], 2)]
+        if self.profiles and self.anchors_:
+            from .profile import profile_candidates
+            rank = list(imp.sort_values(ascending=False).index)
+            rebase, seen = [], set()
+            for _, t_, s_, d_ in getattr(self, "anchor_found_", []):
+                if d_ not in seen and t_ in W.columns and d_ in W.columns:
+                    seen.add(d_)
+                    rebase.append((t_, s_, d_))
+            exclude = {getattr(self, "time_col_", None)} - {None}
+            for sp in profile_candidates(W, ids, self.anchors_, rebase[:12],
+                                         [c for c in rank if c in W.columns and c not in self.cat_cols_],
+                                         [c for c in rank if c in self.cat_cols_ and c not in self.text_cols_],
+                                         exclude=exclude, y=getattr(self, "_yW", None),
+                                         time_col=getattr(self, "time_col_", None)):
+                add(sp)
         t = getattr(self, "time_col_", None)
         for e in ents:
             if self.entity_lags and t is not None and t not in e:
@@ -2180,7 +2365,7 @@ class FeatureForge:
             return
         ids = sorted(self.id_cols_, key=lambda c: -imp.get(c, 0.0))[:2]
         keysets = [[k] for k in ids] or [[]]
-        WU = W if self.U_search_ is None else pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
+        WU = W if self.WU_ is None else self.WU_
         if self.lagged_te and ids:
             flags = [f for f in self.base_cols_ if f != t and f not in ids and f not in self.date_cols_
                      and 2 <= W[f].nunique() <= 7
@@ -2270,6 +2455,23 @@ class FeatureForge:
                     - max(pairs[(a, b)] + max(one[a], one[b], 0.0), 0.0)
         return ({k: v for k, v in pairs.items() if v > 0}, {k: v for k, v in triples.items() if v > 0})
 
+    def _wide_pairs(self, W, y, margin, imp):
+        """Differences and ratios from a vectorised scan of all strong and closely related
+        numeric pairs (``pairscan``); Loan Default's f528 - f527 sits outside the top columns."""
+        budget = min(120.0, 0.05 * self._time_left())
+        if self.n_classes_ > 2 or budget < 1:
+            return []
+        from .pairscan import scan_pairs
+        num = [c for c in self.raw_cols_ if c not in self.cat_cols_ and c in W.columns]
+        strong = [c for c in imp.sort_values(ascending=False).index if c in num][:60]
+        g, h = self._grad_hess(y, margin)
+        t = time.time()
+        out = scan_pairs(W, num, strong, g, h, lambda m, rows: _loss(self.task_, y[rows], m), margin,
+                         time_budget=budget, seed=self.random_state)
+        self._log(f"pair scan: {len(num)} numerics, {time.time() - t:.0f}s -> "
+                  + (", ".join(f"{a} {op} {b} ({v:.4f})" for op, a, b, v in out[:6]) or "nothing"))
+        return out
+
     def _interaction_candidates(self, W, add):
         """Turn tree-path interactions into explicit features of every applicable family."""
         if not self.n_interactions or not getattr(self, "pair_gain_", None):
@@ -2310,19 +2512,36 @@ class FeatureForge:
             add(MixedTE(list(t), binned, self.n_classes_, 6))
             add(MixedCount(list(t), binned, 6))
 
-    def _materialize(self, specs: List[Spec], W: pd.DataFrame, y, folds, keep_fn=None) -> Dict[str, np.ndarray]:
+    def _materialize(self, specs: List[Spec], W: pd.DataFrame, y, folds, keep_fn=None,
+                     score_fn=None) -> Dict[str, np.ndarray]:
+        """Values of the candidates that pass the validity checks and ``keep_fn``.
+
+        Candidates are computed (and scored by ``score_fn``, which must not depend on
+        other candidates) in batches on a thread pool, mostly numpy / pandas kernels that
+        release the GIL; ``keep_fn(spec, values, out, score)`` then decides in the original
+        order, so the result is the same as computing them one by one."""
+        from concurrent.futures import ThreadPoolExecutor
         out = {}
         # Label-free statistics (counts, group statistics, ...) over every row whose
         # features are known: search rows plus gate and unlabeled rows, as at the end.
         WU = None
-        if getattr(self, "U_search_", None) is not None:
-            WU = pd.concat([W[self.raw_cols_], self.U_search_], ignore_index=True)
-            raw = set(self.raw_cols_)
-        for i, s in enumerate(specs):
-            # Leave room in the budget for at least one CV fit of the screened candidates.
-            if i % 20 == 0 and self._time_left() < getattr(self, "_cv_s", 0.0):
-                self._log(f"budget: screened {i} of {len(specs)} candidates")
-                break
+        raw = set(self.raw_cols_)
+        if getattr(self, "WU_", None) is not None:
+            WU = self.WU_
+        spent: Dict[str, list] = {}
+        # No family of candidates may take over a third of the time left for building them
+        # (a few slow ones, neighbour features on large tables, otherwise starve the rest).
+        # Screening, the joint ranking fit and the prefix ladder: eight CV fits, at most half
+        # the time left (when the first round's time is capped by the budget).
+        reserve = min(8 * getattr(self, "_cv_s", 0.0), 0.5 * max(self._time_left(), 0.0))
+        # Thread time: candidates are built on ``_threads()`` threads at once.
+        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share * max(1, self._threads())
+        capped = set()
+
+        def compute(s):
+            if type(s).__name__ in capped:
+                return None
+            t_s = time.time()
             try:
                 if s.target_dep:
                     v = s.fit_transform_oof(W, y, self.ctx_, folds)
@@ -2330,18 +2549,61 @@ class FeatureForge:
                     v = s.fit(WU, None, self.ctx_).transform(W, self.ctx_)
                 else:
                     v = s.fit(W, y, self.ctx_).transform(W, self.ctx_)
+                v = np.asarray(v, dtype=np.float32)
+                v2 = v if v.ndim == 2 else v[:, None]
+                col = v2[:, 0]
+                finite = np.isfinite(col)
+                if finite.mean() < 0.05 or np.nanstd(np.where(finite, col, np.nan)) == 0:
+                    return None
+                return v, (score_fn(s, v) if score_fn is not None else None)
             except Exception:
-                continue
-            v = np.asarray(v, dtype=np.float32)
-            v2 = v if v.ndim == 2 else v[:, None]
-            col = v2[:, 0]
-            finite = np.isfinite(col)
-            if finite.mean() < 0.05 or np.nanstd(np.where(finite, col, np.nan)) == 0:
-                continue
-            if keep_fn is not None and not keep_fn(s, v, out):
-                continue
-            out[s.name] = v
+                return None
+            finally:
+                st = spent.setdefault(type(s).__name__, [0, 0.0])
+                st[0] += 1
+                st[1] += time.time() - t_s
+                if self.time_budget and st[1] > fam_cap and type(s).__name__ not in capped:
+                    capped.add(type(s).__name__)
+                    self._log(f"budget: {type(s).__name__} candidates took {st[1]:.0f}s; the rest of them skipped")
+
+        n_threads = max(1, self._threads())
+        batch = 4 * n_threads
+        # Cheap candidates first: one of each family is built and timed, then the rest go
+        # family by family from the cheapest per candidate.
+        fams: Dict[str, list] = {}
+        for sp in specs:
+            fams.setdefault(type(sp).__name__, []).append(sp)
+        firsts = [g[0] for g in fams.values()]
+        n_first = len(firsts)
+        specs = list(firsts)
+        with ThreadPoolExecutor(n_threads) as pool:
+            i = 0
+            while i < len(specs):
+                # Leave room in the budget for ranking the built candidates (about eight CV fits:
+                # otherwise a few seconds of timing noise decide how many prefixes get tried).
+                if self._time_left() < reserve:
+                    self._log(f"budget: built {i} of {sum(map(len, fams.values()))} candidates")
+                    break
+                end = n_first if i < n_first else i + batch
+                chunk = specs[i:end]
+                for s, r in zip(chunk, pool.map(compute, chunk)):
+                    if r is None:
+                        _release(s)
+                        continue
+                    v, score = r
+                    if keep_fn is not None and not keep_fn(s, v, out, score):
+                        _release(s)
+                        continue
+                    out[s.name] = v
+                i = end
+                if i == n_first:
+                    cost = lambda f: spent.get(f, [1, 0.0])[1] / max(spent.get(f, [1, 0.0])[0], 1)
+                    specs += [sp for f in sorted(fams, key=cost) for sp in fams[f][1:]]
         _CODE_CACHE.clear()  # factorised keys of large frames add up to gigabytes
+        _COL_CACHE.clear()
+        _GROUP_CACHE.clear()
+        top = sorted(spent.items(), key=lambda kv: -kv[1][1])[:6]
+        self._log("  materialised (thread time): " + ", ".join(f"{k} {n}x {t:.0f}s" for k, (n, t) in top))
         return out
 
     # ------------------------------------------------------------ screening
@@ -2404,11 +2666,14 @@ class FeatureForge:
             cols = [v] if v.ndim == 1 else [v[:, j] for j in range(v.shape[1])]
             return max(self._residual_gain(c.astype(float), g, h, lam, n_bins) for c in cols)
 
-        parent_gain = {}
-        for c in W.columns:
+        def own_gain(c):
             col = W[c]
             x = pd.factorize(col)[0].astype(float) if c in self.cat_cols_ else col.to_numpy(dtype=float)
-            parent_gain[c] = max(probe(x), 0.0)
+            return max(probe(x), 0.0)
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max(1, self._threads())) as pool:
+            parent_gain = dict(zip(W.columns, pool.map(own_gain, list(W.columns))))
         return probe, parent_gain
 
     def _evolve(self, W, y, margin, imp, folds, budget, existing):
@@ -2586,7 +2851,8 @@ class FeatureForge:
         if getattr(spec, "paired", False):
             # Block of per-column transforms: each output against its own parent, summed.
             gs = [probe(v[:, j]) for j in range(v.shape[1])]
-            nov = sum(max(g - self.novelty_slack * parent_gain.get(p, 0.0), 0.0) for g, p in zip(gs, spec.parents))
+            src = getattr(spec, "paired_parents", spec.parents)
+            nov = sum(max(g - self.novelty_slack * parent_gain.get(p, 0.0), 0.0) for g, p in zip(gs, src))
             return sum(max(g, 0.0) for g in gs), nov
         g = probe(v)
         parents = getattr(spec, "novelty_parents", None) or spec.parents
@@ -2628,7 +2894,8 @@ class FeatureForge:
         contest trick. Target statistics only ever use labeled rows.
         """
         self._t0 = time.time()
-        X = X.reset_index(drop=True).copy()
+        self._deadline = None
+        X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
         self.n_synthetic_ = 0
         if X_unlabeled is not None and self.drop_synthetic:
@@ -2725,72 +2992,131 @@ class FeatureForge:
         else:
             idx_sel, idx_gate = idx, np.array([], dtype=int)
 
-        W = X.iloc[idx_sel].reset_index(drop=True)
-        yW = y_np[idx_sel]
-        if self.group_col_ is not None:
-            gx = X[self.group_col_].astype(str).to_numpy()
-            self._groups = {len(W): gx[idx_sel], n: gx}
-        self.U_search_ = None
-        if X_unlabeled is not None:
-            self.U_search_ = pd.concat([X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]], ignore_index=True)
-        self.ctx_.extra_rows = self.U_search_
-        # Small tables get repeated CV so that selection is not driven by fold noise.
-        n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
-        folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
-        te_folds = self._te_folds(W, yW, self.random_state + 1)
-        # Screening split (A trains the residual boosters, B measures them).
-        try:
-            idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
-                                            stratify=yW if self.task_ != "regression" else None)
-        except ValueError:
-            idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
-        if self.group_col_ is not None:
-            f0 = self._folds(len(W), yW, 10, self.random_state + 3)
-            idx_b = np.sort(np.concatenate([va for _, va in f0[:3]]))
-            idx_a = np.setdiff1d(np.arange(len(W)), idx_b)
-        if self.time_col_ is not None and self.time_cv:
-            # Rows close in time share their period's level, so random folds reward
-            # features that interpolate between neighbouring days. Contiguous time
-            # blocks as folds, and screening measured on the latest rows, reward only
-            # what carries over to other periods, as the test period needs.
-            order = np.argsort(W[self.time_col_].to_numpy(dtype=float), kind="stable")
-            blocks = np.array_split(order, self.cv)
-            folds = [[(np.sort(np.concatenate(blocks[:i] + blocks[i + 1:])), np.sort(b))
-                      for i, b in enumerate(blocks)]]
-            n_b = int(round(0.3 * len(W)))
-            idx_a, idx_b = np.sort(order[:-n_b]), np.sort(order[-n_b:])
+        # Large tables: the search runs on the latest rows (time-ordered data), whole random
+        # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
+        # budget for several rounds; the rows left out still feed label-free statistics.
+        idx_out = np.array([], dtype=int)
+        m_cap = None
+        for attempt in range(3):
+            m = m_cap or self.max_search_rows or len(idx_sel)
+            if len(idx_sel) > m:
+                rng = np.random.default_rng(self.random_state)
+                if self.time_col_ is not None:
+                    keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
+                elif self.group_col_ is not None:
+                    g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                    perm = rng.permutation(g.max() + 1)
+                    r = perm[g]
+                    keep = idx_sel[np.argsort(r, kind="stable")[:m]]
+                else:
+                    keep = rng.choice(idx_sel, m, replace=False)
+                keep = np.sort(keep)
+                idx_out = np.union1d(idx_out, np.setdiff1d(idx_sel, keep))
+                self._log(f"search on {m} of {len(idx_sel)} rows")
+                idx_sel = keep
+            W = X.iloc[idx_sel].reset_index(drop=True)
+            yW = y_np[idx_sel]
+            if self.group_col_ is not None:
+                gx = X[self.group_col_].astype(str).to_numpy()
+                self._groups = {len(W): gx[idx_sel], n: gx}
+            self.U_search_ = self.WU_ = None
+            extra = np.concatenate([idx_out, idx_gate]).astype(int)
+            self._wu_src = None if X_unlabeled is None and not len(idx_out) else (X, extra, X_unlabeled)
+            self.ctx_.extra_rows = None
+            # Small tables get repeated CV so that selection is not driven by fold noise.
+            n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
+            folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
+            te_folds = self._te_folds(W, yW, self.random_state + 1)
+            # Screening split (A trains the residual boosters, B measures them).
+            try:
+                idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
+                                                stratify=yW if self.task_ != "regression" else None)
+            except ValueError:
+                idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
+            if self.group_col_ is not None:
+                f0 = self._folds(len(W), yW, 10, self.random_state + 3)
+                idx_b = np.sort(np.concatenate([va for _, va in f0[:3]]))
+                idx_a = np.setdiff1d(np.arange(len(W)), idx_b)
+            if self.time_col_ is not None and self.time_cv:
+                # Rows close in time share their period's level, so random folds reward
+                # features that interpolate between neighbouring days. Contiguous time
+                # blocks as folds, and screening measured on the latest rows, reward only
+                # what carries over to other periods, as the test period needs.
+                order = np.argsort(W[self.time_col_].to_numpy(dtype=float), kind="stable")
+                blocks = np.array_split(order, self.cv)
+                folds = [[(np.sort(np.concatenate(blocks[:i] + blocks[i + 1:])), np.sort(b))
+                          for i, b in enumerate(blocks)]]
+                n_b = int(round(0.3 * len(W)))
+                idx_a, idx_b = np.sort(order[:-n_b]), np.sort(order[-n_b:])
 
-        selected: List[Spec] = []
-        self.history_ = []
-        self._nested_cache = {}
-        Wm = self._model_frame(W)
-        t_cv = time.time()
-        margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
-        # One CV fit's duration: the search stops when fewer than two are left in the budget.
-        self._cv_s = time.time() - t_cv
+            selected: List[Spec] = []
+            self.history_ = []
+            self._nested_cache = {}
+            # The model's view of the search rows as one float32 matrix (``_lgb_matrix``), with
+            # its categorical positions and column names; rounds append the chosen features.
+            Mw = (*self._lgb_matrix(self._model_frame(W)), list(W.columns))
+            if attempt == 0 and self.time_budget and len(W) > 150_000:
+                # A CV fit on 50k rows, scaled up, flags tables where one full fit would
+                # take hours before paying for it. Scaling up overstates the full fit (its
+                # fixed costs do not grow with rows: 132s estimated against 94s measured on
+                # IEEE-CIS's 472k rows), so it only acts when the estimate is twice over the
+                # ceiling; otherwise the full fit's measured time below decides.
+                pr = np.sort(np.random.default_rng(self.random_state).choice(len(W), 50_000, replace=False))
+                t_p = time.time()
+                self._cv(None, yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)],
+                         mat=(Mw[0][pr], Mw[1], Mw[2]))
+                est = (time.time() - t_p) * len(W) / 50_000
+                if 16 * est > 6 * self.time_budget:
+                    m_cap = max(100_000, int(len(W) * 3 * self.time_budget / (16 * est) * 0.8))
+                    if m_cap < len(W):
+                        self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
+                        continue
+            t_cv = time.time()
+            margin, cur_loss, imp = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw)
+            # One CV fit's duration: the search stops when fewer than two are left in the budget.
+            self._cv_s = time.time() - t_cv
+            # The first round is promised sixteen CV fits; when they would take more than three times
+            # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
+            room = 3 * self.time_budget
+            if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
+                m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
+                if m_cap < len(W):
+                    self._log(f"budget: one CV fit takes {self._cv_s:.0f}s on {len(W)} rows; searching fewer rows")
+                    continue
+            break
         if self.n_interactions:
             self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
+        self.wide_pairs_ = self._wide_pairs(W, yW, margin, imp) if self.pair_scan else []
+        self._yW = yW  # search rows' labels, for checks that keep labels out of label-free specs
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
             self._fit_rank_maps(W)
-            Wr = self._model_frame(W, recode=True)
-            m_r, loss_r, imp_r = self._cv(Wr, yW, folds)
+            Wr = (*self._lgb_matrix(self._model_frame(W, recode=True)), list(W.columns))
+            m_r, loss_r, imp_r = self._cv(None, yW, folds, mat=Wr)
             self._log(f"high-cardinality recode of {len(self.hc_cols_)} columns: CV loss "
                       f"{cur_loss:.6f} -> {loss_r:.6f} ({100 * (cur_loss - loss_r) / cur_loss:+.2f}%)")
             if loss_r < cur_loss * (1 - self.min_rel_gain):
                 self.recode_ = True
-                Wm, margin, cur_loss, imp = Wr, m_r, loss_r, imp_r
+                Mw, margin, cur_loss, imp = Wr, m_r, loss_r, imp_r
         self._log(f"task={self.task_} rows={n} (search {len(W)}, gate {len(idx_gate)}) "
                   f"cols={X.shape[1]} base CV loss={cur_loss:.6f}")
 
         for r in range(self.n_rounds):
             if len(selected) >= self.max_new_features:
                 break
-            if self._time_left() < 2 * self._cv_s:
+            # The first round always gets room for sixteen CV fits (building, then eight for
+            # screening and the prefix ladder); later rounds start only while ten fit in the budget.
+            self._deadline = None
+            if r == 0 and self._time_left() < 16 * self._cv_s:
+                floor = min(16 * self._cv_s, 3 * self.time_budget)
+                self._deadline = time.time() + floor
+                self._log(f"budget: first round given {floor:.0f}s")
+            if r > 0 and self._time_left() < 10 * self._cv_s:
                 self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
                           f"search stops")
                 break
-            values = joint = None  # release the previous round's candidates first
+            values = None  # release the previous round's candidates first
+            self._set_wu(W)
             cands = self._generate(W, imp, selected, r)
             keep = min(80, 3 * self.max_new_features)
             spec_by_name = {s.name: s for s in cands}
@@ -2799,8 +3125,11 @@ class FeatureForge:
             probe, parent_gain = self._probe_setup(W, yW, margin)
             scores = {}
 
-            def keep_fn(spec, v, out):
-                g, nov = self._spec_novelty(spec, v, probe, parent_gain)
+            def score_fn(spec, v):
+                return self._spec_novelty(spec, v, probe, parent_gain)
+
+            def keep_fn(spec, v, out, score):
+                g, nov = score
                 scores[spec.name] = (g, nov)
                 if nov <= 0:
                     return False
@@ -2809,30 +3138,58 @@ class FeatureForge:
                     if scores[worst][1] >= nov:
                         return False
                     del out[worst]
+                    _release(spec_by_name[worst])
                 return True
-            values = self._materialize(cands, W, yW, te_folds, keep_fn=keep_fn)
+            values = self._materialize(cands, W, yW, te_folds, keep_fn=keep_fn, score_fn=score_fn)
             if self.evolve_time > 0 and r == 0:
                 evolved = self._evolve(W, yW, margin, imp, te_folds, self.evolve_time,
                                        {s.name for s in cands} | {s.name for s in selected})
                 for nm, (sp, v) in evolved.items():
                     cands.append(sp)
                     values[nm] = v
+            self._set_wu(W, on=False)
+            _trim_heap()
             self._log(f"round {r + 1}: {len(cands)} candidates generated, {len(scores)} valid")
             if not values:
                 break
             spec_by_name = {s.name: s for s in cands}
             survivors = self._screen(values, spec_by_name, W, yW, margin, idx_a, idx_b,
                                      keep=keep, scores=scores)
+            for nm in set(values) - set(survivors):
+                _release(spec_by_name[nm])
+            n_values = len(values)
+            values = {nm: values[nm] for nm in survivors}
             if not survivors:
                 break
             # Joint model ranks survivors by split gain alongside current features.
-            joint = Wm.copy()
-            for nm in survivors:
-                for j, col in enumerate(spec_by_name[nm].out_names()):
-                    v = values[nm]
-                    joint[col] = v if v.ndim == 1 else v[:, j]
-            b = self._fit_eval(joint.iloc[idx_a], yW[idx_a], joint.iloc[idx_b], yW[idx_b])
-            gain = pd.Series(b.feature_importance("gain"), index=joint.columns)
+            new = [(col, values[nm] if values[nm].ndim == 1 else values[nm][:, j])
+                   for nm in survivors for j, col in enumerate(spec_by_name[nm].out_names())]
+            new = list(dict(new).items())  # one column per name, last wins (as column assignment)
+            base_cols = Mw[2]
+            jcols = base_cols + [c for c, _ in new if c not in set(base_cols)]
+            Mj = np.empty((len(W), len(jcols)), dtype=np.float32)
+            Mj[:, :len(base_cols)] = Mw[0]
+            jpos = {c: i for i, c in enumerate(jcols)}
+            for c, v in new:
+                Mj[:, jpos[c]] = v
+            cats_j = set(Mw[1])
+            Mw = None  # its columns lead the joint matrix
+            import lightgbm as lgb
+            Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params(),
+                             free_raw_data=False).construct()
+            b = self._fit_eval_rows(Dj, idx_a, idx_b)
+            del Dj
+            gain = pd.Series(b.feature_importance("gain"), index=jcols)
+
+            def sub(cols, copy=True):
+                idx = [jpos[c] for c in cols]
+                cats = [i for i, j in enumerate(idx) if j in cats_j]
+                return (Mj[:, idx], cats, list(cols)) if copy else (Mj, cats, list(cols), idx)
+
+            # The joint matrix holds every survivor's values: keep only what it cannot
+            # (values of another dtype), so they are not held twice during the ladder.
+            values = {nm: v for nm, v in values.items() if v.dtype != np.float32}
+            new = None
             rank = sorted(survivors, key=lambda nm: -sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()))
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
@@ -2865,8 +3222,8 @@ class FeatureForge:
                     if key in tried or (tried and self._time_left() < self._cv_s):
                         continue
                     tried.add(key)
-                    cols = list(Wm.columns) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
-                    oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds, nested=nested)
+                    cols = list(base_cols) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
+                    oof_k, loss_k, imp_k = self._cv(None, yW, folds, nested=nested, mat=sub(cols, copy=False))
                     self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
                     if loss_k < best_loss:
                         best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
@@ -2878,23 +3235,24 @@ class FeatureForge:
             for sp in chosen:
                 sp.round_ = r
             selected.extend(chosen)
-            Wm = joint[best_fit[2]]
+            Mw = sub(best_fit[2])
             for s in chosen:
                 for j, col in enumerate(s.out_names()):
-                    v = values[s.name]
-                    W[col] = v if v.ndim == 1 else v[:, j]
+                    v = values.get(s.name)
+                    W[col] = Mj[:, jpos[col]].copy() if v is None else v if v.ndim == 1 else v[:, j]
+            Mj = None
             margin, imp = best_fit[0], best_fit[1]
-            self.history_.append(dict(round=r + 1, n_candidates=len(values), n_added=best_k,
+            self.history_.append(dict(round=r + 1, n_candidates=n_values, n_added=best_k,
                                       cv_loss_before=cur_loss, cv_loss_after=best_loss))
             self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f}")
             cur_loss = best_loss
 
+        self._deadline = None
         self.search_cv_loss_ = cur_loss
         self.selected_ = selected
         # Candidate values of the last round can be gigabytes on large tables.
-        values = joint = cands = None
-        import gc
-        gc.collect()
+        values = cands = Mw = None
+        _trim_heap()
         if self.parity_check and X_unlabeled is not None and len(idx_gate) and self.selected_:
             self.selected_ = selected = self._parity_filter(X.iloc[idx_gate].reset_index(drop=True),
                                                             self._prep(X_unlabeled)[self.raw_cols_], self.selected_)
@@ -2916,11 +3274,27 @@ class FeatureForge:
                 self.anchors_ = []
 
         # Refit every spec's statistics on all training rows.
-        self.U_search_ = None
+        self.U_search_ = self.WU_ = self._wu_src = None
         self._fit_full(X, y_np, None if X_unlabeled is None else self._prep(X_unlabeled))
+        _CODE_CACHE.clear()
+        _COL_CACHE.clear()
+        _GROUP_CACHE.clear()
         self.elapsed_ = time.time() - self._t0
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
         return self
+
+    def _set_wu(self, W, on=True):
+        """Search rows, then gate and unlabeled rows: every row whose raw features are known,
+        for the label-free statistics of candidates (the rows beyond the search rows are a
+        view, not a second copy). Built for each round's candidates and dropped while models
+        are fitted, when it would only add gigabytes to the peak."""
+        self.U_search_ = self.WU_ = None
+        if on and getattr(self, "_wu_src", None) is not None:
+            X, idx_gate, U = self._wu_src
+            self.WU_ = pd.concat([W[self.raw_cols_], X.iloc[idx_gate]] + ([] if U is None else [self._prep(U)[self.raw_cols_]]),
+                                 ignore_index=True)
+            self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
+        self.ctx_.extra_rows = self.U_search_
 
     def _parity_filter(self, G, U, specs, max_rows=50_000):
         """Drop features distributed differently on the unlabeled rows (the test file) than on
@@ -3002,16 +3376,29 @@ class FeatureForge:
         def gate_loss(cols, recode=None):
             # A bag of differently seeded / early-stopped models: one model's
             # randomness otherwise flips keep-or-drop decisions on small gates.
-            A, G = self._model_frame(Fs[cols], recode), self._model_frame(Fg[cols], recode)
+            A, D = self._lgb_data(self._model_frame(Fs[cols], recode), ys, lr=0.05)
+            G, _ = self._lgb_matrix(self._model_frame(Fg[cols], recode))
             margin = 0.0
             for k, (tr, va) in enumerate(es_splits):
-                b = self._fit_eval(A.iloc[tr], ys[tr], A.iloc[va], ys[va], lr=0.05, es=100)
+                b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
                 # Refit on all search rows at the early-stopped size, then score the gate rows.
-                full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), lgb.Dataset(A, ys),
+                full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
             return _row_loss(self.task_, yg, margin)
 
+        # Rows of one period share its shocks, so their paired differences are not
+        # independent: the period-level test treats each period (gate time value, or one of
+        # 30 equal time blocks when values are finer) as one observation.
+        blocks = None
+        if self.time_col_ is not None and self.time_col_ in Xg.columns:
+            tg = Xg[self.time_col_].to_numpy(dtype=float)
+            u, codes = np.unique(tg, return_inverse=True)
+            if len(u) > 60:
+                order = np.argsort(tg, kind="stable")
+                codes = np.empty(len(tg), dtype=int)
+                codes[order] = np.arange(len(tg)) * 30 // len(tg)
+            blocks = codes if codes.max() >= 4 else None
         # The baseline is always the raw columns as given (native categoricals).
         raw_rows = gate_loss(self.base_cols_, recode=False)
         raw_l = float(raw_rows.mean())
@@ -3040,7 +3427,11 @@ class FeatureForge:
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
-            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
+            zb = _block_z(dw, blocks) if blocks is not None else None
+            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
+                      f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
+            if self.gate_by_period and zb is not None:
+                z = zb
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
         if best_set is None and self.gate_families:
@@ -3116,7 +3507,7 @@ class FeatureForge:
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
-        X = X.reset_index(drop=True).copy()
+        X = X.reset_index(drop=True)
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
@@ -3220,22 +3611,28 @@ class FeatureForge:
         def is_int(v):
             f = v[np.isfinite(v)]
             return len(f) > 0 and not np.any(f != np.round(f))
-        times = [c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0]
+        # Wide anonymous tables have hundreds of time-like columns: try the most distinct
+        # ones, within a minute (Loan Default's 700 columns took hours otherwise).
+        times = sorted([c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0],
+                       key=lambda c: -X[c].nunique())[:20]
+        t_stop = time.time() + 60
         deltas = sorted([c for c in num if is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
                         key=lambda c: -X[c].nunique())[:80]
         ids = []
         for c in self.id_cols_[:3]:
             v = S[c]
-            ids.append(pd.factorize(v)[0].astype(np.int64) if c in self.cat_cols_
-                       else np.nan_to_num(v.to_numpy(dtype=float), nan=-1).astype(np.int64))
+            ids.append(pd.factorize(v)[0].astype(np.int64))
         def n_pairs(idc, v):
             ok = np.isfinite(v)
             if ok.sum() < 0.3 * len(v):
                 return 0
-            code = idc[ok] * (1 << 32) + (v[ok].astype(np.int64) - int(v[ok].min()))
+            # Codes, not values: columns of huge magnitude overflow int64.
+            code = idc[ok] * (1 << 32) + pd.factorize(v[ok])[0].astype(np.int64)
             return len(np.unique(code))
         found = []
         for t in times:
+            if time.time() > t_stop:
+                break
             tv = vals[t]
             for s in (1, 60, 3600, 86400, 604800):
                 span = (np.nanmax(tv) - np.nanmin(tv)) / s
@@ -3256,6 +3653,7 @@ class FeatureForge:
                     if ratios and min(ratios) < max_ratio:
                         found.append((min(ratios) / np.isfinite(dv).mean(), t, s, d))
         found.sort()
+        self.anchor_found_ = list(found)
         out, used = [], set()
         for r, t, s, d in found:
             if d in used:

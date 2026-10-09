@@ -306,6 +306,75 @@ def test_forge_search_respects_small_budget():
     y = X.x0 / (X.x1.abs() + 0.5) + rng.normal(size=len(X)) * 0.1
     t0 = time.time()
     ff = FeatureForge(task="regression", time_budget=0.5, n_jobs=1, verbose=False).fit(X, y)
-    # No search round fits in the budget: base CV, then straight to the output.
-    assert ff.history_ == [] and ff.selected_ == []
+    # Only the first round runs (it always gets sixteen CV fits), none after.
+    assert len(ff.history_) <= 1
     assert time.time() - t0 < 60
+
+
+def test_forge_search_subsample_keeps_output_on_every_row():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.normal(size=(6000, 4)), columns=list("abcd"))
+    X["t"] = np.arange(len(X), dtype=float)
+    y = X.a * X.b + rng.normal(size=len(X)) * 0.1
+    U = X.iloc[:500].assign(t=X.t.iloc[:500] + 6000)
+    f = FeatureForge(task="regression", time_budget=60, n_rounds=1, n_jobs=1, verbose=False,
+                     time_col="t", max_search_rows=2000).fit(X, y, X_unlabeled=U)
+    assert len(f.transform_train(X)) == len(X) and len(f.transform(U)) == len(U)
+    assert any("a" in c and "b" in c for c in f.new_columns_)
+
+
+def test_pair_scan_finds_hidden_difference_of_near_duplicate_columns():
+    # Loan Default's golden feature: two near-identical huge columns whose small difference
+    # decides the label, hidden among many other near-duplicate pairs.
+    from tabularaml.generate.pairscan import scan_pairs
+    rng = np.random.default_rng(0)
+    n = 6000
+    base = rng.lognormal(15, 1, size=(n, 6))
+    X = {}
+    for j in range(6):
+        X[f"a{j}"] = base[:, j]
+        X[f"b{j}"] = base[:, j] + rng.normal(0, 50, n)
+    d = rng.normal(0, 1, n)
+    X["b3"] = X["a3"] + 50 * d
+    W = pd.DataFrame(X)
+    y = (d + 0.3 * rng.normal(size=n) > 1).astype(float)
+    margin = np.full(n, np.log(y.mean() / (1 - y.mean())))
+    p = 1 / (1 + np.exp(-margin))
+    loss = lambda m, rows: float(np.mean(np.logaddexp(0, m) - y[rows] * m))
+    out = scan_pairs(W, list(W.columns), [], p - y, p * (1 - p), loss, margin, top=3)
+    assert out and {out[0][1], out[0][2]} == {"a3", "b3"} and out[0][0] == "sub"
+
+
+def test_client_profile_aggregates_per_client_and_marks_unseen_clients():
+    from tabularaml.generate.profile import ClientProfile, profile_candidates
+    df = pd.DataFrame({"card": [1, 1, 2, 2, 3], "addr": [5.0, 5.0, 5.0, np.nan, np.nan],
+                       "anc": [10, 10, 10, 10, 7], "amt": [1.0, 3.0, 4.0, 6.0, 2.0],
+                       "dev": ["a", "b", "a", "a", None], "day": [20, 25, 30, 31, 40], "D1": [10, 15, 20, 21, 30]})
+    p = ClientProfile(["card", "addr", "anc"], ["amt"], ["dev"], rebase=[("day", 1.0, "D1")]).fit(df)
+    out = p.transform(df)
+    assert out.shape == (5, p.n_out) == (5, 6) and len(p.paired_parents) == p.n_out
+    assert out[0, 0] == out[1, 0] == 2.0 and out[0, 4] == 2 and out[0, 5] == 2  # mean, nunique, rows
+    assert out[0, 2] == 10 and out[0, 3] == 0  # re-based D1 is constant within the client
+    assert out[2, 5] == 1 and out[3, 5] == 1  # a missing key value is its own client, not a crash
+    new = pd.DataFrame({"card": [9], "addr": [5.0], "anc": [10], "amt": [1.0], "dev": ["a"], "day": [1], "D1": [0]})
+    assert np.isnan(p.transform(new)).all()
+    assert profile_candidates(df, ["card"], [], [], ["amt"], ["dev"]) == []
+
+
+def test_label_history_columns_are_kept_out_of_client_profiles():
+    # Riiid-like log: a user's running mean of earlier answers carries each answer into the
+    # user's later rows, so a per-user mean over all rows would leak; raw columns stay in.
+    from tabularaml.generate.profile import label_history_cols
+    rng = np.random.default_rng(0)
+    n_u, k = 400, 30
+    user = np.repeat(np.arange(n_u), k)
+    t = np.tile(np.arange(k), n_u)
+    skill = np.repeat(rng.normal(size=n_u), k)
+    elapsed = rng.normal(size=n_u * k)
+    y = (skill + 0.5 * elapsed + rng.normal(size=n_u * k) > 0).astype(float)
+    df = pd.DataFrame({"user": user, "t": t, "elapsed": elapsed, "y": y})
+    df["past_mean"] = df.groupby("user")["y"].transform(lambda s: s.shift().expanding().mean())
+    perm = rng.permutation(len(df))
+    df = df.iloc[perm].reset_index(drop=True)
+    bad = label_history_cols(df, df["y"].to_numpy(), ["user"], ["elapsed", "past_mean"], time_col="t")
+    assert bad == ["past_mean"]
