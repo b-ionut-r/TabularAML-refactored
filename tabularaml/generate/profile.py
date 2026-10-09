@@ -17,6 +17,12 @@ client's row count. Statistics are computed over every row whose features are kn
 gate and unlabeled rows), as the winners computed them over train + test; labels are never used.
 Rows of a client never seen get NaN. The block is screened like a column family: the novel gains
 of its columns, each against its own source column, are summed.
+
+A client mean over all rows sees the client's later rows. That is harmless for raw event columns
+but leaks when a column is built from earlier labels (a running mean of a user's past answers
+on Riiid): its later values carry the current row's label. ``label_history_cols`` finds such
+columns, whose change across a row moves with that row's label, and they are left
+out of the block.
 """
 from typing import List, Optional, Sequence, Tuple
 
@@ -101,10 +107,53 @@ class ClientProfile:
         return self.fit(df).transform(df)
 
 
+def label_history_cols(W: pd.DataFrame, y: np.ndarray, keys: Sequence[str], cols: Sequence[str],
+                       time_col: Optional[str] = None, max_rows: int = 200_000,
+                       thresh: float = 0.2, seed: int = 0) -> List[str]:
+    """Columns that carry earlier rows' labels: within a client (rows in time order), the rank
+    correlation between the current row's label and the column's change from the previous row
+    to the next one. A label-free column relates to the label the same way before and after it
+    (through the client's traits), so the change cancels; a column built from labels moves with
+    the label it took in. On IEEE-CIS a running mean of a client's earlier labels scores over 0.3 and
+    the strongest raw columns tested (D2, V258) between 0.1 and 0.2 (a fraud changes what the card
+    does next), hence ``thresh=0.2``."""
+    y = np.asarray(y, dtype=float)
+    if len(W) != len(y) or not cols:
+        return []
+    order = np.arange(len(W))
+    if time_col is not None and time_col in W.columns:
+        order = np.argsort(W[time_col].to_numpy(dtype=float), kind="stable")
+    code = pd.factorize(_key_strings(W, keys))[0][order]
+    order = order[np.argsort(code, kind="stable")]
+    code = np.sort(code, kind="stable")
+    i = np.flatnonzero((code[1:-1] == code[:-2]) & (code[1:-1] == code[2:])) + 1  # previous and next row of the same client
+    if len(i) < 100:
+        return []
+    if len(i) > max_rows:
+        i = np.sort(np.random.default_rng(seed).choice(i, max_rows, replace=False))
+    prv, cur, nxt = order[i - 1], order[i], order[i + 1]
+    yc = pd.Series(y[cur]).rank().to_numpy()
+    yc = yc - yc.mean()
+    out = []
+    for c in cols:
+        v = W[c].to_numpy(dtype=float)
+        d = v[nxt] - v[prv]
+        ok = np.isfinite(d)
+        if ok.sum() < 100 or np.nanstd(d[ok]) == 0:
+            continue
+        r = pd.Series(d[ok]).rank().to_numpy()
+        r, a = r - r.mean(), yc[ok] - yc[ok].mean()
+        den = np.sqrt((r * r).sum() * (a * a).sum())
+        if den > 0 and abs((r * a).sum() / den) > thresh:
+            out.append(c)
+    return out
+
+
 def profile_candidates(W: pd.DataFrame, ids: Sequence[str], anchors: Sequence[tuple],
                        rebase: Sequence[Tuple[str, float, str]], num_rank: Sequence[str],
                        cat_rank: Sequence[str], max_nums: int = 120, max_cats: int = 16,
-                       exclude: Sequence[str] = ()) -> List[ClientProfile]:
+                       exclude: Sequence[str] = (), y: Optional[np.ndarray] = None,
+                       time_col: Optional[str] = None) -> List[ClientProfile]:
     """Profile of the discovered client: (two strongest ID columns, best anchor). Nothing without an anchor: plain column combinations
     are not clients (composite-key aggregations over them were neutral)."""
     if not anchors or not ids:
@@ -116,4 +165,8 @@ def profile_candidates(W: pd.DataFrame, ids: Sequence[str], anchors: Sequence[tu
     # One key: the two strongest ID columns plus the best anchor (on IEEE-CIS a second block
     # keyed on one ID column and the anchor lowered AUC 0.9409 -> 0.9398).
     keys = [tuple(ids[:2]) + (a,)] if len(ids) >= 2 else [(ids[0], a)]
+    if y is not None:  # columns built from earlier labels never enter a block over all rows
+        bad = set(label_history_cols(W, y, list(keys[0]), nums + [d for _, _, d in rebase], time_col))
+        nums = [c for c in nums if c not in bad]
+        rebase = [r for r in rebase if r[2] not in bad]
     return [ClientProfile(list(k), nums, cats, rebase, label="+".join(k)) for k in keys]

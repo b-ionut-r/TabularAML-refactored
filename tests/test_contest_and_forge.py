@@ -359,3 +359,22 @@ def test_client_profile_aggregates_per_client_and_marks_unseen_clients():
     new = pd.DataFrame({"card": [9], "addr": [5.0], "anc": [10], "amt": [1.0], "dev": ["a"], "day": [1], "D1": [0]})
     assert np.isnan(p.transform(new)).all()
     assert profile_candidates(df, ["card"], [], [], ["amt"], ["dev"]) == []
+
+
+def test_label_history_columns_are_kept_out_of_client_profiles():
+    # Riiid-like log: a user's running mean of earlier answers carries each answer into the
+    # user's later rows, so a per-user mean over all rows would leak; raw columns stay in.
+    from tabularaml.generate.profile import label_history_cols
+    rng = np.random.default_rng(0)
+    n_u, k = 400, 30
+    user = np.repeat(np.arange(n_u), k)
+    t = np.tile(np.arange(k), n_u)
+    skill = np.repeat(rng.normal(size=n_u), k)
+    elapsed = rng.normal(size=n_u * k)
+    y = (skill + 0.5 * elapsed + rng.normal(size=n_u * k) > 0).astype(float)
+    df = pd.DataFrame({"user": user, "t": t, "elapsed": elapsed, "y": y})
+    df["past_mean"] = df.groupby("user")["y"].transform(lambda s: s.shift().expanding().mean())
+    perm = rng.permutation(len(df))
+    df = df.iloc[perm].reset_index(drop=True)
+    bad = label_history_cols(df, df["y"].to_numpy(), ["user"], ["elapsed", "past_mean"], time_col="t")
+    assert bad == ["past_mean"]

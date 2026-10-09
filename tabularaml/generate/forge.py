@@ -2189,7 +2189,8 @@ class FeatureForge:
             for sp in profile_candidates(W, ids, self.anchors_, rebase[:12],
                                          [c for c in rank if c in W.columns and c not in self.cat_cols_],
                                          [c for c in rank if c in self.cat_cols_ and c not in self.text_cols_],
-                                         exclude=exclude):
+                                         exclude=exclude, y=getattr(self, "_yW", None),
+                                         time_col=getattr(self, "time_col_", None)):
                 add(sp)
         t = getattr(self, "time_col_", None)
         for e in ents:
@@ -2921,6 +2922,7 @@ class FeatureForge:
         if self.n_interactions:
             self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
         self.wide_pairs_ = self._wide_pairs(W, yW, margin, imp) if self.pair_scan else []
+        self._yW = yW  # search rows' labels, for checks that keep labels out of label-free specs
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
             self._fit_rank_maps(W)
