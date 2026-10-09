@@ -24,6 +24,7 @@ on Riiid): its later values carry the current row's label. ``label_history_cols`
 columns, whose change across a row moves with that row's label, and they are left
 out of the block.
 """
+from itertools import combinations
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -162,9 +163,19 @@ def profile_candidates(W: pd.DataFrame, ids: Sequence[str], anchors: Sequence[tu
     skip = set(ids) | {x[3] for x in anchors} | set(exclude)
     nums = [c for c in num_rank if c not in skip and W[c].nunique() > 2][:max_nums]
     cats = [c for c in cat_rank if c not in skip and 2 < W[c].nunique() < 0.5 * len(W)][:max_cats]
-    # One key: the two strongest ID columns plus the best anchor (on IEEE-CIS a second block
-    # keyed on one ID column and the anchor lowered AUC 0.9409 -> 0.9398).
-    keys = [tuple(ids[:2]) + (a,)] if len(ids) >= 2 else [(ids[0], a)]
+    # One key: the best anchor plus the pair of strong ID columns that splits the rows into the
+    # most clients. A pair where one column nearly determines the other (IEEE-CIS: card2 follows
+    # card1) merges different clients: card1 + card2 gives 152k clients and holds out at 0.9288
+    # on a later window, card1 + addr1 gives 218k and 0.9332, the winners' key. A second block
+    # keyed on one ID column and the anchor lowered AUC (0.9409 -> 0.9398).
+    if len(ids) >= 2:
+        S = W.sample(min(len(W), 200_000), random_state=0) if len(W) > 200_000 else W
+        ak = _key_strings(S, [a])
+        best = max(combinations(ids[:4], 2),
+                   key=lambda p: len(pd.unique(_key_strings(S, list(p)) + "|" + ak)))
+        keys = [tuple(best) + (a,)]
+    else:
+        keys = [(ids[0], a)]
     if y is not None:  # columns built from earlier labels never enter a block over all rows
         bad = set(label_history_cols(W, y, list(keys[0]), nums + [d for _, _, d in rebase], time_col))
         nums = [c for c in nums if c not in bad]

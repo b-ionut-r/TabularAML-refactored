@@ -3293,6 +3293,8 @@ class FeatureForge:
             self.history_.append(dict(round=r + 1, n_candidates=n_values, n_added=best_k,
                                       cv_loss_before=cur_loss, cv_loss_after=best_loss))
             self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f}")
+            if chosen:
+                self._log(f"  round {r + 1} picks: {', '.join(sp.name for sp in chosen)[:600]}")
             cur_loss = best_loss
 
         self._deadline = None
