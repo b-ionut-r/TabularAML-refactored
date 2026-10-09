@@ -29,6 +29,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
+from tabularaml.generate.history import history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
 
@@ -128,6 +129,9 @@ def main():
                     help="forecasting family (tabularaml/generate/forecast.py): on when the data has a date, "
                          "repeating entity keys and test rows after the training period")
     ap.add_argument("--forecast-kw", default="{}", help="JSON of extra ForecastFeatures arguments")
+    ap.add_argument("--history", default="off", choices=["auto", "off"],
+                    help="latest-state features of keyed child tables with a time column "
+                         "(tabularaml/generate/history.py): last, last - mean, last - previous")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -176,6 +180,11 @@ def main():
             for c in [c for c in Fk.columns if c.endswith("__count")]:
                 Fk[c] = Fk[c].fillna(0)
             A.insert(0, Fk)
+            if a.history == "auto" and repeats(ch):
+                t = time.time()
+                Hk = history_features(ch).reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
+                print(f"table {ch.name}: latest-state history, {Hk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+                A.insert(1, Hk)
         rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
         # Child rows that also share the main row's code values (a customer's purchases of the
         # offer's brand), counted before the main row's date when both tables carry dates.

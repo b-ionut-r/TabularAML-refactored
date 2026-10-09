@@ -19,12 +19,16 @@ ap.add_argument('--tag', default=''); ap.add_argument('--data', default='data/ro
 ap.add_argument('--shuffle', action='store_true'); ap.add_argument('--keep', default='', help='keep the output directory here')
 ap.add_argument('--forge-kw', default='{}'); ap.add_argument('--win', type=int, default=0, help='holdout ends 48 x win days before the last day')
 ap.add_argument('--customers', action='store_true', help='keep the training-only Customers column for the forecasting family')
+ap.add_argument('--stores', type=int, default=0, help='random sample of stores (quick runs)')
 a = ap.parse_args()
 D = Path(a.data)
 tr = pd.read_csv(D / 'train.csv', dtype={'StateHoliday': str})
 if not a.customers:
     tr = tr.drop(columns=['Customers'])
 st = pd.read_csv(D / 'store.csv')
+if a.stores:
+    keep = np.random.default_rng(0).choice(st.Store.to_numpy(), a.stores, replace=False)
+    tr, st = tr[tr.Store.isin(keep)].reset_index(drop=True), st[st.Store.isin(keep)].reset_index(drop=True)
 d = pd.to_datetime(tr.Date)
 if a.win:
     tr = tr[d <= d.max() - pd.Timedelta(days=48 * a.win)].reset_index(drop=True); d = pd.to_datetime(tr.Date)
