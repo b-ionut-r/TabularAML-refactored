@@ -596,6 +596,13 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
     return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
 
 
+def _block_z(d, blocks):
+    """One-sided z of the mean paired difference with each block (period) as one observation."""
+    m = np.bincount(blocks, weights=d) / np.maximum(np.bincount(blocks), 1)
+    m = m[np.bincount(blocks) > 0]
+    return float(m.mean() / (m.std(ddof=1) / np.sqrt(len(m)) + 1e-300))
+
+
 def synthetic_rows(X: pd.DataFrame, U: pd.DataFrame, min_rate: float = 0.9, min_cols: int = 20) -> np.ndarray:
     """Unlabeled rows that look generated from other rows' values (Santander 2019's
     fake test rows): no value of theirs is unique among all known rows, while
@@ -1655,6 +1662,10 @@ class FeatureForge:
         groups when test rows are new entities, else a random sample); the rest still
         count in label-free statistics, and the output is computed on every row. Off by
         default: a 300k cap lost M5's and Favorita's gains.
+    gate_by_period : bool
+        On time-ordered data, test the gate's paired improvement with each period (gate
+        time value, or one of 30 time blocks) as one observation instead of each row; rows
+        of one period share its shocks. The period-level z is logged either way.
     time_budget : float
         Wall-clock budget in seconds for the search. A round starts only while two CV fits
         (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
@@ -1754,7 +1765,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1792,6 +1803,7 @@ class FeatureForge:
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
         self.max_search_rows = max_search_rows
+        self.gate_by_period = gate_by_period
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -3081,6 +3093,18 @@ class FeatureForge:
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
             return _row_loss(self.task_, yg, margin)
 
+        # Rows of one period share its shocks, so their paired differences are not
+        # independent: the period-level test treats each period (gate time value, or one of
+        # 30 equal time blocks when values are finer) as one observation.
+        blocks = None
+        if self.time_col_ is not None and self.time_col_ in Xg.columns:
+            tg = Xg[self.time_col_].to_numpy(dtype=float)
+            u, codes = np.unique(tg, return_inverse=True)
+            if len(u) > 60:
+                order = np.argsort(tg, kind="stable")
+                codes = np.empty(len(tg), dtype=int)
+                codes[order] = np.arange(len(tg)) * 30 // len(tg)
+            blocks = codes if codes.max() >= 4 else None
         # The baseline is always the raw columns as given (native categoricals).
         raw_rows = gate_loss(self.base_cols_, recode=False)
         raw_l = float(raw_rows.mean())
@@ -3109,7 +3133,11 @@ class FeatureForge:
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
-            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
+            zb = _block_z(dw, blocks) if blocks is not None else None
+            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
+                      f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
+            if self.gate_by_period and zb is not None:
+                z = zb
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
         if best_set is None and self.gate_families:
