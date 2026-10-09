@@ -327,6 +327,36 @@ with `python scripts/ieee_fraud.py`.
   | 100% | 0.9338 | 0.9522 | 0.0886 | 0.0910 |
   | mean | 0.9300 | **0.9490 (+1.9 pts)** | | -1.0% |
 
+## Pair scan: Loan Default Prediction (Imperial College, Kaggle 2014)
+
+105k loans, 769 anonymous columns (OpenML 6331). Every top solution found the
+same golden features by brute force over column pairs: differences of three
+near-identical, huge-valued columns (f528 - f527, f528 - f274, f527 - f274).
+Neither column of a pair is strong alone, so FeatureForge never combined them:
+it composed arithmetic only among its top 24 numerics and tree-mined pairs.
+
+`tabularaml/generate/pairscan.py` (`pair_scan=True`, default) scores `a - b`
+and `a / b` for every pair among the 60 strongest numerics and every pair with
+rank correlation >= 0.9 on a 20k-row sample, by the cross-fitted residual
+Newton gain minus the better parent's, vectorised per chunk, within 5% of the
+budget. Pairs worth at least 0.1% of the loss become ordinary candidates.
+
+Default-stage AUC (loss > 0), stratified 80/20 holdout, `scripts/loandefault_bench.py`:
+
+| Columns | AUC | Feature build |
+|---|---|---|
+| Raw | 0.735 | |
+| Winners' three pairs by hand | 0.998 | |
+| FeatureForge without the scan | 0.974 | 28 min |
+| **FeatureForge with the scan** | **0.999** | 25 min (scan 58 s; its top 3 are the winners' pairs) |
+| Same, shuffled training labels | 0.511 (scan finds nothing) | |
+
+Elsewhere the scan is neutral: the 22-table contest suite +2.164% with it vs
++2.157% without (0 tables worse, 87 vs 86 s per table); IEEE-CIS latest window
+0.9513 either way; Home Credit holdout with the five child tables 0.8022 either
+way (the scan emits nothing). Allstate Claims (MAE, `scripts/allstate_bench.py`):
+raw 1151, the winners' 595 category crosses 1145, FeatureForge 1143; no gap.
+
 ## Related tables: Home Credit Default Risk (Kaggle 2018, $70k)
 
 **Kaggle private leaderboard (late submission, 2026-10-08).** `scripts/contest_features.py`
