@@ -5,7 +5,7 @@ Features only; train any AutoML (AutoGluon, ...) on the outputs.
     python scripts/contest_features.py --train application_train.csv --test application_test.csv \\
         --target TARGET --id SK_ID_CURR \\
         --table bureau=bureau.csv --table prev=previous_application.csv \\
-        --table inst=installments_payments.csv --child-models --out-dir features/
+        --table inst=installments_payments.csv --out-dir features/
 
 Each ``--table name=path[:key[:time]]`` is a child table. The key defaults to the
 main table's id column (or the one column it shares with the main table); the
@@ -29,6 +29,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
+from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
 
@@ -116,7 +117,9 @@ def main():
     ap.add_argument("--id", default=None)
     ap.add_argument("--table", action="append", default=[], help="name=path[:key[:time]]")
     ap.add_argument("--time", default=None, help="main-table time column for as-of aggregation (default: auto)")
-    ap.add_argument("--child-models", action="store_true", help="add out-of-fold child-row model features")
+    ap.add_argument("--child-models", action=argparse.BooleanOptionalAction, default=True,
+                    help="out-of-fold child-row model features for every keyed child table "
+                         "(Home Credit 0.7976 -> 0.8004; --no-child-models turns them off)")
     ap.add_argument("--task", default=None, choices=["regression", "binary", "multiclass"])
     ap.add_argument("--log-target", action="store_true", help="search on log1p(target) (RMSLE-scored contests)")
     ap.add_argument("--budget", type=float, default=900, help="FeatureForge time budget (s)")
@@ -127,6 +130,14 @@ def main():
                     help="directory to save the related-table features to, or load them from when present "
                          "(arms that differ only in FeatureForge settings share them)")
     ap.add_argument("--forge-kw", default="{}", help="JSON of extra FeatureForge arguments")
+    ap.add_argument("--forecast", default="auto", choices=["auto", "off"],
+                    help="forecasting family (tabularaml/generate/forecast.py): on when the data has a date, "
+                         "repeating entity keys and test rows after the training period")
+    ap.add_argument("--forecast-kw", default="{}", help="JSON of extra ForecastFeatures arguments")
+    ap.add_argument("--history", default="auto", choices=["auto", "off"],
+                    help="history families (tabularaml/generate/history.py), on from structure: latest state of keyed "
+                         "child tables with a time column (last, last - mean, last - previous), and outcome history "
+                         "of as-of event logs that carry the target (earlier outcomes, strictly before each row)")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -163,6 +174,17 @@ def main():
             if ch.name in asof:
                 print(f"table {ch.name}: as of {asof[ch.name]} per main row", flush=True)
                 A.append(asof_features(both_main, ch.key, asof[ch.name], ch))
+                if a.history == "auto" and a.target in ch.df.columns:
+                    # The log carries the outcome itself (earlier answers): outcome history strictly before
+                    # each row, overall and on the row's own item (the shared id-like column with most levels).
+                    shared = [c for c in both_main.columns if c in ch.df.columns and c not in (ch.key, asof[ch.name])
+                              and both_main[c].nunique() > 50]
+                    item = max(shared, key=lambda c: both_main[c].nunique()) if shared else None
+                    t = time.time()
+                    El = event_log_features(both_main, ch, a.target, asof[ch.name], item=item,
+                                            outcome_values=sorted(pd.unique(y.dropna())))
+                    print(f"table {ch.name}: outcome history (item={item}), {El.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+                    A.append(El)
         if a.child_models and keyed:
             task = a.task or ("binary" if y.nunique() == 2 else "regression")
             obj = "binary" if task == "binary" else "regression"
@@ -180,6 +202,11 @@ def main():
             for c in [c for c in Fk.columns if c.endswith("__count")]:
                 Fk[c] = Fk[c].fillna(0)
             A.insert(0, Fk)
+            if a.history == "auto" and repeats(ch):
+                t = time.time()
+                Hk = history_features(ch).reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
+                print(f"table {ch.name}: latest-state history, {Hk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+                A.insert(1, Hk)
         rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
         # Child rows that also share the main row's code values (a customer's purchases of the
         # offer's brand), counted before the main row's date when both tables carry dates.
@@ -211,10 +238,24 @@ def main():
             rel_te.to_parquet(cache / "rel_test.parquet")
             tr.to_parquet(cache / "main_train.parquet")  # with any one-row-per-key tables joined
             te.to_parquet(cache / "main_test.parquet")
+        del A, both_main, children, keyed
 
     Xtr = tr.drop(columns=[a.id]) if a.id else tr
     Xte = te.drop(columns=[a.id]) if a.id else te
     Xte = Xte[Xtr.columns]
+    n_main = tr.shape[1]
+    del tr, te  # a second copy of both tables is gigabytes on IEEE-CIS
+    forecasting = False
+    if a.forecast == "auto":
+        from tabularaml.generate.forecast import ForecastFeatures
+        t = time.time()
+        ff = ForecastFeatures(**json.loads(a.forecast_kw)).fit(Xtr, y.to_numpy(), Xte)
+        if ff.active_:
+            forecasting = True
+            Ftr, Fte = ff.transform(Xtr), ff.transform(Xte)
+            Xtr = pd.concat([Xtr.reset_index(drop=True), Ftr.reset_index(drop=True)], axis=1)
+            Xte = pd.concat([Xte.reset_index(drop=True), Fte.reset_index(drop=True)], axis=1)
+            print(f"forecast: {Ftr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
     if rel_tr is not None:
         # The search sees the related columns a quick model uses most; all are written out.
         import lightgbm as lgb
@@ -228,8 +269,17 @@ def main():
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
         Xtr = both[list(Xtr.columns) + top]
         Xte = pd.concat([Xte.reset_index(drop=True), rel_te[top]], axis=1)
-    forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **json.loads(a.forge_kw)).fit(Xtr, y, X_unlabeled=Xte)
-    out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
+        del both, b
+    if forecasting:
+        # On top of the forecasting columns the search's gate rows stop resembling the test
+        # horizon: its picks lost held-out (Favorita 0.669 -> 0.689, Recruit 0.519 -> 0.525,
+        # Rossmann kept none), so a forecasting contest gets the forecasting columns alone.
+        print("forecasting family active: FeatureForge search skipped", flush=True)
+        out_tr, out_te = Xtr.reset_index(drop=True).copy(), Xte.reset_index(drop=True).copy()
+    else:
+        forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target,
+                             **json.loads(a.forge_kw)).fit(Xtr, y, X_unlabeled=Xte)
+        out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
     if rel_tr is not None:
         rest = [c for c in rel_tr.columns if c not in out_tr.columns]
         out_tr = pd.concat([out_tr, rel_tr[rest]], axis=1)
@@ -242,7 +292,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     out_tr.to_parquet(out / "train_features.parquet")
     out_te.to_parquet(out / "test_features.parquet")
-    print(f"done in {time.time() - t0:.0f}s: {out_tr.shape[1] - tr.shape[1] - 1} columns added -> {out}/")
+    print(f"done in {time.time() - t0:.0f}s: {out_tr.shape[1] - n_main - 1} columns added -> {out}/")
 
 
 if __name__ == "__main__":

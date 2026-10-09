@@ -323,6 +323,33 @@ def test_forge_search_subsample_keeps_output_on_every_row():
     assert any("a" in c and "b" in c for c in f.new_columns_)
 
 
+def test_label_echo_columns_stay_out_of_cross_row_features():
+    rng = np.random.default_rng(0)
+    rows, q_hist = [], {}
+    for u in range(300):
+        skill, past, uq = rng.normal(), [], {}
+        for t in range(30):
+            q = int(rng.integers(0, 120))
+            y = int(rng.random() < 1 / (1 + np.exp(-(skill - (q % 7 - 3) / 3))))
+            qh, mine = q_hist.setdefault(q, []), uq.setdefault(q, [])
+            rows.append((u, q, np.mean(past) if past else np.nan,
+                         past[-3] if len(past) >= 3 else np.nan,         # 3rd previous answer
+                         np.mean(qh) if qh else np.nan,                  # question's earlier accuracy
+                         np.mean(mine) if mine else np.nan,              # this user on this question
+                         rng.normal(), q % 7, y))
+            past.append(y)
+            qh.append(y)
+            mine.append(y)
+    cols = ["user", "q", "prior_mean", "lag3", "q_acc", "uq_acc", "noise", "difficulty", "y"]
+    D = pd.DataFrame(rows, columns=cols)
+    y = D.pop("y")
+    f = FeatureForge(task="binary", time_budget=20, n_rounds=1, n_jobs=1, verbose=False)
+    f.task_, f.n_classes_, f.cat_cols_ = "binary", 2, []
+    f.id_cols_ = f._id_columns(D)
+    assert f.id_cols_[:2] == ["user", "q"]
+    assert f._label_echo_cols(D, y.to_numpy(float)) == {"prior_mean", "lag3", "q_acc", "uq_acc"}
+
+
 def test_pair_scan_finds_hidden_difference_of_near_duplicate_columns():
     # Loan Default's golden feature: two near-identical huge columns whose small difference
     # decides the label, hidden among many other near-duplicate pairs.
