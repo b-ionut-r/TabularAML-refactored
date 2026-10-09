@@ -321,3 +321,22 @@ def test_forge_search_subsample_keeps_output_on_every_row():
                      time_col="t", max_search_rows=2000).fit(X, y, X_unlabeled=U)
     assert len(f.transform_train(X)) == len(X) and len(f.transform(U)) == len(U)
     assert any("a" in c and "b" in c for c in f.new_columns_)
+
+
+def test_label_echo_columns_stay_out_of_cross_row_features():
+    rng = np.random.default_rng(0)
+    rows = []
+    for u in range(300):
+        skill, cum = rng.normal(), 0.0
+        for t in range(30):
+            q = rng.integers(0, 50)
+            y = int(rng.random() < 1 / (1 + np.exp(-(skill - (q % 7 - 3) / 3))))
+            rows.append((u, q, cum / t if t else np.nan, rng.normal(), y))
+            cum += y
+    D = pd.DataFrame(rows, columns=["user", "q", "prior_mean", "noise", "y"])
+    y = D.pop("y")
+    f = FeatureForge(task="binary", time_budget=20, n_rounds=1, n_jobs=1, verbose=False)
+    f.task_, f.n_classes_, f.cat_cols_ = "binary", 2, []
+    f.id_cols_ = f._id_columns(D)
+    assert f.id_cols_[:1] == ["user"]
+    assert f._label_echo_cols(D, y.to_numpy(float)) == {"prior_mean"}
