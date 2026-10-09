@@ -1662,6 +1662,8 @@ class FeatureForge:
         groups when test rows are new entities, else a random sample); the rest still
         count in label-free statistics, and the output is computed on every row. Off by
         default: a 300k cap lost M5's and Favorita's gains.
+    family_time_share : float
+        Largest share of the candidate-building time one family may take (1 disables).
     gate_by_period : bool
         On time-ordered data, test the gate's paired improvement with each period (gate
         time value, or one of 30 time blocks) as one observation instead of each row; rows
@@ -1766,7 +1768,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1805,6 +1807,7 @@ class FeatureForge:
         self.parity_check = parity_check
         self.max_search_rows = max_search_rows
         self.gate_by_period = gate_by_period
+        self.family_time_share = family_time_share
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -2345,7 +2348,7 @@ class FeatureForge:
         # on large tables) cannot starve the rest.
         cv_s = getattr(self, "_cv_s", 0.0)
         reserve = 8 * cv_s  # screening, the joint ranking fit and the prefix ladder
-        fam_cap = max(self._time_left() - reserve, 0.0) / 3
+        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share
         fams: Dict[str, list] = {}
         for sp in specs:
             fams.setdefault(type(sp).__name__, []).append(sp)
