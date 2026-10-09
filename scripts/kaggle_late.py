@@ -61,6 +61,9 @@ CONTESTS = {
     # Full IEEE-CIS with the memory-lean FeatureForge (branch claude/faster-featureforge-e7d8eu, worktree).
     "ieee_big": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
                      folds="time", raw="ieee", repo="/tmp/claude-0/wt_big"),
+    # Full IEEE-CIS again: memory-lean branch (4324761) plus PR #2's budget fixes (7b44ed8) merge patch.
+    "ieee_big2": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
+                      folds="time", raw="ieee", repo="/tmp/claude-0/wt_big2"),
     "hc": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                folds="kfold", child_models=True),
     "sct": dict(slug="santander-customer-transaction-prediction", target="target", id="ID_code", task="binary",
