@@ -2038,10 +2038,15 @@ class FeatureForge:
         ``nested`` maps target-encoding specs to the frame they were built on;
         their columns are then recomputed per fold from the fold's training rows.
         ``mat``: the frame as ``(float32 matrix, categorical positions, column names)``,
-        used instead of ``X`` (then None).
+        used instead of ``X`` (then None); an optional fourth item picks the matrix's
+        columns, so no full copy of the selected columns is kept.
         """
         import lightgbm as lgb
-        M, cats, cols = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
+        M, cats, cols, *pick = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
+        pick = pick[0] if pick else None
+
+        def rows(r):
+            return M[r] if pick is None else M[np.ix_(r, pick)]
         n = len(M)
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
@@ -2052,17 +2057,18 @@ class FeatureForge:
         specs = [sp for sp in (nested or {}).get("specs", []) if sp.out_names()[0] in pos]
         D = None
         if not specs:
-            # One binned dataset; folds train on its row subsets.
-            D = lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr),
-                            free_raw_data=False).construct()
+            # One binned dataset; folds train on its row subsets. The raw matrix is not kept:
+            # validation rows are read from ``M`` again.
+            D = lgb.Dataset(M if pick is None else M[:, pick], np.asarray(y), categorical_feature=cats,
+                            params=self._lgb_params(lr)).construct()
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
             for f_i, (tr, va) in enumerate(folds):
                 if D is not None:
                     b = self._fit_eval_rows(D, tr, va, lr=lr)
-                    Mva = M[va]
+                    Mva = rows(va)
                 else:
-                    Mtr, Mva = M[tr], M[va]
+                    Mtr, Mva = rows(tr), rows(va)
                     for sp in specs:
                         vt, vv = self._nested_values(sp, nested["W"], y, (r_i, f_i), tr, va)
                         for j, col in enumerate(sp.out_names()):
@@ -3077,9 +3083,15 @@ class FeatureForge:
             del Dj
             gain = pd.Series(b.feature_importance("gain"), index=jcols)
 
-            def sub(cols):
+            def sub(cols, copy=True):
                 idx = [jpos[c] for c in cols]
-                return Mj[:, idx], [i for i, j in enumerate(idx) if j in cats_j], list(cols)
+                cats = [i for i, j in enumerate(idx) if j in cats_j]
+                return (Mj[:, idx], cats, list(cols)) if copy else (Mj, cats, list(cols), idx)
+
+            # The joint matrix holds every survivor's values: keep only what it cannot
+            # (values of another dtype), so they are not held twice during the ladder.
+            values = {nm: v for nm, v in values.items() if v.dtype != np.float32}
+            new = None
             rank = sorted(survivors, key=lambda nm: -sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()))
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
@@ -3113,7 +3125,7 @@ class FeatureForge:
                         continue
                     tried.add(key)
                     cols = list(base_cols) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
-                    oof_k, loss_k, imp_k = self._cv(None, yW, folds, nested=nested, mat=sub(cols))
+                    oof_k, loss_k, imp_k = self._cv(None, yW, folds, nested=nested, mat=sub(cols, copy=False))
                     self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
                     if loss_k < best_loss:
                         best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
@@ -3126,11 +3138,11 @@ class FeatureForge:
                 sp.round_ = r
             selected.extend(chosen)
             Mw = sub(best_fit[2])
-            Mj = None
             for s in chosen:
                 for j, col in enumerate(s.out_names()):
-                    v = values[s.name]
-                    W[col] = v if v.ndim == 1 else v[:, j]
+                    v = values.get(s.name)
+                    W[col] = Mj[:, jpos[col]].copy() if v is None else v if v.ndim == 1 else v[:, j]
+            Mj = None
             margin, imp = best_fit[0], best_fit[1]
             self.history_.append(dict(round=r + 1, n_candidates=n_values, n_added=best_k,
                                       cv_loss_before=cur_loss, cv_loss_after=best_loss))
