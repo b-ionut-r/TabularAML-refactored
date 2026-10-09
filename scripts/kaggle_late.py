@@ -69,6 +69,9 @@ CONTESTS = {
                       folds="time", raw="ieee", repo="/tmp/claude-0/wt_big3"),
     "hc": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                folds="kfold", child_models=True),
+    # Home Credit v2: PR #2 head 14f8a21 (prefix-ladder budget fix 27f9514); same 5 child tables and judge as "hc".
+    "hc2": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
+                folds="kfold", child_models=True, raw="hc", repo="/tmp/claude-0/wt_pr2"),
     "sct": dict(slug="santander-customer-transaction-prediction", target="target", id="ID_code", task="binary",
                 metric="auc", folds="kfold"),
 }
