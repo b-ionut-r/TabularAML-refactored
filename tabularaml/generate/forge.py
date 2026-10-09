@@ -1749,6 +1749,13 @@ class FeatureForge:
         search CV placed close behind the chosen one (within half its gain), and keeps
         whichever set wins on the time-ordered gate rows. Off by default: on full IEEE-CIS
         the gate preferred the CV's pick anyway (same held-out AUC, about 5 minutes more).
+    gate_families : bool | "auto"
+        When the full set fails the gate, drop feature families one at a time and keep the
+        best remaining set that clears the gate by one more standard error. "auto" (default):
+        only when the test starts after a gap from the training rows, where the gate also
+        starts the same time after the search rows; there a family that leans on the latest
+        labelled rows (neighbours' labels, cross-linear key models on IEEE-CIS) fails while the
+        client encodings and profiles still carry over.
     label_echo : bool
         Find columns that carry earlier rows' labels (running means or counts of past
         answers in an event log: within an entity, or a pair of entities such as student and
@@ -1870,7 +1877,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
                  pair_scan: bool = True, profiles: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
@@ -2981,6 +2988,7 @@ class FeatureForge:
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
         self.horizon_ = 0.0
+        self.embargo_ = np.array([], dtype=int)
         self._groups = {}
         self.group_col_ = None if self.time_col_ is not None else self._detect_group(X, X_unlabeled)
         if self.group_col_ is not None:
@@ -3005,6 +3013,25 @@ class FeatureForge:
                     n_h = int(np.sum(tx > np.nanmax(tx) - horizon))
                     n_gate = int(np.clip(n_h, 0.05 * n, n_gate))
             idx_sel, idx_gate = np.sort(order[:n - n_gate]), np.sort(order[n - n_gate:])
+            if X_unlabeled is not None and self.time_col_ in X_unlabeled:
+                # The test begins some time after the last labelled row: the gate starts the
+                # same time after the search rows, so features that lean on rows just before
+                # (neighbours' labels, a client's last few outcomes) are judged as the test
+                # will see them. The skipped rows still feed label-free statistics.
+                gap = np.nanmin(tu) - np.nanmax(tx)
+                step = np.diff(np.unique(tx[np.isfinite(tx)]))
+                # A real gap: well beyond the time column's own spacing (daily data whose test
+                # starts the next day has none) and at least 2% of the training span.
+                big = (len(step) and gap > 2 * np.median(step)
+                       and gap >= 0.02 * (np.nanmax(tx) - np.nanmin(tx)))
+                if np.isfinite(gap) and big and len(idx_gate):
+                    t_g = np.nanmin(tx[idx_gate])
+                    emb = idx_sel[tx[idx_sel] > t_g - gap]
+                    if 0 < len(emb) <= 0.25 * n:
+                        self.embargo_ = emb
+                        idx_sel = np.setdiff1d(idx_sel, emb)
+                        self._log(f"gate starts {gap:.0f} after the search rows, as the test does after "
+                                  f"training ({len(emb)} rows between them feed only label-free statistics)")
         elif self.gate_frac and n >= 200 and self.group_col_ is not None:
             gx = X[self.group_col_].to_numpy()
             levels, codes = np.unique(gx.astype(str) if gx.dtype == object else gx, return_inverse=True)
@@ -3024,7 +3051,7 @@ class FeatureForge:
         # Large tables: the search runs on the latest rows (time-ordered data), whole random
         # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
         # budget for several rounds; the rows left out still feed label-free statistics.
-        idx_out = np.array([], dtype=int)
+        idx_out = self.embargo_
         m_cap = None
         for attempt in range(3):
             m = m_cap or self.max_search_rows or len(idx_sel)
@@ -3496,7 +3523,8 @@ class FeatureForge:
                 z = zb
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
-        if best_set is None and self.gate_families:
+        fam_on = self.gate_families is True or (self.gate_families == "auto" and len(getattr(self, "embargo_", ())))
+        if fam_on and self.selected_ and (best_set is None or len(best_set) < len(self.selected_)):
             best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
         return best_set, raw_l, best_l
 
