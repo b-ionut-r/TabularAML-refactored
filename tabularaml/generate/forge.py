@@ -596,6 +596,13 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
     return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
 
 
+def _block_z(d, blocks):
+    """One-sided z of the mean paired difference with each block (period) as one observation."""
+    m = np.bincount(blocks, weights=d) / np.maximum(np.bincount(blocks), 1)
+    m = m[np.bincount(blocks) > 0]
+    return float(m.mean() / (m.std(ddof=1) / np.sqrt(len(m)) + 1e-300))
+
+
 def synthetic_rows(X: pd.DataFrame, U: pd.DataFrame, min_rate: float = 0.9, min_cols: int = 20) -> np.ndarray:
     """Unlabeled rows that look generated from other rows' values (Santander 2019's
     fake test rows): no value of theirs is unique among all known rows, while
@@ -1655,10 +1662,17 @@ class FeatureForge:
         groups when test rows are new entities, else a random sample); the rest still
         count in label-free statistics, and the output is computed on every row. Off by
         default: a 300k cap lost M5's and Favorita's gains.
+    family_time_share : float
+        Largest share of the candidate-building time one family may take (1 disables).
+    gate_by_period : bool
+        On time-ordered data, test the gate's paired improvement with each period (gate
+        time value, or one of 30 time blocks) as one observation instead of each row; rows
+        of one period share its shocks. The period-level z is logged either way.
     time_budget : float
-        Wall-clock budget in seconds for the search. A round starts only while two CV fits
-        (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
-        fit's time left; the base CV fit, the gate and the final out-of-fold fits always run.
+        Wall-clock budget in seconds for the search. The first round always gets sixteen
+        CV fits (timed on the base fit), eight of them kept for screening and the prefix
+        ladder; later rounds start only while ten fit in the budget. Cheap candidate
+        families are built first. The base fit, the gate and the final fits always run.
     n_rounds : int
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
@@ -1754,7 +1768,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1792,6 +1806,8 @@ class FeatureForge:
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
         self.max_search_rows = max_search_rows
+        self.gate_by_period = gate_by_period
+        self.family_time_share = family_time_share
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -2331,7 +2347,10 @@ class FeatureForge:
         # third of the time left for building them, so a few slow ones (neighbour features
         # on large tables) cannot starve the rest.
         cv_s = getattr(self, "_cv_s", 0.0)
-        fam_cap = max(self._time_left() - 4 * cv_s, 0.0) / 3
+        # Screening, the joint ranking fit and the prefix ladder: eight CV fits, at most half
+        # the time left (when the first round's time is capped by the budget).
+        reserve = min(8 * cv_s, 0.5 * max(self._time_left(), 0.0))
+        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share
         fams: Dict[str, list] = {}
         for sp in specs:
             fams.setdefault(type(sp).__name__, []).append(sp)
@@ -2372,8 +2391,9 @@ class FeatureForge:
                 by_cost = sorted(fams, key=lambda f: fam_t.get(f, 0.0))
             todo = firsts if phase == 0 else [sp for f in by_cost for sp in fams[f][1:]]
             for s in todo:
-                # Leave room in the budget for at least one CV fit of the screened candidates.
-                if self._time_left() < cv_s:
+                # Leave room in the budget for ranking the built candidates (about eight CV fits:
+                # otherwise a few seconds of timing noise decide how many prefixes get tried).
+                if self._time_left() < reserve:
                     self._log(f"budget: built {done} of {len(specs)} candidates")
                     break
                 if type(s).__name__ not in capped:
@@ -2768,68 +2788,91 @@ class FeatureForge:
         # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
         # budget for several rounds; the rows left out still feed label-free statistics.
         idx_out = np.array([], dtype=int)
-        m = self.max_search_rows or len(idx_sel)
-        if len(idx_sel) > m:
-            rng = np.random.default_rng(self.random_state)
-            if self.time_col_ is not None:
-                keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
-            elif self.group_col_ is not None:
-                g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
-                perm = rng.permutation(g.max() + 1)
-                r = perm[g]
-                keep = idx_sel[np.argsort(r, kind="stable")[:m]]
-            else:
-                keep = rng.choice(idx_sel, m, replace=False)
-            keep = np.sort(keep)
-            idx_out = np.setdiff1d(idx_sel, keep)
-            self._log(f"search on {m} of {len(idx_sel)} rows")
-            idx_sel = keep
-        W = X.iloc[idx_sel].reset_index(drop=True)
-        yW = y_np[idx_sel]
-        if self.group_col_ is not None:
-            gx = X[self.group_col_].astype(str).to_numpy()
-            self._groups = {len(W): gx[idx_sel], n: gx}
-        self.U_search_ = None
-        if X_unlabeled is not None:
-            self.U_search_ = pd.concat([X.iloc[idx_out], X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]],
-                                       ignore_index=True)
-        elif len(idx_out):
-            self.U_search_ = X.iloc[np.concatenate([idx_out, idx_gate])].reset_index(drop=True)
-        self.ctx_.extra_rows = self.U_search_
-        # Small tables get repeated CV so that selection is not driven by fold noise.
-        n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
-        folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
-        te_folds = self._te_folds(W, yW, self.random_state + 1)
-        # Screening split (A trains the residual boosters, B measures them).
-        try:
-            idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
-                                            stratify=yW if self.task_ != "regression" else None)
-        except ValueError:
-            idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
-        if self.group_col_ is not None:
-            f0 = self._folds(len(W), yW, 10, self.random_state + 3)
-            idx_b = np.sort(np.concatenate([va for _, va in f0[:3]]))
-            idx_a = np.setdiff1d(np.arange(len(W)), idx_b)
-        if self.time_col_ is not None and self.time_cv:
-            # Rows close in time share their period's level, so random folds reward
-            # features that interpolate between neighbouring days. Contiguous time
-            # blocks as folds, and screening measured on the latest rows, reward only
-            # what carries over to other periods, as the test period needs.
-            order = np.argsort(W[self.time_col_].to_numpy(dtype=float), kind="stable")
-            blocks = np.array_split(order, self.cv)
-            folds = [[(np.sort(np.concatenate(blocks[:i] + blocks[i + 1:])), np.sort(b))
-                      for i, b in enumerate(blocks)]]
-            n_b = int(round(0.3 * len(W)))
-            idx_a, idx_b = np.sort(order[:-n_b]), np.sort(order[-n_b:])
+        m_cap = None
+        for attempt in range(3):
+            m = m_cap or self.max_search_rows or len(idx_sel)
+            if len(idx_sel) > m:
+                rng = np.random.default_rng(self.random_state)
+                if self.time_col_ is not None:
+                    keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
+                elif self.group_col_ is not None:
+                    g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                    perm = rng.permutation(g.max() + 1)
+                    r = perm[g]
+                    keep = idx_sel[np.argsort(r, kind="stable")[:m]]
+                else:
+                    keep = rng.choice(idx_sel, m, replace=False)
+                keep = np.sort(keep)
+                idx_out = np.union1d(idx_out, np.setdiff1d(idx_sel, keep))
+                self._log(f"search on {m} of {len(idx_sel)} rows")
+                idx_sel = keep
+            W = X.iloc[idx_sel].reset_index(drop=True)
+            yW = y_np[idx_sel]
+            if self.group_col_ is not None:
+                gx = X[self.group_col_].astype(str).to_numpy()
+                self._groups = {len(W): gx[idx_sel], n: gx}
+            self.U_search_ = None
+            if X_unlabeled is not None:
+                self.U_search_ = pd.concat([X.iloc[idx_out], X.iloc[idx_gate], self._prep(X_unlabeled)[self.raw_cols_]],
+                                           ignore_index=True)
+            elif len(idx_out):
+                self.U_search_ = X.iloc[np.concatenate([idx_out, idx_gate])].reset_index(drop=True)
+            self.ctx_.extra_rows = self.U_search_
+            # Small tables get repeated CV so that selection is not driven by fold noise.
+            n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
+            folds = [self._folds(len(W), yW, self.cv, self.random_state + 100 * r) for r in range(n_rep)]
+            te_folds = self._te_folds(W, yW, self.random_state + 1)
+            # Screening split (A trains the residual boosters, B measures them).
+            try:
+                idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state,
+                                                stratify=yW if self.task_ != "regression" else None)
+            except ValueError:
+                idx_a, idx_b = train_test_split(np.arange(len(W)), test_size=0.3, random_state=self.random_state)
+            if self.group_col_ is not None:
+                f0 = self._folds(len(W), yW, 10, self.random_state + 3)
+                idx_b = np.sort(np.concatenate([va for _, va in f0[:3]]))
+                idx_a = np.setdiff1d(np.arange(len(W)), idx_b)
+            if self.time_col_ is not None and self.time_cv:
+                # Rows close in time share their period's level, so random folds reward
+                # features that interpolate between neighbouring days. Contiguous time
+                # blocks as folds, and screening measured on the latest rows, reward only
+                # what carries over to other periods, as the test period needs.
+                order = np.argsort(W[self.time_col_].to_numpy(dtype=float), kind="stable")
+                blocks = np.array_split(order, self.cv)
+                folds = [[(np.sort(np.concatenate(blocks[:i] + blocks[i + 1:])), np.sort(b))
+                          for i, b in enumerate(blocks)]]
+                n_b = int(round(0.3 * len(W)))
+                idx_a, idx_b = np.sort(order[:-n_b]), np.sort(order[-n_b:])
 
-        selected: List[Spec] = []
-        self.history_ = []
-        self._nested_cache = {}
-        Wm = self._model_frame(W)
-        t_cv = time.time()
-        margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
-        # One CV fit's duration: the search stops when fewer than two are left in the budget.
-        self._cv_s = time.time() - t_cv
+            selected: List[Spec] = []
+            self.history_ = []
+            self._nested_cache = {}
+            Wm = self._model_frame(W)
+            if attempt == 0 and self.time_budget and len(W) > 150_000:
+                # A CV fit on 50k rows, scaled up, flags tables where one full fit would
+                # take hours before paying for it.
+                pr = np.sort(np.random.default_rng(self.random_state).choice(len(W), 50_000, replace=False))
+                t_p = time.time()
+                self._cv(Wm.iloc[pr], yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)])
+                est = (time.time() - t_p) * len(W) / 50_000
+                if 16 * est > 2 * self.time_budget:
+                    m_cap = max(100_000, int(len(W) * 2 * self.time_budget / (16 * est) * 0.8))
+                    if m_cap < len(W):
+                        self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
+                        continue
+            t_cv = time.time()
+            margin, cur_loss, imp = self._cv(Wm, yW, folds, mine=self.n_interactions > 0)
+            # One CV fit's duration: the search stops when fewer than two are left in the budget.
+            self._cv_s = time.time() - t_cv
+            # The first round is promised sixteen CV fits; when they would take more than twice
+            # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
+            room = 2 * self.time_budget
+            if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
+                m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
+                if m_cap < len(W):
+                    self._log(f"budget: one CV fit takes {self._cv_s:.0f}s on {len(W)} rows; searching fewer rows")
+                    continue
+            break
         if self.n_interactions:
             self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
         self.base_cv_loss_ = cur_loss
@@ -2848,13 +2891,14 @@ class FeatureForge:
         for r in range(self.n_rounds):
             if len(selected) >= self.max_new_features:
                 break
-            # The first round always gets room for ten CV fits (building, screening and the
-            # prefix ladder); later rounds start only while two fit in the budget.
+            # The first round always gets room for sixteen CV fits (building, then eight for
+            # screening and the prefix ladder); later rounds start only while ten fit in the budget.
             self._deadline = None
-            if r == 0 and self._time_left() < 10 * self._cv_s:
-                self._deadline = time.time() + 10 * self._cv_s
-                self._log(f"budget: first round given {10 * self._cv_s:.0f}s (ten CV fits)")
-            if r > 0 and self._time_left() < 2 * self._cv_s:
+            if r == 0 and self._time_left() < 16 * self._cv_s:
+                floor = min(16 * self._cv_s, 2 * self.time_budget)
+                self._deadline = time.time() + floor
+                self._log(f"budget: first round given {floor:.0f}s")
+            if r > 0 and self._time_left() < 10 * self._cv_s:
                 self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
                           f"search stops")
                 break
@@ -3081,6 +3125,18 @@ class FeatureForge:
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
             return _row_loss(self.task_, yg, margin)
 
+        # Rows of one period share its shocks, so their paired differences are not
+        # independent: the period-level test treats each period (gate time value, or one of
+        # 30 equal time blocks when values are finer) as one observation.
+        blocks = None
+        if self.time_col_ is not None and self.time_col_ in Xg.columns:
+            tg = Xg[self.time_col_].to_numpy(dtype=float)
+            u, codes = np.unique(tg, return_inverse=True)
+            if len(u) > 60:
+                order = np.argsort(tg, kind="stable")
+                codes = np.empty(len(tg), dtype=int)
+                codes[order] = np.arange(len(tg)) * 30 // len(tg)
+            blocks = codes if codes.max() >= 4 else None
         # The baseline is always the raw columns as given (native categoricals).
         raw_rows = gate_loss(self.base_cols_, recode=False)
         raw_l = float(raw_rows.mean())
@@ -3109,7 +3165,11 @@ class FeatureForge:
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
-            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} (z={z:+.2f}, need {z_needed:.2f})")
+            zb = _block_z(dw, blocks) if blocks is not None else None
+            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
+                      f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
+            if self.gate_by_period and zb is not None:
+                z = zb
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
         if best_set is None and self.gate_families:
