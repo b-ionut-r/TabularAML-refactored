@@ -1669,11 +1669,13 @@ class FeatureForge:
     gate_wide : bool
         The gate also scores up to two wider prefixes of the last round's ranking that the
         search CV placed close behind the chosen one (within half its gain), and keeps
-        whichever set wins on the time-ordered gate rows.
+        whichever set wins on the time-ordered gate rows. Off by default: on full IEEE-CIS
+        the gate preferred the CV's pick anyway (same held-out AUC, about 5 minutes more).
     label_echo : bool
         Find columns that carry earlier rows' labels (running means or counts of past
-        answers in an event log: within an entity, the next row's change tracks this row's
-        label) and keep them, and features built on them, out of every cross-row feature
+        answers in an event log: within an entity, or a pair of entities such as student and
+        question, the next row's change tracks this row's label; or lagged answers: a row a
+        few rows later holds this row's label) and keep them, and features built on them, out of every cross-row feature
         (group statistics, counts, encodings, neighbours, anchors). Such statistics would
         hand each row its own label through the entity's later rows.
     family_time_share : float
@@ -1782,7 +1784,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = True,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -3365,43 +3367,89 @@ class FeatureForge:
         return best
 
     # ------------------------------------------------------------- entities
-    def _label_echo_cols(self, X, y, min_corr=0.2):
-        """Columns that carry earlier rows' labels: within an entity (ID-like column, rows in
-        file order, which event logs keep chronological), the change from a row to the next
-        row tracks the first row's label, as a running mean or count of past answers does.
+    def _label_echo_cols(self, X, y, min_corr=0.2, max_lag=5, max_rows=300_000):
+        """Columns that carry earlier rows' labels. Rows of an entity (an ID-like column, or a
+        pair of them such as student and question) are taken in file order, which event logs
+        keep chronological. Two signatures:
+
+        - running statistic: the change from a row to the entity's next row tracks the first
+          row's label (running mean, count or accuracy of past answers);
+        - lagged label: the value ``k`` rows later (k <= ``max_lag``) tracks this row's label
+          far more than the row's own value does (the previous, 2nd previous ... answer).
+
         Statistics over an entity's other rows would hand a row its own label through the
         later rows' values, so these columns stay out of every cross-row feature."""
         if y is None or self.n_classes_ > 2 or not self.id_cols_:
             return set()
         yv = np.asarray(y, dtype=float)
-        echo = set()
+        n = len(X)
         num = [c for c in X.columns if c not in self.cat_cols_ and c not in self.id_cols_]
-        for k in self.id_cols_[:3]:
-            g = pd.factorize(X[k])[0]
-            same = np.zeros(len(X), dtype=bool)
-            same[:-1] = (g[1:] == g[:-1]) & (g[:-1] >= 0)
-            if same.sum() < 200:
+        if not num:
+            return set()
+        vals = {c: X[c].to_numpy(dtype=float) for c in num}
+        ids = list(self.id_cols_[:3])
+        codes = {k: pd.factorize(X[k])[0] for k in ids}
+        groups = [codes[k] for k in ids]
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                gi, gj = codes[ids[i]], codes[ids[j]]
+                pair = pd.factorize(gi.astype(np.int64) * (gj.max() + 2) + gj)[0]
+                pair[(gi < 0) | (gj < 0)] = -1
+                groups.append(pair)
+        rng = np.random.default_rng(0)
+
+        def corr(a, b):
+            m = np.isfinite(a) & np.isfinite(b)
+            if m.sum() < 200 or np.std(a[m]) == 0 or np.std(b[m]) == 0:
+                return 0.0
+            r = np.corrcoef(a[m], b[m])[0, 1]
+            return float(r) if np.isfinite(r) else 0.0
+
+        echo = set()
+        for g in groups:
+            # next occurrence of the same entity, rows in file order
+            order = np.argsort(g, kind="stable")
+            nxt = np.full(n, -1)
+            same = (g[order[1:]] == g[order[:-1]]) & (g[order[:-1]] >= 0)
+            nxt[order[:-1][same]] = order[1:][same]
+            rows = np.flatnonzero(nxt >= 0)
+            if len(rows) < 200:
                 continue
+            if len(rows) > max_rows:
+                rows = np.sort(rng.choice(rows, max_rows, replace=False))
+            # k-th next occurrence for the sampled rows
+            ahead = [rows]
+            for _ in range(max_lag):
+                prev = ahead[-1]
+                cur = np.where(prev >= 0, nxt[np.maximum(prev, 0)], -1)
+                ahead.append(cur)
+            r1, y0 = ahead[1], yv[rows]
+            y1 = yv[r1]
             for c in num:
                 if c in echo:
                     continue
-                v = X[c].to_numpy(dtype=float)
-                d = np.full(len(v), np.nan)
-                d[:-1] = v[1:] - v[:-1]
-                m = same & np.isfinite(d) & np.isfinite(yv)
-                if m.sum() < 200 or np.std(d[m]) == 0 or np.std(yv[m]) == 0:
+                v = vals[c]
+                # running statistic of past labels (sign too: a running mean over many
+                # earlier answers moves by little, but always toward the latest answer)
+                d = v[r1] - v[rows]
+                for dd in (d, np.sign(d)):
+                    r = corr(dd, y0)
+                    if abs(r) >= min_corr and abs(r) >= 3 * abs(corr(dd, y1)):
+                        echo.add(c)
+                        break
+                if c in echo:
                     continue
-                r = np.corrcoef(d[m], yv[m])[0, 1]
-                if not (np.isfinite(r) and abs(r) >= min_corr):
-                    continue
-                # Control: a calendar or other periodic column moves with the next row's label
-                # as much as with this one's; a running statistic of past labels does not.
-                y1 = np.full(len(yv), np.nan)
-                y1[:-1] = yv[1:]
-                m1 = m & np.isfinite(y1)
-                r1 = np.corrcoef(d[m1], y1[m1])[0, 1] if m1.sum() >= 200 and np.std(y1[m1]) > 0 else 0.0
-                if not np.isfinite(r1) or abs(r) >= 3 * abs(r1):
-                    echo.add(c)
+                # lagged label: the entity's k-th next row holds this row's label
+                r_own = abs(corr(v[rows], y0))
+                for k in range(1, max_lag + 1):
+                    rk = ahead[k]
+                    ok = rk >= 0
+                    if ok.sum() < 200:
+                        break
+                    r = abs(corr(v[rk[ok]], y0[ok]))
+                    if r >= min_corr and r >= 3 * r_own:
+                        echo.add(c)
+                        break
         return echo
 
     def _id_columns(self, X, cap=8):
