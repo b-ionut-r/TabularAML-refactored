@@ -129,9 +129,10 @@ def main():
                     help="forecasting family (tabularaml/generate/forecast.py): on when the data has a date, "
                          "repeating entity keys and test rows after the training period")
     ap.add_argument("--forecast-kw", default="{}", help="JSON of extra ForecastFeatures arguments")
-    ap.add_argument("--history", default="off", choices=["auto", "off"],
-                    help="latest-state features of keyed child tables with a time column "
-                         "(tabularaml/generate/history.py): last, last - mean, last - previous")
+    ap.add_argument("--history", default="auto", choices=["auto", "off"],
+                    help="history families (tabularaml/generate/history.py), on from structure: latest state of keyed "
+                         "child tables with a time column (last, last - mean, last - previous), and outcome history "
+                         "of as-of event logs that carry the target (earlier outcomes, strictly before each row)")
     a = ap.parse_args()
 
     t0 = time.time()

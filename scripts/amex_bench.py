@@ -113,3 +113,7 @@ res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, 
            auc=float(roc_auc_score(yte, p)), best_it=b.best_iteration, n_cols=Xtr.shape[1], fe_s=round(fe_t),
            total_s=round(time.time() - t0), n_tr=len(Xtr), n_te=len(Xte), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')
+
+import shutil
+if 'tmp' in globals() and not getattr(a, 'keep', ''):
+    shutil.rmtree(tmp, ignore_errors=True)   # bench outputs fill the disk otherwise
