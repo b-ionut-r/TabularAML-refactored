@@ -205,7 +205,10 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
     if len(num) >= 2:
         X = pd.concat([X, _row_pairs(df, num, 12).astype(np.float32)], axis=1)
     for c in X.columns:
-        if not pd.api.types.is_numeric_dtype(X[c]):
+        if pd.api.types.is_datetime64_any_dtype(X[c]):
+            # days since the epoch: LightGBM cannot serialise Timestamp categories
+            X[c] = (X[c] - pd.Timestamp("1970-01-01")).dt.total_seconds().astype(np.float64) / 86400.0
+        elif not pd.api.types.is_numeric_dtype(X[c]):
             X[c] = X[c].astype("category")
     X.columns = [_safe(c) for c in X.columns]
     X = X.loc[:, ~X.columns.duplicated()]

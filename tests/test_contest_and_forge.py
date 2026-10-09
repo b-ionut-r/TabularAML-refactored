@@ -405,3 +405,16 @@ def test_label_history_columns_are_kept_out_of_client_profiles():
     df = df.iloc[perm].reset_index(drop=True)
     bad = label_history_cols(df, df["y"].to_numpy(), ["user"], ["elapsed", "past_mean"], time_col="t")
     assert bad == ["past_mean"]
+
+
+def test_child_model_features_accept_datetime_child_columns():
+    # Amex: a parsed statement date in the child table used to become Timestamp categories,
+    # which LightGBM cannot serialise.
+    from tabularaml.generate.relational import Child, child_model_features
+    rng = np.random.default_rng(0)
+    n = 3000
+    df = pd.DataFrame({"k": rng.integers(0, 300, n), "v": rng.normal(size=n), "c": rng.choice(list("abc"), n),
+                       "d": pd.Timestamp("2020-01-01") + pd.to_timedelta(rng.integers(0, 500, n), unit="D")})
+    y = pd.Series(rng.integers(0, 2, 250).astype(float), index=np.arange(250))
+    out = child_model_features(Child("t", df, key="k", time="d"), y, np.arange(250, 300), task="binary")
+    assert len(out) == 300 and out.notna().any().all()
