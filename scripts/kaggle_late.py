@@ -69,6 +69,12 @@ CONTESTS = {
                       folds="time", raw="ieee", repo="/tmp/claude-0/wt_big3"),
     "hc": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                folds="kfold", child_models=True),
+    # Full IEEE-CIS v4a: faster branch 4a94315 + PR #4 0a6c198 (client profiles, pair scan) merged locally as ddfbf55.
+    "ieee_v4a": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
+                     folds="time", raw="ieee", repo="/tmp/claude-0/wt_v4a"),
+    # Full IEEE-CIS v4b: same code as v4a, search on the latest 260k rows (max_search_rows; kNN + profiles stack there).
+    "ieee_v4b": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
+                     folds="time", raw="ieee", repo="/tmp/claude-0/wt_v4a"),
     # Home Credit v2: PR #2 head 14f8a21 (prefix-ladder budget fix 27f9514); same 5 child tables and judge as "hc".
     "hc2": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                 folds="kfold", child_models=True, raw="hc", repo="/tmp/claude-0/wt_pr2"),
