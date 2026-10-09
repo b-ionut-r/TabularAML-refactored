@@ -156,6 +156,35 @@ before the first test day; MAE.
 Shuffled labels 396.41 (per-series median 396.52). At the contest's horizon the family cuts MAE by 7% and 20%; a week
 ahead the weather forecast and capacity carry the signal and the family adds nothing. No change followed.
 
+## Gap to the winners (M5, Favorita, Rossmann): features tried, none shipped
+
+Three families from winning write-ups, each opt-in and leak-tested (`tests/test_forecast.py`), measured on the held-out
+windows above (window 0 / window 1; baseline = current defaults):
+
+| Option | Rossmann RMSPE | Favorita NWRMSLE | M5 RMSSE | Walmart WMAE | Recruit RMSLE |
+|---|---|---|---|---|---|
+| defaults | 0.1060 / 0.1006 | 0.6789 / 0.6702 | 0.7510 / 0.7187 | 1676 / 2639 | 0.5153 / 0.5191 |
+| `event_counts`: events in the week and month before and after (after capped where a test file ends) | 0.1072 / 0.1004 | no covariates | 0.7494 / 0.7157 | 1651 / 2734 | 0.5159 / 0.5215 |
+| `numeric_covariates`: price-like columns against the entity's mean, max and earlier values | 0.1063 / 0.1006 (none found) | none found | 0.7510 / 0.7187 (prices move in <20% of items over 150 days) | 1649 / 2671 | 0.5153 / 0.5191 |
+| `companions`: training-only columns read like the target (Rossmann `Customers`, `--customers`) | 0.1066 / 0.1017 | | | | |
+
+None helps on both windows beyond run-to-run noise (about 0.3% here), and each hurts somewhere, so all stay off.
+The hand-made M5 price features on top of the family: 0.7514 / 0.7107, within noise of the family alone.
+
+What did move M5 is data volume, not a new family. Reading 300 more days of labelled history: 0.7463 / 0.7103 (700 more:
+the same). Also training the judge on 450 days instead of 150: 0.7418 / 0.6998. The Kaggle entry already reads 450 days and
+trains on 120.
+
+Where the rest of the gap sits (inferred from the winners' write-ups and the numbers above; not changed here):
+- **M5** (0.852 vs ~0.52 WRMSSE): Tweedie and L2 losses score the same at item level on these windows (0.7510 / 0.7141
+  with L2). The gap is in the levels WRMSSE weighs most (store, state and department totals). Winners got it from per-store
+  and per-department models trained on 4-5 years, recursive and direct models blended, and level corrections.
+- **Favorita** (0.563 vs ~0.51): the winners' strongest inputs were promotion sums over past and future windows. In the
+  train file `onpromotion` is recorded only on days with sales, so on a holdout it marks sales and cannot be scored
+  honestly. The entry reads 56 days of history (memory-bound), against a year or more for the winners.
+- **Rossmann** (0.120 vs ~0.100): ensembles of many models, a multiplicative correction for RMSPE's asymmetry, and
+  external weather and search-trend data.
+
 ## Results (held-out windows built like each contest's test file; same judges as the benches)
 
 | Contest (metric) | Raw | Earlier best | Forecast family | Build time |

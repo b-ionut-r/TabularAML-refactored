@@ -186,8 +186,14 @@ class ForecastFeatures:
 
     def __init__(self, time_col="auto", entity="auto", max_cells: int = 40_000_000, log_target="auto",
                  max_groups: int = 6, max_covariates: int = 8, origins: str = "random", align_week: bool = True,
-                 long_season: bool = True, medians: bool = False, random_state: int = 0, verbose: bool = True):
+                 long_season: bool = True, medians: bool = False, event_counts: bool = False,
+                 numeric_covariates: bool = False, max_numeric: int = 6, companions: bool = False,
+                 random_state: int = 0, verbose: bool = True):
+        self.companions = companions
         self.long_season = long_season
+        self.event_counts = event_counts
+        self.numeric_covariates = numeric_covariates
+        self.max_numeric = max_numeric
         self.medians = medians
         self.origins = origins
         self.align_week = align_week
@@ -303,6 +309,20 @@ class ForecastFeatures:
                 continue
             covs.append((rate, c, _canon(s).value_counts().index[0]))
         self.covariates_ = [(c, m) for _, c, m in sorted(covs, key=lambda t: -t[0])][: self.max_covariates]
+        # Numeric columns known in advance that move within an entity (prices, markdowns, oil): many levels.
+        nums = []
+        taken = {c for c, _ in self.covariates_} | set(ent) | {tc} | set(sum(self.groups_, []))
+        for c in cols:
+            if c in taken or not pd.api.types.is_numeric_dtype(A[c]) or pd.api.types.is_bool_dtype(A[c]):
+                continue
+            x = pd.to_numeric(A[c], errors="coerce").to_numpy(dtype=float)
+            if np.isfinite(x).mean() < 0.5 or (_integral(A[c]) and A[c].nunique() <= 60):
+                continue
+            moves = pd.Series(x).groupby(k).nunique()
+            if (moves > 1).mean() < 0.2:
+                continue
+            nums.append(((moves > 1).mean(), c))
+        self.numeric_ = [c for _, c in sorted(nums, reverse=True)][: self.max_numeric]
         return None
 
     # ------------------------------------------------------------ fitting
@@ -380,6 +400,22 @@ class ForecastFeatures:
         okx = np.isfinite(pp) & (pp >= 0)
         self.ent_ = _Panel(kx[okx], pp[okx].astype(np.int64), yt[okx], ne, Pn)
         self.intermittent_ = bool(np.mean(yt[np.isfinite(yt)] == 0) > 0.05)
+        # Companions: numeric columns of the training rows that the unlabeled rows lack (Rossmann's customers).
+        # Read like the target, as of each row's origin.
+        self.comp_ = []
+        if self.companions:
+            for c in X.columns:
+                if c in X_unlabeled.columns or not pd.api.types.is_numeric_dtype(X[c]) or pd.api.types.is_bool_dtype(X[c]):
+                    continue
+                x = pd.to_numeric(X[c], errors="coerce").to_numpy(dtype=float)
+                fx = x[np.isfinite(x)]
+                if len(fx) < 0.5 * len(x) or np.unique(fx[:100000]).size < 3:
+                    continue
+                if fx.min() >= 0 and fx.max() > 3 * np.median(fx[fx > 0] if (fx > 0).any() else fx):
+                    x = np.log1p(np.maximum(x, 0))
+                x = np.where(np.isfinite(yt) | ~np.isfinite(y), x, np.nan)   # masked periods stay out
+                self.comp_.append((c, _Panel(kx[okx], pp[okx].astype(np.int64), x[okx], ne, Pn)))
+            self.comp_ = self.comp_[:4]
         self.grp_ = []
         for g in self.groups_:
             vocab = self._vocab(A, g)
@@ -405,6 +441,16 @@ class ForecastFeatures:
             self.cov_.append((c, mode, pos, Se, Ce))
             del evy
         self.n_ent_, self.Pn_ = ne, Pn
+        self.num_ = []
+        if self.numeric_covariates:
+            for c in self.numeric_:
+                x = pd.to_numeric(A[c], errors="coerce").to_numpy(dtype=float)
+                f = oka & np.isfinite(x)
+                V = np.full((ne, Pn), np.nan, dtype=np.float32)
+                V[ka[f], pa[f].astype(np.int64)] = x[f]
+                em = pd.Series(x[f]).groupby(ka[f]).mean().reindex(range(ne)).to_numpy()
+                ex = pd.Series(x[f]).groupby(ka[f]).max().reindex(range(ne)).to_numpy()
+                self.num_.append((c, V, em, ex))
         if self.step_ < 1:  # hourly: same hour of the week as the season, a day as a second one
             self.windows_, self.season_, self.year_ = (1, 3, 24, 72, 168, 336, 672, 2016, 8736), 168, 8736
         elif self.step_ == 1:
@@ -537,6 +583,15 @@ class ForecastFeatures:
         F["fc_age"] = np.where(first <= o, o - first, np.nan)
         F["fc_trend_a"] = F[f"fc_mean{W[2]}"] - F[f"fc_mean{W[4]}"]
         F["fc_trend_b"] = F[f"fc_mean{W[4]}"] - F[f"fc_mean{W[6]}"] if len(W) > 6 else F[f"fc_mean{W[-1]}"]
+        for c, Cp in getattr(self, "comp_", []):
+            for w in (W[2], W[4], W[6] if len(W) > 6 else W[-1]):
+                F[f"fc_cmp_mean{w}__{c}"] = Cp.mean(kk, o - w, o)[0]
+            if self.season_:
+                s = self.season_
+                j0 = np.ceil(h / s).astype(np.int64)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    F[f"fc_cmp_same4__{c}"] = np.nanmean(np.vstack([Cp.at(kk, t - s * (j0 + i)) for i in range(4)]), 0)
         # Groups of entities.
         for g, vocab, G in self.grp_:
             tag = "+".join(g) if g else "all"
@@ -583,6 +638,23 @@ class ForecastFeatures:
                 m_ev = np.where(ce > 0, se / np.maximum(ce, 1), np.nan)
                 m_no = np.where(c_all - ce > 0, (s_all - se) / np.maximum(c_all - ce, 1), np.nan)
             F[f"fc_ev_uplift__{c}"] = m_ev - m_no
+            if self.event_counts:
+                # Events in the window before the date and in the window after it (up to where a test file ends).
+                for kw in (W[2], W[4]):
+                    past = np.searchsorted(pos, q, side="left") - np.searchsorted(pos, np.maximum(q - kw, blo), side="left")
+                    fend = np.minimum(q + kw, blo + np.clip(vend, 0, Pn - 1))
+                    fut = np.searchsorted(pos, fend, side="right") - np.searchsorted(pos, q, side="right")
+                    F[f"fc_ev_past{kw}__{c}"] = past
+                    F[f"fc_ev_next{kw}__{c}"] = np.where(fend >= q, fut, 0)
+        for c, V, em, ex in getattr(self, "num_", []):
+            x = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                F[f"fc_num_rel__{c}"] = x / em[kk]
+                F[f"fc_num_norm__{c}"] = x / ex[kk]
+                for lag in (W[2], W[4]):
+                    tp = t - lag
+                    xp = np.where(tp >= 0, V[kk, np.clip(tp, 0, Pn - 1)], np.nan)
+                    F[f"fc_num_mom{lag}__{c}"] = x / xp
         out = pd.DataFrame({n: np.asarray(v, dtype=np.float32) for n, v in F.items()}, index=df.index)
         bad = (k < 0) | ~ok
         if bad.any():

@@ -18,9 +18,12 @@ ap.add_argument('--log-target', action='store_true'); ap.add_argument('--budget'
 ap.add_argument('--tag', default=''); ap.add_argument('--data', default='data/rossmann/'); ap.add_argument('--log', default='rossmann.jsonl')
 ap.add_argument('--shuffle', action='store_true'); ap.add_argument('--keep', default='', help='keep the output directory here')
 ap.add_argument('--forge-kw', default='{}'); ap.add_argument('--win', type=int, default=0, help='holdout ends 48 x win days before the last day')
+ap.add_argument('--customers', action='store_true', help='keep the training-only Customers column for the forecasting family')
 a = ap.parse_args()
 D = Path(a.data)
-tr = pd.read_csv(D / 'train.csv', dtype={'StateHoliday': str}).drop(columns=['Customers'])
+tr = pd.read_csv(D / 'train.csv', dtype={'StateHoliday': str})
+if not a.customers:
+    tr = tr.drop(columns=['Customers'])
 st = pd.read_csv(D / 'store.csv')
 d = pd.to_datetime(tr.Date)
 if a.win:
@@ -32,7 +35,7 @@ if a.rows == 'open':
     tr = tr[(tr.Open == 1) & (tr.Sales > 0)].reset_index(drop=True)
 if a.shuffle:
     tr['Sales'] = np.random.default_rng(0).permutation(tr.Sales.to_numpy())
-te = ho.drop(columns=['Sales']).assign(Id=np.arange(1, len(ho) + 1))[['Id', 'Store', 'DayOfWeek', 'Date', 'Open', 'Promo', 'StateHoliday', 'SchoolHoliday']]
+te = ho.drop(columns=['Sales', 'Customers'], errors='ignore').assign(Id=np.arange(1, len(ho) + 1))[['Id', 'Store', 'DayOfWeek', 'Date', 'Open', 'Promo', 'StateHoliday', 'SchoolHoliday']]
 t0 = time.time(); info = {}
 if a.arm in ('raw', 'fc'):
     Xtr, Xte = tr.merge(st, on='Store', how='left'), te.drop(columns=['Id']).merge(st, on='Store', how='left')
@@ -42,6 +45,8 @@ if a.arm in ('raw', 'fc'):
         from tabularaml.generate.forecast import forecast_features
         Ftr, Fte, ff = forecast_features(Xtr, ytr_all, Xte, **json.loads(a.forge_kw))
         Xtr, Xte = pd.concat([Xtr, Ftr], axis=1), pd.concat([Xte, Fte], axis=1)
+    Xtr = Xtr.drop(columns=['Customers'], errors='ignore')   # not in the test file
+    if a.arm == 'fc':
         info = dict(n_cols=Xtr.shape[1], n_fc=Ftr.shape[1])
 else:
     tmp = Path(a.keep) if a.keep else Path(tempfile.mkdtemp())

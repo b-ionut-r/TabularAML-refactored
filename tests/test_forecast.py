@@ -11,6 +11,7 @@ def _panel(n_ent=30, days=400, test_days=28, seed=0):
     df = pd.DataFrame([(e, d) for e in range(n_ent) for d in dates], columns=["store", "date"])
     df["kind"] = np.where(df.store % 3 == 0, "a", "b")
     df["promo"] = (rng.random(len(df)) < 0.2).astype(int)
+    df["price"] = np.round(rng.uniform(1, 5, len(df)), 2)
     df["date"] = df.date.dt.strftime("%Y-%m-%d")
     lvl = rng.gamma(5, 100, n_ent)
     y = lvl[df.store] * (1 + 0.3 * df.promo) * rng.lognormal(0, 0.2, len(df))
@@ -22,7 +23,7 @@ def test_switches_on_and_off():
     X, y, U = _panel()
     f = ForecastFeatures(verbose=False).fit(X, y, U)
     assert f.active_ and f.entity_ == ["store"] and f.hmin_ == 1 and f.hmax_ == 28
-    assert ["kind"] in f.groups_ and [c for c, _ in f.covariates_] == ["promo"]
+    assert ["kind"] in f.groups_ and [c for c, _ in f.covariates_] == ["promo"] and f.numeric_ == ["price"]
     # Unlabeled rows inside the training period (a random split): off.
     g = ForecastFeatures(verbose=False).fit(X.iloc[::2], y[::2], X.iloc[1::2])
     assert not g.active_
@@ -30,17 +31,19 @@ def test_switches_on_and_off():
 
 def test_no_own_or_later_labels():
     X, y, U = _panel()
-    f = ForecastFeatures(verbose=False, medians=True).fit(X, y, U)
+    X["visits"] = np.round(y / 7)   # a training-only companion of the target
+    f = ForecastFeatures(verbose=False, medians=True, event_counts=True, numeric_covariates=True, companions=True).fit(X, y, U)
     F = f.transform(X)
     p = f._periods(X)
-    assert np.all(F["fc_h"].to_numpy() >= 1)
+    assert np.all(F["fc_h"].to_numpy() >= 1) and "fc_cmp_mean7__visits" in F and "fc_num_rel__price" in F and "fc_ev_next7__promo" in F
     rng = np.random.default_rng(1)
     for i in rng.choice(len(X), 20, replace=False):
         y2 = y.copy()
         later = (p >= p[i]) & (X.store.to_numpy() == X.store[i])
         y2[later] = y2[later] * 10 + 1000          # own and later labels of the entity changed
         y2[p >= p[i]] = y2[p >= p[i]] * 3          # and every later label of any entity
-        F2 = ForecastFeatures(verbose=False, medians=True).fit(X, y2, U).transform(X.iloc[[i]])
+        X2 = X.copy(); X2.loc[p >= p[i], "visits"] *= 5
+        F2 = ForecastFeatures(verbose=False, medians=True, event_counts=True, numeric_covariates=True, companions=True).fit(X2, y2, U).transform(X2.iloc[[i]])
         a, b = F.iloc[[i]].to_numpy(), F2.to_numpy()
         assert np.allclose(np.nan_to_num(a, nan=-1), np.nan_to_num(b, nan=-1), rtol=1e-5), X.iloc[i]
 
