@@ -3025,13 +3025,25 @@ class FeatureForge:
                 big = (len(step) and gap > 2 * np.median(step)
                        and gap >= 0.02 * (np.nanmax(tx) - np.nanmin(tx)))
                 if np.isfinite(gap) and big and len(idx_gate):
+                    # The gate sits as far after the search rows, on average, as the test sits
+                    # after training: the gap plus half the difference between the test's span
+                    # and the gate's (IEEE-CIS: a month's gap, then six months of test rows,
+                    # where neighbour-label features that still help a month out stop helping).
+                    # The search keeps at least a quarter of the rows.
                     t_g = np.nanmin(tx[idx_gate])
-                    emb = idx_sel[tx[idx_sel] > t_g - gap]
-                    if 0 < len(emb) <= 0.25 * n:
+                    span_u = np.nanmax(tu) - np.nanmin(tu)
+                    span_g = np.nanmax(tx[idx_gate]) - t_g
+                    emb_len = gap + max(0.0, (span_u - span_g) / 2)
+                    emb = idx_sel[tx[idx_sel] > t_g - emb_len]
+                    room = len(idx_sel) - int(0.25 * n)
+                    if len(emb) > room:
+                        emb = np.sort(emb[np.argsort(tx[emb], kind="stable")[len(emb) - max(room, 0):]])
+                    if len(emb):
                         self.embargo_ = emb
                         idx_sel = np.setdiff1d(idx_sel, emb)
-                        self._log(f"gate starts {gap:.0f} after the search rows, as the test does after "
-                                  f"training ({len(emb)} rows between them feed only label-free statistics)")
+                        self._log(f"gate starts {np.nanmin(tx[idx_gate]) - np.nanmax(tx[idx_sel]):.0f} after the search rows, "
+                                  f"as the test sits {gap + span_u / 2:.0f} after training on average ({len(emb)} rows "
+                                  f"between them feed only label-free statistics)")
         elif self.gate_frac and n >= 200 and self.group_col_ is not None:
             gx = X[self.group_col_].to_numpy()
             levels, codes = np.unique(gx.astype(str) if gx.dtype == object else gx, return_inverse=True)
