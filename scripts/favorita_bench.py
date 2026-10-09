@@ -56,6 +56,12 @@ elif a.arm.startswith('hand'):
         for keys in (['store_nbr', 'item_nbr'],):
             sp = LaggedTargetMean(keys, 'date', w, 16).fit(Xtr, ytr, None)
             Xtr[sp.name], Xho[sp.name] = sp.fit_transform_oof(Xtr, ytr, None, None), sp.transform(Xho, None)
+elif a.arm == 'fc':
+    # Forecasting family alone (tabularaml/generate/forecast.py) on top of the raw columns.
+    from tabularaml.generate.forecast import forecast_features
+    Ftr, Fho, ff = forecast_features(Xtr, ytr, Xho, **json.loads(a.kw))
+    Xtr, Xho = pd.concat([raw(Xtr), Ftr], axis=1), pd.concat([raw(Xho), Fho], axis=1)
+    info = dict(n_fc=Ftr.shape[1])
 elif a.arm == 'forge':
     from tabularaml.generate.forge import FeatureForge
     kw = dict(time_col='date'); kw.update(json.loads(a.kw))
