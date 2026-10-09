@@ -14,6 +14,8 @@ from sklearn.metrics import roc_auc_score
 ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_argument('--win', type=int, default=0)
 ap.add_argument('--budget', type=float, default=600); ap.add_argument('--kw', default='{}'); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/wnv/'); ap.add_argument('--log', default='wnv.jsonl')
+ap.add_argument('--year', type=int, default=None,
+                help='hold out this whole year and train on the other three (the contest interleaved its test years)')
 ap.add_argument('--dedup', action='store_true', help='merge the rows the files split per 50 mosquitoes (removes the file-construction signal)')
 a = ap.parse_args()
 D = Path(a.data)
@@ -28,13 +30,14 @@ if a.dedup:
 df = tr.merge(w, on='Date', how='left').drop(columns=['NumMosquitos'])
 y = df.pop('WnvPresent').to_numpy()
 yr = df['Date'].str[:4].astype(int)
-hold = [2013, 2011][a.win]
-itr, iho = (yr < hold).to_numpy(), (yr == hold).to_numpy()
+hold = a.year or [2013, 2011][a.win]
+itr, iho = ((yr != hold) if a.year else (yr < hold)).to_numpy(), (yr == hold).to_numpy()
 Xtr, Xho, ytr, yho = df[itr].reset_index(drop=True), df[iho].reset_index(drop=True), y[itr], y[iho]
 def raw(X):
     X = X.copy(); X['Date'] = (pd.to_datetime(X['Date']) - pd.Timestamp('2007-01-01')).dt.days.astype(float)
     for c in X.columns:
-        if X[c].dtype == object: X[c] = X[c].astype('category')
+        if not (pd.api.types.is_numeric_dtype(X[c]) or isinstance(X[c].dtype, pd.CategoricalDtype)):
+            X[c] = X[c].astype(str).astype('category')
     return X
 def hand(Xtr, Xho, parts):
     """Hand-made features of top public kernels: rows per (date, trap, species) over all rows with
@@ -74,6 +77,6 @@ last = (pd.Timestamp('2007-01-01') + pd.to_timedelta(ytr_year, 'D')).year == (pd
 b = lgb.train(P, lgb.Dataset(Xtr[~last], ytr[~last]), 5000, valid_sets=[lgb.Dataset(Xtr[last], ytr[last])],
               callbacks=[lgb.early_stopping(200, verbose=False)])
 p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xho)
-res = dict(arm=a.arm + a.tag + ('_dedup' if a.dedup else ''), win=a.win, auc=roc_auc_score(yho, p), best_it=b.best_iteration, fe_s=round(fe_t),
+res = dict(arm=a.arm + a.tag + ('_dedup' if a.dedup else ''), win=a.win, year=a.year, auc=roc_auc_score(yho, p), best_it=b.best_iteration, fe_s=round(fe_t),
            total_s=round(time.time() - t0), n_tr=len(Xtr), n_ho=len(Xho), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')
