@@ -1666,6 +1666,10 @@ class FeatureForge:
         groups when test rows are new entities, else a random sample); the rest still
         count in label-free statistics, and the output is computed on every row. Off by
         default: a 300k cap lost M5's and Favorita's gains.
+    gate_wide : bool
+        The gate also scores up to two wider prefixes of the last round's ranking that the
+        search CV placed close behind the chosen one (within half its gain), and keeps
+        whichever set wins on the time-ordered gate rows.
     label_echo : bool
         Find columns that carry earlier rows' labels (running means or counts of past
         answers in an event log: within an entity, the next row's change tracks this row's
@@ -1778,7 +1782,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = True,
                  random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1819,6 +1823,7 @@ class FeatureForge:
         self.gate_by_period = gate_by_period
         self.family_time_share = family_time_share
         self.label_echo = label_echo
+        self.gate_wide = gate_wide
         self.gate_families = gate_families
         self.past_te = past_te
         self.random_state = random_state
@@ -2705,6 +2710,7 @@ class FeatureForge:
         """
         self._t0 = time.time()
         self._deadline = None
+        self.wide_ = []
         X = X.reset_index(drop=True).copy()
         y = pd.Series(np.asarray(y))
         self.n_synthetic_ = 0
@@ -2987,6 +2993,7 @@ class FeatureForge:
                 orders.append(("label-free", free_rank, (6, 25)))
             best_k, best_loss, best_fit, best_rank = 0, cur_loss, None, rank
             tried = set()
+            ladder_res = []
             for label, order, steps in orders:
                 ladder = [k for k in steps if k < min(len(order), room)]
                 if label == "gain":
@@ -3001,6 +3008,7 @@ class FeatureForge:
                     cols = list(Wm.columns) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
                     oof_k, loss_k, imp_k = self._cv(joint[cols], yW, folds, nested=nested)
                     self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
+                    ladder_res.append((label, k, loss_k, order))
                     if loss_k < best_loss:
                         best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
             rank = best_rank
@@ -3010,6 +3018,22 @@ class FeatureForge:
             chosen = [spec_by_name[nm] for nm in rank[:best_k]]
             for sp in chosen:
                 sp.round_ = r
+            # Wider prefixes of the same order that the CV ranked close behind: the time-ordered
+            # gate also scores them (the CV, inflated by target statistics, favours few features).
+            wide = []
+            if self.gate_wide:
+                gain_best = cur_loss - best_loss
+                for label, k, loss_k, order in ladder_res:
+                    if order is rank and k > best_k and cur_loss - loss_k >= 0.5 * gain_best:
+                        extra = [spec_by_name[nm] for nm in order[best_k:k]]
+                        arrs = {}
+                        for sp in extra:
+                            sp.round_ = r
+                            v = values[sp.name]
+                            for j, col in enumerate(sp.out_names()):
+                                arrs[col] = v if v.ndim == 1 else v[:, j]
+                        wide.append((f"rounds<={r + 1} + {label} top-{k}", extra, arrs))
+            self.wide_ = wide[:2]
             selected.extend(chosen)
             Wm = joint[best_fit[2]]
             for s in chosen:
@@ -3024,6 +3048,12 @@ class FeatureForge:
 
         self._deadline = None
         self.search_cv_loss_ = cur_loss
+        # Wider sets offered to the gate only belong to the last round that added features.
+        last_r = max((sp.round_ for sp in selected), default=None)
+        self.wide_ = [w for w in getattr(self, "wide_", []) if w[1] and w[1][0].round_ == last_r]
+        for _, _, arrs in self.wide_:
+            for col, v in arrs.items():
+                W[col] = v
         self.selected_ = selected
         # Candidate values of the last round can be gigabytes on large tables.
         values = joint = cands = None
@@ -3036,6 +3066,7 @@ class FeatureForge:
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
             self.gate_passed_ = best_set is not None
+            self.wide_ = []  # their search-row values are not needed after the gate
             if self.gate_passed_:
                 self.selected_ = list(best_set)
             else:
@@ -3120,7 +3151,9 @@ class FeatureForge:
         Xg = X.iloc[idx_gate].reset_index(drop=True)
         ys, yg = y[idx_sel], y[idx_gate]
         Fs, Fg = W, Xg.copy()
-        for s in self.selected_:
+        for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra]:
+            if all(c in Fg.columns for c in s.out_names()):
+                continue
             vg = s.transform(Fg, self.ctx_)
             for j, col in enumerate(s.out_names()):
                 Fg[col] = vg if np.ndim(vg) == 1 else vg[:, j]
@@ -3178,6 +3211,9 @@ class FeatureForge:
                 free = [s for s in full if not s.target_dep]
                 if free and len(free) < len(full):
                     cands.append((f"rounds<={r + 1} label-free", free))
+        if self.selected_:
+            for label, extra, _ in getattr(self, "wide_", []):
+                cands.append((label, list(self.selected_) + list(extra)))
         for label, specs in cands:
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
             rows = gate_loss(cols)
