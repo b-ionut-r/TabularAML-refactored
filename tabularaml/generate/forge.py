@@ -1667,9 +1667,10 @@ class FeatureForge:
         time value, or one of 30 time blocks) as one observation instead of each row; rows
         of one period share its shocks. The period-level z is logged either way.
     time_budget : float
-        Wall-clock budget in seconds for the search. A round starts only while two CV fits
-        (timed on the base fit) still fit in it, screening and the prefix ladder stop with one
-        fit's time left; the base CV fit, the gate and the final out-of-fold fits always run.
+        Wall-clock budget in seconds for the search. The first round always gets sixteen
+        CV fits (timed on the base fit), eight of them kept for screening and the prefix
+        ladder; later rounds start only while ten fit in the budget. Cheap candidate
+        families are built first. The base fit, the gate and the final fits always run.
     n_rounds : int
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
@@ -2343,7 +2344,8 @@ class FeatureForge:
         # third of the time left for building them, so a few slow ones (neighbour features
         # on large tables) cannot starve the rest.
         cv_s = getattr(self, "_cv_s", 0.0)
-        fam_cap = max(self._time_left() - 4 * cv_s, 0.0) / 3
+        reserve = 8 * cv_s  # screening, the joint ranking fit and the prefix ladder
+        fam_cap = max(self._time_left() - reserve, 0.0) / 3
         fams: Dict[str, list] = {}
         for sp in specs:
             fams.setdefault(type(sp).__name__, []).append(sp)
@@ -2384,8 +2386,9 @@ class FeatureForge:
                 by_cost = sorted(fams, key=lambda f: fam_t.get(f, 0.0))
             todo = firsts if phase == 0 else [sp for f in by_cost for sp in fams[f][1:]]
             for s in todo:
-                # Leave room in the budget for at least one CV fit of the screened candidates.
-                if self._time_left() < cv_s:
+                # Leave room in the budget for ranking the built candidates (about eight CV fits:
+                # otherwise a few seconds of timing noise decide how many prefixes get tried).
+                if self._time_left() < reserve:
                     self._log(f"budget: built {done} of {len(specs)} candidates")
                     break
                 if type(s).__name__ not in capped:
@@ -2860,13 +2863,13 @@ class FeatureForge:
         for r in range(self.n_rounds):
             if len(selected) >= self.max_new_features:
                 break
-            # The first round always gets room for ten CV fits (building, screening and the
-            # prefix ladder); later rounds start only while two fit in the budget.
+            # The first round always gets room for sixteen CV fits (building, then eight for
+            # screening and the prefix ladder); later rounds start only while ten fit in the budget.
             self._deadline = None
-            if r == 0 and self._time_left() < 10 * self._cv_s:
-                self._deadline = time.time() + 10 * self._cv_s
-                self._log(f"budget: first round given {10 * self._cv_s:.0f}s (ten CV fits)")
-            if r > 0 and self._time_left() < 2 * self._cv_s:
+            if r == 0 and self._time_left() < 16 * self._cv_s:
+                self._deadline = time.time() + 16 * self._cv_s
+                self._log(f"budget: first round given {16 * self._cv_s:.0f}s (sixteen CV fits)")
+            if r > 0 and self._time_left() < 10 * self._cv_s:
                 self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
                           f"search stops")
                 break
