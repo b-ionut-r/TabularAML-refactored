@@ -109,6 +109,9 @@ def main_time(main: pd.DataFrame, ch: Child, given: str | None) -> str | None:
     return cands[0] if len(cands) == 1 else None
 
 
+CM_CHECK_PARENTS, CM_CHECK_ROWS = 60_000, 300_000
+
+
 def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
     """Keep child-row models only when they add to the aggregates: a quick 3-fold LightGBM on
     training rows with and without them (Home Credit +0.28 AUC points; on Elo they cost
@@ -140,7 +143,7 @@ def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
                           callbacks=[lgb.early_stopping(50, verbose=False)])
             loss.append(b.best_score["valid_0"]["binary_logloss" if binary else "l2"])
         gains.append((loss[0] - loss[1]) / loss[0])
-    keep = float(np.mean(gains)) > 0.001 and sum(g > 0 for g in gains) >= 2
+    keep = float(np.mean(gains)) > 0 and sum(g > 0 for g in gains) >= 2
     print(f"child models: {100 * np.mean(gains):+.2f}% CV loss over the aggregates "
           f"({', '.join(f'{100 * g:+.2f}%' for g in gains)}) -> {'kept' if keep else 'dropped'} "
           f"in {time.time() - t:.0f}s", flush=True)
@@ -223,20 +226,11 @@ def main():
                                             outcome_values=sorted(pd.unique(y.dropna())))
                     print(f"table {ch.name}: outcome history (item={item}), {El.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
                     A.append(El)
-        cm_frames = []
+        cm_tables = []
         if a.child_models and keyed:
-            task = a.task or ("binary" if y.nunique() == 2 else "regression")
-            obj = "binary" if task == "binary" else "regression"
-            for ch in keyed:  # as-of children would see later rows' outcomes
-                if not tr[ch.key].is_unique:
-                    continue  # labels per key are ambiguous when the key repeats
-                t = time.time()
-                yk = pd.Series(y.to_numpy(), index=tr[ch.key].to_numpy())
-                M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)
-                M = M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
-                A.append(M)
-                cm_frames.append(M)
-                print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
+            # as-of children would see later rows' outcomes; labels per key are ambiguous
+            # when the key repeats
+            cm_tables = [ch for ch in keyed if tr[ch.key].is_unique]
         for ch in keyed:
             Fk = RelatedTables([ch]).features()
             Fk = Fk.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
@@ -269,13 +263,34 @@ def main():
             L = lookup_features(both_main, lk.df, lk.key, lk.name)
             print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
             A.append(L)
-        if cm_frames:
-            ids_cm = {id(M) for M in cm_frames}
-            rest = [Fa for Fa in A if id(Fa) not in ids_cm]
-            if not child_models_help(tr.drop(columns=[c for c in (a.id, a.target) if c and c in tr.columns]),
-                                     [Fa.iloc[:len(tr)].reset_index(drop=True) for Fa in rest],
-                                     [M.iloc[:len(tr)].reset_index(drop=True) for M in cm_frames], y, a.task):
-                A = rest
+        if cm_tables:
+            task = a.task or ("binary" if y.nunique() == 2 else "regression")
+            obj = "binary" if task == "binary" else "regression"
+            # Decide on a sample of training parents with few child rows per fit first: on
+            # Elo (29M transactions) the full models took over an hour and lowered the score.
+            rng = np.random.default_rng(0)
+            pos = np.arange(len(tr))
+            if len(pos) > CM_CHECK_PARENTS:
+                pos = np.sort(rng.choice(pos, CM_CHECK_PARENTS, replace=False))
+            t = time.time()
+            cm_s = []
+            for ch in cm_tables:
+                ks = tr[ch.key].to_numpy()[pos]
+                sub = Child(ch.name, ch.df[ch.df[ch.key].isin(set(ks))], key=ch.key, time=ch.time,
+                            children=ch.children, drop=ch.drop)
+                Ms = child_model_features(sub, pd.Series(y.to_numpy()[pos], index=ks), [], task=obj,
+                                          max_rows=CM_CHECK_ROWS)
+                cm_s.append(Ms.reindex(ks).reset_index(drop=True))
+            print(f"child models on {len(pos)} sampled parents: {time.time() - t:.0f}s", flush=True)
+            keep = child_models_help(tr.drop(columns=[c for c in (a.id, a.target) if c and c in tr.columns]).iloc[pos],
+                                     [Fa.iloc[pos].reset_index(drop=True) for Fa in A], cm_s,
+                                     y.iloc[pos].reset_index(drop=True), a.task)
+            for ch in cm_tables if keep else []:
+                t = time.time()
+                yk = pd.Series(y.to_numpy(), index=tr[ch.key].to_numpy())
+                M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)
+                A.append(M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
+                print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
         for Fa in A:
             rel_tr = pd.concat([rel_tr, Fa.iloc[:len(tr)].reset_index(drop=True)], axis=1)
             rel_te = pd.concat([rel_te, Fa.iloc[len(tr):].reset_index(drop=True)], axis=1)
