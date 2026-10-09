@@ -29,7 +29,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
-from tabularaml.generate.history import history_features, repeats  # noqa: E402
+from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
 
@@ -163,6 +163,17 @@ def main():
             if ch.name in asof:
                 print(f"table {ch.name}: as of {asof[ch.name]} per main row", flush=True)
                 A.append(asof_features(both_main, ch.key, asof[ch.name], ch))
+                if a.history == "auto" and a.target in ch.df.columns:
+                    # The log carries the outcome itself (earlier answers): outcome history strictly before
+                    # each row, overall and on the row's own item (the shared id-like column with most levels).
+                    shared = [c for c in both_main.columns if c in ch.df.columns and c not in (ch.key, asof[ch.name])
+                              and both_main[c].nunique() > 50]
+                    item = max(shared, key=lambda c: both_main[c].nunique()) if shared else None
+                    t = time.time()
+                    El = event_log_features(both_main, ch, a.target, asof[ch.name], item=item,
+                                            outcome_values=sorted(pd.unique(y.dropna())))
+                    print(f"table {ch.name}: outcome history (item={item}), {El.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+                    A.append(El)
         if a.child_models and keyed:
             task = a.task or ("binary" if y.nunique() == 2 else "regression")
             obj = "binary" if task == "binary" else "regression"
