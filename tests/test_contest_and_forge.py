@@ -343,3 +343,19 @@ def test_pair_scan_finds_hidden_difference_of_near_duplicate_columns():
     loss = lambda m, rows: float(np.mean(np.logaddexp(0, m) - y[rows] * m))
     out = scan_pairs(W, list(W.columns), [], p - y, p * (1 - p), loss, margin, top=3)
     assert out and {out[0][1], out[0][2]} == {"a3", "b3"} and out[0][0] == "sub"
+
+
+def test_client_profile_aggregates_per_client_and_marks_unseen_clients():
+    from tabularaml.generate.profile import ClientProfile, profile_candidates
+    df = pd.DataFrame({"card": [1, 1, 2, 2, 3], "addr": [5.0, 5.0, 5.0, np.nan, np.nan],
+                       "anc": [10, 10, 10, 10, 7], "amt": [1.0, 3.0, 4.0, 6.0, 2.0],
+                       "dev": ["a", "b", "a", "a", None], "day": [20, 25, 30, 31, 40], "D1": [10, 15, 20, 21, 30]})
+    p = ClientProfile(["card", "addr", "anc"], ["amt"], ["dev"], rebase=[("day", 1.0, "D1")]).fit(df)
+    out = p.transform(df)
+    assert out.shape == (5, p.n_out) == (5, 6) and len(p.paired_parents) == p.n_out
+    assert out[0, 0] == out[1, 0] == 2.0 and out[0, 4] == 2 and out[0, 5] == 2  # mean, nunique, rows
+    assert out[0, 2] == 10 and out[0, 3] == 0  # re-based D1 is constant within the client
+    assert out[2, 5] == 1 and out[3, 5] == 1  # a missing key value is its own client, not a crash
+    new = pd.DataFrame({"card": [9], "addr": [5.0], "anc": [10], "amt": [1.0], "dev": ["a"], "day": [1], "D1": [0]})
+    assert np.isnan(p.transform(new)).all()
+    assert profile_candidates(df, ["card"], [], [], ["amt"], ["dev"]) == []

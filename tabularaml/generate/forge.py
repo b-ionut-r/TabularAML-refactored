@@ -1731,6 +1731,11 @@ class FeatureForge:
         Score differences and ratios of every pair among the 60 strongest numerics and of
         every closely related pair (rank correlation >= 0.9) on a 20k-row sample (5% of the budget), and offer
         the best dozen as candidates (Loan Default's f528 - f527: AUC 0.735 -> 0.998).
+    profiles : bool
+        With a hidden client id (ID-like columns plus an anchor), one candidate block per
+        client key: per-client mean / std of up to 120 numerics and of every re-based
+        "days since" column, distinct counts of categoricals, and row counts, label-free
+        over all known rows (``profile.ClientProfile``).
     time_col : str | "auto" | None
         Column that orders rows in time. When set, the gate holds out the most
         recent rows instead of a random sample, so features that only work
@@ -1773,7 +1778,7 @@ class FeatureForge:
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
-                 pair_scan: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
+                 pair_scan: bool = True, profiles: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
         self.time_budget = time_budget
@@ -1815,6 +1820,7 @@ class FeatureForge:
         self.gate_families = gate_families
         self.past_te = past_te
         self.pair_scan = pair_scan
+        self.profiles = profiles
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.verbose = verbose
@@ -2171,6 +2177,20 @@ class FeatureForge:
         for _, _, _, a in self.anchors_:
             ents += [(k, a) for k in ids[:3]]
             ents += [(k1, k2, a) for k1, k2 in combinations(ids[:3], 2)]
+        if self.profiles and self.anchors_:
+            from .profile import profile_candidates
+            rank = list(imp.sort_values(ascending=False).index)
+            rebase, seen = [], set()
+            for _, t_, s_, d_ in getattr(self, "anchor_found_", []):
+                if d_ not in seen and t_ in W.columns and d_ in W.columns:
+                    seen.add(d_)
+                    rebase.append((t_, s_, d_))
+            exclude = {getattr(self, "time_col_", None)} - {None}
+            for sp in profile_candidates(W, ids, self.anchors_, rebase[:12],
+                                         [c for c in rank if c in W.columns and c not in self.cat_cols_],
+                                         [c for c in rank if c in self.cat_cols_ and c not in self.text_cols_],
+                                         exclude=exclude):
+                add(sp)
         t = getattr(self, "time_col_", None)
         for e in ents:
             if self.entity_lags and t is not None and t not in e:
@@ -2668,7 +2688,8 @@ class FeatureForge:
         if getattr(spec, "paired", False):
             # Block of per-column transforms: each output against its own parent, summed.
             gs = [probe(v[:, j]) for j in range(v.shape[1])]
-            nov = sum(max(g - self.novelty_slack * parent_gain.get(p, 0.0), 0.0) for g, p in zip(gs, spec.parents))
+            src = getattr(spec, "paired_parents", spec.parents)
+            nov = sum(max(g - self.novelty_slack * parent_gain.get(p, 0.0), 0.0) for g, p in zip(gs, src))
             return sum(max(g, 0.0) for g in gs), nov
         g = probe(v)
         parents = getattr(spec, "novelty_parents", None) or spec.parents
@@ -3416,6 +3437,7 @@ class FeatureForge:
                     if ratios and min(ratios) < max_ratio:
                         found.append((min(ratios) / np.isfinite(dv).mean(), t, s, d))
         found.sort()
+        self.anchor_found_ = list(found)
         out, used = [], set()
         for r, t, s, d in found:
             if d in used:
