@@ -77,3 +77,18 @@ instead of 100M), and sequence models (modelling).
 
 The held-out number does not depend on later rows, so 0.546 holds as a held-out score. Group statistics carry most
 of FeatureForge's gain here.
+
+## Default check (history families on from structure, `--history auto`)
+
+Blind `scripts/contest_features.py` at the current head (label_echo guard included), same bagged LightGBM:
+
+| Contest | Metric | Blind, history off | History on | Shuffled labels | Build time |
+|---|---|---|---|---|---|
+| Amex Default, sample 0 / 1 | Amex | 0.784 / 0.773 | 0.794 / 0.783 | 0.03 | 6-8 min |
+| Elo, seed 0 / 1 | RMSE | 3.742 / 3.712 | 3.742 / 3.716 | 3.867 (= constant) | ~same |
+| Riiid (revealed log) | AUC | 0.753 / 0.763 | 0.766 / 0.768 | 0.514 (floor 0.511) | ~same |
+| Home Credit, 100k loans, 5 child tables | AUC | 0.7895 | 0.7889 (noise) | | 14 vs 18 min |
+| Rossmann, 150 stores | RMSPE | 0.1034 | 0.1034 (off: no child table) | | 13 min |
+
+Off by structure: DSB 2019 (its event log has no outcome column; latest-state needs a keyed child table),
+Santander and IEEE-CIS (no keyed child tables; IEEE's identity table is one row per transaction).
