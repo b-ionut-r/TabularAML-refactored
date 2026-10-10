@@ -193,6 +193,8 @@ class Spec:
     """A generated feature. ``transform`` returns an (n,) or (n, k) float array."""
     target_dep = False
     n_out = 1
+    # Skips the one-column residual screen; the joint model and CV judge it instead.
+    screen_exempt = False
 
     def __init__(self, parents: Sequence[str]):
         self.parents = list(parents)
@@ -425,11 +427,15 @@ class KNNClassDist(KNNTarget):
     sits to each class's manifold, a margin-like signal trees cannot form
     from raw axes. Out of fold on training rows.
     """
-
     def __init__(self, cols, ks, n_classes, label, weights=None):
         super().__init__(cols, ks, n_classes, label, weights)
         self.n_out = len(self.ks) * n_classes
         self.name = f"knnd__{label}"
+        # With several classes its signal is which class sits nearest, read across the
+        # per-class columns; one column at a time the residual probe scores it near zero, so
+        # the screen dropped it by chance (wine_white: +12% CV in the joint model, novelty
+        # -0.003 to +0.001 between runs). Binary targets keep the screen (churn lost 2-8%).
+        self.screen_exempt = n_classes > 2
 
     def _query(self, M_ref, Y_ref, M_q):
         from sklearn.neighbors import NearestNeighbors
@@ -2910,7 +2916,8 @@ class FeatureForge:
         gains = {nm: g for nm, (g, _) in scores.items()}
         novelty = {nm: v for nm, (_, v) in scores.items()}
         ranked = sorted([nm for nm in novelty if nm in values], key=novelty.get, reverse=True)
-        alive = [nm for nm in ranked if novelty[nm] > 0][:keep]
+        alive = [nm for nm in ranked if novelty[nm] > 0 and not getattr(specs[nm], "screen_exempt", False)][:keep]
+        alive = [nm for nm in ranked if getattr(specs[nm], "screen_exempt", False)] + alive
         self._log(f"  screened {len(novelty)} candidates on {n} rows (5-fold cross-fitted) "
                   f"-> {sum(g > 0 for g in novelty.values())} novel, {len(alive)} kept")
         self._last_gains, self._last_novelty = gains, novelty
@@ -3199,10 +3206,13 @@ class FeatureForge:
             def keep_fn(spec, v, out, score):
                 g, nov = score
                 scores[spec.name] = (g, nov)
+                if getattr(spec, "screen_exempt", False):
+                    return True
                 if nov <= 0:
                     return False
-                if len(out) >= 4 * keep:
-                    worst = min(out, key=lambda nm: scores[nm][1])
+                rivals = [nm for nm in out if not getattr(spec_by_name[nm], "screen_exempt", False)]
+                if len(rivals) >= 4 * keep:
+                    worst = min(rivals, key=lambda nm: scores[nm][1])
                     if scores[worst][1] >= nov:
                         return False
                     del out[worst]
