@@ -29,6 +29,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
+from tabularaml.generate.lists import as_lists, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
@@ -39,6 +40,11 @@ TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
 def read(path: str) -> pd.DataFrame:
     df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path, low_memory=False)
     for c in df.columns:
+        if df[c].dtype == object and isinstance(df[c].dropna().iloc[:1].tolist()[0] if df[c].notna().any() else None,
+                                                (list, tuple, np.ndarray)):
+            # List cells (amenities, photo URLs): items joined, so they stay readable as a list column.
+            df[c] = df[c].map(lambda v: " ; ".join(str(i).replace(";", ",") for i in v)
+                              if isinstance(v, (list, tuple, np.ndarray)) else v)
         if df[c].dtype == object:
             # Mixed 0 / "0" (pandas reads a CSV column chunk by chunk) become one level.
             df[c] = df[c].where(df[c].isna(), df[c].astype(str)).astype("category")
@@ -179,6 +185,9 @@ def main():
                     help="history families (tabularaml/generate/history.py), on from structure: latest state of keyed "
                          "child tables with a time column (last, last - mean, last - previous), and outcome history "
                          "of as-of event logs that carry the target (earlier outcomes, strictly before each row)")
+    ap.add_argument("--lists", default="auto", choices=["auto", "off"],
+                    help="list columns (item counts and common-item indicators) and per-unit amounts (a skewed amount "
+                         "over small counts and their total), tabularaml/generate/lists.py; on from structure")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -307,6 +316,18 @@ def main():
     Xte = te.drop(columns=[a.id]) if a.id else te
     Xte = Xte[Xtr.columns]
     n_main = tr.shape[1]
+    if a.lists == "auto":
+        t = time.time()
+        Ltr, Lte, found = list_features(Xtr, Xte)
+        for c in found:  # downstream families read them as text: items joined
+            J = as_lists(pd.concat([Xtr[c], Xte[c]], ignore_index=True)).map(" ; ".join).to_numpy()
+            Xtr[c], Xte[c] = J[:len(Xtr)], J[len(Xtr):]
+        Utr, Ute = unit_ratio_features(Xtr, Xte)
+        if Ltr.shape[1] or Utr.shape[1]:
+            Xtr = pd.concat([Xtr.reset_index(drop=True), Ltr, Utr], axis=1)
+            Xte = pd.concat([Xte.reset_index(drop=True), Lte, Ute], axis=1)
+            print(f"lists: {found} -> {Ltr.shape[1]} columns; per-unit amounts: {Utr.shape[1]} columns "
+                  f"in {time.time() - t:.0f}s", flush=True)
     del tr, te  # a second copy of both tables is gigabytes on IEEE-CIS
     forecasting = False
     if a.forecast == "auto":
