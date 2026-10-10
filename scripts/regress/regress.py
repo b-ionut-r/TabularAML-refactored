@@ -72,6 +72,65 @@ CASES = {
 }
 
 
+def _seeds(*xs):
+    return {f's{x}': ['--seed', str(x)] for x in xs}
+
+
+def _wins(*xs):
+    return {f'w{x}': ['--win', str(x)] for x in xs}
+
+
+def _bench(script, data, metric, higher, noise, samples, ff='ff', raw='raw', extra=(), tier='full', needs=None):
+    """A repo bench with the usual flags (--arm, --data, --log, --shuffle)."""
+    return dict(script=script, args=['--data', data, '--log', '{tmp}/log.jsonl', *extra],
+                arms={'raw': ['--arm', raw], 'ff': ['--arm', ff]}, shuffle=['--shuffle'], metric=metric,
+                higher=higher, noise=noise, tier=tier, needs=[needs or data], samples=samples)
+
+
+# Full tier: every other contest used so far, on the bench and samples its thread reported. The FeatureForge
+# arm is the bench's blind arm (scripts/contest_features.py at shipped defaults where the bench has one).
+CASES.update({
+    'amazon': _bench('amazon_bench.py', '{data}/amazon/amazon.pq', 'auc', True, 0.002, _seeds(0, 1)),
+    'telstra': _bench('telstra_bench.py', '{data}/telstra/', 'mlogloss', False, 0.006, _seeds(0, 1),
+                      needs='{data}/telstra/train.csv'),
+    'bnp': _bench('bnp_bench.py', '{data}/bnp/train.csv', 'logloss', False, 0.002, _seeds(0, 1)),
+    'cover': _bench('cover_bench.py', '{data}/cover/cover.pq', 'acc', True, 0.004, _seeds(0, 1)),
+    'homesite': _bench('homesite_bench.py', '{data}/homesite/', 'auc', True, 0.0006, _seeds(0, 1),
+                       needs='{data}/homesite/train.csv'),
+    'kdd12': _bench('kdd12_bench.py', '{data}/kdd12/kdd12.pq', 'auc', True, 0.0015, _seeds(0, 1)),
+    'liberty': _bench('liberty_bench.py', '{data}/liberty/', 'gini', True, 0.004, _seeds(0, 1),
+                      needs='{data}/liberty/train.csv'),
+    'scs': _bench('scs_bench.py', '{data}/scs/scs.pq', 'auc', True, 0.002, _seeds(0, 1)),
+    'porto': dict(_bench('porto_bench.py', '{data}/porto/porto.pq', 'gini', True, 0.004, _seeds(0, 1), ff='forge'),
+                  shuffle=None),
+    'allstate': _bench('allstate_bench.py', '{data}/allstate/as.pq', 'mae', False, 3.0, _seeds(0, 1), ff='forge'),
+    'loandefault': _bench('loandefault_bench.py', '{data}/loandefault/ld.pq', 'auc', True, 0.005, _seeds(0, 1), ff='forge'),
+    'twosigma': _bench('twosigma_bench.py', '{data}/twosigma/', 'logloss', False, 0.002, _seeds(0, 1),
+                       needs='{data}/twosigma/train.json'),
+    'nyctaxi': _bench('nyctaxi_bench.py', '{data}/nyctaxi/', 'rmsle', False, 0.002, _seeds(0, 1),
+                      needs='{data}/nyctaxi/NYC.csv'),
+    'optiver': _bench('optiver_bench.py', '{data}/optiver/', 'rmspe', False, 0.01, _seeds(0, 1), extra=['--stocks', '12'],
+                      needs='{data}/optiver/train.csv'),
+    'vpp': _bench('vpp_bench.py', '{data}/vpp/train_folds.csv', 'mae', False, 0.02, _seeds(0, 1)),
+    'rossmann': _bench('rossmann_bench.py', '{data}/rossmann/', 'rmspe', False, 0.003, _wins(0, 1), ff='fc',
+                       needs='{data}/rossmann/train.csv'),
+    'm5': _bench('m5_bench.py', '{data}/m5/', 'rmsse', False, 0.005, _wins(0, 1), ff='pipe',
+                 needs='{data}/m5/sales_train_evaluation.csv'),
+    'favorita': _bench('favorita_bench.py', '{data}/favorita/', 'nwrmsle', False, 0.005, _wins(0, 1), ff='pipe',
+                       needs='{data}/favorita/train.parquet'),
+    'walmart': _bench('walmart_bench.py', '{data}/walmart/', 'wmae', False, 30.0, _wins(0, 1), ff='fc',
+                      needs='{data}/walmart/train.csv'),
+    'recruit': _bench('recruit_bench.py', '{data}/recruit/', 'rmsle', False, 0.003, _wins(0, 1), ff='fc',
+                      needs='{data}/recruit/air_visit_data.csv'),
+    'riiid': _bench('riiid_bench.py', '{data}/riiid/', 'auc', True, 0.004, _seeds(0, 1), needs='{data}/riiid/riiid_train.parquet'),
+    'elo': _bench('elo_bench.py', '{data}/elo/', 'rmse', False, 0.015, _seeds(0, 1), needs='{data}/elo/train.csv'),
+    'amex': _bench('amex_bench.py', '{data}/amex/', 'amex', True, 0.004, _seeds(0, 1), needs='{data}/amex/train_labels.csv'),
+    'instacart': _bench('instacart_bench.py', '{data}/instacart/', 'auc', True, 0.002, _seeds(0, 1), ff='rel_forge',
+                        needs='{data}/instacart/orders.parquet'),
+    'mercari': _bench('mercari_bench.py', '{data}/mercari/data.parquet', 'rmsle', False, 0.003, _seeds(0, 1), ff='forge'),
+})
+
+
 def fmt(x, ctx):
     if isinstance(x, list):
         return [fmt(v, ctx) for v in x]
@@ -176,7 +235,7 @@ def cmd_run(a):
                 run_job(case, cname, sample, 'raw', repos[shas[0]], rawdir)
             for sha in shas:
                 run_job(case, cname, sample, 'ff', repos[sha], RESULTS / sha[:7])
-        if (a.shuffled or a.tier == 'full') and 'shuffle' in case:
+        if (a.shuffled or a.tier == 'full') and case.get('shuffle'):
             for sha in shas:
                 run_job(case, cname, next(iter(case['samples'])), 'ff', repos[sha], RESULTS / sha[:7], shuffled=True)
 
