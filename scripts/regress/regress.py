@@ -130,6 +130,27 @@ CASES.update({
     'mercari': _bench('mercari_bench.py', '{data}/mercari/data.parquet', 'rmsle', False, 0.003, _seeds(0, 1), ff='forge'),
 })
 
+# Unseen recent contests (sealed_bench.py). 'sealed_open' run now; 'sealed' only once the final variant is declared
+# (sealed_bench refuses them unless UNSEAL=1).
+def _sealed(name, higher, noise, n_seeds=2, tier='sealed_open'):
+    return dict(script='sealed_bench.py', args=['--contest', name, '--repo', '{repo}', '--log', '{tmp}/log.jsonl'],
+                arms={'raw': ['--arm', 'raw'], 'ff': ['--arm', 'ff']}, shuffle=['--shuffle'], metric='score',
+                higher=higher, noise=noise, tier=tier, needs=['{data}/sealed/' + name], samples=_seeds(*range(n_seeds)))
+
+
+CASES.update({
+    'icr': _sealed('icr', False, 0.03, n_seeds=5),
+    'cibmtr': _sealed('cibmtr', True, 0.004),
+    'mcts': _sealed('mcts', False, 0.005),
+    'writing_quality': _sealed('writing_quality', False, 0.01, n_seeds=3),
+    'jpx': _sealed('jpx', True, 0.02, n_seeds=1),
+    'isic2024_meta': _sealed('isic2024_meta', True, 0.004, tier='sealed'),
+    'cmi_piu': _sealed('cmi_piu', True, 0.02, n_seeds=5, tier='sealed'),
+    'student_gameplay': _sealed('student_gameplay', True, 0.003, tier='sealed'),
+    'otto': _sealed('otto', True, 0.002, tier='sealed'),
+    'jane_street': _sealed('jane_street', True, 0.002, n_seeds=1, tier='sealed'),
+})
+
 
 def fmt(x, ctx):
     if isinstance(x, list):
@@ -231,7 +252,9 @@ def run_job(case, cname, sample, arm, repo, outdir, shuffled=False, timeout=4 * 
 def cases_for(tier, names):
     if names:
         return {n: CASES[n] for n in names.split(',')}
-    return {n: c for n, c in CASES.items() if tier == 'full' or c['tier'] == 'fast'}
+    if tier == 'full':
+        return {n: c for n, c in CASES.items() if c['tier'] in ('fast', 'full')}
+    return {n: c for n, c in CASES.items() if c['tier'] == tier}
 
 
 def cmd_run(a):
@@ -251,6 +274,36 @@ def cmd_run(a):
         if (a.shuffled or a.tier == 'full') and case.get('shuffle'):
             for sha in shas:
                 run_job(case, cname, next(iter(case['samples'])), 'ff', repos[sha], RESULTS / sha[:7], shuffled=True)
+
+
+def cmd_probe(a):
+    """Rank-fit switch probe (38fef7e): each case's FeatureForge arm, stopped where it decides where search-time
+    frequency ranks are fitted; prints the share of later rows on levels the search rows lack."""
+    sha = resolve(a.commit); repo = worktree(sha)
+    out = RESULTS / f'{sha[:7]}_probe'; out.mkdir(parents=True, exist_ok=True)
+    for cname, case in cases_for(a.tier, a.cases).items():
+        if case['tier'] == 'sealed':
+            continue
+        for sample in case['samples']:
+            pf = out / f'{cname}__{sample}.jsonl'
+            if pf.exists():
+                continue
+            tmp = Path('/home/user/tmp') / f'probe_{cname}_{sample}'; shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
+            ctx = dict(repo=str(repo), data=str(DATA), tmp=str(tmp))
+            argv = [sys.executable, str(repo / 'scripts' / case['script'])] + fmt(case['args'], ctx) + \
+                fmt(case['arms']['ff'], ctx) + fmt(case['samples'][sample], ctx)
+            env = dict(os.environ, **{k: fmt(v, ctx) for k, v in case.get('env', {}).items()})
+            env.update(PYTHONPATH=f'{HERE / "probe_ranks"}:{repo}', PROBE_OUT=str(pf))
+            for _ in range(120):
+                if os.getloadavg()[0] < 1.0:
+                    break
+                time.sleep(10)
+            t0 = time.time()
+            r = subprocess.run(argv, cwd=repo / 'scripts', env=env, capture_output=True, text=True, timeout=3 * 3600)
+            if not pf.exists():
+                pf.write_text(json.dumps(dict(msg='no probe line', tail=(r.stdout + r.stderr)[-800:])) + '\n')
+            print(f'{cname} {sample} ({time.time() - t0:.0f}s): {pf.read_text().strip()[:300]}', flush=True)
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def load(d, cname, tag):
@@ -306,12 +359,16 @@ def main():
     r.add_argument('--no-raw', action='store_true')
     c = sp.add_parser('compare'); c.add_argument('--ref', required=True); c.add_argument('--new', required=True)
     c.add_argument('--tier', default='fast'); c.add_argument('--cases', default=''); c.add_argument('--out', default='')
+    pr = sp.add_parser('probe'); pr.add_argument('--commit', required=True); pr.add_argument('--tier', default='fast')
+    pr.add_argument('--cases', default='')
     sp.add_parser('list')
     a = ap.parse_args()
     if a.cmd == 'run':
         cmd_run(a)
     elif a.cmd == 'compare':
         cmd_compare(a)
+    elif a.cmd == 'probe':
+        cmd_probe(a)
     else:
         for n, c in CASES.items():
             print(f"{n:14s} {c['tier']:5s} {c['metric']:8s} {'higher' if c['higher'] else 'lower'} "
