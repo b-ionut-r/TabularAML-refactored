@@ -3681,7 +3681,7 @@ class FeatureForge:
     def _mem_rows(self, n_cols, share=0.3):
         """Search rows whose candidate columns, their build-time copies and the model's matrix
         (float32) fit in ``share`` of the memory still free under the limit (the container's
-        cgroup limit when set), or None when it is unknown. Malware: about 3 KB per search row
+        cgroup limit when set), or None when it is unknown. Malware: about 6 KB per search row
         in the first round on top of the 7 GB its tables already take."""
         lim = []
         for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
@@ -3700,7 +3700,7 @@ class FeatureForge:
         if not lim:
             return None
         keep = min(80, 3 * self.max_new_features)
-        return int(share * max(min(lim) - rss, 0) / (4 * (8 * keep + 2 * n_cols + 16)))
+        return int(share * max(min(lim) - rss, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
