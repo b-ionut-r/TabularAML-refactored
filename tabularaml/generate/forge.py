@@ -2094,9 +2094,15 @@ class FeatureForge:
         self.rank_maps_ = {}
         for c in self.hc_cols_:
             vc = _as_str(X[c]).value_counts()
-            # Levels seen equally often share a rank: ordering ties by value spread the many
-            # once-seen device IPs over a meaningless range a tree then splits on.
-            self.rank_maps_[c] = (-vc).rank(method="dense").astype(float)
+            # Ranked by frequency, ties by value; levels seen at most twice share one rank per count:
+            # ordering them by value spread the many once-seen device IPs over a meaningless range
+            # a tree then splits on.
+            order = sorted(vc.index, key=lambda v: (-vc[v], v))
+            r = pd.Series(np.arange(1, len(order) + 1, dtype=float), index=order)
+            rare = vc[order].to_numpy() <= 2
+            if rare.any():
+                r[rare] = r[rare].groupby(vc[order].to_numpy()[rare]).transform("min").to_numpy()
+            self.rank_maps_[c] = r
 
     def _rank(self, s: pd.Series, c: str) -> np.ndarray:
         return self.rank_maps_[c].reindex(_as_str(s).to_numpy()).to_numpy(dtype=float)
@@ -3299,11 +3305,9 @@ class FeatureForge:
         self._yW = yW  # search rows' labels, for checks that keep labels out of label-free specs
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
-            # Ranks count every row whose features are known (search, gate and unlabeled rows),
-            # as the final fit does: fitted on the search rows alone, later periods' new levels
-            # had no rank and the gate judged a recode the transform never produces.
-            U_ = None if X_unlabeled is None else self._prep(X_unlabeled)
-            self._fit_rank_maps(X if U_ is None else pd.concat([X[self.hc_cols_], U_[self.hc_cols_]], ignore_index=True))
+            # Fitted on the search rows: fitted over the test file too, a large test (West Nile's
+            # is 11x the training file) set the ranks and the search found less.
+            self._fit_rank_maps(W)
             Wr = (*self._lgb_matrix(self._model_frame(W, recode=True)), list(W.columns))
             m_r, loss_r, imp_r = self._cv(None, yW, folds, mat=Wr)
             self._log(f"high-cardinality recode of {len(self.hc_cols_)} columns: CV loss "
