@@ -84,6 +84,9 @@ CONTESTS = {
     # Full IEEE-CIS v6: PR #4 at 5bc9711 (gate drops drifting kNN / cross-linear label features), latest 260k rows searched.
     "ieee_v6": dict(slug="ieee-fraud-detection", target="isFraud", id="TransactionID", task="binary", metric="auc",
                     folds="time", raw="ieee", repo="/tmp/claude-0/wt_v6"),
+    # Porto Seguro v2: PR #2 head ac319b5 (integer codes as keys, numbered codes offered as numbers).
+    "porto_v2": dict(slug="porto-seguro-safe-driver-prediction", target="target", id="id", task="binary",
+                     metric="gini", folds="kfold", raw="porto", repo="/tmp/claude-0/wt_ac3"),
     # Home Credit v2: PR #2 head 14f8a21 (prefix-ladder budget fix 27f9514); same 5 child tables and judge as "hc".
     "hc2": dict(slug="home-credit-default-risk", target="TARGET", id="SK_ID_CURR", task="binary", metric="auc",
                 folds="kfold", child_models=True, raw="hc", repo="/tmp/claude-0/wt_pr2"),
@@ -96,6 +99,12 @@ FINAL_REPO = "/tmp/claude-0/wt_final"
 for _c, _base in [("hc", "hc"), ("sct", "sct"), ("ross", "ross_fc"), ("m5", "m5"), ("fav", "fav"), ("wnv", "wnv"),
                   ("porto", "porto")]:
     CONTESTS[f"{_c}_final"] = dict(CONTESTS[_base], raw=CONTESTS[_base].get("raw", _base), repo=FINAL_REPO, base=_base)
+
+# Rebuild on PR #2 at 2c26dfc (click-log id fixes, tied-rank frequency recode, grouped sequences, list columns).
+C2_REPO = "/tmp/claude-0/wt_2c2"
+CONTESTS["ieee_c2"] = dict(CONTESTS["ieee_v6"], repo=C2_REPO)
+for _c in ["wnv", "porto", "sct", "hc"]:
+    CONTESTS[f"{_c}_c2"] = dict(CONTESTS[_c], raw=CONTESTS[_c].get("raw", _c), repo=C2_REPO, base=_c)
 
 
 def download(c: str) -> Path:
