@@ -156,7 +156,7 @@ def worktree(sha):
     return d
 
 
-def peak_monitor(proc, out):
+def peak_monitor(proc, out, trace=None):
     import psutil
     try:
         root = psutil.Process(proc.pid)
@@ -173,6 +173,9 @@ def peak_monitor(proc, out):
         except psutil.Error:
             pass
         out[0] = max(out[0], rss)
+        if trace:  # survives a container kill (local disk), shows whether memory ran out
+            with open(trace, 'a') as f:
+                f.write(f'{time.strftime("%H:%M:%S")} {rss / 2 ** 30:.2f}\n')
         time.sleep(2)
 
 
@@ -185,15 +188,24 @@ def run_job(case, cname, sample, arm, repo, outdir, shuffled=False, timeout=4 * 
     tmp = Path('/home/user/tmp') / f'regress_{cname}_{tag}'
     shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
     ctx = dict(repo=str(repo), data=str(DATA), tmp=str(tmp))
+    # FeatureForge's search is time-budgeted: another job on the 4 cores shrinks it and changes the picks
+    # (West Nile at 2fbcbc2 kept 12 columns instead of 21 next to a second job). Start only on an idle box.
+    for _ in range(120):
+        if os.getloadavg()[0] < 1.0:
+            break
+        time.sleep(10)
+    load0 = os.getloadavg()[0]
     argv = [sys.executable, str(repo / 'scripts' / case['script'])] + fmt(case['args'], ctx) + \
         fmt(case['arms'][arm], ctx) + fmt(case['samples'][sample], ctx) + (case.get('shuffle', []) if shuffled else [])
     env = dict(os.environ, **{k: fmt(v, ctx) for k, v in case.get('env', {}).items()})
-    log = out.with_suffix('.log')
+    log = Path('/home/user/logs/jobs') / out.parent.parent.name / cname / f'{tag}.log'
+    log.parent.mkdir(parents=True, exist_ok=True)
+    mem = log.with_suffix('.mem'); mem.unlink(missing_ok=True)
     print(f'[{time.strftime("%H:%M:%S")}] {cname} {tag}: {" ".join(argv[1:])}', flush=True)
     t0, peak = time.time(), [0]
     with open(log, 'w') as f:
         proc = subprocess.Popen(argv, cwd=repo / 'scripts', env=env, stdout=f, stderr=subprocess.STDOUT)
-        th = threading.Thread(target=peak_monitor, args=(proc, peak), daemon=True); th.start()
+        th = threading.Thread(target=peak_monitor, args=(proc, peak, mem), daemon=True); th.start()
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -201,7 +213,7 @@ def run_job(case, cname, sample, arm, repo, outdir, shuffled=False, timeout=4 * 
     wall = time.time() - t0
     lines = [l for l in log.read_text(errors='replace').splitlines() if l.startswith('RESULT ')]
     res = dict(case=cname, sample=sample, arm=arm, shuffled=shuffled, rc=rc, wall_s=round(wall),
-               peak_gb=round(peak[0] / 2 ** 30, 2), argv=argv[1:])
+               peak_gb=round(peak[0] / 2 ** 30, 2), load_at_start=round(load0, 2), argv=argv[1:])
     if rc == 0 and lines:
         r = json.loads(lines[-1][7:])
         res.update(score=r.get(case['metric']), fe_s=r.get('fe_s'), detail={k: v for k, v in r.items() if k not in
@@ -209,6 +221,7 @@ def run_job(case, cname, sample, arm, repo, outdir, shuffled=False, timeout=4 * 
     else:
         res.update(score=None, error=log.read_text(errors='replace')[-1500:])
     shutil.rmtree(tmp, ignore_errors=True)
+    shutil.copy2(log, out.with_suffix('.log'))
     if res['score'] is not None:  # failures are rerun next time
         out.write_text(json.dumps(res, indent=1, default=str))
     print(f'    -> {res.get("score")} ({res["wall_s"]} s, {res["peak_gb"]} GB, rc={rc})', flush=True)

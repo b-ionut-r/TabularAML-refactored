@@ -23,8 +23,11 @@ def kaggle_files(ds, files, d, rename=None):
         out = d / (rename or {}).get(f, Path(f).name)
         curl(f'{KG}/datasets/download/{ds}?fileName={f}', out)
         if open(out, 'rb').read(4) == b'PK\x03\x04':  # big files come zipped
-            z = zipfile.ZipFile(out); inner = z.namelist()[0]; z.extract(inner, d); z.close()
-            out.unlink(); (d / inner).rename(out)
+            # unzip, not zipfile: Python 3.13's zipfile hits EOFError on these streamed (v4.5) archives
+            tmpz = out.with_suffix(out.suffix + '.zip'); out.rename(tmpz)
+            with open(out, 'wb') as f:
+                subprocess.run(['unzip', '-p', str(tmpz)], stdout=f, check=True)
+            tmpz.unlink()
 
 
 def hf(repo, files, d):
@@ -126,7 +129,7 @@ def main():
         try:
             SOURCES[n](d)
         except Exception as e:
-            print(f'FAILED {n}: {e!r}', flush=True); continue
+            import traceback; traceback.print_exc(); print(f'FAILED {n}: {e!r}', flush=True); continue
         (d / '.done').touch()
         size = sum(p.stat().st_size for p in d.rglob('*') if p.is_file()) / 2 ** 20
         print(f'fetched {n}: {size:.0f} MB in {time.time() - t0:.0f}s', flush=True)
