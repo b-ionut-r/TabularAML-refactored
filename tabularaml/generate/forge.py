@@ -427,15 +427,15 @@ class KNNClassDist(KNNTarget):
     sits to each class's manifold, a margin-like signal trees cannot form
     from raw axes. Out of fold on training rows.
     """
-    # Its signal is which class sits nearest, read across the per-class columns; one column
-    # at a time the residual probe scores it near zero, so the screen dropped it by chance
-    # (wine_white: +12% CV in the joint model, novelty -0.003 to +0.001 between runs).
-    screen_exempt = True
-
     def __init__(self, cols, ks, n_classes, label, weights=None):
         super().__init__(cols, ks, n_classes, label, weights)
         self.n_out = len(self.ks) * n_classes
         self.name = f"knnd__{label}"
+        # With several classes its signal is which class sits nearest, read across the
+        # per-class columns; one column at a time the residual probe scores it near zero, so
+        # the screen dropped it by chance (wine_white: +12% CV in the joint model, novelty
+        # -0.003 to +0.001 between runs). Binary targets keep the screen (churn lost 2-8%).
+        self.screen_exempt = n_classes > 2
 
     def _query(self, M_ref, Y_ref, M_q):
         from sklearn.neighbors import NearestNeighbors
