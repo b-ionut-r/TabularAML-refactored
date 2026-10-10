@@ -83,10 +83,12 @@ def book_levels(cols: Sequence[str], prices: Sequence[str]) -> dict:
     return out
 
 
-def return_features(df: pd.DataFrame, key: str, name: str, time: Optional[str] = None) -> pd.DataFrame:
+def return_features(df: pd.DataFrame, key: str, name: str, time: Optional[str] = None,
+                    plan: Optional[dict] = None) -> pd.DataFrame:
     """Per parent key: realized volatility of each price column (and of their row mean, a mid price) over the
     whole window and its later half, the net log move, and the share of rows where it moved. Empty when the table
-    has no price path. A book with bid / ask prices and sizes also gets each level's size-weighted price."""
+    has no price path. A book with bid / ask prices and sizes also gets each level's size-weighted price.
+    ``plan``: a dict shared by the chunks of one table; the first chunk records which columns are prices."""
     num = [c for c in df.columns if c != key and pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])]
     if len(df) < 1000 or not df[key].duplicated().any():
         return pd.DataFrame()
@@ -94,11 +96,14 @@ def return_features(df: pd.DataFrame, key: str, name: str, time: Optional[str] =
         df = df.sort_values([key, time], kind="stable")
     elif not (df[key].to_numpy()[1:] >= df[key].to_numpy()[:-1]).all():
         df = df.sort_values(key, kind="stable")   # a parent's rows together, file order kept within it
-    prices = price_cols(df, key, num)
-    if not prices:
-        return pd.DataFrame()
-    order = _order_col(df, key, time, [c for c in num if c not in prices])
-    if order is None:
+    if plan is not None and "prices" in plan:
+        prices, order = plan["prices"], plan["order"]   # decided on an earlier chunk of the same table
+    else:
+        prices = price_cols(df, key, num)
+        order = _order_col(df, key, time, [c for c in num if c not in prices]) if prices else None
+        if plan is not None:
+            plan.update(prices=prices, order=order)
+    if not prices or order is None:
         return pd.DataFrame()
     d = df[[key, order] + prices]
     k = d[key].to_numpy()
