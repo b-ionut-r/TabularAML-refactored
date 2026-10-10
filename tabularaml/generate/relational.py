@@ -56,6 +56,7 @@ class Child:
     time: Optional[str] = None     # larger = more recent
     children: List["Child"] = field(default_factory=list)
     drop: Sequence[str] = ()       # ids that are not features (other foreign keys)
+    source: Optional[str] = None   # a parquet path read a key range at a time (df holds a sample)
 
 
 def _stem(c: str) -> str:
@@ -88,8 +89,12 @@ def _row_pairs(df: pd.DataFrame, num: Sequence[str], max_pairs: int) -> pd.DataF
 class RelatedTables:
     def __init__(self, children: Sequence[Child], stats=("mean", "max", "min", "sum", "std"),
                  recent: int = 3, top_levels: int = 8, max_pairs: int = 12, row_pairs: bool = True,
-                 n_split: int = 0):
+                 n_split: int = 0, drop_const: bool = True):
         self.children = list(children)
+        self.drop_const = drop_const
+        # Levels picked per (table, column) on the first call: a table aggregated chunk by chunk gets the
+        # same columns from every chunk.
+        self.levels_ = {}
         self.stats = tuple(stats)
         self.recent = recent
         self.top_levels = top_levels
@@ -125,14 +130,14 @@ class RelatedTables:
         bag = len(cats) == 1 and len(feats) <= 3
         for c in cats:
             s = df[c].astype(str)
-            vc = s.value_counts()
-            levels = vc.index[vc >= 20][:300] if bag else vc.index[:self.top_levels]
-            for lv in levels:
+            if (ch.name, c) not in self.levels_:
+                vc = s.value_counts()
+                self.levels_[(ch.name, c)] = list(vc.index[vc >= 20][:300] if bag else vc.index[:self.top_levels])
+            for lv in self.levels_[(ch.name, c)]:
                 parts.append(pd.DataFrame({f"{c}={lv}": (s == lv).astype(np.float32)}, index=df.index))
         if bag and num:
             s = df[cats[0]].astype(str)
-            vc = s.value_counts()
-            for lv in vc.index[vc >= 20][:300]:
+            for lv in self.levels_[(ch.name, cats[0])]:
                 m = (s == lv).to_numpy()
                 for c in num:
                     parts.append(pd.DataFrame({f"{c}@{cats[0]}={lv}": np.where(m, df[c].to_numpy(dtype=float), 0.0)
@@ -180,6 +185,8 @@ class RelatedTables:
         res = pd.concat(out, axis=1)
         res.columns = [_safe(f"{ch.name}:{c}") for c in res.columns]
         res = res.loc[:, ~res.columns.duplicated()]
+        if not self.drop_const:
+            return res.astype(np.float32)
         # Drop constant and almost-empty columns.
         keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
         return res[keep].astype(np.float32)
