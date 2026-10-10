@@ -1533,6 +1533,34 @@ class Digits(Spec):
         raise ValueError(self.kind)
 
 
+class StrNum(Spec):
+    """The number written inside a coded string ("location 118", "feature 68"): codes
+    issued in order put neighbouring numbers close, which the category alone hides."""
+
+    def __init__(self, col: str):
+        super().__init__([col])
+        self.name = f"strnum__{col}"
+
+    @staticmethod
+    def parse(s: pd.Series) -> np.ndarray:
+        return pd.to_numeric(s.astype(str).str.extract(r"(\d+)\s*$")[0], errors="coerce").to_numpy(dtype=float)
+
+    def transform(self, df, ctx):
+        return self.parse(df[self.parents[0]])
+
+
+def _numbered_codes(s: pd.Series) -> bool:
+    """A string column whose values are one shared prefix and a number."""
+    v = pd.Series(pd.unique(s.astype(str)))
+    v = v[v != "__NA__"]
+    if len(v) <= 10:
+        return False
+    m = v.str.extract(r"^(\D*?)\s*(\d+)\s*$")
+    ok = m[1].notna()
+    pre = m.loc[ok, 0]
+    return bool(ok.mean() >= 0.95 and pre.nunique() == 1 and pre.iloc[0].strip().isalpha())
+
+
 def geo_points(cols: Sequence[str]) -> List[tuple]:
     """(lat, lon) column pairs found by name: ``*lat*`` matched with the same name using ``lon``/``lng``."""
     import re
@@ -2281,6 +2309,8 @@ class FeatureForge:
                 elif np.nanmax(np.abs(fin)) >= 100:
                     add(Digits(c, "mod10"))
                     add(Digits(c, "mod100"))
+            for c in self.numbered_:
+                add(StrNum(c))
             for a, b in combinations(top_num, 2):
                 for op in self.arith_ops:
                     add(Arith(op, a, b))
@@ -2966,6 +2996,8 @@ class FeatureForge:
             X[c] = _as_str(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
+        # Coded strings that carry a number ("location 118") are offered as that number.
+        self.numbered_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and _numbered_codes(X[c])]
         # Native categorical splits on many-level columns overfit; frequency-rank codes
         # are the usual contest alternative. Which one wins is measured, not assumed.
         self.hc_cols_ = [c for c in self.cat_cols_ if X[c].nunique() > self.hc_threshold]
@@ -2982,6 +3014,13 @@ class FeatureForge:
         self.key_cols_ = [c for c in X.columns
                           if 2 <= X[c].nunique() <= (0.5 * len(X) if c in self.cat_cols_
                                                      else self.max_key_cardinality)]
+        # Integer codes with many levels (Amazon's RESOURCE and MGR_ID, card numbers) are
+        # categories written as numbers: their crosses and target maps are what contest
+        # winners built, so they join the keys while staying numeric for the trees.
+        self.code_cols_ = [c for c in self._code_columns(X) if c not in self.key_cols_]
+        if self.code_cols_:
+            self._log(f"integer codes used as keys: {self.code_cols_}")
+        self.key_cols_ += self.code_cols_
         self.key_cols_ += [a[3] for a in self.anchors_]
         self.key_cols_ = [c for c in self.key_cols_ if c not in self.text_cols_]
         if self.text_cols_:
@@ -3792,6 +3831,35 @@ class FeatureForge:
                 if pd.Series(vc.index.to_numpy(dtype=float)).corr(pd.Series(vc.to_numpy(dtype=float)),
                                                                   method="spearman") < -0.3:
                     continue
+            out.append((nu, c))
+        return [c for _, c in sorted(out, reverse=True)][:cap]
+
+    def _code_columns(self, X, cap=12):
+        """Integer columns past the key cardinality whose levels behave like codes, not
+        quantities: thinly spread over a wide range (Amazon's ROLE_TITLE: 343 levels
+        between 117,000 and 311,000), not piled up at the low end as counts and amounts
+        are, and not rounded to tens as prices and areas written by people are."""
+        n, out = len(X), []
+        for c in X.columns:
+            if c in self.cat_cols_ or c in getattr(self, "date_cols_", []):
+                continue
+            nu = X[c].nunique()
+            # From 300 levels: Kick's WarrantyCost (281 prices of warranty plans) lost
+            # 0.4% log loss as a key on all three seeds.
+            if not (max(300, self.max_key_cardinality) <= nu <= n / 3):
+                continue
+            x = X[c].to_numpy(dtype=float)
+            fin = x[np.isfinite(x)]
+            if len(fin) < 0.5 * n or np.any(fin != np.round(fin)):
+                continue
+            if X[c].value_counts(normalize=True).iloc[0] > 0.5:
+                continue
+            u = np.unique(fin)
+            if np.gcd.reduce(np.diff(u).astype(np.int64)) > 1:  # quantised: a measurement in steps
+                continue
+            span = u[-1] - u[0]
+            if span / len(u) < 10 or np.quantile(u, 0.9) - u[0] < 0.2 * span or np.mean(u % 10 == 0) >= 0.2:
+                continue
             out.append((nu, c))
         return [c for _, c in sorted(out, reverse=True)][:cap]
 
