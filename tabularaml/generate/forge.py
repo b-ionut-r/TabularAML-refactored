@@ -2090,8 +2090,9 @@ class FeatureForge:
         self.rank_maps_ = {}
         for c in self.hc_cols_:
             vc = _as_str(X[c]).value_counts()
-            order = sorted(vc.index, key=lambda v: (-vc[v], v))
-            self.rank_maps_[c] = pd.Series(np.arange(1, len(order) + 1, dtype=float), index=order)
+            # Levels seen equally often share a rank: ordering ties by value spread the many
+            # once-seen device IPs over a meaningless range a tree then splits on.
+            self.rank_maps_[c] = (-vc).rank(method="dense").astype(float)
 
     def _rank(self, s: pd.Series, c: str) -> np.ndarray:
         return self.rank_maps_[c].reindex(_as_str(s).to_numpy()).to_numpy(dtype=float)
@@ -2482,6 +2483,12 @@ class FeatureForge:
                                          time_col=getattr(self, "time_col_", None)):
                 add(sp)
         t = getattr(self, "time_col_", None)
+        if t is not None:
+            # Rows of the entity (or entity pair) at the same time value: clicks by one device in
+            # the same hour or day (Avazu, TalkingData).
+            for e in [(k,) for k in ids] + list(combinations(ids[:3], 2)):
+                if t not in e:
+                    add(Count(list(e) + [t]))
         for e in ents:
             if self.entity_lags and t is not None and t not in e:
                 tw = W[t].to_numpy(dtype=float)
@@ -3305,7 +3312,11 @@ class FeatureForge:
         self._yW = yW  # search rows' labels, for checks that keep labels out of label-free specs
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
-            self._fit_rank_maps(W)
+            # Ranks count every row whose features are known (search, gate and unlabeled rows),
+            # as the final fit does: fitted on the search rows alone, later periods' new levels
+            # had no rank and the gate judged a recode the transform never produces.
+            U_ = None if X_unlabeled is None else self._prep(X_unlabeled)
+            self._fit_rank_maps(X if U_ is None else pd.concat([X[self.hc_cols_], U_[self.hc_cols_]], ignore_index=True))
             Wr = (*self._lgb_matrix(self._model_frame(W, recode=True)), list(W.columns))
             m_r, loss_r, imp_r = self._cv(None, yW, folds, mat=Wr)
             self._log(f"high-cardinality recode of {len(self.hc_cols_)} columns: CV loss "
@@ -3956,9 +3967,14 @@ class FeatureForge:
             if c in getattr(self, "date_cols_", []) or c in getattr(self, "text_cols_", []):
                 continue
             nu = X[c].nunique()
-            if not (100 <= nu <= n / 5):
+            if nu < 100:
                 continue
             vc = X[c].value_counts(normalize=True)
+            # Over n/5 levels it is still an id when most rows sit in levels seen three or more
+            # times: click logs' device IPs (Avazu: a quarter of rows are distinct levels, yet 78%
+            # of rows belong to repeating devices). Near-unique row ids fail this.
+            if nu > n / 5 and vc[vc * n >= 3].sum() < 0.5:
+                continue
             if vc.iloc[0] > 0.5:  # mostly one value: a count or flag, not an id
                 continue
             if c not in self.cat_cols_:

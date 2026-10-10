@@ -420,6 +420,22 @@ def test_child_model_features_accept_datetime_child_columns():
     assert len(out) == 300 and out.notna().any().all()
 
 
+def test_id_columns_accept_repeating_many_level_keys_and_tied_frequency_ranks():
+    rng = np.random.default_rng(0)
+    n = 3000
+    # Device-like key: 900 levels (over n/5) but most rows on devices seen 3+ times.
+    dev = np.concatenate([rng.integers(0, 300, 2400), np.arange(1000, 1600)]).astype(str)
+    X = pd.DataFrame({"dev": dev, "row_id": np.arange(n).astype(str), "x": rng.normal(size=n)})
+    f = FeatureForge(task="binary")
+    f.cat_cols_, f.date_cols_, f.text_cols_ = ["dev", "row_id"], [], []
+    ids = f._id_columns(X)
+    assert "dev" in ids and "row_id" not in ids
+    f.hc_cols_ = ["dev"]
+    f._fit_rank_maps(X)
+    once = f.rank_maps_["dev"][[str(i) for i in range(1000, 1600)]]
+    assert once.nunique() == 1  # levels seen equally often share one rank
+
+
 def test_group_sequences_get_running_sums_when_test_holds_new_groups():
     # Each "breath" is a sequence ordered by t; the target is the running sum of u inside it,
     # which no single-row or per-group statistic gives.
