@@ -38,3 +38,13 @@ def test_unit_ratios_need_an_amount_and_two_counts():
     assert np.allclose(r[b > 0], df.price.iloc[:400].to_numpy()[b > 0] / b[b > 0], rtol=1e-5)
     Utr, _ = unit_ratio_features(df.iloc[:400].drop(columns=["bathrooms"]), df.iloc[400:].drop(columns=["bathrooms"]))
     assert Utr.shape[1] == 0
+
+
+def test_addresses_are_not_lists_but_tag_sets_are():
+    rng = np.random.default_rng(0)
+    streets = [f"{n} North {s} Avenue" for n, s in zip(rng.integers(100, 9999, 150), rng.choice(list("ABCDEFGH"), 150))]
+    addr = pd.Series([f"{rng.choice(streets)}, Chicago, IL {rng.integers(60601, 60660)}, USA" for _ in range(3000)])
+    assert as_lists(addr) is None
+    voc = [f"tag{i}" for i in range(30)]
+    tags = pd.Series([",".join(rng.choice(voc, rng.integers(1, 6), replace=False)) for _ in range(3000)])
+    assert as_lists(tags) is not None
