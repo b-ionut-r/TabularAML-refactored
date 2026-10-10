@@ -118,14 +118,30 @@ class RelatedTables:
             parts.append(df[num].astype(np.float32))
         if self.row_pairs and len(num) >= 2:
             parts.append(_row_pairs(df, num, self.max_pairs).astype(np.float32))
+        # A long-format child (one attribute column, maybe a value per row: Telstra's
+        # log_feature / volume, event_type) is a bag of attributes per entity: every level
+        # seen 20 times gets its own column, and the values are spread by level (the pivot
+        # contest winners used); wide children keep their most common levels.
+        bag = len(cats) == 1 and len(feats) <= 3
         for c in cats:
             s = df[c].astype(str)
-            for lv in s.value_counts().index[:self.top_levels]:
+            vc = s.value_counts()
+            levels = vc.index[vc >= 20][:300] if bag else vc.index[:self.top_levels]
+            for lv in levels:
                 parts.append(pd.DataFrame({f"{c}={lv}": (s == lv).astype(np.float32)}, index=df.index))
+        if bag and num:
+            s = df[cats[0]].astype(str)
+            vc = s.value_counts()
+            for lv in vc.index[vc >= 20][:300]:
+                m = (s == lv).to_numpy()
+                for c in num:
+                    parts.append(pd.DataFrame({f"{c}@{cats[0]}={lv}": np.where(m, df[c].to_numpy(dtype=float), 0.0)
+                                               .astype(np.float32)}, index=df.index))
         W = pd.concat(parts, axis=1)
         vals = [c for c in W.columns if c != key]
         dense = [c for c in vals if "=" not in c]
-        onehot = [c for c in vals if "=" in c]
+        onehot = [c for c in vals if "=" in c and "@" not in c]
+        spread = [c for c in vals if "@" in c]
         g = W.groupby(key, sort=False)
         out = [g.size().rename("count").to_frame()]
         if dense:
@@ -134,6 +150,8 @@ class RelatedTables:
             out.append(a)
         if onehot:
             out.append(g[onehot].mean())
+        if spread:
+            out.append(g[spread].sum())
         for c in cats:
             out.append(df.groupby(key, sort=False)[c].nunique().rename(f"{c}_nunique").to_frame())
         if ch.time is not None and self.recent and dense:
