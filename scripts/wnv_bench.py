@@ -16,6 +16,7 @@ ap.add_argument('--budget', type=float, default=600); ap.add_argument('--kw', de
 ap.add_argument('--data', default='data/wnv/'); ap.add_argument('--log', default='wnv.jsonl')
 ap.add_argument('--year', type=int, default=None,
                 help='hold out this whole year and train on the other three (the contest interleaved its test years)')
+ap.add_argument('--shuffle', action='store_true', help='permute the training labels (leakage control)')
 ap.add_argument('--dedup', action='store_true', help='merge the rows the files split per 50 mosquitoes (removes the file-construction signal)')
 a = ap.parse_args()
 D = Path(a.data)
@@ -33,6 +34,8 @@ yr = df['Date'].str[:4].astype(int)
 hold = a.year or [2013, 2011][a.win]
 itr, iho = ((yr != hold) if a.year else (yr < hold)).to_numpy(), (yr == hold).to_numpy()
 Xtr, Xho, ytr, yho = df[itr].reset_index(drop=True), df[iho].reset_index(drop=True), y[itr], y[iho]
+if a.shuffle:
+    ytr = np.random.default_rng(0).permutation(ytr)
 def raw(X):
     X = X.copy(); X['Date'] = (pd.to_datetime(X['Date']) - pd.Timestamp('2007-01-01')).dt.days.astype(float)
     for c in X.columns:
@@ -77,6 +80,6 @@ last = (pd.Timestamp('2007-01-01') + pd.to_timedelta(ytr_year, 'D')).year == (pd
 b = lgb.train(P, lgb.Dataset(Xtr[~last], ytr[~last]), 5000, valid_sets=[lgb.Dataset(Xtr[last], ytr[last])],
               callbacks=[lgb.early_stopping(200, verbose=False)])
 p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xho)
-res = dict(arm=a.arm + a.tag + ('_dedup' if a.dedup else ''), win=a.win, year=a.year, auc=roc_auc_score(yho, p), best_it=b.best_iteration, fe_s=round(fe_t),
+res = dict(arm=a.arm + a.tag + ('_dedup' if a.dedup else '') + ('_shuffled' if a.shuffle else ''), win=a.win, year=a.year, auc=roc_auc_score(yho, p), best_it=b.best_iteration, fe_s=round(fe_t),
            total_s=round(time.time() - t0), n_tr=len(Xtr), n_ho=len(Xho), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')

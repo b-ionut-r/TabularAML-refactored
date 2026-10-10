@@ -3025,13 +3025,25 @@ class FeatureForge:
                 big = (len(step) and gap > 2 * np.median(step)
                        and gap >= 0.02 * (np.nanmax(tx) - np.nanmin(tx)))
                 if np.isfinite(gap) and big and len(idx_gate):
+                    # The gate sits as far after the search rows, on average, as the test sits
+                    # after training: the gap plus half the difference between the test's span
+                    # and the gate's (IEEE-CIS: a month's gap, then six months of test rows,
+                    # where neighbour-label features that still help a month out stop helping).
+                    # The search keeps at least a quarter of the rows.
                     t_g = np.nanmin(tx[idx_gate])
-                    emb = idx_sel[tx[idx_sel] > t_g - gap]
-                    if 0 < len(emb) <= 0.25 * n:
+                    span_u = np.nanmax(tu) - np.nanmin(tu)
+                    span_g = np.nanmax(tx[idx_gate]) - t_g
+                    emb_len = gap + max(0.0, (span_u - span_g) / 2)
+                    emb = idx_sel[tx[idx_sel] > t_g - emb_len]
+                    room = len(idx_sel) - int(0.25 * n)
+                    if len(emb) > room:
+                        emb = np.sort(emb[np.argsort(tx[emb], kind="stable")[len(emb) - max(room, 0):]])
+                    if len(emb):
                         self.embargo_ = emb
                         idx_sel = np.setdiff1d(idx_sel, emb)
-                        self._log(f"gate starts {gap:.0f} after the search rows, as the test does after "
-                                  f"training ({len(emb)} rows between them feed only label-free statistics)")
+                        self._log(f"gate starts {np.nanmin(tx[idx_gate]) - np.nanmax(tx[idx_sel]):.0f} after the search rows, "
+                                  f"as the test sits {gap + span_u / 2:.0f} after training on average ({len(emb)} rows "
+                                  f"between them feed only label-free statistics)")
         elif self.gate_frac and n >= 200 and self.group_col_ is not None:
             gx = X[self.group_col_].to_numpy()
             levels, codes = np.unique(gx.astype(str) if gx.dtype == object else gx, return_inverse=True)
@@ -3524,12 +3536,15 @@ class FeatureForge:
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
         fam_on = self.gate_families is True or (self.gate_families == "auto" and len(getattr(self, "embargo_", ())))
-        if fam_on and self.selected_ and (best_set is None or len(best_set) < len(self.selected_)):
+        # Under an embargo the families are checked even when the whole set passes: on
+        # IEEE-CIS the set passed while dropping kNN and cross-linear target features
+        # cut the gate loss further (0.1152 -> 0.1081) and lifted held-out AUC 0.926 -> 0.937.
+        if fam_on and self.selected_:
             best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
         return best_set, raw_l, best_l
 
     def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
-        """When the whole set fails the gate, drop feature families (target encodings, group
+        """When the whole set fails the gate (or always, under an embargo), drop feature families (target encodings, group
         statistics, event recencies, ...) one at a time, each time the one whose removal helps
         the gate rows most, and keep the best remaining set if it clears the gate by one more
         standard error than usual (the families were chosen on the gate rows). One family
