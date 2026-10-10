@@ -32,6 +32,7 @@ Typical use::
 """
 from __future__ import annotations
 
+import os
 import time
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence
@@ -3326,8 +3327,15 @@ class FeatureForge:
         # budget for several rounds; the rows left out still feed label-free statistics.
         idx_out = self.embargo_
         m_cap = None
+        # Memory: each round holds up to four times ``keep`` candidate columns over the search
+        # rows next to the model's matrix. When labels carry little signal, fits stop early and
+        # the time rule above never shrinks the search (Malware's 5.9M search rows with shuffled
+        # labels: killed at 14 GB in the first round), so the rows are also capped by memory.
+        mem_cap = self._mem_rows(len(self.raw_cols_))
+        if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
+            self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
-            m = m_cap or self.max_search_rows or len(idx_sel)
+            m = min(m_cap or self.max_search_rows or len(idx_sel), mem_cap or len(idx_sel))
             if len(idx_sel) > m:
                 rng = np.random.default_rng(self.random_state)
                 if self.time_col_ is not None:
@@ -3653,6 +3661,26 @@ class FeatureForge:
         self.elapsed_ = time.time() - self._t0
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
         return self
+
+    def _mem_rows(self, n_cols, share=0.2):
+        """Search rows whose candidate columns and model matrix (float32) fit in ``share`` of
+        the memory limit (the container's cgroup limit when set), or None when it is unknown."""
+        lim = []
+        for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                v = open(f).read().strip()
+                if v.isdigit() and int(v) < 1 << 60:
+                    lim.append(int(v))
+            except OSError:
+                pass
+        try:
+            lim.append(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except (ValueError, OSError, AttributeError):
+            pass
+        if not lim:
+            return None
+        keep = min(80, 3 * self.max_new_features)
+        return int(share * min(lim) / (4 * (4 * keep + 2 * n_cols + 16)))
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
