@@ -60,6 +60,21 @@ def _as_str(s: pd.Series) -> pd.Series:
     return s.astype(object).where(s.notna(), "__NA__").astype(str)
 
 
+def _concat_cats(parts: List[pd.DataFrame]) -> pd.DataFrame:
+    """Row-wise concat that keeps ``category`` columns as categories (on the union of the parts'
+    levels): pandas otherwise falls back to one string object per row, gigabytes on 9M rows."""
+    parts = [p.copy(deep=False) for p in parts]
+    for c in parts[0].columns:
+        if all(c in p.columns and isinstance(p[c].dtype, pd.CategoricalDtype) for p in parts):
+            cats = parts[0][c].cat.categories
+            for p in parts[1:]:
+                cats = cats.union(p[c].cat.categories)
+            for p in parts:
+                if not p[c].cat.categories.equals(cats):
+                    p[c] = p[c].cat.set_categories(cats)
+    return pd.concat(parts, ignore_index=True)
+
+
 def _key_values(s: pd.Series) -> np.ndarray:
     """Hashable, NaN-safe values used to index key categories."""
     if _is_cat(s):
@@ -2174,7 +2189,7 @@ class FeatureForge:
             self._nested_cache[ck] = (np.asarray(vt, dtype=np.float32), np.asarray(vv, dtype=np.float32))
         return self._nested_cache[ck]
 
-    def _cv(self, X: Optional[pd.DataFrame], y, repeats, lr=0.1, mine=False, nested=None, mat=None):
+    def _cv(self, X: Optional[pd.DataFrame], y, repeats, lr=0.1, mine=False, nested=None, mat=None, give_up=None):
         """Repeated K-fold: OOF raw margins (averaged over repeats), mean loss, summed gain importance.
 
         ``nested`` maps target-encoding specs to the frame they were built on;
@@ -2182,6 +2197,8 @@ class FeatureForge:
         ``mat``: the frame as ``(float32 matrix, categorical positions, column names)``,
         used instead of ``X`` (then None); an optional fourth item picks the matrix's
         columns, so no full copy of the selected columns is kept.
+        ``give_up`` (seconds): when the first fold shows the whole fit would take longer, stop
+        and return None, keeping the projected duration in ``_cv_projected``.
         """
         import lightgbm as lgb
         M, cats, cols, *pick = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
@@ -2203,9 +2220,14 @@ class FeatureForge:
             # validation rows are read from ``M`` again.
             D = lgb.Dataset(M if pick is None else M[:, pick], np.asarray(y), categorical_feature=cats,
                             params=self._lgb_params(lr)).construct()
+        n_fits = sum(len(f) for f in repeats)
+        t_start = time.time()
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
             for f_i, (tr, va) in enumerate(folds):
+                if give_up and (r_i or f_i) and (time.time() - t_start) * n_fits / (r_i * len(folds) + f_i) > give_up:
+                    self._cv_projected = (time.time() - t_start) * n_fits / (r_i * len(folds) + f_i)
+                    return None
                 if D is not None:
                     b = self._fit_eval_rows(D, tr, va, lr=lr)
                     Mva = rows(va)
@@ -3256,13 +3278,22 @@ class FeatureForge:
                         self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
                         continue
             t_cv = time.time()
-            margin, cur_loss, imp = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw)
-            # One CV fit's duration: the search stops when fewer than two are left in the budget.
-            self._cv_s = time.time() - t_cv
             # The first round is promised sixteen CV fits; when they would take more than three times
-            # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
+            # the budget, the search runs on fewer rows (sized from this fit, not below 100k). The
+            # first fold already shows it: the 50k-row probe can miss that bigger samples train for
+            # more rounds (Microsoft Malware's 5.7M rows: a fit inside the ceiling estimated, about
+            # 2000s measured), so the fit stops there rather than paying for every fold.
             room = 3 * self.time_budget
-            if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
+            shrinkable = attempt < 2 and self.time_budget and len(W) > 150_000
+            out = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw,
+                           give_up=room / 16 if shrinkable else None)
+            if out is None:
+                self._cv_s = self._cv_projected
+            else:
+                margin, cur_loss, imp = out
+                # One CV fit's duration: the search stops when fewer than two are left in the budget.
+                self._cv_s = time.time() - t_cv
+            if shrinkable and 16 * self._cv_s > room:
                 m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
                 if m_cap < len(W):
                     self._log(f"budget: one CV fit takes {self._cv_s:.0f}s on {len(W)} rows; searching fewer rows")
@@ -3506,8 +3537,8 @@ class FeatureForge:
         self.U_search_ = self.WU_ = None
         if on and getattr(self, "_wu_src", None) is not None:
             X, idx_gate, U = self._wu_src
-            self.WU_ = pd.concat([W[self.raw_cols_], X.iloc[idx_gate]] + ([] if U is None else [self._prep(U)[self.raw_cols_]]),
-                                 ignore_index=True)
+            parts = [W[self.raw_cols_], X.iloc[idx_gate][self.raw_cols_]] + ([] if U is None else [self._prep(U)[self.raw_cols_]])
+            self.WU_ = _concat_cats(parts)
             self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
         self.ctx_.extra_rows = self.U_search_
 
@@ -3707,7 +3738,7 @@ class FeatureForge:
 
     def _fit_full(self, X, y, U=None):
         if self.recode_:
-            self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
+            self._fit_rank_maps(X if U is None else _concat_cats([X[self.raw_cols_], U[self.raw_cols_]]))
         folds = self._te_folds(X, y, self.random_state + 1)
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy()
@@ -3716,14 +3747,20 @@ class FeatureForge:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
             elif U is not None:
-                s.fit(pd.concat([F, U], ignore_index=True), None, self.ctx_)
+                # Only the spec's columns: a copy of the whole growing frame per feature is
+                # gigabytes at a time on Microsoft Malware's 9M rows.
+                cols = list(dict.fromkeys(s.parents))
+                s.fit(_concat_cats([F[cols], U[cols]]), None, self.ctx_)
                 v = s.transform(F, self.ctx_)
             else:
                 v = s.fit(F, y, self.ctx_).transform(F, self.ctx_)
             if U is not None:
                 vu = s.transform(U, self.ctx_)
+                vu = np.asarray(vu, dtype=np.float32)
                 for j, col in enumerate(s.out_names()):
                     U[col] = vu if np.ndim(vu) == 1 else vu[:, j]
+            # float32, as the search saw them (and half the memory of the growing frame).
+            v = np.asarray(v, dtype=np.float32)
             for j, col in enumerate(s.out_names()):
                 F[col] = v if np.ndim(v) == 1 else v[:, j]
         self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
