@@ -3063,7 +3063,10 @@ class FeatureForge:
             self.n_classes_ = 0
             y_np = y.to_numpy(dtype=float)
             if self.log_target:
-                y_np = np.log1p(y_np)
+                # log1p of a small positive target (a volatility of 0.003) is the target itself: the
+                # search would chase absolute errors. log keeps it a relative-error search.
+                small = np.nanmin(y_np) > 0 and np.nanmedian(y_np) < 1
+                y_np = np.log(y_np) if small else np.log1p(y_np)
         else:
             self.classes_, y_np = np.unique(y.to_numpy(), return_inverse=True)
             self.n_classes_ = len(self.classes_)

@@ -30,11 +30,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
 from tabularaml.generate.lists import as_lists, list_features, unit_ratio_features  # noqa: E402
+from tabularaml.generate.returns import return_features  # noqa: E402
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
 
 TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
+
+
+def log_y(y: pd.Series) -> np.ndarray:
+    """The search's log target: log of a small positive target (FeatureForge does the same), else log1p."""
+    v = y.to_numpy(dtype=float)
+    return np.log(v) if np.nanmin(v) > 0 and np.nanmedian(v) < 1 else np.log1p(v)
 
 
 def read(path: str) -> pd.DataFrame:
@@ -246,6 +253,12 @@ def main():
             for c in [c for c in Fk.columns if c.endswith("__count")]:
                 Fk[c] = Fk[c].fillna(0)
             A.insert(0, Fk)
+            # Price paths (an order book, a trade log): realized volatility per parent.
+            t = time.time()
+            Rk = return_features(ch.df.drop(columns=[c for c in ch.drop if c in ch.df.columns]), ch.key, ch.name, ch.time)
+            if Rk.shape[1]:
+                A.insert(1, Rk.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
+                print(f"table {ch.name}: price paths, {Rk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
             if a.history == "auto" and repeats(ch):
                 t = time.time()
                 Hk = history_features(ch).reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
@@ -348,7 +361,7 @@ def main():
             if not (pd.api.types.is_numeric_dtype(both[c]) or isinstance(both[c].dtype, pd.CategoricalDtype)):
                 both[c] = both[c].astype(str).astype("category")
         b = lgb.train(dict(objective="binary" if y.nunique() == 2 else "regression", learning_rate=0.1,
-                           num_leaves=31, feature_fraction=0.5, verbose=-1), lgb.Dataset(both, np.log1p(y) if a.log_target else y), 300)
+                           num_leaves=31, feature_fraction=0.5, verbose=-1), lgb.Dataset(both, log_y(y) if a.log_target else y), 300)
         gain = pd.Series(b.feature_importance("gain"), index=both.columns)[rel_tr.columns]
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
         Xtr = both[list(Xtr.columns) + top]
