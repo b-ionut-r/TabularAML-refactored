@@ -30,3 +30,13 @@ tokens 0.004 / 0.003, others 0-0.002); what the families add is mostly those two
 
 The families stay off on Rossmann, Walmart, Recruit, Elo, ASHRAE, Enefit, M5, DSB 2019 and Home Credit's tables
 (checked on their files), so those results are unchanged.
+
+## New York City Taxi Trip Duration (Kaggle 2017): coordinates, nothing missing
+
+Public copy of train.csv (`yasserh/nyc-taxi-trip-duration`, 1,458,644 trips); a random 20% held out like the contest's
+test (same months, `dropoff_datetime` dropped); RMSLE, same bagged LightGBM on log1p; `scripts/nyctaxi_bench.py`.
+Samples 0 / 1: raw 0.434 / 0.432 (1 GB); winners' public features without outside data (distances, bearing, PCA
+coordinates, k-means clusters, time parts, cluster-hour counts, out-of-fold speeds) 0.377 / 0.375 (7 min, 2.4 GB);
+PR #2 head (ac319b5) blind 0.371 / 0.369 (37-40 min, peak 2.9 GB); shuffled 0.798 (constant 0.798). All the hand
+features on top of the head: 0.3713 -> 0.3705 (no group above 0.0006). A map family (k-means neighbourhoods shared by
+both points, cell / cluster / cluster-hour counts, cluster pairs) scored 0.372 on sample 0 and was dropped.
