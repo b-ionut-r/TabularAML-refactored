@@ -40,18 +40,61 @@ if a.rows == 'open':
 if a.shuffle:
     tr['Sales'] = np.random.default_rng(0).permutation(tr.Sales.to_numpy())
 te = ho.drop(columns=['Sales', 'Customers'], errors='ignore').assign(Id=np.arange(1, len(ho) + 1))[['Id', 'Store', 'DayOfWeek', 'Date', 'Open', 'Promo', 'StateHoliday', 'SchoolHoliday']]
+
+
+def hand(Xtr, ytr, Xte):
+    """Features from the winners' public write-ups and top public kernels: per-store sales levels over the last
+    quarter / half-year / year of training (overall, by weekday, by promo), sales per customer, competition and
+    Promo2 age, Promo2 month, and days since / until state and school holidays and promotions per store."""
+    cust = pd.read_csv(D / 'train.csv', usecols=['Store', 'Date', 'Customers'])
+    both = pd.concat([Xtr.assign(_tr=1, _y=ytr), Xte.assign(_tr=0, _y=np.nan)], ignore_index=True)
+    both['_d'] = pd.to_datetime(both.Date)
+    both = both.merge(cust.assign(_d=pd.to_datetime(cust.Date)).drop(columns='Date'), on=['Store', '_d'], how='left')
+    both.loc[both._tr == 0, 'Customers'] = np.nan                         # unknown on test days
+    end = both.loc[both._tr == 1, '_d'].max()
+    L = both[(both._tr == 1) & (both.Open == 1) & (both._y > 0)].copy(); L['ly'] = np.log1p(L._y)
+    out = {}
+    for days in (90, 180, 365):
+        R = L[L._d > end - pd.Timedelta(days=days)]
+        out[f'h_store_mean{days}'] = both.Store.map(R.groupby('Store').ly.mean())
+        k = R.groupby(['Store', 'DayOfWeek']).ly.mean()
+        out[f'h_store_dow_mean{days}'] = pd.Series(k.reindex(pd.MultiIndex.from_frame(both[['Store', 'DayOfWeek']])).to_numpy())
+        k = R.groupby(['Store', 'Promo']).ly.mean()
+        out[f'h_store_promo_mean{days}'] = pd.Series(k.reindex(pd.MultiIndex.from_frame(both[['Store', 'Promo']])).to_numpy())
+    out['h_store_cust_mean'] = both.Store.map(L.groupby('Store').Customers.mean())
+    out['h_store_spc'] = both.Store.map((L.groupby('Store')._y.sum() / L.groupby('Store').Customers.sum()))
+    y, m = both._d.dt.year, both._d.dt.month
+    out['h_comp_months'] = (12 * (y - both.CompetitionOpenSinceYear) + m - both.CompetitionOpenSinceMonth).clip(lower=0)
+    wk = both._d.dt.isocalendar().week.astype(float)
+    out['h_promo2_weeks'] = (52 * (y - both.Promo2SinceYear) + wk - both.Promo2SinceWeek).clip(lower=0) * both.Promo2
+    mon = both._d.dt.strftime('%b').replace('Sep', 'Sept')
+    out['h_promo2_month'] = [int(isinstance(iv, str) and mm in iv.split(',')) for iv, mm in zip(both.PromoInterval, mon)]
+    both = both.sort_values(['Store', '_d'])
+    for name, flag in (('state', both.StateHoliday.astype(str) != '0'), ('school', both.SchoolHoliday == 1), ('promo', both.Promo == 1)):
+        t = both._d.where(flag)
+        g = both.Store
+        last = t.groupby(g).ffill(); nxt = t.groupby(g).bfill()
+        out[f'h_since_{name}'] = ((both._d - last).dt.days).reindex(both.index)
+        out[f'h_until_{name}'] = ((nxt - both._d).dt.days).reindex(both.index)
+    H = pd.DataFrame({k: pd.Series(np.asarray(v, dtype=float)) if not isinstance(v, pd.Series) else v.astype(float) for k, v in out.items()})
+    H = H.sort_index()
+    n = len(Xtr)
+    return (pd.concat([Xtr.reset_index(drop=True), H.iloc[:n].reset_index(drop=True)], axis=1),
+            pd.concat([Xte.reset_index(drop=True), H.iloc[n:].reset_index(drop=True)], axis=1))
+
 t0 = time.time(); info = {}
-if a.arm in ('raw', 'fc'):
+if a.arm in ('raw', 'fc', 'hand', 'hand_fc'):
     Xtr, Xte = tr.merge(st, on='Store', how='left'), te.drop(columns=['Id']).merge(st, on='Store', how='left')
     ytr_all = Xtr.pop('Sales').to_numpy(dtype=float)
-    if a.arm == 'fc':
+    if a.arm.startswith('hand'):
+        Xtr, Xte = hand(Xtr, ytr_all, Xte)
+    if a.arm.endswith('fc'):
         # Forecasting family alone (tabularaml/generate/forecast.py) on top of the raw columns.
         from tabularaml.generate.forecast import forecast_features
         Ftr, Fte, ff = forecast_features(Xtr, ytr_all, Xte, **json.loads(a.forge_kw))
         Xtr, Xte = pd.concat([Xtr, Ftr], axis=1), pd.concat([Xte, Fte], axis=1)
     Xtr = Xtr.drop(columns=['Customers'], errors='ignore')   # not in the test file
-    if a.arm == 'fc':
-        info = dict(n_cols=Xtr.shape[1], n_fc=Ftr.shape[1])
+    info = dict(n_cols=Xtr.shape[1])
 else:
     tmp = Path(a.keep) if a.keep else Path(tempfile.mkdtemp())
     tmp.mkdir(parents=True, exist_ok=True)
