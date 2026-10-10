@@ -418,3 +418,23 @@ def test_child_model_features_accept_datetime_child_columns():
     y = pd.Series(rng.integers(0, 2, 250).astype(float), index=np.arange(250))
     out = child_model_features(Child("t", df, key="k", time="d"), y, np.arange(250, 300), task="binary")
     assert len(out) == 300 and out.notna().any().all()
+
+
+def test_group_sequences_get_running_sums_when_test_holds_new_groups():
+    # Each "breath" is a sequence ordered by t; the target is the running sum of u inside it,
+    # which no single-row or per-group statistic gives.
+    from tabularaml.generate.forge import GroupSeq
+    rng = np.random.default_rng(0)
+    n_g, L = 400, 20
+    g = np.repeat(np.arange(n_g), L)
+    t = np.tile(np.arange(L, dtype=float), n_g)
+    u = rng.uniform(0, 1, n_g * L)
+    y = pd.Series(u).groupby(g).cumsum().to_numpy() + rng.normal(scale=0.05, size=n_g * L)
+    X = pd.DataFrame({"g": g, "t": t, "u": u, "r": np.repeat(rng.integers(0, 3, n_g), L)})
+    tr = np.isin(g, rng.choice(n_g, 300, replace=False))  # test breaths interleave with training ones
+    f = FeatureForge(task="regression", time_budget=60, random_state=0, n_jobs=2, verbose=False).fit(
+        X[tr].reset_index(drop=True), y[tr], X_unlabeled=X[~tr].reset_index(drop=True))
+    assert f.seq_order_ == "t"
+    assert any(c.startswith("seq_cumsum__u") or c.startswith("seq_area__u") for c in f.new_columns_)
+    v = GroupSeq("g", "t", "u", "cumsum").transform(X[~tr].reset_index(drop=True), None)
+    assert np.allclose(v, pd.Series(u[~tr]).groupby(g[~tr]).cumsum().to_numpy())
