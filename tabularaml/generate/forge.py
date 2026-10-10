@@ -1429,7 +1429,7 @@ class TextLinearOOF(Spec):
             mu = y.mean()
             return (Ridge(alpha=3.0, solver="sparse_cg").fit(A, y - mu).predict(B) + mu)[:, None]
         if self.n_classes == 2:
-            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3).fit(A, y.astype(int))
+            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3, random_state=0).fit(A, y.astype(int))
             return m.decision_function(B)[:, None]
         Y = np.eye(self.n_classes)[y.astype(int)]
         return Ridge(alpha=3.0, solver="sparse_cg").fit(A, Y - Y.mean(0)).predict(B) + Y.mean(0)
@@ -1504,7 +1504,7 @@ class CrossLinearOOF(Spec):
         if self.n_classes > 2:
             return LogisticRegression(C=0.5, max_iter=300)
         # Wide one-hot designs solve much faster in the dual.
-        return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0])
+        return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0], random_state=0)
 
     def _query(self, S_ref, y_ref, S_q):
         A, B = self._design(S_ref, S_ref), self._design(S_ref, S_q)
@@ -3062,6 +3062,7 @@ class FeatureForge:
             X[c] = _as_str(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
+        X = self._compact(X)
         # Coded strings that carry a number ("location 118") are offered as that number.
         self.numbered_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and _numbered_codes(X[c])]
         # Native categorical splits on many-level columns overfit; frequency-rank codes
@@ -3735,7 +3736,16 @@ class FeatureForge:
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
             X[c] = _as_str(X[c])
-        return self._add_anchors(X)
+        return self._add_anchors(self._compact(X))
+
+    def _compact(self, X):
+        """Short-text categoricals held as ``category`` (a code per row) rather than one string per
+        row: the same values, an eighth of the memory (Microsoft Malware's 30 string columns over
+        9M rows were 5 GB per copy of the frame)."""
+        for c in self.cat_cols_:
+            if c in X.columns and c not in self.text_cols_ and not isinstance(X[c].dtype, pd.CategoricalDtype):
+                X[c] = X[c].astype("category")
+        return X
 
     def _detect_group(self, X, U):
         """A column whose test values are (almost) all unseen in training while it
