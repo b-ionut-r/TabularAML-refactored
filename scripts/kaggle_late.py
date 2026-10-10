@@ -106,6 +106,11 @@ CONTESTS["ieee_c2"] = dict(CONTESTS["ieee_v6"], repo=C2_REPO)
 for _c in ["wnv", "porto", "sct", "hc"]:
     CONTESTS[f"{_c}_c2"] = dict(CONTESTS[_c], raw=CONTESTS[_c].get("raw", _c), repo=C2_REPO, base=_c)
 
+# Rebuild on PR #2 at 2fbcbc2 (frequency ranks fitted on train-side rows during the search; fixes the 2c26dfc West Nile drop).
+F2_REPO = "/tmp/claude-0/wt_2fb"
+for _c in ["wnv", "porto", "sct", "hc"]:
+    CONTESTS[f"{_c}_f2"] = dict(CONTESTS[_c], raw=CONTESTS[_c].get("raw", _c), repo=F2_REPO, base=_c)
+
 
 def download(c: str) -> Path:
     d = ROOT / CONTESTS[c].get("raw", c) / "raw"
