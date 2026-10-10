@@ -20,6 +20,7 @@ ap.add_argument('--pages', type=int, default=5000); ap.add_argument('--days', ty
 ap.add_argument('--tag', default=''); ap.add_argument('--kw', default='{}')
 ap.add_argument('--data', default='data/wt/kaggle_web_traffic_dataset_with_missing_values.tsf')
 ap.add_argument('--log', default='webtraffic.jsonl'); ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--budget', type=float, default=900)
 a = ap.parse_args()
 rows = []
 with open(a.data) as f:
@@ -54,6 +55,10 @@ if a.arm == 'fc':
     Ftr, Fho, ff = forecast_features(Xtr, ytr, Xho, **json.loads(a.kw))
     Xtr, Xho = pd.concat([Xtr, Ftr], axis=1), pd.concat([Xho, Fho], axis=1)
     info = dict(n_fc=Ftr.shape[1])
+if a.arm == 'pipe':
+    sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+    from _pipe import pipe_features
+    Xtr, Xho, info = pipe_features(Xtr, ytr, Xho, budget=a.budget)
 fe_t = time.time() - t0
 for X in (Xtr, Xho):
     d = pd.to_datetime(X['date'])

@@ -14,6 +14,7 @@ ap.add_argument('--budget', type=float, default=1200); ap.add_argument('--kw', d
 ap.add_argument('--hist', type=int, default=0, help='extra labelled days before the training window that only the forecasting family reads')
 ap.add_argument('--obj', default='tweedie')
 ap.add_argument('--data', default='data/m5/'); ap.add_argument('--log', default='m5.jsonl')
+ap.add_argument('--shuffle', action='store_true')
 a = ap.parse_args()
 D = a.data
 s = pd.read_csv(D + 'sales_train_evaluation.csv'); s = s[s.store_id == a.store]
@@ -35,6 +36,8 @@ y_all = L.pop('sales').to_numpy(dtype=float); rid = L.pop('id').to_numpy()
 L = L.drop(columns=['store_id', 'state_id'])
 start = cal.loc[cal.d == ho_days[0], 'date'].iloc[0]
 tr = (L.date < start).to_numpy(); ho = ~tr
+if a.shuffle:
+    y_all[tr] = np.random.default_rng(0).permutation(y_all[tr])   # leakage control
 def raw(df):
     df = df.copy(); df['date'] = (df['date'] - pd.Timestamp('2011-01-01')).dt.days.astype(float); return df
 def hand(df):
@@ -82,6 +85,12 @@ elif a.arm in ('forge', 'hand_forge'):
     f = FeatureForge(task='regression', time_budget=a.budget, random_state=0, n_jobs=4, verbose=True, **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho)
     info = dict(n_added=len(f.new_columns_), gate=f.gate_passed_, time_col=f.time_col_, feats=f.new_columns_[:60])
     Xtr, Xho = raw(f.transform_train(Xtr)), raw(f.transform(Xho))
+if a.arm == 'pipe':
+    sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+    from _pipe import pipe_features
+    Ftr, Xho, info = pipe_features(Hx, Hy, Xho, budget=a.budget)
+    Xtr = Ftr[recent].reset_index(drop=True)
+    Xtr, Xho = raw(Xtr), raw(Xho)
 fe_t = time.time() - t0
 P = dict(objective=a.obj, tweedie_variance_power=1.1, learning_rate=0.05, num_leaves=63, min_child_samples=100,
          feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=1, num_threads=4, verbose=-1, seed=0)
@@ -92,6 +101,6 @@ p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict
 e = pd.DataFrame({'id': rid[ho], 'se': (p - yho) ** 2}).groupby('id')['se'].mean()
 sc = scale.reindex(e.index).to_numpy(); ok = np.isfinite(sc) & (sc > 0)
 rmsse = float(np.mean(np.sqrt(e.to_numpy()[ok] / sc[ok])))
-res = dict(arm=a.arm + a.tag, win=a.win, rmsse=rmsse, rmse=float(np.sqrt(np.mean((p - yho) ** 2))), best_it=b.best_iteration,
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), win=a.win, rmsse=rmsse, rmse=float(np.sqrt(np.mean((p - yho) ** 2))), best_it=b.best_iteration,
            fe_s=round(fe_t), total_s=round(time.time() - t0), n_tr=len(Xtr), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')

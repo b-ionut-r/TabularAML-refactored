@@ -21,6 +21,7 @@ ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_
 ap.add_argument('--days', type=int, default=7); ap.add_argument('--tag', default=''); ap.add_argument('--kw', default='{}')
 ap.add_argument('--data', default='data/enefit/'); ap.add_argument('--log', default='enefit.jsonl')
 ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--budget', type=float, default=900)
 a = ap.parse_args()
 D = Path(a.data)
 W = ['temperature', 'dewpoint', 'cloudcover_total', 'cloudcover_low', '10_metre_u_wind_component', '10_metre_v_wind_component',
@@ -62,6 +63,10 @@ if a.arm == 'fc':
     Ftr, Fte, ff = forecast_features(Xtr, ytr, Xte, **json.loads(a.kw))
     Xtr, Xte = pd.concat([Xtr, Ftr], axis=1), pd.concat([Xte, Fte], axis=1)
     info = dict(n_fc=Ftr.shape[1], on=ff.active_, why=getattr(ff, 'reason_', ''))
+if a.arm == 'pipe':
+    sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+    from _pipe import pipe_features
+    Xtr, Xte, info = pipe_features(Xtr, ytr, Xte, budget=a.budget)
 fe_t = time.time() - t0
 for X in (Xtr, Xte):
     d = pd.to_datetime(X['datetime'])
