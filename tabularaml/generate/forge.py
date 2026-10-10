@@ -3082,7 +3082,10 @@ class FeatureForge:
             self.n_classes_ = 0
             y_np = y.to_numpy(dtype=float)
             if self.log_target:
-                y_np = np.log1p(y_np)
+                # log1p of a small positive target (a volatility of 0.003) is the target itself: the
+                # search would chase absolute errors. log keeps it a relative-error search.
+                small = np.nanmin(y_np) > 0 and np.nanmedian(y_np) < 1
+                y_np = np.log(y_np) if small else np.log1p(y_np)
         else:
             self.classes_, y_np = np.unique(y.to_numpy(), return_inverse=True)
             self.n_classes_ = len(self.classes_)
@@ -3305,9 +3308,23 @@ class FeatureForge:
         self._yW = yW  # search rows' labels, for checks that keep labels out of label-free specs
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
-            # Fitted on the search rows: fitted over the test file too, a large test (West Nile's
-            # is 11x the training file) set the ranks and the search found less.
-            self._fit_rank_maps(W)
+            # Where later rows bring many levels the search rows never saw (new devices and cards
+            # in a click log's or IEEE-CIS's later period), ranks count every row whose features are
+            # known, as the final fit does; else those rows go unranked and the gate judges a recode
+            # the transform never produces. Otherwise they are fitted on the search rows: over the
+            # test file too, a large test of known levels (West Nile's is 11x the training file)
+            # set the ranks and the search found less.
+            U_ = None if X_unlabeled is None else self._prep(X_unlabeled)
+            later = U_ if U_ is not None else X.drop(index=W.index, errors="ignore")
+            new_share = max((~_as_str(later[c]).isin(set(_as_str(W[c])))).mean() if len(later) else 0.0
+                            for c in self.hc_cols_)
+            if new_share > 0.1:
+                self._fit_rank_maps(pd.concat([X[self.hc_cols_]] + ([] if U_ is None else [U_[self.hc_cols_]]),
+                                              ignore_index=True))
+            else:
+                self._fit_rank_maps(W)
+            self._log(f"frequency ranks: {100 * new_share:.0f}% of later rows hold levels the search rows "
+                      f"lack -> fitted on {'all known rows' if new_share > 0.1 else 'the search rows'}")
             Wr = (*self._lgb_matrix(self._model_frame(W, recode=True)), list(W.columns))
             m_r, loss_r, imp_r = self._cv(None, yW, folds, mat=Wr)
             self._log(f"high-cardinality recode of {len(self.hc_cols_)} columns: CV loss "
