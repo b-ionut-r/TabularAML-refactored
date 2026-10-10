@@ -2916,8 +2916,8 @@ class FeatureForge:
         gains = {nm: g for nm, (g, _) in scores.items()}
         novelty = {nm: v for nm, (_, v) in scores.items()}
         ranked = sorted([nm for nm in novelty if nm in values], key=novelty.get, reverse=True)
-        alive = [nm for nm in ranked if novelty[nm] > 0 and not specs[nm].screen_exempt][:keep]
-        alive = [nm for nm in ranked if specs[nm].screen_exempt] + alive
+        alive = [nm for nm in ranked if novelty[nm] > 0 and not getattr(specs[nm], "screen_exempt", False)][:keep]
+        alive = [nm for nm in ranked if getattr(specs[nm], "screen_exempt", False)] + alive
         self._log(f"  screened {len(novelty)} candidates on {n} rows (5-fold cross-fitted) "
                   f"-> {sum(g > 0 for g in novelty.values())} novel, {len(alive)} kept")
         self._last_gains, self._last_novelty = gains, novelty
@@ -3194,11 +3194,11 @@ class FeatureForge:
             def keep_fn(spec, v, out, score):
                 g, nov = score
                 scores[spec.name] = (g, nov)
-                if spec.screen_exempt:
+                if getattr(spec, "screen_exempt", False):
                     return True
                 if nov <= 0:
                     return False
-                rivals = [nm for nm in out if not spec_by_name[nm].screen_exempt]
+                rivals = [nm for nm in out if not getattr(spec_by_name[nm], "screen_exempt", False)]
                 if len(rivals) >= 4 * keep:
                     worst = min(rivals, key=lambda nm: scores[nm][1])
                     if scores[worst][1] >= nov:
