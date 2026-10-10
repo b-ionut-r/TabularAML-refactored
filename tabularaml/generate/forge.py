@@ -437,6 +437,21 @@ class KNNClassDist(KNNTarget):
         # -0.003 to +0.001 between runs). Binary targets keep the screen (churn lost 2-8%).
         self.screen_exempt = n_classes > 2
 
+    def fit_transform_oof(self, df, y, ctx, folds):
+        self.folds_ = [np.asarray(tr) for tr, _ in folds]
+        return super().fit_transform_oof(df, y, ctx, folds)
+
+    def transform(self, df, ctx):
+        # Distances shrink as the reference grows: a training row's out-of-fold distances
+        # come from (k-1)/k of the rows, so new rows are measured against the same fold
+        # references and averaged. Measured against all rows, they sat nearer every class
+        # than any training row (Telstra held-out: +0.004 / +0.028 log loss with them).
+        folds = getattr(self, "folds_", None)
+        if not folds:
+            return super().transform(df, ctx)
+        M_q = self._matrix(df)
+        return sum(self._query(self.M_[tr], self.Y_[tr], M_q) for tr in folds) / len(folds)
+
     def _query(self, M_ref, Y_ref, M_q):
         from sklearn.neighbors import NearestNeighbors
         yc = Y_ref.argmax(1) if Y_ref.shape[1] > 1 else Y_ref[:, 0].astype(int)
@@ -1536,6 +1551,10 @@ class Digits(Spec):
 class StrNum(Spec):
     """The number written inside a coded string ("location 118", "feature 68"): codes
     issued in order put neighbouring numbers close, which the category alone hides."""
+    # Skips the one-feature residual screen and is judged in the joint model: the number's
+    # worth is in its interactions (Telstra's location number: hand +0.02 log loss, no
+    # residual gain on its own).
+    screen_exempt = True
 
     def __init__(self, col: str):
         super().__init__([col])
@@ -3566,31 +3585,70 @@ class FeatureForge:
                 free = [s for s in full if not s.target_dep]
                 if free and len(free) < len(full):
                     cands.append((f"rounds<={r + 1} label-free", free))
+        # Picks that skipped the residual screen (kNN class distances, numbered codes) reach
+        # the gate untested on their own: each set is also offered without each such family,
+        # so one that does not carry over cannot ride on the others (Telstra: kNN distances
+        # passed with the location number and cost 0.025 log loss held-out).
+        for label, specs in list(cands):
+            for f in sorted({type(sp).__name__ for sp in specs if getattr(sp, "screen_exempt", False)}):
+                gone, rest = set(), []
+                for sp in specs:
+                    if type(sp).__name__ == f or any(p in gone for p in sp.parents):
+                        gone.update(sp.out_names())
+                    else:
+                        rest.append(sp)
+                if rest:
+                    cands.append((f"{label} without {f}", rest))
         if self.selected_:
             for label, extra, _ in getattr(self, "wide_", []):
                 cands.append((label, list(self.selected_) + list(extra)))
-        for label, specs in cands:
+        # The recode was chosen on the search rows; each feature set is also offered on the
+        # native categoricals, so features that need them are not sunk by it (Telstra: the
+        # location's number lost with "location" rank-coded, gained with it native).
+        if self.recode_:
+            cands += [(label + " native", specs, False) for label, specs in cands if specs]
+        best_recode = self.recode_
+        for label, specs, *rc in cands:
+            rc = rc[0] if rc else None
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
-            rows = gate_loss(cols)
+            rows = gate_loss(cols, rc)
             d = raw_rows - rows
             # Winsorise so a handful of extreme rows cannot carry the decision.
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
             zb = _block_z(dw, blocks) if blocks is not None else None
-            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
+            self._log(f"  gate {label}{' (recoded)' if self.recode_ and rc is None else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
                       f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
             if self.gate_by_period and zb is not None:
                 z = zb
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
-        fam_on = self.gate_families is True or (self.gate_families == "auto" and len(getattr(self, "embargo_", ())))
+                best_recode = self.recode_ if rc is None else rc
+        self.recode_ = best_recode
+        fam_on = self.gate_families is True or (self.gate_families == "auto" and (
+            len(getattr(self, "embargo_", ())) or (len(idx_gate) >= 20_000 and self._sparse_te(X))))
         # Under an embargo the families are checked even when the whole set passes: on
         # IEEE-CIS the set passed while dropping kNN and cross-linear target features
         # cut the gate loss further (0.1152 -> 0.1081) and lifted held-out AUC 0.926 -> 0.937.
         if fam_on and self.selected_:
             best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
         return best_set, raw_l, best_l
+
+    def _sparse_te(self, X) -> bool:
+        """A selected target statistic keyed on a thin key (under 20 rows a level). Its
+        out-of-fold values carry each training row's own label against its group's (KDD Cup
+        2012: within-group correlation -0.16 to -0.32), which group statistics on the same
+        key let the model read; held-out rows have no such signal (0.7500 -> 0.7476 AUC with
+        both families). The family pass finds the set without the pair. Only on large gates:
+        on Amazon's 5k gate rows it dropped families on noise (held-out -0.003 / -0.001 AUC)."""
+        keys = set(self.key_cols_)
+        for sp in self.selected_:
+            if sp.target_dep:
+                for p in sp.parents:
+                    if p in keys and p in X.columns and len(X) / max(X[p].nunique(), 1) < 20:
+                        return True
+        return False
 
     def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
         """When the whole set fails the gate (or always, under an embargo), drop feature families (target encodings, group
