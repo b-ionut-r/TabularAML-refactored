@@ -1056,6 +1056,62 @@ class EntityLag(Spec):
         return r
 
 
+class GroupSeq(Spec):
+    """A row's place in its group's sequence: earlier and later values of a column (lags,
+    leads, differences), its running sum and its time-weighted running sum (area), and the
+    row's step within the group. Groups are whole sequences (breaths, sessions) whose rows
+    the test holds in full; label-free, computed inside each group of the frame it sees.
+    The per-breath lags and u_in cumsum of the Ventilator winners."""
+
+    def __init__(self, key: str, order: str, col: Optional[str], kind: str):
+        super().__init__([key, order] + ([col] if col else []))
+        self.key, self.order, self.col, self.kind = key, order, col, kind
+        self.name = f"seq_{kind}__{col or order}__{key}"
+
+    @property
+    def novelty_parents(self):
+        # The group and its order scope the feature; it re-expresses the column.
+        return [self.col or self.order]
+
+    def transform(self, df, ctx):
+        g = pd.factorize(df[self.key].to_numpy())[0]
+        t = df[self.order].to_numpy(dtype=float)
+        o = np.lexsort((t, g))
+        gs, ts = g[o], t[o]
+        start = np.r_[True, gs[1:] != gs[:-1]]
+        first = np.maximum.accumulate(np.where(start, np.arange(len(gs)), 0))
+        step = np.arange(len(gs)) - first
+        k = self.kind
+        if k == "step":
+            r = step.astype(float)
+        elif k == "dt":
+            r = np.where(start, 0.0, np.diff(ts, prepend=np.nan))
+        else:
+            x = df[self.col].to_numpy(dtype=float)[o]
+            if k.startswith(("lag", "lead", "diff")):
+                m = int(k.lstrip("abcdefghijklmnopqrstuvwxyz"))
+                sh = -m if k.startswith("lead") else m
+                idx = np.arange(len(gs)) - sh
+                ok = (idx >= 0) & (idx < len(gs))
+                idx = np.clip(idx, 0, len(gs) - 1)
+                ok &= gs[idx] == gs
+                prev = np.where(ok, x[idx], np.nan)
+                r = x - prev if k.startswith("diff") else prev
+            elif k in ("cumsum", "area"):
+                v = np.nan_to_num(x)
+                if k == "area":
+                    v = v * np.where(start, 0.0, np.diff(ts, prepend=np.nan))
+                c = np.cumsum(v)
+                r = c - (c - v)[first]
+            elif k == "cummax":
+                r = pd.Series(x).groupby(gs).cummax().to_numpy(dtype=float)
+            else:
+                raise ValueError(k)
+        out = np.empty(len(gs))
+        out[o] = r
+        return out
+
+
 _DAY = 86400.0
 _DATE_PARTS = ("dow", "dom", "month", "year", "doy", "woy", "to_month_end")
 
@@ -2208,6 +2264,16 @@ class FeatureForge:
 
         sel_names = [s.name for s in selected if s.n_out == 1 and s.name in num_cols]
         label_free = {s.name for s in selected if not s.target_dep}
+        seq = getattr(self, "seq_order_", None)
+        if round_idx == 0 and seq is not None:
+            g = self.group_col_
+            add(GroupSeq(g, seq, None, "step"))
+            add(GroupSeq(g, seq, None, "dt"))
+            varying = [c for c in num_rank if c not in (g, seq) and c in self.base_cols_
+                       and W.groupby(g, sort=False)[c].nunique().mean() > 1.5]
+            for c in varying[:4]:
+                for kind in ("lag1", "lag2", "lag3", "lead1", "lead2", "diff1", "diff2", "cumsum", "area", "cummax"):
+                    add(GroupSeq(g, seq, c, kind))
         if round_idx == 0:
             raw_num = [c for c in self.base_cols_ if c not in self.cat_cols_]
             for stem, cols in column_families(raw_num).items():
@@ -3046,6 +3112,9 @@ class FeatureForge:
         self.group_col_ = None if self.time_col_ is not None else self._detect_group(X, X_unlabeled)
         if self.group_col_ is not None:
             self._log(f"test rows are new {self.group_col_} groups: grouped gate, folds and screening")
+        self.seq_order_ = None if self.group_col_ is None else self._detect_order(X, self.group_col_)
+        if self.seq_order_ is not None:
+            self._log(f"{self.group_col_} groups are sequences ordered by {self.seq_order_}: lags, leads, running sums")
         if self.time_col_ is not None:
             # Levels of the time column never recur later: no target maps over it (label-
             # free counts and group statistics per date still carry over to test dates).
@@ -3705,6 +3774,29 @@ class FeatureForge:
             if ov < best_ov:
                 best, best_ov = c, ov
         return best
+
+    def _detect_order(self, X, key):
+        """A numeric column that orders each group's rows: distinct within nearly every group
+        and rising in row order (time steps of a breath, event times of a session)."""
+        g = pd.factorize(X[key].to_numpy())[0]
+        sizes = np.bincount(g)
+        if np.median(sizes) < 5:
+            return None
+        rng = np.random.default_rng(0)
+        pick = rng.choice(g.max() + 1, min(2000, g.max() + 1), replace=False)
+        rows = np.flatnonzero(np.isin(g, pick))
+        gs = g[rows]
+        for c in X.columns:
+            if c == key or c in self.cat_cols_ or not pd.api.types.is_numeric_dtype(X[c]):
+                continue
+            x = X[c].to_numpy(dtype=float)[rows]
+            if not np.isfinite(x).all():
+                continue
+            same = gs[1:] == gs[:-1]
+            rising = (np.diff(x) > 0)[same].mean() if same.any() else 0.0
+            if rising > 0.98:
+                return c
+        return None
 
     def _detect_time(self, X, U):
         if self.time_col != "auto":
