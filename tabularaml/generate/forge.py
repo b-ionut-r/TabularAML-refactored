@@ -1607,10 +1607,11 @@ class Digits(Spec):
 class StrNum(Spec):
     """The number written inside a coded string ("location 118", "feature 68"): codes
     issued in order put neighbouring numbers close, which the category alone hides."""
-    # Skips the one-feature residual screen and is judged in the joint model: the number's
-    # worth is in its interactions (Telstra's location number: hand +0.02 log loss, no
-    # residual gain on its own).
-    screen_exempt = True
+    # Its worth is in interactions (Telstra's location number: hand +0.02 log loss, no
+    # residual gain on its own), so it is also offered to the gate on top of each feature
+    # set. Exempt from the screen instead, it took a joint-model slot on West Nile's trap
+    # code and the search stopped a round early (21 features, gate +7.2% -> 12, +2.9%).
+    gate_addon = True
 
     def __init__(self, col: str):
         super().__init__([col])
@@ -2111,7 +2112,11 @@ class FeatureForge:
         p = dict(_lgb_objective(self.task_, self.n_classes_), learning_rate=lr, num_leaves=31,
                  min_data_in_leaf=20, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
                  lambda_l2=1.0, verbosity=-1, seed=self.random_state, data_random_seed=self.random_state,
-                 num_threads=threads or self._threads(), max_cat_to_onehot=8)
+                 num_threads=threads or self._threads(), max_cat_to_onehot=8,
+                 # LightGBM otherwise picks row- or column-wise histograms by timing both, and
+                 # the two sum in a different order: on Airline the same commit's round-one
+                 # ranking split on that and kept 41 features or none on alternate runs.
+                 deterministic=True, force_col_wise=True)
         p.update(kw)
         return p
 
@@ -2741,6 +2746,7 @@ class FeatureForge:
             fams.setdefault(type(sp).__name__, []).append(sp)
         firsts = [g[0] for g in fams.values()]
         n_first = len(firsts)
+        order = {sp.name: i for i, sp in enumerate(specs)}
         specs = list(firsts)
         with ThreadPoolExecutor(n_threads) as pool:
             i = 0
@@ -2765,6 +2771,11 @@ class FeatureForge:
                 if i == n_first:
                     cost = lambda f: spent.get(f, [1, 0.0])[1] / max(spent.get(f, [1, 0.0])[0], 1)
                     specs += [sp for f in sorted(fams, key=cost) for sp in fams[f][1:]]
+        # Back in generation order: families are built cheapest first by measured time, so
+        # the order they finished in varied from run to run, and with it the joint model's
+        # column order, its split-gain ranking and the round's picks (Airline: the same commit
+        # kept 41 features or none on alternate runs).
+        out = dict(sorted(out.items(), key=lambda kv: order.get(kv[0], len(order))))
         _CODE_CACHE.clear()  # factorised keys of large frames add up to gigabytes
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
@@ -3063,6 +3074,7 @@ class FeatureForge:
         self._t0 = time.time()
         self._deadline = None
         self.wide_ = []
+        self.addons_ = {}
         X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
         self.n_synthetic_ = 0
@@ -3365,6 +3377,8 @@ class FeatureForge:
             def keep_fn(spec, v, out, score):
                 g, nov = score
                 scores[spec.name] = (g, nov)
+                if getattr(spec, "gate_addon", False) and spec.name not in self.addons_:
+                    self.addons_[spec.name] = (spec, v)
                 if getattr(spec, "screen_exempt", False):
                     return True
                 if nov <= 0:
@@ -3513,6 +3527,12 @@ class FeatureForge:
         for _, _, arrs in self.wide_:
             for col, v in arrs.items():
                 W[col] = v
+        chosen_names = {sp.name for sp in selected}
+        self.addons_ = {nm: av for nm, av in self.addons_.items() if nm not in chosen_names}
+        for sp, v in self.addons_.values():
+            sp.round_ = last_r if last_r is not None else 0
+            for j, col in enumerate(sp.out_names()):
+                W[col] = v if v.ndim == 1 else v[:, j]
         self.selected_ = selected
         # Candidate values of the last round can be gigabytes on large tables.
         values = cands = Mw = None
@@ -3525,6 +3545,7 @@ class FeatureForge:
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
             self.gate_passed_ = best_set is not None
             self.wide_ = []  # their search-row values are not needed after the gate
+            self.addons_ = {}
             if self.gate_passed_:
                 self.selected_ = list(best_set)
             else:
@@ -3625,7 +3646,8 @@ class FeatureForge:
         Xg = X.iloc[idx_gate].reset_index(drop=True)
         ys, yg = y[idx_sel], y[idx_gate]
         Fs, Fg = W, Xg.copy()
-        for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra]:
+        addons = [sp for sp, _ in getattr(self, "addons_", {}).values()]
+        for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra] + addons:
             if all(c in Fg.columns for c in s.out_names()):
                 continue
             vg = s.transform(Fg, self.ctx_)
@@ -3700,6 +3722,11 @@ class FeatureForge:
                         rest.append(sp)
                 if rest:
                     cands.append((f"{label} without {f}", rest))
+        # Numbered codes the screen passed over (their worth is in interactions) are offered on
+        # top of each set.
+        if addons:
+            cands += [(f"{label} + {', '.join(sp.name for sp in addons)}", list(specs) + addons)
+                      for label, specs in list(cands) if specs and not label.endswith(" without StrNum")]
         if self.selected_:
             for label, extra, _ in getattr(self, "wide_", []):
                 cands.append((label, list(self.selected_) + list(extra)))
