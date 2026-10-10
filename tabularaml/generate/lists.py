@@ -28,6 +28,19 @@ def _safe(s: str, n: int = 40) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "_", str(s)).strip("_")[:n] or "x"
 
 
+def _fixed_places(head: pd.Series, d: str, top: int = 20) -> float:
+    """How often the most common parts sit at one place (counted from the end) in their cells."""
+    pos: Dict[str, Counter] = {}
+    for x in head:
+        parts = [i.strip() for i in x.split(d) if i.strip()]
+        for k, i in enumerate(parts):
+            pos.setdefault(i, Counter())[len(parts) - k] += 1
+    common = [i for i in sorted(pos, key=lambda i: -sum(pos[i].values()))[:top] if sum(pos[i].values()) >= 5]
+    if not common:
+        return 0.0
+    return float(np.mean([max(pos[i].values()) / sum(pos[i].values()) for i in common]))
+
+
 def as_lists(s: pd.Series, sample: int = 5000) -> Optional[pd.Series]:
     """The column as lists of stripped items, or None when it does not hold lists."""
     v = s.dropna()
@@ -53,6 +66,10 @@ def as_lists(s: pd.Series, sample: int = 5000) -> Optional[pd.Series]:
         # Short items that recur across rows (an amenity, a tag), not clauses of free text.
         # " ; " is how list cells arrive (contest_features.read joins them): photo URLs are a list too.
         if d != " ; " and (np.median(lens) > 30 or len(set(items)) > 0.5 * len(items)):
+            continue
+        # Parts that keep their place are fields of one value, not list items: an address's
+        # "Chicago, IL 60634, USA" puts the same city, state and country last on every row.
+        if d != " ; " and _fixed_places(head, d) > 0.9:
             continue
         return s.map(lambda x: [i.strip() for i in str(x).split(d) if i.strip()] if isinstance(x, str) else [])
     return None
