@@ -3450,8 +3450,7 @@ class FeatureForge:
             new_share = max((~_as_str(later[c]).isin(set(_as_str(W[c])))).mean() if len(later) else 0.0
                             for c in self.hc_cols_)
             if new_share > 0.1:
-                self._fit_rank_maps(pd.concat([X[self.hc_cols_]] + ([] if U_ is None else [U_[self.hc_cols_]]),
-                                              ignore_index=True))
+                self._fit_rank_maps(_concat_cats([X[self.hc_cols_]] + ([] if U_ is None else [U_[self.hc_cols_]])))
             else:
                 self._fit_rank_maps(W)
             self._log(f"frequency ranks: {100 * new_share:.0f}% of later rows hold levels the search rows "
