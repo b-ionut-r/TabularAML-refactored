@@ -55,7 +55,8 @@ ARITH_OPS = ("add", "sub", "mul", "div", "rdiv")
 # the 4-core reference container, from row and column counts only, so ``time_budget`` keeps its
 # meaning there. Measured on Home Credit, IEEE-CIS, Santander and Porto Seguro builds:
 _CV_CELL_S = 3e-7       # one 5-fold CV fit, per search row and model column
-_ROW_PASS_S = 2e-7      # building one candidate of unit cost, per row (thread time)
+_ROW_PASS_S = 4e-7      # building and screening one candidate of unit cost, per row (thread time; on Home
+                        # Credit, building took twice the thread time it logs, as four threads share memory)
 _PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
 _KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
 _REF_THREADS = 4        # candidate building runs on this many threads there
@@ -2916,7 +2917,8 @@ class FeatureForge:
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
         top = sorted(spent.items(), key=lambda kv: -kv[1][1])[:6]
-        self._log("  materialised (thread time): " + ", ".join(f"{k} {n}x {t:.0f}s" for k, (n, t) in top))
+        self._log("  materialised (thread time): " + ", ".join(f"{k} {n}x {t:.0f}s" for k, (n, t) in top)
+                  + f" ({self._work:.0f}s of work)")
         return out
 
     # ------------------------------------------------------------ screening
@@ -3487,7 +3489,7 @@ class FeatureForge:
                 self.recode_ = True
                 Mw, margin, cur_loss, imp = Wr, m_r, loss_r, imp_r
         self._log(f"task={self.task_} rows={n} (search {len(W)}, gate {len(idx_gate)}) "
-                  f"cols={X.shape[1]} base CV loss={cur_loss:.6f}")
+                  f"cols={X.shape[1]} base CV loss={cur_loss:.6f} (one CV fit {self._cv_s:.0f}s of work)")
 
         for r in range(self.n_rounds):
             if len(selected) >= self.max_new_features:
@@ -3656,7 +3658,7 @@ class FeatureForge:
             margin, imp = best_fit[0], best_fit[1]
             self.history_.append(dict(round=r + 1, n_candidates=n_values, n_added=best_k,
                                       cv_loss_before=cur_loss, cv_loss_after=best_loss))
-            self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f}")
+            self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f} ({self._work:.0f}s of work)")
             if chosen:
                 self._log(f"  round {r + 1} picks: {', '.join(sp.name for sp in chosen)[:600]}")
             cur_loss = best_loss
@@ -3708,7 +3710,7 @@ class FeatureForge:
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
         self.elapsed_ = time.time() - self._t0
-        self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
+        self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s ({self._work:.0f}s of work)")
         return self
 
     def _mem_rows(self, n_cols, share=0.3):
