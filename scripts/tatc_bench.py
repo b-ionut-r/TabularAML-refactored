@@ -28,6 +28,7 @@ ap.add_argument('--budget', type=float, default=900); ap.add_argument('--extra',
 ap.add_argument('--data', default='/home/user/data/tatc/'); ap.add_argument('--log', default='tatc.jsonl')
 ap.add_argument('--shuffle', action='store_true'); ap.add_argument('--groups', default='')
 ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[1])); ap.add_argument('--ff-cache', action='store_true')
+ap.add_argument('--judge-seed', type=int, default=0, help='offset of the judge LightGBM seeds (noise checks)')
 a = ap.parse_args()
 D = Path(a.data)
 df = pd.read_csv(D / 'train.csv')
@@ -86,6 +87,12 @@ def hand(tr, te):
         med = tr.groupby('stock_id')[c].median()
         H[f'{c}_stock_median'] = A.stock_id.map(med)
     H = H.replace([np.inf, -np.inf], np.nan).astype(np.float32)
+    if a.groups:
+        grp = {'lag': [c for c in H.columns if '_ret' in c and 'vs_mean' not in c] + ['imb_flag_change'],
+               'xs': ['wap_vs_mean', 'wap_ret1_vs_mean'] + [c for c in H.columns if c.endswith('_rank')],
+               'med': [c for c in H.columns if c.endswith('_stock_median')]}
+        grp['imb'] = [c for c in H.columns if not any(c in v for v in grp.values())]
+        H = H[[c for g in a.groups.split(',') for c in grp[g]]]
     return H.iloc[:n].reset_index(drop=True), H.iloc[n:].reset_index(drop=True)
 
 
@@ -111,6 +118,10 @@ elif a.arm.startswith('ff'):
     info['n_new'] = len(new)
     cache.mkdir(exist_ok=True); Ftr.to_parquet(cache / 'tr.parquet'); Fte.to_parquet(cache / 'te.parquet')
     shutil.rmtree(tmp, ignore_errors=True)
+if 'panel' in a.arm.split('_'):   # diagnostic: raw + tabularaml.generate.panel only
+    from tabularaml.generate.panel import panel_features
+    Ptr, Pte, _ = panel_features(tr.drop(columns=['row_id']), te.drop(columns=['row_id']))
+    Xtr, Xte = pd.concat([Xtr, Ptr], axis=1), pd.concat([Xte, Pte], axis=1)
 if a.arm.endswith('hand'):
     Htr, Hte = hand(tr, te)
     Xtr, Xte = pd.concat([Xtr, Htr], axis=1), pd.concat([Xte, Hte], axis=1)
@@ -123,12 +134,12 @@ P = dict(objective='l1', learning_rate=0.05, num_leaves=127, min_child_samples=2
          bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, num_threads=4, verbose=-1)
 days = tr.date_id.to_numpy(); cut = np.quantile(days, 0.85)
 fit, va = np.flatnonzero(days < cut), np.flatnonzero(days >= cut)
-b = lgb.train(dict(P, seed=0), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 3000, valid_sets=[lgb.Dataset(Xtr.iloc[va], ytr[va])],
+b = lgb.train(dict(P, seed=a.judge_seed * 10), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 3000, valid_sets=[lgb.Dataset(Xtr.iloc[va], ytr[va])],
               callbacks=[lgb.early_stopping(100, verbose=False)])
 p = np.zeros(len(Xte))
 for s in range(3):
-    p += lgb.train(dict(P, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
-res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), win=a.win, mae=float(np.mean(np.abs(p - yte))),
+    p += lgb.train(dict(P, seed=a.judge_seed * 10 + s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), win=a.win, judge_seed=a.judge_seed, mae=float(np.mean(np.abs(p - yte))),
            mae_const=float(np.mean(np.abs(np.median(ytr) - yte))), best_it=b.best_iteration, n_cols=Xtr.shape[1],
            fe_s=round(fe_t), total_s=round(time.time() - t0), peak_gb=round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 20, 2),
            n_tr=len(Xtr), n_te=len(Xte), **info)

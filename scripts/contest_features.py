@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
 from tabularaml.generate.lists import as_lists, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.returns import return_features  # noqa: E402
+from tabularaml.generate.panel import panel_features  # noqa: E402
 from tabularaml.generate.stream import aggregation_bytes, chunks, memory_bytes  # noqa: E402
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
@@ -242,6 +243,9 @@ def main():
                     help="history families (tabularaml/generate/history.py), on from structure: latest state of keyed "
                          "child tables with a time column (last, last - mean, last - previous), and outcome history "
                          "of as-of event logs that carry the target (earlier outcomes, strictly before each row)")
+    ap.add_argument("--panel", default="auto", choices=["auto", "off"],
+                    help="intraday panels: each entity against all at the same moment and its own last steps of the "
+                         "day, tabularaml/generate/panel.py; on from structure")
     ap.add_argument("--lists", default="auto", choices=["auto", "off"],
                     help="list columns (item counts and common-item indicators) and per-unit amounts (a skewed amount "
                          "over small counts and their total), tabularaml/generate/lists.py; on from structure")
@@ -400,6 +404,13 @@ def main():
             Xte = pd.concat([Xte.reset_index(drop=True), Lte, Ute], axis=1)
             print(f"lists: {found} -> {Ltr.shape[1]} columns; per-unit amounts: {Utr.shape[1]} columns "
                   f"in {time.time() - t:.0f}s", flush=True)
+    if a.panel == "auto":
+        t = time.time()
+        Ptr, Pte, P = panel_features(Xtr, Xte)
+        if P is not None:
+            Xtr = pd.concat([Xtr.reset_index(drop=True), Ptr], axis=1)
+            Xte = pd.concat([Xte.reset_index(drop=True), Pte], axis=1)
+            print(f"panel: {P} -> {Ptr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
     del tr, te  # a second copy of both tables is gigabytes on IEEE-CIS
     forecasting = False
     if a.forecast == "auto":
