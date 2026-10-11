@@ -454,3 +454,15 @@ def test_group_sequences_get_running_sums_when_test_holds_new_groups():
     assert any(c.startswith("seq_cumsum__u") or c.startswith("seq_area__u") for c in f.new_columns_)
     v = GroupSeq("g", "t", "u", "cumsum").transform(X[~tr].reset_index(drop=True), None)
     assert np.allclose(v, pd.Series(u[~tr]).groupby(g[~tr]).cumsum().to_numpy())
+
+
+def test_field_missing_from_unlabeled_rows_is_left_out():
+    # "z" is measured on training rows but a -9 placeholder on almost every unlabeled row.
+    rng = np.random.default_rng(0)
+    n = 2000
+    X = pd.DataFrame({"x": rng.normal(size=n), "z": rng.uniform(0, 2, n)})
+    y = pd.Series((X.x + X.z > 1).astype(int))
+    U = pd.DataFrame({"x": rng.normal(size=500), "z": np.where(rng.random(500) < 0.95, -9.0, rng.uniform(0, 2, 500))})
+    f = FeatureForge(task="binary", time_budget=20, random_state=0, n_jobs=1, verbose=False).fit(X, y, X_unlabeled=U)
+    assert f.shifted_ == ["z"]
+    assert "z" not in f.transform(U).columns and "z" not in f.transform_train(X).columns

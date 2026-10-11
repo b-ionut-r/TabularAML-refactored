@@ -1659,6 +1659,22 @@ class StrNum(Spec):
         return self.parse(df[self.parents[0]])
 
 
+def _absent_in_test(X: pd.DataFrame, U: pd.DataFrame) -> List[str]:
+    """Columns at least 80% one value in ``U`` that at most 5% of ``X`` holds, while ``X`` has 10+ values."""
+    out = []
+    for c in X.columns:
+        if c not in U.columns or len(U) < 50:
+            continue
+        vb = U[c].value_counts(dropna=False, normalize=True)
+        if not len(vb) or vb.iloc[0] < 0.8 or X[c].nunique(dropna=False) < 10:
+            continue
+        v = vb.index[0]
+        s_tr = float(X[c].isna().mean()) if pd.isna(v) else float((X[c] == v).mean())
+        if s_tr <= 0.05:
+            out.append(c)
+    return out
+
+
 def _numbered_codes(s: pd.Series) -> bool:
     """A string column whose values are one shared prefix and a number."""
     v = pd.Series(pd.unique(as_text(s)))
@@ -3137,6 +3153,14 @@ class FeatureForge:
                 self._log(f"unlabeled rows: {self.n_synthetic_} of {len(fake)} look synthetic "
                           "(no value unique among all rows); left out of label-free statistics")
                 X_unlabeled = X_unlabeled[~fake]
+        # Fields the unlabeled rows lack: almost constant there on a value training rows (almost) never
+        # hold, while varied in training (PLAsTiCC's spectroscopic redshift: -9 on 97% of test objects,
+        # measured on 70% of training ones). A model trained on them meets a value it never saw.
+        self.shifted_ = [] if X_unlabeled is None else _absent_in_test(X, X_unlabeled)
+        if self.shifted_:
+            self._log(f"left out, almost constant in the unlabeled rows on a value training rarely holds: {self.shifted_}")
+            X = X.drop(columns=self.shifted_)
+            X_unlabeled = X_unlabeled.drop(columns=[c for c in self.shifted_ if c in X_unlabeled.columns])
         if self.task is None:
             from tabularaml.contest.solver import infer_task
             self.task_ = infer_task(y)
@@ -3945,7 +3969,7 @@ class FeatureForge:
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
-        X = X.reset_index(drop=True)
+        X = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
@@ -4275,7 +4299,7 @@ class FeatureForge:
         return out
 
     def _recode_out(self, X):
-        out = X.reset_index(drop=True).copy()
+        out = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         if self.recode_:
             for c in self.rank_maps_:
                 out[c] = self._rank(out[c], c)
