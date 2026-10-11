@@ -54,11 +54,16 @@ ARITH_OPS = ("add", "sub", "mul", "div", "rdiv")
 # and would pick differently again on a faster or busier machine. Work is charged in seconds of
 # the 4-core reference container, from row and column counts only, so ``time_budget`` keeps its
 # meaning there. Measured on Home Credit, IEEE-CIS, Santander and Porto Seguro builds:
-_CV_CELL_S = 3e-7       # one 5-fold CV fit, per search row and model column
-_ROW_PASS_S = 4e-7      # building and screening one candidate of unit cost, per row (thread time; on Home
-                        # Credit, building took twice the thread time it logs, as four threads share memory)
+_CV_CELL_S = 3e-7       # prior for one 5-fold CV fit, per search row and model column (before it runs)
+_TREE_CELL_S = 1.6e-9   # one boosting iteration, per training row and model column (Home Credit 320 and 120
+                        # columns, 80k-197k rows, and a 100-column regression all measured 1.5-2.0e-9)
+_ROW_PASS_S = 2e-7      # building and screening one candidate of unit cost, per row (thread time)
 _PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
 _KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
+_SETUP_COL_S = 5e-1     # column screens before the search (codes, keys, label echoes), per column of a
+                        # table of 300k rows or more (Home Credit and IEEE-CIS both took 0.6 s a column)
+_WU_ROW_SHARE = 0.05    # a label-free candidate fitted over all known rows costs its search rows plus this
+                        # share of those rows (IEEE-CIS: 1,698 group statistics over 1.1M rows, 0.09 s each)
 _REF_THREADS = 4        # candidate building runs on this many threads there
 # Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
 _SPEC_WORK = {
@@ -2370,12 +2375,14 @@ class FeatureForge:
             return M[r] if pick is None else M[np.ix_(r, pick)]
         n = len(M)
         n_fits = sum(len(f) for f in repeats)
-        cost = self._cv_cost(n, M.shape[1] if pick is None else len(pick), n_fits)
-        self._last_cv_cost = cost
-        if give_up and cost > give_up:
-            self._cv_projected = cost
+        width = M.shape[1] if pick is None else len(pick)
+        prior = self._cv_cost(n, width, n_fits)
+        if give_up and prior > give_up:
+            self._cv_projected = prior
             return None
-        self._charge(cost)
+        # Each fold is charged from the iterations it trained (early stopping is deterministic):
+        # a fit of thousands of trees costs that, not the row-by-column prior.
+        self._last_cv_cost = 0.0
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
@@ -2407,6 +2414,9 @@ class FeatureForge:
                     b = lgb.train(self._lgb_params(lr), dtr, 2000, valid_sets=[dva],
                                   callbacks=[lgb.early_stopping(50, verbose=False)])
                     del Mtr, dtr, dva
+                fold_cost = _TREE_CELL_S * b.current_iteration() * len(tr) * width * (self.n_classes_ if self.task_ == "multiclass" else 1)
+                self._last_cv_cost += fold_cost
+                self._charge(fold_cost)
                 oof[va] = b.predict(Mva, num_iteration=b.best_iteration, raw_score=True)
                 imp += pd.Series(b.feature_importance("gain"), index=cols)
                 if mine:
@@ -2875,7 +2885,7 @@ class FeatureForge:
 
         def work(s):
             """A candidate's building cost on the work clock (thread seconds), from its family and rows."""
-            rows = len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else len(W)
+            rows = len(W) + (_WU_ROW_SHARE * len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else 0)
             return _SPEC_WORK.get(type(s).__name__, _SPEC_WORK_DEFAULT) * rows * _ROW_PASS_S
 
         def compute(s):
@@ -2913,7 +2923,15 @@ class FeatureForge:
         plan, fam_work, capped, total = [], {}, set(), 0.0
         firsts = [g[0] for g in fams.values()]
         rest = [sp for f in sorted(fams, key=lambda f: work(fams[f][0])) for sp in fams[f][1:]]
-        for sp in firsts + rest:
+        # When every candidate fits, none is skipped: a family's share only matters when the
+        # families compete for the work (IEEE-CIS's seven neighbour encodings fit with the rest).
+        everything = sum(work(sp) for sp in specs)
+        fits_all = not self.time_budget or self._time_left() - everything / _REF_THREADS >= reserve
+        for sp in (specs if fits_all else firsts + rest):
+            if fits_all:
+                total += work(sp)
+                plan.append(sp)
+                continue
             f = type(sp).__name__
             if f in capped:
                 continue
@@ -2927,6 +2945,8 @@ class FeatureForge:
             fam_work[f] = fam_work.get(f, 0.0) + w
             total += w
             plan.append(sp)
+        if self.time_budget:
+            self._log(f"budget: {self._time_left():.0f}s of work left; building takes {total / _REF_THREADS:.0f}s")
         if len(plan) < n_all:
             self._log(f"budget: built {len(plan)} of {n_all} candidates")
         self._charge(total / _REF_THREADS)
@@ -3324,6 +3344,7 @@ class FeatureForge:
         self.key_cols_ += self.code_cols_
         self.key_cols_ += [a[3] for a in self.anchors_]
         self.key_cols_ = [c for c in self.key_cols_ if c not in self.text_cols_]
+        self._charge(_SETUP_COL_S * X.shape[1] * min(len(X), 300_000) / 300_000)
         if self.text_cols_:
             self._log(f"free text: {', '.join(self.text_cols_)}")
         if self.seq_cols_:
