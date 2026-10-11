@@ -343,7 +343,7 @@ def cmd_compare(a):
         if flag.startswith('WORSE'):
             flags.append(cname)
     head = (f'## {ref} (reference) vs {new}, {a.tier} tier\n\n'
-            '| case | raw | ref FF | new FF | samples | paired change (+ = new better) | noise band | build s ref→new | peak GB ref→new | flag |\n'
+            '| case | raw | ref FF | new FF | samples | paired change (+ = new better) | noise band | build s ref→new | peak GB, process tree incl. judge, ref→new | flag |\n'
             '|---|---|---|---|---|---|---|---|---|---|')
     txt = head + '\n' + '\n'.join(rows) + f'\n\nWorse beyond noise: {", ".join(flags) or "none"}\n'
     print(txt)
