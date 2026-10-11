@@ -2704,7 +2704,8 @@ class FeatureForge:
                 if t not in e:
                     add(Count(list(e) + [t]))
         for e in ents:
-            if self.entity_lags and t is not None and t not in e:
+            # Read from the history fit holds: only with the test rows at fit (see _event_gap_candidates).
+            if self.entity_lags and t is not None and t not in e and getattr(self, "has_test_", False):
                 tw = W[t].to_numpy(dtype=float)
                 R = float(np.nanmax(tw) - np.nanmin(tw))
                 wins = [f"{p}{R * f:.6g}" for f in (0.001, 0.01, 0.05) for p in ("win", "fwd")] if R > 0 else []
@@ -2748,6 +2749,10 @@ class FeatureForge:
                      and 2 <= W[f].nunique() <= 7
                      and W.groupby(ids[0], sort=False)[f].nunique().mean() >= 1.5][:3]
             self._lagged_target_candidates(W, ids[:2], flags, add)
+        if not getattr(self, "has_test_", False):
+            # Times to an entity's last / next flagged row are read from the history fit holds: test rows
+            # sent later in batches would miss their own batch's rows (see _event_gap_candidates).
+            return
         for f in self.base_cols_:
             if f == t or f in ids or f in self.date_cols_:
                 continue
