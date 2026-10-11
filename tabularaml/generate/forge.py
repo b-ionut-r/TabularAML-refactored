@@ -2637,9 +2637,15 @@ class FeatureForge:
         the most levels (a device's ip) together with the row's other codes (app, device, os,
         channel) does, the way TalkingData's winners keyed time-to-next-click. Offered whenever a
         time column orders the rows and such a key repeats; the gate decides. ``event_gaps="past"``
-        leaves out the next row (it reads later rows of the same file)."""
+        leaves out the next row (it reads later rows of the same file).
+
+        Only with the test rows passed to ``fit`` (``X_unlabeled``): the gaps are read from the history
+        fit holds, so test rows that arrive later in batches (an API feeding Jane Street's or Optiver's
+        test) would find their own neighbours missing: no next row at all, and a previous row taken
+        from training rather than their batch, unlike every training row."""
         t = getattr(self, "time_col_", None)
-        if self.event_gaps == "off" or t is None or t == ROW_TIME or not self.id_cols_:
+        if (self.event_gaps == "off" or t is None or t == ROW_TIME or not self.id_cols_
+                or not getattr(self, "has_test_", False)):
             return
         echo = set(getattr(self, "echo_cols_", ()))
         k = self.id_cols_[0]
@@ -3302,6 +3308,7 @@ class FeatureForge:
         # hold, while varied in training (PLAsTiCC's spectroscopic redshift: -9 on 97% of test objects,
         # measured on 70% of training ones). A model trained on them meets a value it never saw.
         self.shifted_ = [] if X_unlabeled is None else _absent_in_test(X, X_unlabeled)
+        self.has_test_ = X_unlabeled is not None and len(X_unlabeled) > 0
         if self.shifted_:
             self._log(f"left out, almost constant in the unlabeled rows on a value training rarely holds: {self.shifted_}")
             X = X.drop(columns=self.shifted_)

@@ -545,10 +545,14 @@ def test_event_gaps_find_time_to_next_click_of_a_user():
     y = ((X.groupby(["ip", "app"])["t"].shift(-1) - X["t"]) < 60).to_numpy(dtype=int)[:n]
     X = X.iloc[:n]
     tr = np.arange(n) < 4800
-    ff = FeatureForge(task="binary", time_budget=20, time_col="t", verbose=False, random_state=0, label_echo=False)
+    ff = FeatureForge(task="binary", time_budget=1, time_col="t", verbose=False, random_state=0, label_echo=False)
     ff.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]), X_unlabeled=X[~tr].reset_index(drop=True))
     assert any(c.startswith("lag_next__ip+app__") for c in ff.new_columns_), ff.new_columns_
-    past = FeatureForge(task="binary", time_budget=20, time_col="t", verbose=False, random_state=0, label_echo=False,
+    past = FeatureForge(task="binary", time_budget=1, time_col="t", verbose=False, random_state=0, label_echo=False,
                         event_gaps="past")
     past.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]), X_unlabeled=X[~tr].reset_index(drop=True))
     assert not any(c.startswith("lag_next__") for c in past.new_columns_)
+    # Without the test rows at fit (an API that sends them later in batches) the family stays off.
+    blind = FeatureForge(task="binary", time_budget=1, time_col="t", verbose=False, random_state=0, label_echo=False)
+    blind.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]))
+    assert not any(c.startswith("lag_") and "+" in c for c in blind.new_columns_), blind.new_columns_
