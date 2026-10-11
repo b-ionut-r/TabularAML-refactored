@@ -93,7 +93,7 @@ def row_stat_features(Xtr: pd.DataFrame, Xte: pd.DataFrame, min_cols: int = 10, 
     """Row statistics for every kind with ``min_cols`` or more columns (kinds read on the training rows)."""
     groups = {k: cols for k, cols in column_kinds(Xtr, min_cols=min_cols).items() if len(cols) >= min_cols}
 
-    def build(X: pd.DataFrame) -> pd.DataFrame:
+    def build(X: pd.DataFrame, keep=None) -> pd.DataFrame:
         parts = []
         for k, cols in groups.items():
             cols = [c for c in cols if c in X.columns]
@@ -102,9 +102,14 @@ def row_stat_features(Xtr: pd.DataFrame, Xte: pd.DataFrame, min_cols: int = 10, 
                 M = X[cols].iloc[i:i + chunk].to_numpy(dtype=float)
                 blocks.append(pd.DataFrame({f"rows_{k}__{n}": v for n, v in _stats(M, k).items()}))
             parts.append(pd.concat(blocks, ignore_index=True))
-        return (pd.concat(parts, axis=1) if parts else pd.DataFrame(index=range(len(X)))).astype(np.float32)
+        out = (pd.concat(parts, axis=1) if parts else pd.DataFrame(index=range(len(X)))).astype(np.float32)
+        return out if keep is None else out[keep]
 
-    return build(Xtr), build(Xte), {k: len(v) for k, v in groups.items()}
+    # A statistic constant over the training rows says nothing (one-hot groups: one non-zero cell per row).
+    Rtr = build(Xtr)
+    keep = [c for c in Rtr.columns if Rtr[c].nunique(dropna=False) > 1]
+    groups = {k: v for k, v in groups.items() if any(c.startswith(f"rows_{k}__") for c in keep)}
+    return Rtr[keep], build(Xte, keep), {k: len(v) for k, v in groups.items()}
 
 
 def rows_help(X: pd.DataFrame, R: pd.DataFrame, y, task: str, z_needed: float = 1.0, folds: int = 5,
@@ -124,8 +129,10 @@ def rows_help(X: pd.DataFrame, R: pd.DataFrame, y, task: str, z_needed: float = 
                          for c in base.columns})
     full = pd.concat([base, R.iloc[rows].reset_index(drop=True)], axis=1)
     y = y[rows]
-    P = dict(objective=task, learning_rate=0.1, num_leaves=31, min_child_samples=20, feature_fraction=0.5,
-             bagging_fraction=0.8, bagging_freq=1, verbose=-1, num_threads=4, seed=seed)
+    # Every column and row in every tree: with column or row sampling, adding columns reshuffles the draws and the
+    # paired losses move on that alone (covertype: two constant columns scored z=+3.9).
+    P = dict(objective=task, learning_rate=0.1, num_leaves=31, min_child_samples=20, verbose=-1, num_threads=4,
+             seed=seed, deterministic=True, force_row_wise=True)
     if task == "multiclass":
         P["num_class"] = int(y.max()) + 1
     split = (KFold(folds, shuffle=True, random_state=seed).split(rows) if task == "regression"
