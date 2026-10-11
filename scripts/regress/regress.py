@@ -153,6 +153,10 @@ CASES.update({
     'jane_street': _sealed('jane_street', True, 0.002, n_seeds=1, tier='sealed'),
 })
 
+# Held-back validation cases, registered from a git-excluded file when present (their FF arm needs HELDBACK_FF=1).
+if (HERE / 'heldback_cases.py').exists():
+    exec((HERE / 'heldback_cases.py').read_text())
+
 
 def fmt(x, ctx):
     if isinstance(x, list):

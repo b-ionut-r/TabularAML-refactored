@@ -362,8 +362,12 @@ if a.shuffle:
 t0 = time.time()
 idc = P.get('id')
 if a.arm == 'hand':
-    _H = globals()[f'hand_{a.contest}'](pd.concat([Xtr, Xte], ignore_index=True))
-    Xtr, Xte = _H.iloc[:len(Xtr)].reset_index(drop=True), _H.iloc[len(Xtr):].reset_index(drop=True)
+    _hf = globals()[f'hand_{a.contest}']; del X, P['X']
+    if getattr(_hf, 'rowwise', False):  # per-row features: no joint copy of a wide frame
+        Xtr, Xte = _hf(Xtr), _hf(Xte)
+    else:
+        _H = _hf(pd.concat([Xtr, Xte], ignore_index=True))
+        Xtr, Xte = _H.iloc[:len(Xtr)].reset_index(drop=True), _H.iloc[len(Xtr):].reset_index(drop=True); del _H
 if a.arm == 'ff':
     tmp = Path(tempfile.mkdtemp(dir='/home/user/tmp'))
     try:
