@@ -312,6 +312,23 @@ def test_forge_search_respects_small_budget():
     assert time.time() - t0 < 60
 
 
+def test_cross_linear_oof_same_on_threads():
+    # liblinear's random generator is process-wide: concurrent dual solves changed the values.
+    from concurrent.futures import ThreadPoolExecutor
+    rng = np.random.default_rng(0)
+    n = 20000
+    df = pd.DataFrame({f"k{i}": rng.integers(0, 40 + 30 * i, n).astype(str) for i in range(6)})
+    y = (rng.random(n) < 0.1 + 0.05 * (df.k0.astype(int) % 3)).astype(float)
+    folds = [(np.setdiff1d(np.arange(n), v), v) for v in np.array_split(rng.permutation(n), 5)]
+
+    def run(_):
+        return CrossLinearOOF(list(df.columns), 2, pairs=True).fit_transform_oof(df, y, None, folds)
+    ref = run(0)
+    with ThreadPoolExecutor(4) as pool:
+        for v in pool.map(run, range(8)):
+            np.testing.assert_array_equal(v, ref)
+
+
 def test_forge_picks_do_not_depend_on_the_clock(monkeypatch):
     # A budget that binds: the same search on a machine whose clock races ahead (every reading
     # a minute later than the last) must build, rank and keep exactly the same features.

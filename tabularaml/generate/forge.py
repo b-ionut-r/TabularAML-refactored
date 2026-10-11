@@ -150,6 +150,10 @@ _COL_CACHE: dict = {}
 # hundred cached code arrays are gigabytes.
 _CACHE_BYTES = 1 << 30
 _CACHE_LOCK = __import__("threading").Lock()
+# scikit-learn's liblinear draws from one process-wide random generator, reseeded at the start of
+# each fit: two fits on different threads interleave its draws, so a dual solve's values changed
+# from run to run (IEEE-CIS xlin__keys; Amazon's picks). Liblinear fits take turns.
+_LIBLINEAR_LOCK = __import__("threading").Lock()
 
 
 def _cache_put(cache: dict, key, df, *entry):
@@ -1552,7 +1556,8 @@ class TextLinearOOF(Spec):
             mu = y.mean()
             return (Ridge(alpha=3.0, solver="sparse_cg").fit(A, y - mu).predict(B) + mu)[:, None]
         if self.n_classes == 2:
-            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3, random_state=0).fit(A, y.astype(int))
+            with _LIBLINEAR_LOCK:
+                m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3, random_state=0).fit(A, y.astype(int))
             return m.decision_function(B)[:, None]
         Y = np.eye(self.n_classes)[y.astype(int)]
         return Ridge(alpha=3.0, solver="sparse_cg").fit(A, Y - Y.mean(0)).predict(B) + Y.mean(0)
@@ -1636,7 +1641,11 @@ class CrossLinearOOF(Spec):
             mu = y_ref.mean()
             m.fit(A, y_ref - mu)
             return (m.predict(B) + mu)[:, None]
-        m.fit(A, y_ref.astype(int))
+        if self.n_classes > 2:
+            m.fit(A, y_ref.astype(int))
+        else:
+            with _LIBLINEAR_LOCK:
+                m.fit(A, y_ref.astype(int))
         if self.n_out == 1:
             return m.decision_function(B)[:, None]
         P = np.full((B.shape[0], self.n_out), 1e-6)
