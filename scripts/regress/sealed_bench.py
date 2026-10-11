@@ -335,11 +335,20 @@ def hand_talkingdata(X):
     return X
 
 
+# Held-back validation cases (kept out of this repo until each is run blind): preps live in heldback_preps.py
+# next to this script when present; their FF arm runs only with HELDBACK_FF=1.
+HELDBACK = set()
+_hb = Path(__file__).with_name('heldback_preps.py')
+if _hb.exists():
+    exec(_hb.read_text())
+
 SEALED = {'isic2024_meta', 'cmi_piu', 'student_gameplay', 'otto', 'jane_street'}
 
 
 if a.contest in SEALED and a.arm != 'prep' and not os.environ.get('UNSEAL'):
     sys.exit(f'{a.contest} is sealed until the final variant is declared (set UNSEAL=1 then)')
+if a.contest in HELDBACK and a.arm == 'ff' and not os.environ.get('HELDBACK_FF'):
+    sys.exit(f'{a.contest} is held back for a family hash: set HELDBACK_FF=1 to run FeatureForge on it')
 P = globals()[f'prep_{a.contest}']()
 if a.arm == 'prep':  # shapes only: no model, no label statistics
     print(dict(contest=a.contest, rows=len(P['X']), cols=P['X'].shape[1], held_out=int(P['ho'].sum()),
@@ -383,8 +392,8 @@ for c in Xtr.columns:
         cats = pd.Index(pd.unique(_s(Xtr[c])))
         Xtr[c] = pd.Categorical(_s(Xtr[c]), categories=cats); Xte[c] = pd.Categorical(_s(Xte[c]), categories=cats)
 import lightgbm as lgb
-obj = 'binary' if P['task'] == 'binary' else 'regression'
-Pm = dict(objective=obj, learning_rate=0.05, num_leaves=63, min_child_samples=20 if len(Xtr) < 5000 else 100,
+obj = {'binary': 'binary', 'multiclass': 'multiclass'}.get(P['task'], 'regression')
+Pm = dict(objective=obj, **({'num_class': P['n_class']} if obj == 'multiclass' else {}), learning_rate=0.05, num_leaves=63, min_child_samples=20 if len(Xtr) < 5000 else 100,
           feature_fraction=0.5, bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, num_threads=4, verbose=-1,
           max_cat_to_onehot=8, cat_smooth=50)
 n = len(Xtr)
@@ -394,7 +403,7 @@ else:
     perm = np.random.default_rng(a.seed + 1).permutation(n); fit, va = np.sort(perm[:int(0.85 * n)]), np.sort(perm[int(0.85 * n):])
 b = lgb.train(dict(Pm, seed=0), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 5000, valid_sets=[lgb.Dataset(Xtr.iloc[va], ytr[va])],
               callbacks=[lgb.early_stopping(200, verbose=False)])
-p = np.zeros(len(Xte))
+p = np.zeros((len(Xte), P['n_class']) if obj == 'multiclass' else len(Xte))
 for s in range(3):
     p += lgb.train(dict(Pm, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
 res = dict(contest=a.contest, arm=a.arm + ('_shuffled' if a.shuffle else ''), seed=a.seed, metric=P['metric'],
