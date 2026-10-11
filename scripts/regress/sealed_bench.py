@@ -279,6 +279,33 @@ def prep_jane_street():
     return dict(X=d, y=y, task='regression', ho=ho, score=weighted_r2(w), metric='weighted_r2', higher=True, time=True)
 
 
+def prep_svp():
+    # Santander Value Prediction (2018): 4,459 rows x 4,991 anonymised, mostly-zero columns; the test is a random
+    # draw of other customers. Scored as RMSLE: fit log1p(target), RMSE on that scale.
+    d = pd.read_csv(D / 'train.csv')
+    y = np.log1p(d.pop('target').to_numpy())
+    d = d.drop(columns=['ID'])
+    d = d.loc[:, d.nunique(dropna=False) > 1]
+    ho = np.zeros(len(d), bool); ho[np.random.default_rng(a.seed).permutation(len(d))[:int(0.2 * len(d))]] = True
+    return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmsle', higher=False)
+
+
+def prep_talkingdata():
+    # TalkingData AdTracking (2018): click log, every click of 2% of IPs (tdata_prep.py). The real test is the next
+    # day's hours 4, 5, 9, 10, 13, 14 (UTC) about 12 h after train ends; here train = clicks before 2017-11-08 16:00,
+    # holdout = 2017-11-09 at those hours, the rows between are dropped. attributed_time is never loaded (leak).
+    d = pd.read_parquet(D / 'clicks.parquet').sort_values('click_time', kind='stable').reset_index(drop=True)
+    t = d['click_time']
+    tr = t < pd.Timestamp('2017-11-08 16:00')
+    te = (t.dt.normalize() == pd.Timestamp('2017-11-09')) & t.dt.hour.isin([4, 5, 9, 10, 13, 14])
+    d = d[tr | te].reset_index(drop=True); ho = te[tr | te].to_numpy()
+    y = d.pop('is_attributed').to_numpy()
+    for c in ['ip', 'app', 'device', 'os', 'channel']:
+        d[c] = d[c].astype('int64')
+    from sklearn.metrics import roc_auc_score
+    return dict(X=d, y=y, task='binary', ho=ho, score=roc_auc_score, metric='auc', higher=True, time=True)
+
+
 SEALED = {'isic2024_meta', 'cmi_piu', 'student_gameplay', 'otto', 'jane_street'}
 
 

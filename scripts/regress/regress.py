@@ -144,6 +144,8 @@ CASES.update({
     'mcts': _sealed('mcts', False, 0.005),
     'writing_quality': _sealed('writing_quality', False, 0.01, n_seeds=3),
     'jpx': _sealed('jpx', True, 0.02, n_seeds=1),
+    'svp': _sealed('svp', False, 0.01, n_seeds=3, tier='new'),
+    'talkingdata': _sealed('talkingdata', True, 0.002, n_seeds=1, tier='new'),
     'isic2024_meta': _sealed('isic2024_meta', True, 0.004, tier='sealed'),
     'cmi_piu': _sealed('cmi_piu', True, 0.02, n_seeds=5, tier='sealed'),
     'student_gameplay': _sealed('student_gameplay', True, 0.003, tier='sealed'),
