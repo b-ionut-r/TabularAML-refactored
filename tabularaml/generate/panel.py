@@ -114,6 +114,16 @@ def panel_features(Xtr: pd.DataFrame, Xte: pd.DataFrame, lags: Tuple[int, ...] =
                 md = v.sum(1) - mx - mn
                 with np.errstate(all="ignore"):
                     imb["__triplet__".join(t)] = np.where(md - mn > 0, (mx - md) / (md - mn), np.nan)
+        # A side flag (-1 / 0 / 1) signs the amount it shares a name with (imbalance_size by imbalance_buy_sell_flag).
+        for f in [c for c in X.columns if c not in keys and pd.api.types.is_numeric_dtype(X[c])
+                  and set(pd.unique(X[c].dropna().iloc[:100_000])) <= {-1, 0, 1} and (X[c] < 0).any()]:
+            stem = f.lower().split("_")[0]
+            for c in [c for c in num if c.lower().split("_")[0] == stem]:
+                sv = X[c].to_numpy(dtype=float) * X[f].to_numpy(dtype=float)
+                imb[f"{c}__signed"] = sv
+                for b in [b for b in num if b != c and any(w in b.lower() for w in UNIT_WORDS[1]) and any(w in c.lower() for w in UNIT_WORDS[1])]:
+                    with np.errstate(all="ignore"):
+                        imb[f"{c}__signed__over__{b}"] = sv / X[b].to_numpy(dtype=float)
         out.update(imb)
         for c in imb:
             out[f"{c}__moment_rank"] = pd.Series(imb[c]).groupby(mk, observed=True).rank(pct=True).to_numpy()

@@ -84,3 +84,25 @@ samples 0 / 1:
 
 On 12 stocks the streamed run (no child-row models) scored 0.317 / 0.324 in 8-12 min at 3.8 GB, against 0.316 / 0.341
 whole (25 min, 9.6 GB).
+
+## Intraday panels (`tabularaml/generate/panel.py`): Optiver Trading at the Close (Kaggle 2023)
+
+One row per stock, day and 10-second step of the closing auction (5.2M rows, 200 stocks). The family switches on when
+an entity recurs in the test rows, a moment's rows sit together in the file with at least 10 entities each, and the
+test rows' days are new. It adds same-unit imbalances (sizes against sizes, prices against prices, signed by a
+-1 / 0 / 1 side flag that shares the amount's name), each column against the moment's mean and its rank in the moment,
+and the entity's change over its last 1-3 steps that day (earlier steps only). Off on Rossmann, Walmart, Recruit,
+Favorita, Enefit, GoDaddy, Riiid and every random split.
+
+`scripts/tatc_bench.py`: last 45 days held out (window 0: days 436-480, 1: days 391-435), 120 training days, L1
+bagged LightGBM; MAE, mean of 3 judge seeds (seed noise about 0.01-0.02).
+
+| arm | window 0 | window 1 |
+|---|---|---|
+| raw | 5.904 | 6.029 |
+| winners' hand features | 5.844 | 5.984 |
+| PR #2 head 8d6cf0e | 5.886 | 6.016 |
+| 8d6cf0e + panel family | 5.851 | 6.001 |
+
+Build 17-19 min (panel part seconds), judge peak 5.8 GB. The winners' gap left is mostly in their imbalance and
+cross-stock groups beyond these (window 1: imbalance group alone 5.979).
