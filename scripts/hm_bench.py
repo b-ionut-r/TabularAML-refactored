@@ -14,7 +14,9 @@ Arms (same bagged LightGBM: early stopping on 15% of the training customers, the
   ``raw``  the pair's own columns (customer, article and its product / type / department / garment / colour codes);
   ``ff``   blind: ``scripts/contest_features.py`` at its defaults, the history as an event log
            (``log=...:customer_id:week``), so its as-of aggregation switches on.
-``--shuffle`` permutes the training labels (leakage control).
+``--shuffle`` permutes the training labels (leakage control): ``--shuffle-within all`` (default) across every training row,
+``customer`` within each customer, ``count`` within customers bucketed by their number of candidate pairs (powers of 2);
+``--shuffle-seed`` picks the permutation.
 """
 import sys, time, json, warnings, argparse, subprocess, tempfile, shutil
 from pathlib import Path
@@ -25,6 +27,9 @@ ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_
 ap.add_argument('--customers', type=int, default=30000); ap.add_argument('--window', type=int, default=0)
 ap.add_argument('--data', default='data/hm/'); ap.add_argument('--log', default='hm.jsonl'); ap.add_argument('--tag', default='')
 ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--shuffle-seed', type=int, default=0)
+ap.add_argument('--shuffle-within', default='all', choices=['all', 'customer', 'count'],
+                help="permute labels across all training rows, within each customer, or within customers' candidate-count buckets")
 ap.add_argument('--keep', default='all', help="diagnosis: 'agg' keeps the raw columns plus the log's aggregates only")
 a = ap.parse_args()
 D = Path(a.data)
@@ -56,7 +61,15 @@ print('pairs', pairs.shape, 'positive rate', round(y.mean(), 4), 'history rows',
 tr, te = pairs[~ho].reset_index(drop=True), pairs[ho].reset_index(drop=True)
 ytr, yte = y[~ho], y[ho]
 if a.shuffle:
-    ytr = np.random.default_rng(0).permutation(ytr)
+    rng = np.random.default_rng(a.shuffle_seed)
+    if a.shuffle_within == 'all':
+        ytr = rng.permutation(ytr)
+    else:
+        n_c = tr.groupby('customer_id').customer_id.transform('size').to_numpy()
+        grp = tr.customer_id.to_numpy() if a.shuffle_within == 'customer' else np.ceil(np.log2(n_c)).astype(int)
+        ytr = ytr.copy()
+        for idx in pd.Series(np.arange(len(ytr))).groupby(grp).indices.values():
+            ytr[idx] = ytr[rng.permutation(idx)]
 t0 = time.time(); info = {}
 if a.arm == 'raw':
     Xtr, Xte = tr.drop(columns=['week']), te.drop(columns=['week'])
@@ -94,7 +107,7 @@ b = lgb.train(dict(P, seed=0), lgb.Dataset(Xtr[~va], ytr[~va]), 5000, valid_sets
 p = np.zeros(len(Xte))
 for s in range(3):
     p += lgb.train(dict(P, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
-res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else '') + ('' if a.keep == 'all' else '_' + a.keep), seed=a.seed, window=a.window, customers=a.customers,
+res = dict(arm=a.arm + a.tag + (f'_shuffled_{a.shuffle_within}{a.shuffle_seed}' if a.shuffle else '') + ('' if a.keep == 'all' else '_' + a.keep), seed=a.seed, window=a.window, customers=a.customers,
            auc=float(roc_auc_score(yte, p)), n_cols=Xtr.shape[1], best_it=b.best_iteration, fe_s=round(fe_t),
            total_s=round(time.time() - t0), **info)
 print('RESULT', json.dumps(res)); open(a.log, 'a').write(json.dumps(res) + '\n')
