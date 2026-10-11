@@ -32,6 +32,7 @@ from tabularaml.generate.forge import FeatureForge  # noqa: E402
 from tabularaml.generate.lists import as_lists, json_fields, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.returns import return_features  # noqa: E402
 from tabularaml.generate.panel import panel_features  # noqa: E402
+from tabularaml.generate.rowstats import row_stat_features  # noqa: E402
 from tabularaml.generate.stream import aggregation_bytes, chunks, memory_bytes  # noqa: E402
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, time_values, child_model_features,  # noqa: E402
@@ -244,6 +245,9 @@ def main():
                     help="history families (tabularaml/generate/history.py), on from structure: latest state of keyed "
                          "child tables with a time column (last, last - mean, last - previous), and outcome history "
                          "of as-of event logs that carry the target (earlier outcomes, strictly before each row)")
+    ap.add_argument("--rowstats", default="auto", choices=["auto", "off"],
+                    help="row statistics across groups of 10+ same-kind columns (count of non-zero cells, mean, std, "
+                         "min, max, median, sum), tabularaml/generate/rowstats.py; on from structure")
     ap.add_argument("--panel", default="auto", choices=["auto", "off"],
                     help="intraday panels: each entity against all at the same moment and its own last steps of the "
                          "day, tabularaml/generate/panel.py; on from structure")
@@ -403,6 +407,7 @@ def main():
     Xte = te.drop(columns=[a.id]) if a.id else te
     Xte = Xte[Xtr.columns]
     n_main = tr.shape[1]
+    file_cols = list(Xtr.columns)   # (row statistics read the file's own columns, not other families')
     if a.lists == "auto":
         t = time.time()
         Jtr, Jte, jfound = json_fields(Xtr, Xte)
@@ -428,6 +433,13 @@ def main():
             Xtr = pd.concat([Xtr.reset_index(drop=True), Ptr], axis=1)
             Xte = pd.concat([Xte.reset_index(drop=True), Pte], axis=1)
             print(f"panel: {P} -> {Ptr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+    if a.rowstats == "auto":
+        t = time.time()
+        Rtr, Rte, G = row_stat_features(Xtr[file_cols], Xte[[c for c in file_cols if c in Xte.columns]])
+        if G:
+            Xtr = pd.concat([Xtr.reset_index(drop=True), Rtr], axis=1)
+            Xte = pd.concat([Xte.reset_index(drop=True), Rte], axis=1)
+            print(f"row statistics: groups {G} -> {Rtr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
     del tr, te  # a second copy of both tables is gigabytes on IEEE-CIS
     forecasting = False
     if a.forecast == "auto":
