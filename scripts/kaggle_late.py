@@ -133,6 +133,8 @@ CONTESTS["hc_s"] = dict(CONTESTS["hc"], raw="hc", repo=S_REPO, base="hc")
 
 # Work clock with per-iteration fit costs (wt_det2, on superset 3f92353).
 CONTESTS["ieee_t"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_det2")
+# Calibrated work clock 76b7e07.
+CONTESTS["hc_t"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_76b7e07", base="hc")
 
 
 def download(c: str) -> Path:
@@ -348,8 +350,9 @@ def cmd_feats(c: str, budget: float, extra: list[str]):
 
 # ---------------------------------------------------------------- judge
 
-def encode(Xtr: pd.DataFrame, Xte: pd.DataFrame, dates: list[str]):
-    Xtr, Xte = Xtr.copy(), Xte.copy()
+def encode(Xtr: pd.DataFrame, Xte: pd.DataFrame, dates: list[str], copy: bool = True):
+    if copy:
+        Xtr, Xte = Xtr.copy(), Xte.copy()
     for c in Xtr.columns:
         if c in dates:
             for X in (Xtr, Xte):
@@ -426,13 +429,17 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
     if gone:
         print(f"dropped {len(gone)} columns: {gone}")
     Xte = Xte[Xtr.columns]
+    # Only the closed flag is read from the raw frames later: wide feature frames (IEEE-CIS, 1,000+
+    # columns) otherwise sit in memory three times over.
+    te = te[[cfg["closed_zero"]]] if cfg.get("closed_zero") else None
+    del tr
     if cfg.get("fit_pos"):  # score-relevant training rows only (RMSPE skips zero sales)
         keep = y > 0
         Xtr, y = Xtr[keep].reset_index(drop=True), y[keep]
     groups = None
     if cfg["folds"] == "group:year":
         groups = pd.to_datetime(Xtr["Date"].astype(str)).dt.year.to_numpy()
-    Xtr, Xte = encode(Xtr, Xte, cfg.get("dates", []))
+    Xtr, Xte = encode(Xtr, Xte, cfg.get("dates", []), copy=False)
     t0 = time.time()
     pte, oof, m = judge(Xtr, y, Xte, cfg, groups)
     cv = score(cfg["metric"], np.log1p(y[m]) if cfg.get("log_target") else y[m], oof[m])
