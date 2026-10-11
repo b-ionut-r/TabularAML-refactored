@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .relational import Child, _safe
+from .relational import Child, _safe, time_values
 from tabularaml.generate.strs import as_text
 
 
@@ -78,8 +78,8 @@ def event_log_features(main: pd.DataFrame, ch: Child, outcome: str, time: str, i
     keys = pd.Index(pd.unique(main[ch.key]))
     ek = keys.get_indexer(df[ch.key]); keep = ek >= 0
     df, ek = df.loc[keep], ek[keep]
-    et = df[ch.time].to_numpy(dtype=float)
-    mk = keys.get_indexer(main[ch.key]); mt = main[time].to_numpy(dtype=float)
+    et = time_values(df[ch.time])
+    mk = keys.get_indexer(main[ch.key]); mt = time_values(main[time])
     yv = pd.to_numeric(df[outcome], errors="coerce").to_numpy(dtype=float)
     if outcome_values is not None:
         yv = np.where(np.isin(yv, list(outcome_values)), yv, np.nan)

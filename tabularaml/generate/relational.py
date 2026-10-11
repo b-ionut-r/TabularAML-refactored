@@ -302,6 +302,17 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
     return res.astype(np.float32)
 
 
+def time_values(s: pd.Series) -> np.ndarray:
+    """A time column as floats: numbers as they are, dates (datetime or text such as 2015-01-28) as nanoseconds."""
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+        return s.to_numpy(dtype=float)
+    if not pd.api.types.is_datetime64_any_dtype(s):
+        s = pd.to_datetime(as_text(s), errors="coerce")
+    v = s.to_numpy("datetime64[ns]").astype(np.int64).astype(float)
+    v[s.isna().to_numpy()] = np.nan
+    return v
+
+
 def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Sequence[int] = (5, 20),
                   top_levels: int = 12, stats: Sequence[str] = ("mean", "sum", "max", "min", "std")) -> pd.DataFrame:
     """Aggregations of a child event table as of each main row's time: only child rows of
@@ -322,9 +333,9 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
     ck = keys.get_indexer(df[key])
     keep = ck >= 0
     df, ck = df.loc[keep], ck[keep]
-    ct = df[ch.time].to_numpy(dtype=float)
+    ct = time_values(df[ch.time])
     mk = keys.get_indexer(main[key])
-    mt = main[time].to_numpy(dtype=float)
+    mt = time_values(main[time])
     # Positions in the child sorted by (key, time): a time rank over child and main times
     # makes the pair one sortable integer.
     allt = np.unique(np.concatenate([ct[np.isfinite(ct)], mt[np.isfinite(mt)]]))
