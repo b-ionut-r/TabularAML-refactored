@@ -111,6 +111,13 @@ F2_REPO = "/tmp/claude-0/wt_2fb"
 for _c in ["wnv", "porto", "sct", "hc"]:
     CONTESTS[f"{_c}_f2"] = dict(CONTESTS[_c], raw=CONTESTS[_c].get("raw", _c), repo=F2_REPO, base=_c)
 
+# Candidate head 6c034b5 (faster branch: 8d6cf0e + category-column fixes, panel family with as-of fix, wide-frame fixes).
+G6_REPO = "/tmp/claude-0/wt_6c0"
+CONTESTS["ieee_g6"] = dict(CONTESTS["ieee_v6"], repo=G6_REPO)
+for _c, _base in [("hc", "hc"), ("sct", "sct"), ("wnv", "wnv"), ("porto", "porto"), ("ross", "ross_fc"), ("m5", "m5"),
+                  ("fav", "fav")]:
+    CONTESTS[f"{_c}_g6"] = dict(CONTESTS[_base], raw=CONTESTS[_base].get("raw", _base), repo=G6_REPO, base=_base)
+
 
 def download(c: str) -> Path:
     d = ROOT / CONTESTS[c].get("raw", c) / "raw"
