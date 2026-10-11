@@ -24,6 +24,8 @@ def test_as_text_matches_astype_str_without_fixed_width_copies():
     out = as_text(s)
     assert out.dtype == object and out.iloc[0] == str(s.iloc[0])
     assert list(as_text(pd.Series([1.5, np.nan]))) == ["1.5", "nan"]
+    assert list(as_text(pd.Series(["x", None], dtype=object))) == ["x", "nan"]
+    assert list(as_text(pd.Series([1, 2]).astype("category"))) == ["1", "2"]
 
 
 def test_long_text_columns_go_through_date_check_and_child_aggregates():
