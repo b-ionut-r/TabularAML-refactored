@@ -306,6 +306,35 @@ def prep_talkingdata():
     return dict(X=d, y=y, task='binary', ho=ho, score=roc_auc_score, metric='auc', higher=True, time=True)
 
 
+def hand_svp(X):
+    # Public kernels' row statistics over the non-zero cells (count of non-zeros, log-scale mean/max/min/std/median, sum).
+    v = X.to_numpy(float); nz = v != 0; lv = np.where(nz, np.log1p(np.abs(v)), np.nan)
+    import warnings; warnings.simplefilter('ignore')
+    H = pd.DataFrame({'nz_count': nz.sum(1), 'nz_logmean': np.nanmean(lv, 1), 'nz_logmax': np.nanmax(lv, 1),
+                      'nz_logmin': np.nanmin(lv, 1), 'nz_logstd': np.nanstd(lv, 1), 'nz_logmed': np.nanmedian(lv, 1),
+                      'logsum': np.log1p(np.abs(v).sum(1))}, index=X.index)
+    return pd.concat([X, H], axis=1)
+
+
+def hand_talkingdata(X):
+    # Winners' staples: group counts, unique counts and time to the next click of the same user/app (on all rows,
+    # unlabeled holdout included, as the real test was used).
+    X = X.copy(); t = X['click_time']; X['hour'] = t.dt.hour; X['day'] = t.dt.day
+    ts = t.astype('int64') // 10**9
+    for g in [['ip', 'day', 'hour'], ['ip', 'app'], ['ip', 'app', 'os'], ['ip', 'device'], ['app', 'channel'], ['ip']]:
+        X['cnt_' + '_'.join(g)] = X.groupby(g)['app'].transform('size').astype(float)
+    for g, c in [(['ip'], 'channel'), (['ip'], 'app'), (['ip', 'day'], 'hour'), (['ip', 'app'], 'os'), (['ip'], 'device'),
+                 (['app'], 'channel'), (['ip', 'device', 'os'], 'app')]:
+        X['nu_' + '_'.join(g) + '_' + c] = X.groupby(g)[c].transform('nunique').astype(float)
+    for g in [['ip', 'app', 'device', 'os'], ['ip', 'os', 'device'], ['ip', 'app', 'device', 'os', 'channel']]:
+        X['next_' + '_'.join(g)] = (X.groupby(g)['click_time'].shift(-1).astype('int64') // 10**9 - ts).where(
+            X.groupby(g)['click_time'].shift(-1).notna()).astype(float)
+        X['prev_' + '_'.join(g)] = (ts - X.groupby(g)['click_time'].shift(1).astype('int64') // 10**9).where(
+            X.groupby(g)['click_time'].shift(1).notna()).astype(float)
+    X['cum_ip_device_os'] = X.groupby(['ip', 'device', 'os']).cumcount().astype(float)
+    return X
+
+
 SEALED = {'isic2024_meta', 'cmi_piu', 'student_gameplay', 'otto', 'jane_street'}
 
 
@@ -323,6 +352,9 @@ if a.shuffle:
     ytr = np.random.default_rng(0).permutation(ytr)
 t0 = time.time()
 idc = P.get('id')
+if a.arm == 'hand':
+    _H = globals()[f'hand_{a.contest}'](pd.concat([Xtr, Xte], ignore_index=True))
+    Xtr, Xte = _H.iloc[:len(Xtr)].reset_index(drop=True), _H.iloc[len(Xtr):].reset_index(drop=True)
 if a.arm == 'ff':
     tmp = Path(tempfile.mkdtemp(dir='/home/user/tmp'))
     try:

@@ -134,7 +134,7 @@ CASES.update({
 # (sealed_bench refuses them unless UNSEAL=1).
 def _sealed(name, higher, noise, n_seeds=2, tier='sealed_open'):
     return dict(script='sealed_bench.py', args=['--contest', name, '--repo', '{repo}', '--log', '{tmp}/log.jsonl'],
-                arms={'raw': ['--arm', 'raw'], 'ff': ['--arm', 'ff']}, shuffle=['--shuffle'], metric='score',
+                arms={'raw': ['--arm', 'raw'], 'ff': ['--arm', 'ff'], 'hand': ['--arm', 'hand']}, shuffle=['--shuffle'], metric='score',
                 higher=higher, noise=noise, tier=tier, needs=['{data}/sealed/' + name], samples=_seeds(*range(n_seeds)))
 
 
