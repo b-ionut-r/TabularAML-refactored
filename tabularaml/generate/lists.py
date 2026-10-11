@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from tabularaml.generate.strs import as_text
 
 DELIMS = (" ; ", ";", "|", ",")
 
@@ -53,7 +54,7 @@ def as_lists(s: pd.Series, sample: int = 5000) -> Optional[pd.Series]:
             or isinstance(s.dtype, pd.CategoricalDtype)):
         return None
     s = s.astype(object).where(s.notna(), None)
-    head = head.astype(str)
+    head = as_text(head)
     if head.nunique() <= 50:
         return None   # a category whose names hold a comma ("Stone, brick"), or a few fixed item sets
     for d in DELIMS:

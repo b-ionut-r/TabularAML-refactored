@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .relational import Child, _safe
+from tabularaml.generate.strs import as_text
 
 
 def repeats(ch: Child, min_share: float = 0.3) -> bool:
@@ -30,7 +31,7 @@ def history_features(ch: Child) -> pd.DataFrame:
            and not pd.api.types.is_bool_dtype(df[c])]
     if not num:
         return pd.DataFrame(index=pd.Index(pd.unique(df[ch.key]), name=ch.key))
-    order = np.lexsort((df[ch.time].to_numpy(), df[ch.key].astype(str).to_numpy()))
+    order = np.lexsort((df[ch.time].to_numpy(), as_text(df[ch.key]).to_numpy()))
     d = df.iloc[order][[ch.key] + num].reset_index(drop=True)
     for c in num:
         d[c] = d[c].astype(np.float32)
@@ -107,9 +108,9 @@ def event_log_features(main: pd.DataFrame, ch: Child, outcome: str, time: str, i
             i = p - j
             out[f"{pre}_since{j}"] = np.where(i >= lo, mt - ts[np.clip(i, 0, len(ts) - 1)], np.nan)
     if item is not None and item in df.columns and item in main.columns:
-        iv = pd.Index(pd.unique(pd.concat([df[item], main[item]]).astype(str)))
-        ki = ek.astype(np.int64) * (len(iv) + 1) + iv.get_indexer(df[item].astype(str))
-        qi = mk.astype(np.int64) * (len(iv) + 1) + iv.get_indexer(main[item].astype(str))
+        iv = pd.Index(pd.unique(pd.concat([as_text(df[item]), as_text(main[item])])))
+        ki = ek.astype(np.int64) * (len(iv) + 1) + iv.get_indexer(as_text(df[item]))
+        qi = mk.astype(np.int64) * (len(iv) + 1) + iv.get_indexer(as_text(main[item]))
         _, inv_e = np.unique(np.concatenate([ki, qi]), return_inverse=True)
         o2, lo2, p2 = _sorted_index(inv_e[:len(ki)], et, inv_e[len(ki):], mt)
         y2, t2 = yv[o2], et[o2]

@@ -39,6 +39,7 @@ import re
 
 import numpy as np
 import pandas as pd
+from tabularaml.generate.strs import as_text
 
 
 def _safe(name: str) -> str:
@@ -129,14 +130,14 @@ class RelatedTables:
         # contest winners used); wide children keep their most common levels.
         bag = len(cats) == 1 and len(feats) <= 3
         for c in cats:
-            s = df[c].astype(str)
+            s = as_text(df[c])
             if (ch.name, c) not in self.levels_:
                 vc = s.value_counts()
                 self.levels_[(ch.name, c)] = list(vc.index[vc >= 20][:300] if bag else vc.index[:self.top_levels])
             for lv in self.levels_[(ch.name, c)]:
                 parts.append(pd.DataFrame({f"{c}={lv}": (s == lv).astype(np.float32)}, index=df.index))
         if bag and num:
-            s = df[cats[0]].astype(str)
+            s = as_text(df[cats[0]])
             for lv in self.levels_[(ch.name, cats[0])]:
                 m = (s == lv).to_numpy()
                 for c in num:
@@ -171,11 +172,11 @@ class RelatedTables:
         # refused applications).
         splits = []
         for c in cats:
-            vc = df[c].astype(str).value_counts(normalize=True)
+            vc = as_text(df[c]).value_counts(normalize=True)
             if 2 <= len(vc) <= 6 and vc.iloc[0] < 0.9:
                 splits.append((vc.iloc[0], c, list(vc.index[:2])))
         for _, c, levels in sorted(splits)[:self.n_split]:
-            s = df[c].astype(str).to_numpy()
+            s = as_text(df[c]).to_numpy()
             for lv in levels:
                 sub = W.loc[s == lv, [key] + dense]
                 a = sub.groupby(key, sort=False)[dense].agg(["mean", "max", "sum"])
@@ -353,7 +354,7 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
                 cum = (s.groupby(blk).cummax() if st == "max" else s.groupby(blk).cummin()).to_numpy()
                 out[f"{pre}__{c}_{st}"] = np.where(has, cum[np.maximum(p - 1, 0)], np.nan)
     for c in cats:
-        s = df[c].astype(str).to_numpy()[order]
+        s = as_text(df[c]).to_numpy()[order]
         for lv in pd.Series(s).value_counts().index[:top_levels]:
             S = prefix((s == lv).astype(float))
             with np.errstate(all="ignore"):
@@ -380,14 +381,14 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
     """
     from tabularaml.generate.forge import column_families
     tab = table.drop_duplicates(key).set_index(key)
-    keys = set(tab.index.astype(str))
+    keys = set(as_text(tab.index))
     num = [c for c in tab.columns if pd.api.types.is_numeric_dtype(tab[c])]
     cat = [c for c in tab.columns if c not in num and 2 <= tab[c].nunique() <= 30]
 
     def hits(cols):
         # The columns hold the table's keys: most of their values are keys, or (a table
         # covering one kind of component among many) most of the table's keys occur in them.
-        v = pd.concat([main[c].dropna().astype(str) for c in cols])
+        v = pd.concat([as_text(main[c].dropna()) for c in cols])
         if len(v) == 0:
             return False
         seen = set(pd.unique(v))
@@ -409,9 +410,9 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
     nfam = column_families([c for c in main.columns if pd.api.types.is_numeric_dtype(main[c])])
     out = {}
     T = tab.copy()
-    T.index = T.index.astype(str)
+    T.index = as_text(T.index)
     for c in [c for c in cand if c not in in_fam]:
-        A = T.reindex(main[c].astype(str).to_numpy())
+        A = T.reindex(as_text(main[c]).to_numpy())
         for a in num:
             out[f"{name}__{c}__{a}"] = A[a].to_numpy(dtype=float)
         for a in cat:
@@ -420,7 +421,7 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
     idx = lambda c: re.match(r"^.*?(\d+)$", str(c)).group(1)
     for stem, cols in fams.items():
         pair = next((v for v in nfam.values() if [idx(x) for x in v] == [idx(x) for x in cols]), None)
-        V = np.column_stack([main[c].astype(str).where(main[c].notna(), None).to_numpy() for c in cols])
+        V = np.column_stack([as_text(main[c]).where(main[c].notna(), None).to_numpy() for c in cols])
         filled = np.column_stack([main[c].notna().to_numpy() for c in cols])
         Q = (np.nan_to_num(np.column_stack([main[c].to_numpy(dtype=float) for c in pair]), nan=0.0)
              if pair else filled.astype(float))
@@ -461,8 +462,8 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
             and pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 2][:4]
     t_child = t_main = None
     if main_time is not None and ch.time is not None:
-        t_child = pd.to_datetime(df[ch.time].astype(str), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
-        t_main = pd.to_datetime(main[main_time].astype(str), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
+        t_child = pd.to_datetime(as_text(df[ch.time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
+        t_main = pd.to_datetime(as_text(main[main_time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
     rows = pd.DataFrame({"__r": np.arange(len(main)), key: main[key].to_numpy()})
     for c in cols:
         rows[c] = main[c].to_numpy()

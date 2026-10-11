@@ -32,13 +32,14 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+from tabularaml.generate.strs import as_text
 
 _DAY = 86400.0
 
 
 def _to_days(s: pd.Series) -> np.ndarray:
     if isinstance(s.dtype, pd.CategoricalDtype) or s.dtype == object:
-        s = s.astype(str)
+        s = as_text(s)
     d = pd.to_datetime(s, errors="coerce")
     if getattr(d.dt, "tz", None) is not None:
         d = d.dt.tz_localize(None)
@@ -60,7 +61,7 @@ def _is_date(s: pd.Series) -> bool:
         return True
     if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
         return False
-    v = s.dropna().astype(str).head(500)
+    v = as_text(s.dropna().head(500))
     if len(v) < 20 or v.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}").mean() < 0.95:
         return False
     return pd.to_datetime(v, errors="coerce").notna().mean() > 0.95
@@ -75,7 +76,7 @@ def _canon(s: pd.Series) -> pd.Series:
             s = num
     if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
         return pd.Series(np.where(s.isna(), None, s.astype(float).astype(str)), index=s.index, dtype=object)
-    return s.astype(object).where(s.notna(), None).astype(str).where(s.notna(), None)
+    return as_text(s).where(s.notna(), None)
 
 
 def _keytext(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
@@ -86,7 +87,7 @@ def _keytext(df: pd.DataFrame, cols: Sequence[str]) -> pd.Series:
 
 
 def _codes(s: pd.Series) -> np.ndarray:
-    return pd.factorize(s.astype(str) if isinstance(s.dtype, pd.CategoricalDtype) else s, use_na_sentinel=True)[0]
+    return pd.factorize(as_text(s) if isinstance(s.dtype, pd.CategoricalDtype) else s, use_na_sentinel=True)[0]
 
 
 def _combo(df: pd.DataFrame, cols: Sequence[str]) -> np.ndarray:
