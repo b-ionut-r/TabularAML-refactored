@@ -304,7 +304,7 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
 
     Per main row: number of earlier events, time since the first and the last; mean /
     sum / max / min / std of each numeric child column over all earlier events and the
-    mean over the last ``recent`` ones; share of earlier events at each frequent level of
+    mean over the last ``recent`` ones, the latest value and its last change; share of earlier events at each frequent level of
     each categorical column, their count over the last ``recent[0]``, and the number of
     distinct levels seen. Computed with prefix sums over the child sorted by (key, time),
     so the cost is O((rows + events) log) whatever the number of main rows per key.
@@ -367,6 +367,10 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
             for k in recent:
                 a = np.maximum(lo, p - k)
                 out[f"{pre}__{c}_last{k}"] = window(S, a, p) / window(N, a, p)
+            # The latest state as of the row (a customer's products last month) and its last change.
+            last = np.where(has, x[np.maximum(p - 1, 0)], np.nan)
+            out[f"{pre}__{c}_latest"] = last
+            out[f"{pre}__{c}_latest_change"] = np.where(n >= 2, last - x[np.maximum(p - 2, 0)], np.nan)
         for st, fn in (("max", np.fmax), ("min", np.fmin)):
             if st in stats:
                 s = pd.Series(np.where(ok, x, np.nan))
