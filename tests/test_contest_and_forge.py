@@ -3,7 +3,8 @@ import pandas as pd
 import pytest
 
 from tabularaml.contest import ContestSolver, get_metric, hill_climb
-from tabularaml.generate.forge import FeatureForge, column_families
+from tabularaml.generate.forge import (CrossLinearOOF, FeatureForge, GeoPair, column_families,
+                                       geo_points)
 
 
 def _frame(n=1500, seed=0):
@@ -81,3 +82,375 @@ def test_forge_adds_nothing_on_pure_noise_target():
     y = rng.normal(size=len(X))
     f = FeatureForge(task="regression", time_budget=60, n_jobs=1, verbose=False).fit(X, y)
     assert f.new_columns_ == []
+
+
+def test_column_families_sorted_by_index():
+    fam = column_families(["PAY_0", "PAY_10", "PAY_2", "PAY_3"])
+    assert fam == {"PAY": ["PAY_0", "PAY_2", "PAY_3", "PAY_10"]}
+
+
+def test_geo_points_and_haversine():
+    cols = ["Restaurant_latitude", "Restaurant_longitude", "drop_lat", "drop_lng", "x"]
+    pts = geo_points(cols)
+    assert pts == [("Restaurant_latitude", "Restaurant_longitude"), ("drop_lat", "drop_lng")]
+    df = pd.DataFrame({"Restaurant_latitude": [0.0], "Restaurant_longitude": [0.0],
+                       "drop_lat": [0.0], "drop_lng": [1.0]})
+    km = GeoPair(pts[0], pts[1], "hav").transform(df, None)
+    assert abs(km[0] - 111.19) < 0.1
+
+
+def test_cross_linear_is_out_of_fold_and_learns_pairs():
+    from sklearn.model_selection import StratifiedKFold
+    rng = np.random.default_rng(0)
+    n = 4000
+    X = pd.DataFrame({"u": rng.choice(list("abcdefghij"), n), "v": rng.choice(list("klmnopqrst"), n)})
+    # The label depends only on the (u, v) pair, not on u or v alone.
+    good = {(a, b) for a in "abcdefghij" for b in "klmnopqrst" if rng.random() < 0.5}
+    y = np.array([int((a, b) in good) for a, b in zip(X.u, X.v)])
+    folds = list(StratifiedKFold(5, shuffle=True, random_state=0).split(X, y))
+    pair = CrossLinearOOF(["u", "v"], 2, pairs=True).fit_transform_oof(X, y, None, folds)
+    single = CrossLinearOOF(["u", "v"], 2, pairs=False).fit_transform_oof(X, y, None, folds)
+    acc = lambda m: ((m > 0) == y).mean()
+    assert acc(pair) > 0.95 > 0.7 > acc(single)
+    spec = CrossLinearOOF(["u", "v"], 2).fit(X, y, None)
+    assert spec.transform(X.iloc[:7], None).shape == (7,)
+
+
+def test_forge_high_cardinality_recode_is_consistent():
+    rng = np.random.default_rng(0)
+    n = 6000
+    ids = np.array([f"id{i}" for i in range(400)])
+    X = pd.DataFrame({"user": rng.choice(ids, n), "x": rng.normal(size=n)})
+    eff = dict(zip(ids, rng.normal(size=len(ids))))
+    y = (X.user.map(eff) + X.x + rng.normal(scale=0.5, size=n) > 0).astype(int)
+    f = FeatureForge(task="binary", time_budget=60, n_rounds=1, n_jobs=1, verbose=False).fit(X, y)
+    A, B = f.transform_train(X), f.transform(X)
+    assert list(A.columns) == list(B.columns)
+    if f.recode_:
+        assert A["user"].dtype.kind == "f" and np.array_equal(A["user"], B["user"])
+    new = f.transform(pd.DataFrame({"user": ["never_seen"], "x": [0.0]}))
+    assert len(new) == 1
+
+
+def test_linresid_recovers_unexplained_part():
+    from tabularaml.generate.forge import LinResid
+    rng = np.random.default_rng(0)
+    n = 3000
+    a, b, c = rng.uniform(1, 5, (3, n))
+    extra = rng.normal(0, 1, n)
+    X = pd.DataFrame({"a": a, "b": b, "c": c, "w": a + b + c + extra})
+    r = LinResid(["a", "b", "c", "w"], "w").fit(X, None, None).transform(X, None)
+    assert np.corrcoef(r, extra)[0, 1] > 0.95
+    assert np.isfinite(LinResid(["a", "b", "c", "w"], "w", log=True).fit(X, None, None).transform(X, None)).all()
+
+
+def test_expr_spec_is_canonical_and_evaluates():
+    from tabularaml.generate.forge import Expr
+    X = pd.DataFrame({"a": [1.0, 2.0, 3.0], "b": [2.0, 0.0, 1.0], "c": [1.0, 1.0, 2.0]})
+    e1, e2 = Expr(("div", ("add", "a", "b"), "c")), Expr(("div", ("add", "b", "a"), "c"))
+    assert e1.name == e2.name and e1.parents == ["a", "b", "c"]
+    assert np.allclose(e1.transform(X, None), [3.0, 2.0, 2.0])
+    assert np.isnan(Expr(("div", "a", "b")).transform(X, None)[1])
+
+
+def test_genetic_search_finds_compound_ratio():
+    rng = np.random.default_rng(0)
+    n = 3000
+    X = pd.DataFrame(rng.uniform(1, 5, (n, 6)), columns=list("abcdef"))
+    y = X.a * X.b / X.c - X.d * X.e / X.f + rng.normal(0, 0.3, n)
+    kw = dict(task="regression", n_rounds=1, max_new_features=10, n_jobs=1, verbose=False, random_state=0)
+    base = FeatureForge(**kw).fit(X, y)
+    ga = FeatureForge(evolve_time=8, **kw).fit(X, y)
+    assert any(c.startswith("gp__") for c in ga.new_columns_)
+    assert ga.gate_fe_loss_ < base.gate_fe_loss_
+
+
+def test_entity_anchor_detection_finds_opening_day():
+    rng = np.random.default_rng(0)
+    n_ent, n = 3000, 30000
+    card = rng.integers(1000, 1300, n_ent)          # many entities share a card number
+    opened = rng.integers(0, 400, n_ent)            # hidden account-opening day
+    ent = rng.integers(0, n_ent, n)
+    day = rng.uniform(400, 580, n)
+    X = pd.DataFrame({"T": day * 86400, "card": card[ent], "D1": np.floor(day) - opened[ent],
+                      "D3": rng.integers(0, 300, n), "amt": rng.gamma(2, 50, n)})
+    f = FeatureForge(task="binary", verbose=False)
+    f.cat_cols_ = []
+    f.id_cols_ = f._id_columns(X)
+    assert "card" in f.id_cols_
+    anchors = f._find_anchors(X)
+    assert [(t, s, d) for t, s, d, _ in anchors] == [("T", 86400, "D1")]
+    f.anchors_ = anchors
+    A = f._add_anchors(X.copy())
+    assert (A.groupby(ent)[anchors[0][3]].nunique() == 1).all()
+
+
+def test_entity_lag_prev_next_nth():
+    from tabularaml.generate.forge import EntityLag
+    df = pd.DataFrame({"k": [1, 1, 1, 2, 2], "t": [10., 20., 35., 5., 7.]})
+    q = pd.DataFrame({"k": [1, 2], "t": [25., 100.]})
+    get = lambda kind, d: EntityLag("k", "t", kind).fit(df, None, None).transform(d, None)
+    np.testing.assert_allclose(get("prev", df), [np.nan, 10, 15, np.nan, 2])
+    np.testing.assert_allclose(get("next", df), [10, 15, np.nan, 2, np.nan])
+    np.testing.assert_allclose(get("nth", q), [2, 2])
+    np.testing.assert_allclose(get("prev", q), [5, 93])
+
+
+def test_related_tables_aggregates_children_and_grandchildren():
+    from tabularaml.generate.relational import Child, RelatedTables
+    main = pd.DataFrame({"id": [1, 2, 3]})
+    loans = pd.DataFrame({"id": [1, 1, 2], "loan": [10, 11, 12], "DAYS_DUE": [-30., -10., -5.],
+                          "DAYS_PAID": [-28., -12., -5.], "kind": ["a", "b", "a"]})
+    pays = pd.DataFrame({"loan": [10, 10, 11], "AMT_PAID": [5., 7., 1.]})
+    rt = RelatedTables([Child("loans", loans, key="id", time="DAYS_DUE", drop=["loan"],
+                              children=[Child("pay", pays, key="loan")])], recent=1)
+    X = rt.join(main, key="id")
+    assert list(X["loans__count"]) == [2, 1, 0]
+    late = X["loans__DAYS_DUE_sub_DAYS_PAID_max"]
+    assert late.iloc[0] == 2 and late.iloc[1] == 0 and np.isnan(late.iloc[2])
+    assert X["loans__kind_is_a"].iloc[0] == 0.5
+    assert X["loans__pay__AMT_PAID_sum_sum"].iloc[0] == 13
+    assert X["loans__DAYS_DUE_last1"].iloc[0] == -10
+
+
+def test_family_count_counts_and_masks_repeated_values():
+    from tabularaml.generate.forge import FamilyCount
+    df = pd.DataFrame({"v_0": [1., 1., 2., 3.], "v_1": [5., 6., 7., 7.]})
+    get = lambda kind: FamilyCount(["v_0", "v_1"], kind, "v").fit(df, None, None).transform(df, None)
+    np.testing.assert_allclose(get("count"), [[2, 1], [2, 1], [1, 2], [1, 2]])
+    np.testing.assert_allclose(get("mask"), [[1, np.nan], [1, np.nan], [np.nan, 7], [np.nan, 7]])
+    assert FamilyCount(["v_0", "v_1"], "count", "v").out_names() == ["famcount__v_0", "famcount__v_1"]
+
+
+def test_event_recency_and_window_counts():
+    from tabularaml.generate.forge import EntityLag, EventRecency
+    df = pd.DataFrame({"k": [1, 1, 1, 1, 2, 2], "t": [0., 1, 2, 3, 0, 1], "f": [1, 0, 0, 1, 0, 1]})
+    get = lambda kind: EventRecency(["k"], "t", "f", 1.0, kind).fit(df, None, None).transform(df, None)
+    np.testing.assert_allclose(get("prev"), [np.nan, 1, 2, 3, np.nan, np.nan])
+    np.testing.assert_allclose(get("next"), [3, 2, 1, np.nan, 1, np.nan])
+    d = pd.DataFrame({"k": [1, 1, 1, 1, 2], "t": [0., 1, 2, 5, 1]})
+    win = lambda kind: EntityLag("k", "t", kind).fit(d, None, None).transform(d, None)
+    np.testing.assert_allclose(win("win2"), [0, 1, 2, 0, 0])
+    np.testing.assert_allclose(win("fwd2"), [2, 1, 0, 0, 0])
+
+
+def test_date_strings_become_calendar_fields():
+    from tabularaml.generate.forge import DatePart, _is_date_like, _to_days
+    s = pd.Series(["2015-07-31", "2015-08-01"] * 20)
+    assert _is_date_like(s)
+    days = pd.DataFrame({"d": _to_days(s)})
+    np.testing.assert_allclose(DatePart("d", "dow").transform(days, None)[:2], [4, 5])
+    np.testing.assert_allclose(DatePart("d", "to_month_end").transform(days, None)[:2], [0, 30])
+
+
+def test_free_text_detection_and_word_model():
+    from sklearn.model_selection import KFold
+    from tabularaml.generate.forge import Context, TextLinearOOF, TextStats, _is_text
+    rng = np.random.default_rng(0)
+    words = np.array(["red", "blue", "leather", "wallet", "phone", "case", "vintage", "new", "used", "shoes"])
+    n = 600
+    text = pd.Series([" ".join(rng.choice(words, 5)) + f" item {i}" for i in range(n)])
+    y = text.str.contains("leather").to_numpy(dtype=float) * 2 + rng.normal(0, 0.1, n)
+    assert _is_text(text)
+    assert not _is_text(pd.Series(rng.choice(["A1", "B2", "C3"], n)))
+    assert not _is_text(pd.Series([f"id{i}" for i in range(n)]))
+    df = pd.DataFrame({"t": text})
+    assert TextStats("t").transform(df, None).shape == (n, 7)
+    folds = list(KFold(5, shuffle=True, random_state=0).split(df))
+    v = TextLinearOOF(["t"], 0, chars=False).fit_transform_oof(df, y, Context("regression", 0, 0), folds)
+    assert np.corrcoef(v, y)[0, 1] > 0.9
+
+
+def test_asof_features_use_only_earlier_events():
+    from tabularaml.generate.relational import Child, asof_features
+    ev = pd.DataFrame({"u": ["a", "a", "a", "b"], "t": [1, 2, 5, 1], "v": [10.0, 20.0, 30.0, 1.0],
+                       "k": ["x", "y", "x", "x"]})
+    main = pd.DataFrame({"u": ["a", "a", "b", "c"], "t": [2, 6, 1, 9]})
+    F = asof_features(main, "u", "t", Child("ev", ev, key="u", time="t"), recent=(1, 2))
+    np.testing.assert_allclose(F["ev__n"], [1, 3, 0, 0])
+    np.testing.assert_allclose(F["ev__v_mean"].to_numpy()[:2], [10, 20])
+    np.testing.assert_allclose(F["ev__v_last2"].to_numpy()[:2], [10, 25])
+    assert np.isnan(F["ev__v_mean"].to_numpy()[2])
+
+
+def test_synthetic_unlabeled_rows_detected():
+    from tabularaml.generate.forge import synthetic_rows
+    rng = np.random.default_rng(0)
+    cols = [f"v{i}" for i in range(30)]
+    X = pd.DataFrame(rng.normal(size=(3000, 30)).round(4), columns=cols)
+    real = pd.DataFrame(rng.normal(size=(1500, 30)).round(4), columns=cols)
+    # Fake rows: every value copied from some real unlabeled row (Santander 2019's test file).
+    fake = pd.DataFrame({c: rng.choice(real[c].to_numpy(), 1500) for c in cols})
+    U = pd.concat([real, fake], ignore_index=True)
+    m = synthetic_rows(X, U)
+    assert m[1500:].all() and m[:1500].mean() < 0.02
+    assert not synthetic_rows(X, real).any()
+
+
+def test_match_features_count_only_earlier_same_value_rows():
+    from tabularaml.generate.relational import Child, match_features
+    main = pd.DataFrame({"id": [1, 2], "brand": [10, 20], "offerdate": ["2013-04-10", "2013-04-10"]})
+    tx = pd.DataFrame({"id": [1, 1, 1, 2, 2], "brand": [10, 10, 30, 20, 20],
+                       "date": ["2013-04-01", "2013-01-01", "2013-04-02", "2013-04-10", "2013-04-20"],
+                       "amount": [1.0, 2.0, 4.0, 8.0, 16.0]})
+    F = match_features(main, "id", Child("tx", tx, key="id", time="date"), ["brand"], main_time="offerdate", windows=(30,))
+    assert F["tx__same_brand__all__n"].tolist() == [2, 0]  # customer 2's rows are on / after the date
+    assert F["tx__same_brand__30d__n"].tolist() == [1, 0]
+    assert F["tx__same_brand__all__amount_sum"].tolist() == [3.0, 0.0]
+
+
+def test_forge_search_respects_small_budget():
+    import time
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.normal(size=(20000, 8)), columns=[f"x{i}" for i in range(8)])
+    y = X.x0 / (X.x1.abs() + 0.5) + rng.normal(size=len(X)) * 0.1
+    t0 = time.time()
+    ff = FeatureForge(task="regression", time_budget=0.5, n_jobs=1, verbose=False).fit(X, y)
+    # Only the first round runs (it always gets sixteen CV fits), none after.
+    assert len(ff.history_) <= 1
+    assert time.time() - t0 < 60
+
+
+def test_forge_search_subsample_keeps_output_on_every_row():
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(rng.normal(size=(6000, 4)), columns=list("abcd"))
+    X["t"] = np.arange(len(X), dtype=float)
+    y = X.a * X.b + rng.normal(size=len(X)) * 0.1
+    U = X.iloc[:500].assign(t=X.t.iloc[:500] + 6000)
+    f = FeatureForge(task="regression", time_budget=60, n_rounds=1, n_jobs=1, verbose=False,
+                     time_col="t", max_search_rows=2000).fit(X, y, X_unlabeled=U)
+    assert len(f.transform_train(X)) == len(X) and len(f.transform(U)) == len(U)
+    assert any("a" in c and "b" in c for c in f.new_columns_)
+
+
+def test_label_echo_columns_stay_out_of_cross_row_features():
+    rng = np.random.default_rng(0)
+    rows, q_hist = [], {}
+    for u in range(300):
+        skill, past, uq = rng.normal(), [], {}
+        for t in range(30):
+            q = int(rng.integers(0, 120))
+            y = int(rng.random() < 1 / (1 + np.exp(-(skill - (q % 7 - 3) / 3))))
+            qh, mine = q_hist.setdefault(q, []), uq.setdefault(q, [])
+            rows.append((u, q, np.mean(past) if past else np.nan,
+                         past[-3] if len(past) >= 3 else np.nan,         # 3rd previous answer
+                         np.mean(qh) if qh else np.nan,                  # question's earlier accuracy
+                         np.mean(mine) if mine else np.nan,              # this user on this question
+                         rng.normal(), q % 7, y))
+            past.append(y)
+            qh.append(y)
+            mine.append(y)
+    cols = ["user", "q", "prior_mean", "lag3", "q_acc", "uq_acc", "noise", "difficulty", "y"]
+    D = pd.DataFrame(rows, columns=cols)
+    y = D.pop("y")
+    f = FeatureForge(task="binary", time_budget=20, n_rounds=1, n_jobs=1, verbose=False)
+    f.task_, f.n_classes_, f.cat_cols_ = "binary", 2, []
+    f.id_cols_ = f._id_columns(D)
+    assert f.id_cols_[:2] == ["user", "q"]
+    assert f._label_echo_cols(D, y.to_numpy(float)) == {"prior_mean", "lag3", "q_acc", "uq_acc"}
+
+
+def test_pair_scan_finds_hidden_difference_of_near_duplicate_columns():
+    # Loan Default's golden feature: two near-identical huge columns whose small difference
+    # decides the label, hidden among many other near-duplicate pairs.
+    from tabularaml.generate.pairscan import scan_pairs
+    rng = np.random.default_rng(0)
+    n = 6000
+    base = rng.lognormal(15, 1, size=(n, 6))
+    X = {}
+    for j in range(6):
+        X[f"a{j}"] = base[:, j]
+        X[f"b{j}"] = base[:, j] + rng.normal(0, 50, n)
+    d = rng.normal(0, 1, n)
+    X["b3"] = X["a3"] + 50 * d
+    W = pd.DataFrame(X)
+    y = (d + 0.3 * rng.normal(size=n) > 1).astype(float)
+    margin = np.full(n, np.log(y.mean() / (1 - y.mean())))
+    p = 1 / (1 + np.exp(-margin))
+    loss = lambda m, rows: float(np.mean(np.logaddexp(0, m) - y[rows] * m))
+    out = scan_pairs(W, list(W.columns), [], p - y, p * (1 - p), loss, margin, top=3)
+    assert out and {out[0][1], out[0][2]} == {"a3", "b3"} and out[0][0] == "sub"
+
+
+def test_client_profile_aggregates_per_client_and_marks_unseen_clients():
+    from tabularaml.generate.profile import ClientProfile, profile_candidates
+    df = pd.DataFrame({"card": [1, 1, 2, 2, 3], "addr": [5.0, 5.0, 5.0, np.nan, np.nan],
+                       "anc": [10, 10, 10, 10, 7], "amt": [1.0, 3.0, 4.0, 6.0, 2.0],
+                       "dev": ["a", "b", "a", "a", None], "day": [20, 25, 30, 31, 40], "D1": [10, 15, 20, 21, 30]})
+    p = ClientProfile(["card", "addr", "anc"], ["amt"], ["dev"], rebase=[("day", 1.0, "D1")]).fit(df)
+    out = p.transform(df)
+    assert out.shape == (5, p.n_out) == (5, 6) and len(p.paired_parents) == p.n_out
+    assert out[0, 0] == out[1, 0] == 2.0 and out[0, 4] == 2 and out[0, 5] == 2  # mean, nunique, rows
+    assert out[0, 2] == 10 and out[0, 3] == 0  # re-based D1 is constant within the client
+    assert out[2, 5] == 1 and out[3, 5] == 1  # a missing key value is its own client, not a crash
+    new = pd.DataFrame({"card": [9], "addr": [5.0], "anc": [10], "amt": [1.0], "dev": ["a"], "day": [1], "D1": [0]})
+    assert np.isnan(p.transform(new)).all()
+    assert profile_candidates(df, ["card"], [], [], ["amt"], ["dev"]) == []
+
+
+def test_label_history_columns_are_kept_out_of_client_profiles():
+    # Riiid-like log: a user's running mean of earlier answers carries each answer into the
+    # user's later rows, so a per-user mean over all rows would leak; raw columns stay in.
+    from tabularaml.generate.profile import label_history_cols
+    rng = np.random.default_rng(0)
+    n_u, k = 400, 30
+    user = np.repeat(np.arange(n_u), k)
+    t = np.tile(np.arange(k), n_u)
+    skill = np.repeat(rng.normal(size=n_u), k)
+    elapsed = rng.normal(size=n_u * k)
+    y = (skill + 0.5 * elapsed + rng.normal(size=n_u * k) > 0).astype(float)
+    df = pd.DataFrame({"user": user, "t": t, "elapsed": elapsed, "y": y})
+    df["past_mean"] = df.groupby("user")["y"].transform(lambda s: s.shift().expanding().mean())
+    perm = rng.permutation(len(df))
+    df = df.iloc[perm].reset_index(drop=True)
+    bad = label_history_cols(df, df["y"].to_numpy(), ["user"], ["elapsed", "past_mean"], time_col="t")
+    assert bad == ["past_mean"]
+
+
+def test_child_model_features_accept_datetime_child_columns():
+    # Amex: a parsed statement date in the child table used to become Timestamp categories,
+    # which LightGBM cannot serialise.
+    from tabularaml.generate.relational import Child, child_model_features
+    rng = np.random.default_rng(0)
+    n = 3000
+    df = pd.DataFrame({"k": rng.integers(0, 300, n), "v": rng.normal(size=n), "c": rng.choice(list("abc"), n),
+                       "d": pd.Timestamp("2020-01-01") + pd.to_timedelta(rng.integers(0, 500, n), unit="D")})
+    y = pd.Series(rng.integers(0, 2, 250).astype(float), index=np.arange(250))
+    out = child_model_features(Child("t", df, key="k", time="d"), y, np.arange(250, 300), task="binary")
+    assert len(out) == 300 and out.notna().any().all()
+
+
+def test_id_columns_accept_repeating_many_level_keys_and_tied_frequency_ranks():
+    rng = np.random.default_rng(0)
+    n = 3000
+    # Device-like key: 900 levels (over n/5) but most rows on devices seen 3+ times.
+    dev = np.concatenate([rng.integers(0, 300, 2400), np.arange(1000, 1600)]).astype(str)
+    X = pd.DataFrame({"dev": dev, "row_id": np.arange(n).astype(str), "x": rng.normal(size=n)})
+    f = FeatureForge(task="binary")
+    f.cat_cols_, f.date_cols_, f.text_cols_ = ["dev", "row_id"], [], []
+    ids = f._id_columns(X)
+    assert "dev" in ids and "row_id" not in ids
+    f.hc_cols_ = ["dev"]
+    f._fit_rank_maps(X)
+    once = f.rank_maps_["dev"][[str(i) for i in range(1000, 1600)]]
+    assert once.nunique() == 1  # levels seen equally often share one rank
+
+
+def test_group_sequences_get_running_sums_when_test_holds_new_groups():
+    # Each "breath" is a sequence ordered by t; the target is the running sum of u inside it,
+    # which no single-row or per-group statistic gives.
+    from tabularaml.generate.forge import GroupSeq
+    rng = np.random.default_rng(0)
+    n_g, L = 400, 20
+    g = np.repeat(np.arange(n_g), L)
+    t = np.tile(np.arange(L, dtype=float), n_g)
+    u = rng.uniform(0, 1, n_g * L)
+    y = pd.Series(u).groupby(g).cumsum().to_numpy() + rng.normal(scale=0.05, size=n_g * L)
+    X = pd.DataFrame({"g": g, "t": t, "u": u, "r": np.repeat(rng.integers(0, 3, n_g), L)})
+    tr = np.isin(g, rng.choice(n_g, 300, replace=False))  # test breaths interleave with training ones
+    f = FeatureForge(task="regression", time_budget=60, random_state=0, n_jobs=2, verbose=False).fit(
+        X[tr].reset_index(drop=True), y[tr], X_unlabeled=X[~tr].reset_index(drop=True))
+    assert f.seq_order_ == "t"
+    assert any(c.startswith("seq_cumsum__u") or c.startswith("seq_area__u") for c in f.new_columns_)
+    v = GroupSeq("g", "t", "u", "cumsum").transform(X[~tr].reset_index(drop=True), None)
+    assert np.allclose(v, pd.Series(u[~tr]).groupby(g[~tr]).cumsum().to_numpy())
