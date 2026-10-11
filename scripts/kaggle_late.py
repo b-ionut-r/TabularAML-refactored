@@ -125,6 +125,12 @@ CONTESTS["ieee_w2"] = dict(CONTESTS["ieee_v6"], repo=W_REPO)
 for _c in ["sct", "wnv", "hc"]:
     CONTESTS[f"{_c}_w"] = dict(CONTESTS[_c], raw=CONTESTS[_c].get("raw", _c), repo=W_REPO, base=_c)
 
+# Final superset 698d2fb (faster branch: 6c034b5 + gate rule + HC memory fix + 198d8de + d335dfc + 42086ff).
+S_REPO = "/tmp/claude-0/wt_sup"
+for _n in ["ieee_s", "ieee_s2"]:
+    CONTESTS[_n] = dict(CONTESTS["ieee_v6"], repo=S_REPO)
+CONTESTS["hc_s"] = dict(CONTESTS["hc"], raw="hc", repo=S_REPO, base="hc")
+
 
 def download(c: str) -> Path:
     d = ROOT / CONTESTS[c].get("raw", c) / "raw"
