@@ -89,7 +89,9 @@ def return_features(df: pd.DataFrame, key: str, name: str, time: Optional[str] =
     whole window and its later half, the net log move, and the share of rows where it moved. Empty when the table
     has no price path. A book with bid / ask prices and sizes also gets each level's size-weighted price.
     ``plan``: a dict shared by the chunks of one table; the first chunk records which columns are prices."""
-    num = [c for c in df.columns if c != key and pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])]
+    # The time column is the order, never a price (PLAsTiCC's mjd rises slowly and stays positive).
+    num = [c for c in df.columns if c not in (key, time) and pd.api.types.is_numeric_dtype(df[c])
+           and not pd.api.types.is_bool_dtype(df[c])]
     if len(df) < 1000 or not df[key].duplicated().any():
         return pd.DataFrame()
     if time is not None and time in df.columns:

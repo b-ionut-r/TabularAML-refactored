@@ -29,7 +29,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
-from tabularaml.generate.lists import as_lists, list_features, unit_ratio_features  # noqa: E402
+from tabularaml.generate.lists import as_lists, json_fields, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.returns import return_features  # noqa: E402
 from tabularaml.generate.panel import panel_features  # noqa: E402
 from tabularaml.generate.stream import aggregation_bytes, chunks, memory_bytes  # noqa: E402
@@ -405,6 +405,12 @@ def main():
     n_main = tr.shape[1]
     if a.lists == "auto":
         t = time.time()
+        Jtr, Jte, jfound = json_fields(Xtr, Xte)
+        if jfound:
+            Xtr = pd.concat([Xtr.drop(columns=jfound).reset_index(drop=True), Jtr], axis=1)
+            Xte = pd.concat([Xte.drop(columns=jfound).reset_index(drop=True), Jte], axis=1)
+            print(f"JSON fields: {jfound} -> {Jtr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+            del Jtr, Jte
         Ltr, Lte, found = list_features(Xtr, Xte)
         for c in found:  # downstream families read them as text: items joined
             J = as_lists(pd.concat([Xtr[c], Xte[c]], ignore_index=True)).map(" ; ".join).to_numpy()

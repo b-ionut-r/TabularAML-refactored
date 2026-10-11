@@ -162,7 +162,9 @@ class RelatedTables:
             out.append(df.groupby(key, sort=False)[c].nunique().rename(f"{c}_nunique").to_frame())
         if ch.time is not None and self.recent and dense:
             # Rank within the entity: rows sorted by time, most recent first.
-            r = W.assign(_t=df[ch.time].to_numpy()).sort_values([key, "_t"], ascending=[True, False])
+            # Only the columns averaged: the one-hot and spread columns made this copy gigabytes
+            # on an 8.4M-row keystroke log.
+            r = W[[key] + dense].assign(_t=df[ch.time].to_numpy()).sort_values([key, "_t"], ascending=[True, False])
             r = r[r.groupby(key, sort=False).cumcount() < self.recent]
             a = r.groupby(key, sort=False)[dense].mean()
             a.columns = [f"{c}_last{self.recent}" for c in a.columns]
@@ -183,6 +185,30 @@ class RelatedTables:
                 a.columns = [f"{c}={lv}:{v}_{st}" for v, st in a.columns]
                 cnt = sub.groupby(key, sort=False).size().rename(f"{c}={lv}:count")
                 out += [a, cnt.to_frame()]
+        # Readings split by channel: an integer column of 3 to 8 levels, each on at least 5% of rows (a light
+        # curve's passband, a sensor id, a book side), gets each raw numeric's statistics per level, the
+        # per-band summaries astronomy and sensor contests are won with. Decided on the first chunk.
+        if (ch.name, "__channels__") not in self.levels_:
+            chans = []
+            for c in num:
+                if c == ch.time:
+                    continue
+                v = df[c]
+                if not pd.api.types.is_integer_dtype(v):
+                    continue
+                vc = v.value_counts(normalize=True)
+                if 3 <= len(vc) <= 8 and vc.min() >= 0.05:
+                    chans.append((c, sorted(vc.index.tolist())))
+            vals_ = [c for c in num if c != ch.time and c not in {cc for cc, _ in chans}][:6]
+            self.levels_[(ch.name, "__channels__")] = (chans[:1], vals_)
+        chans, vals_ = self.levels_[(ch.name, "__channels__")]
+        for c, levels in chans:
+            lv_of = df[c].to_numpy()
+            for lv in levels:
+                sub = df.loc[lv_of == lv, [key] + vals_]
+                a = sub.groupby(key, sort=False)[vals_].agg(["mean", "max", "min", "std"])
+                a.columns = [f"{v}@{c}{lv}_{st}" for v, st in a.columns]
+                out.append(a)
         res = pd.concat(out, axis=1)
         res.columns = [_safe(f"{ch.name}:{c}") for c in res.columns]
         res = res.loc[:, ~res.columns.duplicated()]
