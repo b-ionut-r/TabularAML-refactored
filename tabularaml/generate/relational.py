@@ -277,9 +277,17 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
 
 
 def time_values(s: pd.Series) -> np.ndarray:
-    """A time column as floats: numbers as they are, dates (datetime or text such as 2015-01-28) as nanoseconds."""
+    """A time column as floats: numbers as they are, dates (datetime, text such as 2015-01-28, or numbers such as
+    20170131) as nanoseconds."""
     if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
-        return s.to_numpy(dtype=float)
+        v = s.to_numpy(dtype=float)
+        f = v[np.isfinite(v)]
+        if len(f) and f.min() >= 19000101 and f.max() <= 21001231 and np.all(f % 1 == 0):
+            # Dates written as numbers (20170131): days apart, not numbers apart.
+            d = pd.to_datetime(pd.Series(v).astype("Int64").astype(str), format="%Y%m%d", errors="coerce")
+            if d.notna().sum() >= 0.99 * len(f):
+                return time_values(d)
+        return v
     if not pd.api.types.is_datetime64_any_dtype(s):
         s = pd.to_datetime(as_text(s), errors="coerce")
     v = s.to_numpy("datetime64[ns]").astype(np.int64).astype(float)

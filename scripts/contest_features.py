@@ -222,7 +222,7 @@ def main():
     ap.add_argument("--target", required=True)
     ap.add_argument("--id", default=None)
     ap.add_argument("--table", action="append", default=[], help="name=path[:key[:time]]")
-    ap.add_argument("--time", default=None, help="main-table time column for as-of aggregation (default: auto)")
+    ap.add_argument("--time", default=None, help="main-table time column for as-of aggregation (default: auto, when a key repeats; given, every timed table is aggregated as of it, e.g. a snapshot date when train and test are different months)")
     ap.add_argument("--child-models", action=argparse.BooleanOptionalAction, default=True,
                     help="out-of-fold child-row model features for every keyed child table "
                          "(Home Credit 0.7976 -> 0.8004; --no-child-models turns them off)")
@@ -283,7 +283,7 @@ def main():
             print(f"table {ch.name}: one row per {ch.key}, joined as columns", flush=True)
         both_main = pd.concat([tr, te[[c for c in tr.columns if c in te.columns]]], ignore_index=True)
         asof = {ch.name: main_time(tr, ch, a.time) for ch in children
-                if ch.source is None and ch.time is not None and ch.key in tr.columns and tr[ch.key].duplicated().any()}
+                if ch.source is None and ch.time is not None and ch.key in tr.columns and (tr[ch.key].duplicated().any() or a.time)}
         asof = {k: v for k, v in asof.items() if v is not None}
         keyed = [ch for ch in children if ch.name not in asof]
         F = pd.DataFrame()
