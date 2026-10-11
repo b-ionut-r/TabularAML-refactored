@@ -29,6 +29,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from tabularaml.generate.strs import as_text
 
 
 def _key_strings(df: pd.DataFrame, keys: Sequence[str]) -> np.ndarray:
@@ -37,7 +38,7 @@ def _key_strings(df: pd.DataFrame, keys: Sequence[str]) -> np.ndarray:
     parts = []
     for k in keys:
         v = df[k]
-        v = v.astype(np.float64).astype(str) if pd.api.types.is_numeric_dtype(v) else v.astype(str)
+        v = v.astype(np.float64).astype(str) if pd.api.types.is_numeric_dtype(v) else as_text(v)
         parts.append(v.fillna("nan"))  # pandas' string dtype keeps missing values missing
     s = parts[0]
     for p in parts[1:]:

@@ -45,16 +45,27 @@ main = main[main.stock_id.isin(stocks)].reset_index(drop=True)
 main.insert(0, 'row_id', main.stock_id.astype(np.int64) * 100_000 + main.time_id)
 
 
-def child(kind):
-    parts = []
-    for s in stocks:
-        t = pd.read_parquet(D / f'{kind}_train.parquet' / f'stock_id={s}')
-        t.insert(0, 'row_id', s * 100_000 + t.time_id.astype(np.int64))
-        parts.append(t.drop(columns=['time_id']))
-    return pd.concat(parts, ignore_index=True)
+def stock_table(kind, s):
+    t = pd.read_parquet(D / f'{kind}_train.parquet' / f'stock_id={s}')
+    t.insert(0, 'row_id', s * 100_000 + t.time_id.astype(np.int64))
+    return t.drop(columns=['time_id'])
 
 
-book, trade = child('book'), child('trade')
+def child_file(kind):
+    """The sampled stocks' rows of one table with the row_id key, written a stock at a time (never all in memory)."""
+    import pyarrow as pa, pyarrow.parquet as pq
+    f = D / f'prep_{kind}_{len(stocks)}_{a.stock_seed}.parquet'
+    if not f.exists():
+        w = None
+        for s in stocks:
+            t = pa.Table.from_pandas(stock_table(kind, s), preserve_index=False)
+            w = w or pq.ParquetWriter(str(f) + '.tmp', t.schema)
+            w.write_table(t, row_group_size=1_000_000)
+        w.close(); Path(str(f) + '.tmp').rename(f)
+    return f
+
+
+book_f, trade_f = child_file('book'), child_file('trade')
 tids = np.sort(main.time_id.unique())
 rng = np.random.default_rng(a.seed)
 ho_t = set(rng.choice(tids, len(tids) // 5, replace=False).tolist())
@@ -63,15 +74,15 @@ tr, te = main[~is_ho].reset_index(drop=True), main[is_ho].reset_index(drop=True)
 ytr, yte = tr.pop('target').to_numpy(), te.pop('target').to_numpy()
 if a.shuffle:
     ytr = np.random.default_rng(0).permutation(ytr)
-print(f'stocks {len(stocks)} train {len(tr)} held out {len(te)} book {len(book)} trade {len(trade)}', flush=True)
+print(f'stocks {len(stocks)} train {len(tr)} held out {len(te)}', flush=True)
 
 
 def raw(X):
     return X[['stock_id']].astype(str).astype('category')
 
 
-def hand(tr, te):
-    b = book.copy()
+def hand_stock(book, trade):
+    b = book
     b['wap1'] = (b.bid_price1 * b.ask_size1 + b.ask_price1 * b.bid_size1) / (b.bid_size1 + b.ask_size1)
     b['wap2'] = (b.bid_price2 * b.ask_size2 + b.ask_price2 * b.bid_size2) / (b.bid_size2 + b.ask_size2)
     g = b.groupby('row_id', sort=False)
@@ -93,14 +104,18 @@ def hand(tr, te):
                 [f'{c}_{m}' for c in ['wap1', 'wap2', 'price_spread', 'bid_spread', 'ask_spread', 'total_volume', 'volume_imbalance'] for m in ['mean', 'std', 'sum']], axis=1))
             f['n_book'] = g.size()
         H.append(f.add_suffix(f'_{start}'))
-    t = trade.copy()
+    t = trade
     t['lr'] = np.log(t.price).groupby(t.row_id).diff()
     for start in (0, 300):
         s = t[t.seconds_in_bucket >= start]; g = s.groupby('row_id')
         f = pd.DataFrame({'trade_rv': g.lr.apply(rv), 'trade_n': g.size(), 'trade_size': g['size'].sum(),
                           'trade_orders': g.order_count.sum(), 'trade_size_mean': g['size'].mean()})
         H.append(f.add_suffix(f'_{start}'))
-    H = pd.concat(H, axis=1)
+    return pd.concat(H, axis=1)
+
+
+def hand(tr, te):
+    H = pd.concat([hand_stock(stock_table('book', s), stock_table('trade', s)) for s in stocks])
     A = pd.concat([tr, te], ignore_index=True)
     F = H.reindex(A.row_id.to_numpy()).reset_index(drop=True)
     # Cross-stock: the mean of the main ones over the sampled stocks of the same bucket.
@@ -119,10 +134,9 @@ if a.arm.startswith('ff') and a.ff_cache and (cache / 'tr.parquet').exists():
 elif a.arm.startswith('ff'):
     tmp = Path(tempfile.mkdtemp(dir='/home/user/tmp'))
     tr.assign(target=ytr).to_parquet(tmp / 'train.parquet'); te.to_parquet(tmp / 'test.parquet')
-    book.to_parquet(tmp / 'book.parquet'); trade.to_parquet(tmp / 'trade.parquet')
     cmd = [sys.executable, str(Path(a.repo) / 'scripts' / 'contest_features.py'), '--train', str(tmp / 'train.parquet'),
            '--test', str(tmp / 'test.parquet'), '--target', 'target', '--id', 'row_id', '--task', 'regression', '--log-target',
-           '--table', f'book={tmp / "book.parquet"}:row_id', '--table', f'trade={tmp / "trade.parquet"}:row_id',
+           '--table', f'book={book_f}:row_id', '--table', f'trade={trade_f}:row_id',
            '--budget', str(a.budget), '--out-dir', str(tmp / 'out')] + (a.extra.split() if a.extra else [])
     subprocess.run(cmd, check=True, cwd=a.repo)
     info['pipe_peak_gb'] = round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 2 ** 20, 2)
@@ -139,6 +153,7 @@ if a.arm.endswith('hand'):
     Xtr, Xte = pd.concat([Xtr, Htr], axis=1), pd.concat([Xte, Hte], axis=1)
 if a.add_paths:
     from tabularaml.generate.returns import return_features
+    book, trade = pd.read_parquet(book_f), pd.read_parquet(trade_f)
     R = pd.concat([return_features(book, 'row_id', 'book'), return_features(trade, 'row_id', 'trade')], axis=1)
     if a.groups == 'wap':
         b = book[['row_id', 'seconds_in_bucket']].copy()
