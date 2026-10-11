@@ -36,6 +36,7 @@ from tabularaml.generate.stream import aggregation_bytes, chunks, memory_bytes  
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
+from tabularaml.generate.strs import as_text  # noqa: E402
 
 TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
 
@@ -59,7 +60,7 @@ def normalise(df: pd.DataFrame) -> pd.DataFrame:
                               if isinstance(v, (list, tuple, np.ndarray)) else v)
         if df[c].dtype == object:
             # Mixed 0 / "0" (pandas reads a CSV column chunk by chunk) become one level.
-            df[c] = df[c].where(df[c].isna(), df[c].astype(str)).astype("category")
+            df[c] = df[c].where(df[c].isna(), as_text(df[c])).astype("category")
         elif df[c].dtype == np.float64:
             df[c] = df[c].astype(np.float32)
     return df
@@ -138,7 +139,7 @@ def date_col(df: pd.DataFrame) -> str | None:
     for c in df.columns:
         if pd.api.types.is_numeric_dtype(df[c]):
             continue
-        v = df[c].dropna().astype(str).head(1000)
+        v = as_text(df[c].dropna().head(1000))
         if len(v) and v.str.match(r"^\d{4}-\d{2}-\d{2}").mean() > 0.95:
             return c
     return None
@@ -156,8 +157,8 @@ def match_cols(main: pd.DataFrame, ch: Child) -> list[str]:
             continue
         if s.nunique() < 20:
             continue
-        vals = pd.unique(main[c].dropna().astype(str))
-        if len(vals) and np.isin(vals, pd.unique(s.dropna().astype(str))).mean() >= 0.5:
+        vals = pd.unique(as_text(main[c].dropna()))
+        if len(vals) and np.isin(vals, pd.unique(as_text(s.dropna()))).mean() >= 0.5:
             out.append(c)
     return out
 
@@ -188,7 +189,7 @@ def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
     for X in (base, full):
         for c in X.columns:
             if not (pd.api.types.is_numeric_dtype(X[c]) or isinstance(X[c].dtype, pd.CategoricalDtype)):
-                X[c] = X[c].astype(str).astype("category")
+                X[c] = as_text(X[c]).astype("category")
     yv = y.to_numpy(dtype=float)
     rows = np.arange(len(yv))
     if len(rows) > max_rows:
@@ -429,7 +430,7 @@ def main():
         both = pd.concat([Xtr.reset_index(drop=True), rel_tr], axis=1)
         for c in both.columns:
             if not (pd.api.types.is_numeric_dtype(both[c]) or isinstance(both[c].dtype, pd.CategoricalDtype)):
-                both[c] = both[c].astype(str).astype("category")
+                both[c] = as_text(both[c]).astype("category")
         b = lgb.train(dict(objective="binary" if y.nunique() == 2 else "regression", learning_rate=0.1,
                            num_leaves=31, feature_fraction=0.5, verbose=-1), lgb.Dataset(both, log_y(y) if a.log_target else y), 300)
         gain = pd.Series(b.feature_importance("gain"), index=both.columns)[rel_tr.columns]

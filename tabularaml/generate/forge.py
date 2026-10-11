@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 import warnings
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from tabularaml.generate.strs import as_text, as_text_frame
 
 TE_SMOOTHING = 20.0
 GROUP_STATS = ("mean", "std", "min", "max", "dev", "z")
@@ -436,6 +437,21 @@ class KNNClassDist(KNNTarget):
         # the screen dropped it by chance (wine_white: +12% CV in the joint model, novelty
         # -0.003 to +0.001 between runs). Binary targets keep the screen (churn lost 2-8%).
         self.screen_exempt = n_classes > 2
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        self.folds_ = [np.asarray(tr) for tr, _ in folds]
+        return super().fit_transform_oof(df, y, ctx, folds)
+
+    def transform(self, df, ctx):
+        # Distances shrink as the reference grows: a training row's out-of-fold distances
+        # come from (k-1)/k of the rows, so new rows are measured against the same fold
+        # references and averaged. Measured against all rows, they sat nearer every class
+        # than any training row (Telstra held-out: +0.004 / +0.028 log loss with them).
+        folds = getattr(self, "folds_", None)
+        if not folds:
+            return super().transform(df, ctx)
+        M_q = self._matrix(df)
+        return sum(self._query(self.M_[tr], self.Y_[tr], M_q) for tr in folds) / len(folds)
 
     def _query(self, M_ref, Y_ref, M_q):
         from sklearn.neighbors import NearestNeighbors
@@ -835,7 +851,7 @@ def slot_families(df: pd.DataFrame, cat_cols: Sequence[str]) -> List[tuple]:
         na = [df[c].isna().mean() + (_as_str(df[c]) == "__NA__").mean() for c in cols]
         if na[-1] < na[0] + 0.2:
             continue
-        sets = [set(pd.unique(df[c].dropna().astype(str))) - {"__NA__"} for c in cols[:3]]
+        sets = [set(pd.unique(as_text(df[c].dropna()))) - {"__NA__"} for c in cols[:3]]
         if len(sets[0]) < 5 or len(sets[0] & sets[1]) < 0.2 * min(len(sets[0]), len(sets[1]) or 1):
             continue
         slots = [idx(c) for c in cols]
@@ -1131,7 +1147,7 @@ def _is_date_like(s: pd.Series) -> bool:
         return True
     if not (s.dtype == object or pd.api.types.is_string_dtype(s)):
         return False
-    sample = s.dropna().astype(str).head(500)
+    sample = as_text(s.dropna().head(500))
     if len(sample) < 20 or not sample.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}").mean() > 0.95:
         return False
     return pd.to_datetime(sample, errors="coerce").notna().mean() > 0.95
@@ -1297,7 +1313,7 @@ def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
     (titles, descriptions, comments), as opposed to codes, ids or category labels."""
     if not _is_cat(s) or len(s) < 100:
         return False
-    v = s.dropna().astype(str)
+    v = as_text(s.dropna())
     if len(v) > n_sample:
         v = v.sample(n_sample, random_state=0)
     if len(v) < 50 or v.nunique() < max(50, 0.05 * len(v)):
@@ -1308,7 +1324,7 @@ def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
 
 
 def _text_values(df, c, clip: Optional[int] = None) -> pd.Series:
-    t = df[c].astype(str)
+    t = as_text(df[c])
     t = t.where(t != "__NA__", "")
     # Long fields (review dumps) cost n-gram time quadratically in nothing but their tails.
     return t if clip is None else t.str.slice(0, clip)
@@ -1414,13 +1430,13 @@ class TextLinearOOF(Spec):
         if self.keys:
             from sklearn.preprocessing import OneHotEncoder
             self.ohe_ = OneHotEncoder(handle_unknown="ignore", min_frequency=2, dtype=np.float32).fit(
-                df[self.keys].astype(str))
+                as_text_frame(df[self.keys]))
 
     def _design(self, df):
         from scipy import sparse
         blocks = [v.transform(_text_values(df, c, TEXT_CLIP)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
         if self.keys:
-            blocks.append(self.ohe_.transform(df[self.keys].astype(str)))
+            blocks.append(self.ohe_.transform(as_text_frame(df[self.keys])))
         return sparse.hstack(blocks, format="csr")
 
     def _query(self, A, y, B):
@@ -1592,6 +1608,11 @@ class Digits(Spec):
 class StrNum(Spec):
     """The number written inside a coded string ("location 118", "feature 68"): codes
     issued in order put neighbouring numbers close, which the category alone hides."""
+    # Its worth is in interactions (Telstra's location number: hand +0.02 log loss, no
+    # residual gain on its own), so it is also offered to the gate on top of each feature
+    # set. Exempt from the screen instead, it took a joint-model slot on West Nile's trap
+    # code and the search stopped a round early (21 features, gate +7.2% -> 12, +2.9%).
+    gate_addon = True
 
     def __init__(self, col: str):
         super().__init__([col])
@@ -1599,7 +1620,7 @@ class StrNum(Spec):
 
     @staticmethod
     def parse(s: pd.Series) -> np.ndarray:
-        return pd.to_numeric(s.astype(str).str.extract(r"(\d+)\s*$")[0], errors="coerce").to_numpy(dtype=float)
+        return pd.to_numeric(as_text(s).str.extract(r"(\d+)\s*$")[0], errors="coerce").to_numpy(dtype=float)
 
     def transform(self, df, ctx):
         return self.parse(df[self.parents[0]])
@@ -1607,7 +1628,7 @@ class StrNum(Spec):
 
 def _numbered_codes(s: pd.Series) -> bool:
     """A string column whose values are one shared prefix and a number."""
-    v = pd.Series(pd.unique(s.astype(str)))
+    v = pd.Series(pd.unique(as_text(s)))
     v = v[v != "__NA__"]
     if len(v) <= 10:
         return False
@@ -2070,19 +2091,30 @@ class FeatureForge:
                 X[c] = pd.Categorical(_as_str(X[c]), categories=self.cat_levels_[c])
         return X
 
-    def _fit_rank_maps(self, X: pd.DataFrame):
-        """Frequency rank of each level of the high-cardinality categoricals (1 = most common)."""
+    def _fit_rank_maps(self, *frames: pd.DataFrame):
+        """Frequency rank of each level of the high-cardinality categoricals (1 = most common),
+        counted over the rows of all ``frames`` (counted per frame, so categoricals are never
+        stacked into per-row strings)."""
         self.rank_maps_ = {}
         for c in self.hc_cols_:
-            vc = _as_str(X[c]).value_counts()
+            vc = None
+            for F in frames:
+                col = F[c] if isinstance(F[c].dtype, pd.CategoricalDtype) else F[c].astype(object)
+                v = col.value_counts(dropna=False)
+                v.index = np.where(pd.isna(v.index.to_numpy(dtype=object)), "__NA__", v.index.astype(object).astype(str))
+                v = v.groupby(level=0).sum()
+                vc = v if vc is None else vc.add(v, fill_value=0)
+            vc = vc[vc > 0]
             # Ranked by frequency, ties by value; levels seen at most twice share one rank per count:
             # ordering them by value spread the many once-seen device IPs over a meaningless range
             # a tree then splits on.
-            order = sorted(vc.index, key=lambda v: (-vc[v], v))
-            r = pd.Series(np.arange(1, len(order) + 1, dtype=float), index=order)
-            rare = vc[order].to_numpy() <= 2
+            t = pd.DataFrame({"v": vc.index.to_numpy(dtype=object), "n": vc.to_numpy()}).sort_values(
+                ["n", "v"], ascending=[False, True], kind="mergesort")
+            r = pd.Series(np.arange(1, len(t) + 1, dtype=float), index=t["v"].to_numpy())
+            n_ = t["n"].to_numpy()
+            rare = n_ <= 2
             if rare.any():
-                r[rare] = r[rare].groupby(vc[order].to_numpy()[rare]).transform("min").to_numpy()
+                r[rare] = r[rare].groupby(n_[rare]).transform("min").to_numpy()
             self.rank_maps_[c] = r
 
     def _rank(self, s: pd.Series, c: str) -> np.ndarray:
@@ -2092,7 +2124,11 @@ class FeatureForge:
         p = dict(_lgb_objective(self.task_, self.n_classes_), learning_rate=lr, num_leaves=31,
                  min_data_in_leaf=20, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
                  lambda_l2=1.0, verbosity=-1, seed=self.random_state, data_random_seed=self.random_state,
-                 num_threads=threads or self._threads(), max_cat_to_onehot=8)
+                 num_threads=threads or self._threads(), max_cat_to_onehot=8,
+                 # LightGBM otherwise picks row- or column-wise histograms by timing both, and
+                 # the two sum in a different order: on Airline the same commit's round-one
+                 # ranking split on that and kept 41 features or none on alternate runs.
+                 deterministic=True, force_col_wise=True)
         p.update(kw)
         return p
 
@@ -2722,6 +2758,7 @@ class FeatureForge:
             fams.setdefault(type(sp).__name__, []).append(sp)
         firsts = [g[0] for g in fams.values()]
         n_first = len(firsts)
+        order = {sp.name: i for i, sp in enumerate(specs)}
         specs = list(firsts)
         with ThreadPoolExecutor(n_threads) as pool:
             i = 0
@@ -2746,6 +2783,11 @@ class FeatureForge:
                 if i == n_first:
                     cost = lambda f: spent.get(f, [1, 0.0])[1] / max(spent.get(f, [1, 0.0])[0], 1)
                     specs += [sp for f in sorted(fams, key=cost) for sp in fams[f][1:]]
+        # Back in generation order: families are built cheapest first by measured time, so
+        # the order they finished in varied from run to run, and with it the joint model's
+        # column order, its split-gain ranking and the round's picks (Airline: the same commit
+        # kept 41 features or none on alternate runs).
+        out = dict(sorted(out.items(), key=lambda kv: order.get(kv[0], len(order))))
         _CODE_CACHE.clear()  # factorised keys of large frames add up to gigabytes
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
@@ -3044,6 +3086,7 @@ class FeatureForge:
         self._t0 = time.time()
         self._deadline = None
         self.wide_ = []
+        self.addons_ = {}
         X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
         self.n_synthetic_ = 0
@@ -3177,7 +3220,7 @@ class FeatureForge:
                                   f"between them feed only label-free statistics)")
         elif self.gate_frac and n >= 200 and self.group_col_ is not None:
             gx = X[self.group_col_].to_numpy()
-            levels, codes = np.unique(gx.astype(str) if gx.dtype == object else gx, return_inverse=True)
+            levels, codes = np.unique(as_text(pd.Series(gx)).to_numpy() if gx.dtype == object else gx, return_inverse=True)
             in_gate = np.random.default_rng(self.random_state).random(len(levels)) < self.gate_frac
             idx_sel, idx_gate = np.flatnonzero(~in_gate[codes]), np.flatnonzero(in_gate[codes])
         elif self.gate_frac and n >= 200:
@@ -3203,7 +3246,7 @@ class FeatureForge:
                 if self.time_col_ is not None:
                     keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
                 elif self.group_col_ is not None:
-                    g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                    g = pd.factorize(as_text(X[self.group_col_]).to_numpy()[idx_sel])[0]
                     perm = rng.permutation(g.max() + 1)
                     r = perm[g]
                     keep = idx_sel[np.argsort(r, kind="stable")[:m]]
@@ -3216,7 +3259,7 @@ class FeatureForge:
             W = X.iloc[idx_sel].reset_index(drop=True)
             yW = y_np[idx_sel]
             if self.group_col_ is not None:
-                gx = X[self.group_col_].astype(str).to_numpy()
+                gx = as_text(X[self.group_col_]).to_numpy()
                 self._groups = {len(W): gx[idx_sel], n: gx}
             self.U_search_ = self.WU_ = None
             extra = np.concatenate([idx_out, idx_gate]).astype(int)
@@ -3289,9 +3332,22 @@ class FeatureForge:
         self._yW = yW  # search rows' labels, for checks that keep labels out of label-free specs
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
-            # Fitted on the search rows: fitted over the test file too, a large test (West Nile's
-            # is 11x the training file) set the ranks and the search found less.
-            self._fit_rank_maps(W)
+            # Where later rows bring many levels the search rows never saw (new devices and cards
+            # in a click log's or IEEE-CIS's later period), ranks count every row whose features are
+            # known, as the final fit does; else those rows go unranked and the gate judges a recode
+            # the transform never produces. Otherwise they are fitted on the search rows: over the
+            # test file too, a large test of known levels (West Nile's is 11x the training file)
+            # set the ranks and the search found less.
+            U_ = None if X_unlabeled is None else self._prep(X_unlabeled)
+            later = U_ if U_ is not None else X.drop(index=W.index, errors="ignore")
+            new_share = max((~_as_str(later[c]).isin(set(_as_str(W[c])))).mean() if len(later) else 0.0
+                            for c in self.hc_cols_)
+            if new_share > 0.1:
+                self._fit_rank_maps(X, *([] if U_ is None else [U_]))
+            else:
+                self._fit_rank_maps(W)
+            self._log(f"frequency ranks: {100 * new_share:.0f}% of later rows hold levels the search rows "
+                      f"lack -> fitted on {'all known rows' if new_share > 0.1 else 'the search rows'}")
             Wr = (*self._lgb_matrix(self._model_frame(W, recode=True)), list(W.columns))
             m_r, loss_r, imp_r = self._cv(None, yW, folds, mat=Wr)
             self._log(f"high-cardinality recode of {len(self.hc_cols_)} columns: CV loss "
@@ -3332,6 +3388,8 @@ class FeatureForge:
             def keep_fn(spec, v, out, score):
                 g, nov = score
                 scores[spec.name] = (g, nov)
+                if getattr(spec, "gate_addon", False) and spec.name not in self.addons_:
+                    self.addons_[spec.name] = (spec, v)
                 if getattr(spec, "screen_exempt", False):
                     return True
                 if nov <= 0:
@@ -3480,6 +3538,12 @@ class FeatureForge:
         for _, _, arrs in self.wide_:
             for col, v in arrs.items():
                 W[col] = v
+        chosen_names = {sp.name for sp in selected}
+        self.addons_ = {nm: av for nm, av in self.addons_.items() if nm not in chosen_names}
+        for sp, v in self.addons_.values():
+            sp.round_ = last_r if last_r is not None else 0
+            for j, col in enumerate(sp.out_names()):
+                W[col] = v if v.ndim == 1 else v[:, j]
         self.selected_ = selected
         # Candidate values of the last round can be gigabytes on large tables.
         values = cands = Mw = None
@@ -3492,6 +3556,7 @@ class FeatureForge:
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
             self.gate_passed_ = best_set is not None
             self.wide_ = []  # their search-row values are not needed after the gate
+            self.addons_ = {}
             if self.gate_passed_:
                 self.selected_ = list(best_set)
             else:
@@ -3592,7 +3657,8 @@ class FeatureForge:
         Xg = X.iloc[idx_gate].reset_index(drop=True)
         ys, yg = y[idx_sel], y[idx_gate]
         Fs, Fg = W, Xg.copy()
-        for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra]:
+        addons = [sp for sp, _ in getattr(self, "addons_", {}).values()]
+        for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra] + addons:
             if all(c in Fg.columns for c in s.out_names()):
                 continue
             vg = s.transform(Fg, self.ctx_)
@@ -3653,31 +3719,75 @@ class FeatureForge:
                 free = [s for s in full if not s.target_dep]
                 if free and len(free) < len(full):
                     cands.append((f"rounds<={r + 1} label-free", free))
+        # Picks that skipped the residual screen (kNN class distances, numbered codes) reach
+        # the gate untested on their own: each set is also offered without each such family,
+        # so one that does not carry over cannot ride on the others (Telstra: kNN distances
+        # passed with the location number and cost 0.025 log loss held-out).
+        for label, specs in list(cands):
+            for f in sorted({type(sp).__name__ for sp in specs if getattr(sp, "screen_exempt", False)}):
+                gone, rest = set(), []
+                for sp in specs:
+                    if type(sp).__name__ == f or any(p in gone for p in sp.parents):
+                        gone.update(sp.out_names())
+                    else:
+                        rest.append(sp)
+                if rest:
+                    cands.append((f"{label} without {f}", rest))
+        # Numbered codes the screen passed over (their worth is in interactions) are offered on
+        # top of each set.
+        if addons:
+            cands += [(f"{label} + {', '.join(sp.name for sp in addons)}", list(specs) + addons)
+                      for label, specs in list(cands) if specs and not label.endswith(" without StrNum")]
         if self.selected_:
             for label, extra, _ in getattr(self, "wide_", []):
                 cands.append((label, list(self.selected_) + list(extra)))
-        for label, specs in cands:
+        # The recode was chosen on the search rows; each feature set is also offered on the
+        # native categoricals, so features that need them are not sunk by it (Telstra: the
+        # location's number lost with "location" rank-coded, gained with it native).
+        if self.recode_:
+            cands += [(label + " native", specs, False) for label, specs in cands if specs]
+        best_recode = self.recode_
+        for label, specs, *rc in cands:
+            rc = rc[0] if rc else None
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
-            rows = gate_loss(cols)
+            rows = gate_loss(cols, rc)
             d = raw_rows - rows
             # Winsorise so a handful of extreme rows cannot carry the decision.
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
             zb = _block_z(dw, blocks) if blocks is not None else None
-            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
+            self._log(f"  gate {label}{' (recoded)' if self.recode_ and rc is None else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
                       f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
             if self.gate_by_period and zb is not None:
                 z = zb
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
-        fam_on = self.gate_families is True or (self.gate_families == "auto" and len(getattr(self, "embargo_", ())))
+                best_recode = self.recode_ if rc is None else rc
+        self.recode_ = best_recode
+        fam_on = self.gate_families is True or (self.gate_families == "auto" and (
+            len(getattr(self, "embargo_", ())) or (len(idx_gate) >= 20_000 and self._sparse_te(X))))
         # Under an embargo the families are checked even when the whole set passes: on
         # IEEE-CIS the set passed while dropping kNN and cross-linear target features
         # cut the gate loss further (0.1152 -> 0.1081) and lifted held-out AUC 0.926 -> 0.937.
         if fam_on and self.selected_:
             best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
         return best_set, raw_l, best_l
+
+    def _sparse_te(self, X) -> bool:
+        """A selected target statistic keyed on a thin key (under 20 rows a level). Its
+        out-of-fold values carry each training row's own label against its group's (KDD Cup
+        2012: within-group correlation -0.16 to -0.32), which group statistics on the same
+        key let the model read; held-out rows have no such signal (0.7500 -> 0.7476 AUC with
+        both families). The family pass finds the set without the pair. Only on large gates:
+        on Amazon's 5k gate rows it dropped families on noise (held-out -0.003 / -0.001 AUC)."""
+        keys = set(self.key_cols_)
+        for sp in self.selected_:
+            if sp.target_dep:
+                for p in sp.parents:
+                    if p in keys and p in X.columns and len(X) / max(X[p].nunique(), 1) < 20:
+                        return True
+        return False
 
     def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
         """When the whole set fails the gate (or always, under an embargo), drop feature families (target encodings, group
@@ -3724,7 +3834,7 @@ class FeatureForge:
 
     def _fit_full(self, X, y, U=None):
         if self.recode_:
-            self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
+            self._fit_rank_maps(X, *([] if U is None else [U]))
         folds = self._te_folds(X, y, self.random_state + 1)
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy()
