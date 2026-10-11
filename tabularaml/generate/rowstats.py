@@ -5,25 +5,39 @@ is how a customer's row looks as a whole (how many non-zero cells, their typical
 pair carries and FeatureForge's search over columns never builds. Public kernels' row statistics over the non-zero
 cells moved RMSLE 1.445 -> 1.356.
 
-Structure: numeric columns are sorted into kinds by what their values are (0/1 flags; mostly-zero amounts; other
-amounts; signed or non-negative). A kind with at least ``min_cols`` columns is a group of interchangeable cells, and
+Structure: interchangeable columns share a name family with a running index (V1..V339, var_0..var_199) or all carry
+opaque hashed names, and are sorted into kinds by what their values are (0/1 flags; mostly-zero amounts; other
+amounts; signed or non-negative). A kind with at least ``min_cols`` such columns is a group of interchangeable cells, and
 each row gets: the count of non-zero (and of missing) cells, and the mean, standard deviation, minimum, maximum,
-median and sum of its cells (non-zero cells only for mostly-zero kinds; on log1p for non-negative kinds). Groups of a
-few columns are left to the column search.
+median and sum of its cells (non-zero cells only for mostly-zero kinds; on log1p for non-negative kinds). Named
+columns of different meaning (prices next to sizes) are never pooled; groups of a few columns are left to the search.
 """
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
+from tabularaml.generate.forge import column_families
 
-def column_kinds(X: pd.DataFrame, sample: int = 200_000) -> Dict[str, List[str]]:
-    """{kind: columns}; kind = binary | (sparse | dense) x (pos | signed)."""
+
+def _opaque(name) -> bool:
+    """A hashed, meaningless column name (Santander Value's 48df886f9)."""
+    return bool(re.fullmatch(r"[0-9a-f]{6,}", str(name))) and any(ch.isdigit() for ch in str(name))
+
+
+def column_kinds(X: pd.DataFrame, sample: int = 200_000, min_cols: int = 10) -> Dict[str, List[str]]:
+    """{kind: columns}. Interchangeable columns share a name family (V1..V339, var_0..var_199) or all carry
+    opaque hashed names, and hold the same kind of value: binary | (sparse | dense) x (pos | signed)."""
     S = X.iloc[:sample]
+    fam = {c: f for f, cols in column_families(list(S.columns), min_size=min_cols).items() for c in cols}
     out: Dict[str, List[str]] = {}
     for c in S.columns:
+        name = "anon" if _opaque(c) else fam.get(c)
+        if name is None:
+            continue
         s = S[c]
         if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
             continue
@@ -35,11 +49,12 @@ def column_kinds(X: pd.DataFrame, sample: int = 200_000) -> Dict[str, List[str]]
             k = "binary"
         else:
             k = ("sparse" if (v == 0).mean() >= 0.5 else "dense") + ("_pos" if v.min() >= 0 else "_signed")
-        out.setdefault(k, []).append(c)
+        out.setdefault(f"{name}_{k}", []).append(c)
     return out
 
 
 def _stats(M: np.ndarray, kind: str) -> Dict[str, np.ndarray]:
+    kind = "binary" if kind.endswith("_binary") else "_".join(kind.split("_")[-2:])   # the value kind
     miss = ~np.isfinite(M)
     nz = np.isfinite(M) & (M != 0)
     out = {"nonzero": nz.sum(1).astype(float)}
@@ -70,7 +85,7 @@ def _stats(M: np.ndarray, kind: str) -> Dict[str, np.ndarray]:
 def row_stat_features(Xtr: pd.DataFrame, Xte: pd.DataFrame, min_cols: int = 10, chunk: int = 100_000
                       ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     """Row statistics for every kind with ``min_cols`` or more columns (kinds read on the training rows)."""
-    groups = {k: cols for k, cols in column_kinds(Xtr).items() if len(cols) >= min_cols}
+    groups = {k: cols for k, cols in column_kinds(Xtr, min_cols=min_cols).items() if len(cols) >= min_cols}
 
     def build(X: pd.DataFrame) -> pd.DataFrame:
         parts = []
