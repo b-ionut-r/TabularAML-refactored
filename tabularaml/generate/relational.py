@@ -302,10 +302,27 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
     return res.astype(np.float32)
 
 
+def _yyyymmdd(v: np.ndarray) -> pd.Series:
+    return pd.to_datetime(pd.Series(v).astype("Int64").astype(str), format="%Y%m%d", errors="coerce")
+
+
+def _numeric_dates(v: np.ndarray) -> bool:
+    """Numbers that are calendar dates written as yyyymmdd (20170131)."""
+    f = v[np.isfinite(v)]
+    if not len(f) or f.min() < 19000101 or f.max() > 21001231 or not np.all(f % 1 == 0):
+        return False
+    return _yyyymmdd(f[:10_000]).notna().mean() >= 0.99
+
+
 def time_values(s: pd.Series) -> np.ndarray:
-    """A time column as floats: numbers as they are, dates (datetime or text such as 2015-01-28) as nanoseconds."""
-    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+    """A time column as floats: numbers as they are, dates (datetime, text such as 2015-01-28, or numbers such as
+    20170131) as nanoseconds."""
+    if pd.api.types.is_bool_dtype(s):
         return s.to_numpy(dtype=float)
+    if pd.api.types.is_numeric_dtype(s):
+        v = s.to_numpy(dtype=float)
+        # Dates written as numbers (20170131): days apart, not numbers apart.
+        return time_values(_yyyymmdd(v)) if _numeric_dates(v) else v
     if not pd.api.types.is_datetime64_any_dtype(s):
         s = pd.to_datetime(as_text(s), errors="coerce")
     v = s.to_numpy("datetime64[ns]").astype(np.int64).astype(float)
@@ -322,7 +339,7 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
 
     Per main row: number of earlier events, time since the first and the last; mean /
     sum / max / min / std of each numeric child column over all earlier events and the
-    mean over the last ``recent`` ones; share of earlier events at each frequent level of
+    mean over the last ``recent`` ones, the latest value and its last change; share of earlier events at each frequent level of
     each categorical column, their count over the last ``recent[0]``, and the number of
     distinct levels seen. Computed with prefix sums over the child sorted by (key, time),
     so the cost is O((rows + events) log) whatever the number of main rows per key.
@@ -366,10 +383,16 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
     feats = [c for c in df.columns if c not in ids]
     cats = [c for c in feats if df[c].dtype == object or isinstance(df[c].dtype, pd.CategoricalDtype)
             or pd.api.types.is_string_dtype(df[c]) or df[c].dtype == bool]
-    num = [c for c in feats if c not in cats and pd.api.types.is_numeric_dtype(df[c])]
+    num = [c for c in feats if c not in cats and (pd.api.types.is_numeric_dtype(df[c])
+                                                  or pd.api.types.is_datetime64_any_dtype(df[c]))]
     blk = ck[order]
     for c in num:
-        x = df[c].to_numpy(dtype=float)[order]
+        # A date column (membership expiry as 20170315) is read in days from the row's time: absolute dates
+        # shift between a training month and a later test month.
+        dated = pd.api.types.is_datetime64_any_dtype(df[c]) or (
+            not pd.api.types.is_bool_dtype(df[c]) and _numeric_dates(df[c].to_numpy(dtype=float)))
+        x = time_values(df[c])[order] / 864e11 if dated else df[c].to_numpy(dtype=float)[order]
+        rel = mt / 864e11 if dated else 0.0
         ok = np.isfinite(x)
         xz = np.where(ok, x, 0.0)
         S, S2, N = prefix(xz), prefix(xz ** 2), prefix(ok.astype(float))
@@ -377,19 +400,23 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
         with np.errstate(all="ignore"):
             mean = window(S, lo, p) / m
             if "mean" in stats:
-                out[f"{pre}__{c}_mean"] = mean
-            if "sum" in stats:
+                out[f"{pre}__{c}_mean"] = mean - rel
+            if "sum" in stats and not dated:
                 out[f"{pre}__{c}_sum"] = window(S, lo, p)
             if "std" in stats:
                 out[f"{pre}__{c}_std"] = np.sqrt(np.maximum(window(S2, lo, p) / m - mean ** 2, 0))
             for k in recent:
                 a = np.maximum(lo, p - k)
-                out[f"{pre}__{c}_last{k}"] = window(S, a, p) / window(N, a, p)
+                out[f"{pre}__{c}_last{k}"] = window(S, a, p) / window(N, a, p) - rel
+            # The latest state as of the row (a customer's products last month) and its last change.
+            last = np.where(has, x[np.maximum(p - 1, 0)], np.nan)
+            out[f"{pre}__{c}_latest"] = last - rel
+            out[f"{pre}__{c}_latest_change"] = np.where(n >= 2, last - x[np.maximum(p - 2, 0)], np.nan)
         for st, fn in (("max", np.fmax), ("min", np.fmin)):
             if st in stats:
                 s = pd.Series(np.where(ok, x, np.nan))
                 cum = (s.groupby(blk).cummax() if st == "max" else s.groupby(blk).cummin()).to_numpy()
-                out[f"{pre}__{c}_{st}"] = np.where(has, cum[np.maximum(p - 1, 0)], np.nan)
+                out[f"{pre}__{c}_{st}"] = np.where(has, cum[np.maximum(p - 1, 0)], np.nan) - rel
     for c in cats:
         s = as_text(df[c]).to_numpy()[order]
         for lv in pd.Series(s).value_counts().index[:top_levels]:
@@ -483,7 +510,8 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
 
 
 def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
-                   main_time: Optional[str] = None, windows: Sequence[int] = (30, 90, 180)) -> pd.DataFrame:
+                   main_time: Optional[str] = None, windows: Sequence[int] = (30, 90, 180),
+                   ordinal: bool = False) -> pd.DataFrame:
     """Child rows of the same key that also share a main row's value in other columns.
 
     A customer's purchases in the offer's category, from its company, of its brand (Acquire
@@ -492,13 +520,19 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
     of each numeric child column over them, all-time and, when the main row has a date and the
     child a time, over the last ``windows`` days before that date (child rows dated on or after
     it are left out). One output row per main row; label-free.
+
+    ``ordinal``: the times are positions in a sequence the main row also carries (Instacart's order
+    number): only child rows strictly earlier count, and the gap to the latest match is in those units.
     """
     out = pd.DataFrame(index=main.index)
     df = ch.df
     nums = [c for c in df.columns if c not in (key, ch.time) and c not in cols and c not in ch.drop
             and pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 2][:4]
     t_child = t_main = None
-    if main_time is not None and ch.time is not None:
+    if ordinal and main_time is not None and ch.time is not None:
+        t_child, t_main = time_values(df[ch.time]), time_values(main[main_time])
+        windows = ()
+    elif main_time is not None and ch.time is not None:
         t_child = pd.to_datetime(as_text(df[ch.time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
         t_main = pd.to_datetime(as_text(main[main_time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
     rows = pd.DataFrame({"__r": np.arange(len(main)), key: main[key].to_numpy()})
@@ -521,6 +555,6 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
                 out[f"{base}__{_safe(v)}_sum"] = g[v].sum().reindex(np.arange(len(main))).fillna(0).to_numpy(dtype=np.float32)
         if t_child is not None:
             last = m.groupby("__r")["__age"].min().reindex(np.arange(len(main)))
-            out[f"{ch.name}__same_{_safe(c)}__days_since"] = last.to_numpy(dtype=np.float32)
+            out[f"{ch.name}__same_{_safe(c)}__{'since' if ordinal else 'days_since'}"] = last.to_numpy(dtype=np.float32)
         del m, j
     return out

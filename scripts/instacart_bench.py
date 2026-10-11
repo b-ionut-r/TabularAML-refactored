@@ -65,6 +65,27 @@ if 'text' in a.arm:
 Xtr, Xho, ytr, yho = X[~ho].reset_index(drop=True), X[ho].reset_index(drop=True), y[~ho], y[ho]
 if a.shuffle:  # leakage control: permuted training labels
     ytr = np.random.default_rng(0).permutation(ytr)
+if a.arm == 'ff':
+    # Blind: scripts/contest_features.py at its defaults, with the prior order lines as an event log keyed by user
+    # and ordered by order number (held-out users' prior orders are known, as the contest's test users' were).
+    import subprocess, tempfile, shutil
+    tmp = Path(tempfile.mkdtemp(dir='/home/user/tmp'))
+    try:
+        Xtr.assign(reordered_next=ytr).to_parquet(tmp / 'train.parquet'); Xho.to_parquet(tmp / 'test.parquet')
+        op.drop(columns=['up', 'order_id']).merge(prod, on='product_id', how='left').to_parquet(tmp / 'log.parquet')
+        subprocess.run([sys.executable, str(Path(__file__).resolve().parent / 'contest_features.py'), '--train', str(tmp / 'train.parquet'),
+                        '--test', str(tmp / 'test.parquet'), '--target', 'reordered_next', '--task', 'binary', '--out-dir', str(tmp / 'out'),
+                        '--table', f'log={tmp / "log.parquet"}:user_id:order_number'], check=True)
+        Xtr = pd.read_parquet(tmp / 'out' / 'train_features.parquet').drop(columns=['reordered_next'])
+        Xho = pd.read_parquet(tmp / 'out' / 'test_features.parquet')[Xtr.columns]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for X_ in (Xtr, Xho):
+        for c in X_.columns:
+            if not (pd.api.types.is_numeric_dtype(X_[c]) or isinstance(X_[c].dtype, pd.CategoricalDtype)):
+                X_[c] = X_[c].astype('category')
+    import resource
+    info['peak_mb'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024
 if 'forge' in a.arm:
     from tabularaml.generate.forge import FeatureForge
     f = FeatureForge(task='binary', time_budget=a.budget, random_state=a.seed, n_jobs=4, verbose=True, **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho)

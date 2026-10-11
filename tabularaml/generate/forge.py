@@ -54,11 +54,16 @@ ARITH_OPS = ("add", "sub", "mul", "div", "rdiv")
 # and would pick differently again on a faster or busier machine. Work is charged in seconds of
 # the 4-core reference container, from row and column counts only, so ``time_budget`` keeps its
 # meaning there. Measured on Home Credit, IEEE-CIS, Santander and Porto Seguro builds:
-_CV_CELL_S = 3e-7       # one 5-fold CV fit, per search row and model column
-_ROW_PASS_S = 4e-7      # building and screening one candidate of unit cost, per row (thread time; on Home
-                        # Credit, building took twice the thread time it logs, as four threads share memory)
+_CV_CELL_S = 3e-7       # prior for one 5-fold CV fit, per search row and model column (before it runs)
+_TREE_CELL_S = 1.6e-9   # one boosting iteration, per training row and model column (Home Credit 320 and 120
+                        # columns, 80k-197k rows, and a 100-column regression all measured 1.5-2.0e-9)
+_ROW_PASS_S = 2e-7      # building and screening one candidate of unit cost, per row (thread time)
 _PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
 _KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
+_SETUP_COL_S = 5e-1     # column screens before the search (codes, keys, label echoes), per column of a
+                        # table of 300k rows or more (Home Credit and IEEE-CIS both took 0.6 s a column)
+_WU_ROW_SHARE = 0.05    # a label-free candidate fitted over all known rows costs its search rows plus this
+                        # share of those rows (IEEE-CIS: 1,698 group statistics over 1.1M rows, 0.09 s each)
 _REF_THREADS = 4        # candidate building runs on this many threads there
 # Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
 _SPEC_WORK = {
@@ -123,6 +128,9 @@ def _key_values(s: pd.Series) -> np.ndarray:
     if _is_cat(s):
         return _as_str(s).to_numpy()
     return s.astype(float).fillna(-1.234567e300).to_numpy()
+
+
+ROW_TIME = "__row__"
 
 
 class Context:
@@ -747,6 +755,31 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
             fam.setdefault(m.group(1), []).append(c)
             idx[c] = int(m.group(2))
     return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
+
+
+def _winsor(d, y=None, q=0.01):
+    """Clip paired per-row loss differences at their ``q`` / ``1 - q`` quantiles, so a handful
+    of extreme rows cannot carry a gate decision. For class labels the quantiles are taken
+    within each class: with rare positives every positive row sat in the global tails (H&M,
+    0.4% positives: a set with a worse mean loss scored z=+190 once they were clipped)."""
+    d = np.asarray(d, dtype=float)
+    if y is None:
+        lo, hi = np.quantile(d, [q, 1 - q])
+        return np.clip(d, lo, hi)
+    out = d.copy()
+    y = np.asarray(y)
+    for k in np.unique(y):
+        m = y == k
+        lo, hi = np.quantile(d[m], [q, 1 - q])
+        out[m] = np.clip(d[m], lo, hi)
+    return out
+
+
+def _later_half(dw, t):
+    """Mean of the paired differences over the later half of the gate rows by time: the test
+    rows come after the gate, so a gain that has already reversed there does not carry."""
+    order = np.argsort(np.asarray(t, dtype=float), kind="stable")
+    return float(dw[order[len(order) // 2:]].mean())
 
 
 def _block_z(d, blocks):
@@ -2342,12 +2375,14 @@ class FeatureForge:
             return M[r] if pick is None else M[np.ix_(r, pick)]
         n = len(M)
         n_fits = sum(len(f) for f in repeats)
-        cost = self._cv_cost(n, M.shape[1] if pick is None else len(pick), n_fits)
-        self._last_cv_cost = cost
-        if give_up and cost > give_up:
-            self._cv_projected = cost
+        width = M.shape[1] if pick is None else len(pick)
+        prior = self._cv_cost(n, width, n_fits)
+        if give_up and prior > give_up:
+            self._cv_projected = prior
             return None
-        self._charge(cost)
+        # Each fold is charged from the iterations it trained (early stopping is deterministic):
+        # a fit of thousands of trees costs that, not the row-by-column prior.
+        self._last_cv_cost = 0.0
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
@@ -2379,6 +2414,9 @@ class FeatureForge:
                     b = lgb.train(self._lgb_params(lr), dtr, 2000, valid_sets=[dva],
                                   callbacks=[lgb.early_stopping(50, verbose=False)])
                     del Mtr, dtr, dva
+                fold_cost = _TREE_CELL_S * b.current_iteration() * len(tr) * width * (self.n_classes_ if self.task_ == "multiclass" else 1)
+                self._last_cv_cost += fold_cost
+                self._charge(fold_cost)
                 oof[va] = b.predict(Mva, num_iteration=b.best_iteration, raw_score=True)
                 imp += pd.Series(b.feature_importance("gain"), index=cols)
                 if mine:
@@ -2406,6 +2444,8 @@ class FeatureForge:
                 echo |= set(sp.out_names()) | {sp.name}
 
         def add(spec):
+            if ROW_TIME in spec.parents:  # file position: it orders the splits, it is not a feature
+                return
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
                 return
             # Label-echo columns (and features built on them) only in same-row features.
@@ -2498,6 +2538,11 @@ class FeatureForge:
                 if len(W) <= 300_000:
                     ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
                     add(KNNTarget([la, lo], ks, self.n_classes_, f"geo_{la}"))
+            # Structured strings: character n-grams, and molecule descriptors when they parse as SMILES.
+            if self.seq_cols_:
+                from .seqstr import seq_specs
+                for sp in seq_specs(self.seq_cols_, self.smiles_cols_, self.n_classes_):
+                    add(sp)
             # Free text: how it is written, its topics, and a sparse linear model on its words.
             for c in self.text_cols_:
                 add(TextStats(c))
@@ -2840,7 +2885,7 @@ class FeatureForge:
 
         def work(s):
             """A candidate's building cost on the work clock (thread seconds), from its family and rows."""
-            rows = len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else len(W)
+            rows = len(W) + (_WU_ROW_SHARE * len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else 0)
             return _SPEC_WORK.get(type(s).__name__, _SPEC_WORK_DEFAULT) * rows * _ROW_PASS_S
 
         def compute(s):
@@ -2878,7 +2923,15 @@ class FeatureForge:
         plan, fam_work, capped, total = [], {}, set(), 0.0
         firsts = [g[0] for g in fams.values()]
         rest = [sp for f in sorted(fams, key=lambda f: work(fams[f][0])) for sp in fams[f][1:]]
-        for sp in firsts + rest:
+        # When every candidate fits, none is skipped: a family's share only matters when the
+        # families compete for the work (IEEE-CIS's seven neighbour encodings fit with the rest).
+        everything = sum(work(sp) for sp in specs)
+        fits_all = not self.time_budget or self._time_left() - everything / _REF_THREADS >= reserve
+        for sp in (specs if fits_all else firsts + rest):
+            if fits_all:
+                total += work(sp)
+                plan.append(sp)
+                continue
             f = type(sp).__name__
             if f in capped:
                 continue
@@ -2892,6 +2945,8 @@ class FeatureForge:
             fam_work[f] = fam_work.get(f, 0.0) + w
             total += w
             plan.append(sp)
+        if self.time_budget:
+            self._log(f"budget: {self._time_left():.0f}s of work left; building takes {total / _REF_THREADS:.0f}s")
         if len(plan) < n_all:
             self._log(f"budget: built {len(plan)} of {n_all} candidates")
         self._charge(total / _REF_THREADS)
@@ -3257,6 +3312,10 @@ class FeatureForge:
             X[c] = _as_str_frame_col(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
+        # Structured strings (molecules, sequences, segmented codes): read character by character.
+        from .seqstr import is_seq_string, is_smiles
+        self.seq_cols_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and is_seq_string(X[c])] if self.text else []
+        self.smiles_cols_ = [c for c in self.seq_cols_ if is_smiles(X[c])]
         X = self._compact(X)
         # Coded strings that carry a number ("location 118") are offered as that number.
         self.numbered_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and _numbered_codes(X[c])]
@@ -3285,8 +3344,12 @@ class FeatureForge:
         self.key_cols_ += self.code_cols_
         self.key_cols_ += [a[3] for a in self.anchors_]
         self.key_cols_ = [c for c in self.key_cols_ if c not in self.text_cols_]
+        self._charge(_SETUP_COL_S * X.shape[1] * min(len(X), 300_000) / 300_000)
         if self.text_cols_:
             self._log(f"free text: {', '.join(self.text_cols_)}")
+        if self.seq_cols_:
+            self._log(f"structured strings: {', '.join(self.seq_cols_)}"
+                      + (f" (molecules: {', '.join(self.smiles_cols_)})" if self.smiles_cols_ else ""))
         self.ctx_ = Context(self.task_, self.n_classes_, self.random_state)
         self.ctx_.fold_avg_te = self.fold_avg_te
 
@@ -3295,6 +3358,18 @@ class FeatureForge:
         idx = np.arange(n)
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
+        if (self.time_col_ is None and self.time_col == "auto" and X_unlabeled is not None
+                and self._row_ordered(X, y_np, X_unlabeled) and self._detect_group(X, X_unlabeled) is None):
+            # Rows in file order form a series (each row nearly repeats the one before: minute bars
+            # without their timestamps, as DRW's crypto file came): random gate rows and folds would
+            # sit between their neighbours, and neighbour / target features pass on a gate the later
+            # test never matches (DRW: gate +41%, held-out Pearson 0.073 -> 0.016). The file position
+            # orders the gate and folds as a time column would; no feature is built from it.
+            X[ROW_TIME] = np.arange(n, dtype=float)
+            X_unlabeled = X_unlabeled.copy()
+            X_unlabeled[ROW_TIME] = n + np.arange(len(X_unlabeled), dtype=float)
+            self.time_col_ = ROW_TIME
+            self._log("rows in file order form a series: gate and folds follow file order")
         self.horizon_ = 0.0
         self.embargo_ = np.array([], dtype=int)
         self._groups = {}
@@ -3856,6 +3931,10 @@ class FeatureForge:
                 codes = np.empty(len(tg), dtype=int)
                 codes[order] = np.arange(len(tg)) * 30 // len(tg)
             blocks = codes if codes.max() >= 4 else None
+        yc = yg if self.task_ != "regression" else None
+        tg_all = (Xg[self.time_col_].to_numpy(dtype=float)
+                  if self.time_col_ is not None and self.time_col_ in Xg.columns else None)
+        self._gate_yt = (yc, tg_all)
         # The baseline is always the raw columns as given (native categoricals).
         raw_rows = gate_loss(self.base_cols_, recode=False)
         raw_l = float(raw_rows.mean())
@@ -3909,16 +3988,19 @@ class FeatureForge:
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
             rows = gate_loss(cols, rc)
             d = raw_rows - rows
-            # Winsorise so a handful of extreme rows cannot carry the decision.
-            lo, hi = np.quantile(d, [0.01, 0.99])
-            dw = np.clip(d, lo, hi)
+            dw = _winsor(d, yc)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
             zb = _block_z(dw, blocks) if blocks is not None else None
+            late = _later_half(dw, tg_all) if tg_all is not None else None
             self._log(f"  gate {label}{' (recoded)' if self.recode_ and rc is None else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
-                      f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
+                      f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "")
+                      + (f", later half {late:+.2e}" if late is not None else "") + f", need {z_needed:.2f})")
             if self.gate_by_period and zb is not None:
                 z = zb
-            if rows.mean() < best_l and z >= z_needed:
+            # Time-ordered gates: the gain must still hold over the later half of the gate rows
+            # (Hull Tactical, 1,086 daily gate rows: z=+1.59 overall, +2.47 / -1.35 by half;
+            # held-out Pearson 0.072 -> 0.038).
+            if rows.mean() < best_l and z >= z_needed and (late is None or late > 0):
                 best_set, best_l, best_z = specs, float(rows.mean()), z
                 best_recode = self.recode_ if rc is None else rc
         self.recode_ = best_recode
@@ -3969,9 +4051,12 @@ class FeatureForge:
         def score(specs):
             rows = gate_loss(self.raw_cols_ + [c for sp in specs for c in sp.out_names()])
             d = raw_rows - rows
-            lo, hi = np.quantile(d, [0.01, 0.99])
-            dw = np.clip(d, lo, hi)
-            return float(rows.mean()), float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
+            yc, tg = getattr(self, "_gate_yt", (None, None))
+            dw = _winsor(d, yc)
+            z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
+            if tg is not None and _later_half(dw, tg) <= 0:
+                z = min(z, 0.0)   # reversed over the later gate rows: never clears the gate
+            return float(rows.mean()), z
 
         cur = closed(list(self.selected_))
         while len({fam(sp) for sp in cur}) > 1:
@@ -4089,6 +4174,58 @@ class FeatureForge:
             if rising > 0.98:
                 return c
         return None
+
+    def _row_ordered(self, X, y, U=None, max_rows=200_000) -> bool:
+        """Most numeric columns carry over from each row to the next: their lag-1 correlation
+        is beyond chance (z > 4, which a shuffled file passes in about 3 columns per 100,000),
+        the labels are not sorted, and the test rows lie beyond the training rows rather than
+        among them. Shuffled files never qualify; time-ordered ones do. A file kept in some other
+        order (Forest Cover's, by area) whose test rows were drawn from among its rows does not."""
+        num = [c for c in self.base_cols_ if c not in self.cat_cols_ and X[c].nunique() > 10][:200]
+        if len(num) < 3 or len(X) < 1000:
+            return False
+        yy = np.asarray(y, dtype=float)[:max_rows]
+        if np.mean(np.diff(yy) >= 0) > 0.99 or np.mean(np.diff(yy) <= 0) > 0.99:
+            return False
+        z = []
+        for c in num:
+            x = X[c].to_numpy(dtype=float)[:max_rows]
+            a, b = x[:-1], x[1:]
+            ok = np.isfinite(a) & np.isfinite(b)
+            if ok.sum() > 100 and np.std(a[ok]) > 0 and np.std(b[ok]) > 0:
+                z.append(np.corrcoef(a[ok], b[ok])[0, 1] * np.sqrt(ok.sum()))
+        if not (len(z) >= 3 and float(np.mean(np.array(z) > 4)) > 0.5):
+            return False
+        return U is None or self._test_beyond(X, U, num)
+
+    def _test_beyond(self, X, U, num, m=2000, seed=0) -> bool:
+        """Test rows sit farther from the training rows than training rows sit from each other.
+        Equal-sized samples of training and test rows find their nearest neighbour among the other
+        training rows (columns as ranks); a test drawn from among the training rows (a random
+        holdout, however the file is ordered) gives the two the same distances, a later period
+        gives the test larger ones. One-sided rank test, z > 4."""
+        from scipy.stats import mannwhitneyu
+        from sklearn.neighbors import NearestNeighbors
+        cols = [c for c in num if c in U.columns][:50]
+        if len(cols) < 3 or len(U) < 100:
+            return True
+        A = pd.concat([X[cols], U[cols]], ignore_index=True).apply(pd.to_numeric, errors="coerce")
+        A = A.rank(pct=True).fillna(0.5).to_numpy(dtype=np.float32)
+        tr, te = A[:len(X)], A[len(X):]
+        rng = np.random.default_rng(seed)
+        k = min(m, len(te), len(tr) // 4)
+        perm = rng.permutation(len(tr))
+        q_tr, ref = tr[perm[:k]], tr[perm[k:]]
+        if len(ref) > 100_000:
+            ref = ref[rng.choice(len(ref), 100_000, replace=False)]
+        q_te = te[rng.choice(len(te), k, replace=False)]
+        nn = NearestNeighbors(n_neighbors=1).fit(ref)
+        d_tr, d_te = nn.kneighbors(q_tr)[0][:, 0], nn.kneighbors(q_te)[0][:, 0]
+        u = mannwhitneyu(d_te, d_tr, alternative="greater").statistic
+        z = (u - k * k / 2) / np.sqrt(k * k * (2 * k + 1) / 12)
+        self._log(f"file-order check: test rows {'beyond' if z > 4 else 'among'} the training rows "
+                  f"(nearest-row distance z={z:+.1f})")
+        return bool(z > 4)
 
     def _detect_time(self, X, U):
         if self.time_col != "auto":
