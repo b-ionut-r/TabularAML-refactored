@@ -1331,6 +1331,19 @@ def _text_values(df, c, clip: Optional[int] = None) -> pd.Series:
     return t if clip is None else t.str.slice(0, clip)
 
 
+def _text_parts(df, c, clip: Optional[int] = None):
+    """``_text_values`` as its distinct texts and each row's index into them: texts repeated over
+    many rows (a game's rules on each of its matches) are transformed once, not once per row."""
+    s = df[c]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        codes, u = s.cat.codes.to_numpy().astype(np.int64), pd.Series(s.cat.categories.astype(object))
+    else:
+        codes, u = pd.factorize(s)
+        u = pd.Series(np.asarray(u, dtype=object))
+    u = pd.concat([u, pd.Series([np.nan], dtype=object)], ignore_index=True)
+    return _text_values(pd.DataFrame({c: u}), c, clip), np.where(codes < 0, len(u) - 1, codes)
+
+
 TEXT_CLIP = 1500
 
 
@@ -1344,7 +1357,7 @@ class TextStats(Spec):
         self.name = f"txtstat__{col}"
 
     def transform(self, df, ctx):
-        t = _text_values(df, self.parents[0])
+        t, codes = _text_parts(df, self.parents[0])
         n_ch = t.str.len().to_numpy(dtype=float)
         words = t.str.lower().str.findall(r"\w+")
         n_w = words.str.len().to_numpy(dtype=float)
@@ -1354,7 +1367,7 @@ class TextStats(Spec):
         pun = t.str.count(r"[^\w\s]").to_numpy(dtype=float)
         den = np.maximum(n_ch, 1.0)
         return np.column_stack([n_ch, n_w, dig / den, up / den, pun / den,
-                                n_u / np.maximum(n_w, 1.0), (n_ch == 0).astype(float)]).astype(np.float32)
+                                n_u / np.maximum(n_w, 1.0), (n_ch == 0).astype(float)]).astype(np.float32)[codes]
 
 
 def _tfidf(kind: str, max_features: int):
@@ -1393,7 +1406,8 @@ class TextSVD(Spec):
         return self
 
     def transform(self, df, ctx):
-        return self.svd_.transform(self.vec_.transform(_text_values(df, self.parents[0], TEXT_CLIP))).astype(np.float32)
+        t, codes = _text_parts(df, self.parents[0], TEXT_CLIP)
+        return self.svd_.transform(self.vec_.transform(t)).astype(np.float32)[codes]
 
 
 class TextLinearOOF(Spec):
@@ -1435,7 +1449,10 @@ class TextLinearOOF(Spec):
 
     def _design(self, df):
         from scipy import sparse
-        blocks = [v.transform(_text_values(df, c, TEXT_CLIP)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
+        blocks = []
+        for c, vs in zip(self.text_cols, self.vecs_):
+            t, codes = _text_parts(df, c, TEXT_CLIP)
+            blocks += [v.transform(t)[codes] for v in vs]
         if self.keys:
             blocks.append(self.ohe_.transform(as_text_frame(df[self.keys])))
         return sparse.hstack(blocks, format="csr")
@@ -3965,8 +3982,11 @@ class FeatureForge:
         row: the same values, an eighth of the memory (Microsoft Malware's 30 string columns over
         9M rows were 5 GB per copy of the frame)."""
         for c in self.cat_cols_:
-            if c in X.columns and c not in self.text_cols_ and not isinstance(X[c].dtype, pd.CategoricalDtype):
-                X[c] = X[c].astype("category")
+            if c in X.columns and not isinstance(X[c].dtype, pd.CategoricalDtype):
+                # Free text too when it repeats (MCTS: a game's rules, thousands of characters,
+                # on each of its matches; one string per row was gigabytes per frame copy).
+                if c not in self.text_cols_ or X[c].nunique() <= 0.5 * len(X):
+                    X[c] = X[c].astype("category")
         return X
 
     def _detect_group(self, X, U):
