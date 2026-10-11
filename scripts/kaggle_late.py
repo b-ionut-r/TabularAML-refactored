@@ -131,6 +131,9 @@ for _n in ["ieee_s", "ieee_s2"]:
     CONTESTS[_n] = dict(CONTESTS["ieee_v6"], repo=S_REPO)
 CONTESTS["hc_s"] = dict(CONTESTS["hc"], raw="hc", repo=S_REPO, base="hc")
 
+# Work clock with per-iteration fit costs (wt_det2, on superset 3f92353).
+CONTESTS["ieee_t"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_det2")
+
 
 def download(c: str) -> Path:
     d = ROOT / CONTESTS[c].get("raw", c) / "raw"
