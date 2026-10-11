@@ -120,8 +120,8 @@ def json_fields(Xtr: pd.DataFrame, Xte: pd.DataFrame, sample: int = 2000, min_sh
         if not (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)
                 or isinstance(s.dtype, pd.CategoricalDtype)):
             continue
-        head = s.dropna().iloc[:sample]
-        if len(head) == 0 or head.map(lambda x: _as_object(x) is not None).mean() < 0.9:
+        head = s.dropna().iloc[:sample].astype(object)   # a category column maps to a category column
+        if len(head) == 0 or np.mean([_as_object(x) is not None for x in head]) < 0.9:
             continue
         found.append(c)
         both = pd.concat([s, Xte[c]], ignore_index=True).astype(object)

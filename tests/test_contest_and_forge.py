@@ -482,3 +482,7 @@ def test_json_object_columns_are_flattened_into_fields():
     assert a["totals.hits"].dtype == np.float32 and len(b) == 100
     assert a["totals.hits"].iloc[0] == float(json.loads(rows[0])["hits"])
     assert json_fields(tr[["other"]], te[["other"]])[2] == []
+    cat = pd.DataFrame({"c": pd.Series(["a", "b"] * 100, dtype="category")})
+    assert json_fields(cat, cat.iloc[:10])[2] == []
+    a2, _, found2 = json_fields(tr.astype({"totals": "category"}), te.astype({"totals": "category"}))
+    assert found2 == ["totals"] and a2.equals(a)
