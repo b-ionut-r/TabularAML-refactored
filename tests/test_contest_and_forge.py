@@ -484,5 +484,7 @@ def test_json_object_columns_are_flattened_into_fields():
     assert json_fields(tr[["other"]], te[["other"]])[2] == []
     cat = pd.DataFrame({"c": pd.Series(["a", "b"] * 100, dtype="category")})
     assert json_fields(cat, cat.iloc[:10])[2] == []
+    from tabularaml.generate.lists import list_features
+    assert list_features(cat, cat.iloc[:10])[2] == []
     a2, _, found2 = json_fields(tr.astype({"totals": "category"}), te.astype({"totals": "category"}))
     assert found2 == ["totals"] and a2.equals(a)

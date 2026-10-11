@@ -54,7 +54,7 @@ def as_lists(s: pd.Series, sample: int = 5000) -> Optional[pd.Series]:
     if len(v) == 0:
         return None
     head = v.iloc[:sample]
-    if head.map(lambda x: isinstance(x, (list, tuple, np.ndarray))).mean() > 0.9:
+    if np.mean([isinstance(x, (list, tuple, np.ndarray)) for x in head]) > 0.9:   # not .map: a category column maps to categories
         return s.map(lambda x: [str(i).strip() for i in x] if isinstance(x, (list, tuple, np.ndarray)) else [])
     if not (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)
             or isinstance(s.dtype, pd.CategoricalDtype)):
