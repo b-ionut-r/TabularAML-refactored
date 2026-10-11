@@ -60,6 +60,10 @@ _TREE_CELL_S = 1.6e-9   # one boosting iteration, per training row and model col
 _ROW_PASS_S = 2e-7      # building and screening one candidate of unit cost, per row (thread time)
 _PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
 _KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
+_SETUP_COL_S = 5e-1     # column screens before the search (codes, keys, label echoes), per column of a
+                        # table of 300k rows or more (Home Credit and IEEE-CIS both took 0.6 s a column)
+_WU_ROW_SHARE = 0.05    # a label-free candidate fitted over all known rows costs its search rows plus this
+                        # share of those rows (IEEE-CIS: 1,698 group statistics over 1.1M rows, 0.09 s each)
 _REF_THREADS = 4        # candidate building runs on this many threads there
 # Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
 _SPEC_WORK = {
@@ -2881,7 +2885,7 @@ class FeatureForge:
 
         def work(s):
             """A candidate's building cost on the work clock (thread seconds), from its family and rows."""
-            rows = len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else len(W)
+            rows = len(W) + (_WU_ROW_SHARE * len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else 0)
             return _SPEC_WORK.get(type(s).__name__, _SPEC_WORK_DEFAULT) * rows * _ROW_PASS_S
 
         def compute(s):
@@ -2919,7 +2923,15 @@ class FeatureForge:
         plan, fam_work, capped, total = [], {}, set(), 0.0
         firsts = [g[0] for g in fams.values()]
         rest = [sp for f in sorted(fams, key=lambda f: work(fams[f][0])) for sp in fams[f][1:]]
-        for sp in firsts + rest:
+        # When every candidate fits, none is skipped: a family's share only matters when the
+        # families compete for the work (IEEE-CIS's seven neighbour encodings fit with the rest).
+        everything = sum(work(sp) for sp in specs)
+        fits_all = not self.time_budget or self._time_left() - everything / _REF_THREADS >= reserve
+        for sp in (specs if fits_all else firsts + rest):
+            if fits_all:
+                total += work(sp)
+                plan.append(sp)
+                continue
             f = type(sp).__name__
             if f in capped:
                 continue
@@ -2933,6 +2945,8 @@ class FeatureForge:
             fam_work[f] = fam_work.get(f, 0.0) + w
             total += w
             plan.append(sp)
+        if self.time_budget:
+            self._log(f"budget: {self._time_left():.0f}s of work left; building takes {total / _REF_THREADS:.0f}s")
         if len(plan) < n_all:
             self._log(f"budget: built {len(plan)} of {n_all} candidates")
         self._charge(total / _REF_THREADS)
@@ -3330,6 +3344,7 @@ class FeatureForge:
         self.key_cols_ += self.code_cols_
         self.key_cols_ += [a[3] for a in self.anchors_]
         self.key_cols_ = [c for c in self.key_cols_ if c not in self.text_cols_]
+        self._charge(_SETUP_COL_S * X.shape[1] * min(len(X), 300_000) / 300_000)
         if self.text_cols_:
             self._log(f"free text: {', '.join(self.text_cols_)}")
         if self.seq_cols_:
