@@ -454,3 +454,16 @@ def test_group_sequences_get_running_sums_when_test_holds_new_groups():
     assert any(c.startswith("seq_cumsum__u") or c.startswith("seq_area__u") for c in f.new_columns_)
     v = GroupSeq("g", "t", "u", "cumsum").transform(X[~tr].reset_index(drop=True), None)
     assert np.allclose(v, pd.Series(u[~tr]).groupby(g[~tr]).cumsum().to_numpy())
+
+
+def test_row_order_rule_fires_on_series_not_on_shuffled_or_label_sorted_files():
+    rng = np.random.default_rng(0)
+    n = 5000
+    X = pd.DataFrame({f"x{i}": np.cumsum(rng.normal(size=n)) for i in range(8)})
+    y = rng.normal(size=n)
+    ff = FeatureForge()
+    ff.base_cols_, ff.cat_cols_ = list(X.columns), []
+    assert ff._row_ordered(X, y)
+    p = rng.permutation(n)
+    assert not ff._row_ordered(X.iloc[p].reset_index(drop=True), y[p])
+    assert not ff._row_ordered(X, np.sort(y))  # sorted by the label: a file layout, not a series

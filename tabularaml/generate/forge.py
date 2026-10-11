@@ -68,6 +68,9 @@ def _key_values(s: pd.Series) -> np.ndarray:
     return s.astype(float).fillna(-1.234567e300).to_numpy()
 
 
+ROW_TIME = "__row__"
+
+
 class Context:
     """Shared task info passed to specs."""
 
@@ -2291,6 +2294,8 @@ class FeatureForge:
                 echo |= set(sp.out_names()) | {sp.name}
 
         def add(spec):
+            if ROW_TIME in spec.parents:  # file position: it orders the splits, it is not a feature
+                return
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
                 return
             # Label-echo columns (and features built on them) only in same-row features.
@@ -3170,6 +3175,18 @@ class FeatureForge:
         idx = np.arange(n)
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
+        if (self.time_col_ is None and self.time_col == "auto" and X_unlabeled is not None
+                and self._row_ordered(X, y_np) and self._detect_group(X, X_unlabeled) is None):
+            # Rows in file order form a series (each row nearly repeats the one before: minute bars
+            # without their timestamps, as DRW's crypto file came): random gate rows and folds would
+            # sit between their neighbours, and neighbour / target features pass on a gate the later
+            # test never matches (DRW: gate +41%, held-out Pearson 0.073 -> 0.016). The file position
+            # orders the gate and folds as a time column would; no feature is built from it.
+            X[ROW_TIME] = np.arange(n, dtype=float)
+            X_unlabeled = X_unlabeled.copy()
+            X_unlabeled[ROW_TIME] = n + np.arange(len(X_unlabeled), dtype=float)
+            self.time_col_ = ROW_TIME
+            self._log("rows in file order form a series: gate and folds follow file order")
         self.horizon_ = 0.0
         self.embargo_ = np.array([], dtype=int)
         self._groups = {}
@@ -3926,6 +3943,25 @@ class FeatureForge:
             if rising > 0.98:
                 return c
         return None
+
+    def _row_ordered(self, X, y, max_rows=200_000) -> bool:
+        """Most numeric columns carry over from each row to the next: their lag-1 correlation
+        is beyond chance (z > 4, which a shuffled file passes in about 3 columns per 100,000),
+        and the labels are not sorted. Shuffled files never qualify; time-ordered ones do."""
+        num = [c for c in self.base_cols_ if c not in self.cat_cols_ and X[c].nunique() > 10][:200]
+        if len(num) < 3 or len(X) < 1000:
+            return False
+        yy = np.asarray(y, dtype=float)[:max_rows]
+        if np.mean(np.diff(yy) >= 0) > 0.99 or np.mean(np.diff(yy) <= 0) > 0.99:
+            return False
+        z = []
+        for c in num:
+            x = X[c].to_numpy(dtype=float)[:max_rows]
+            a, b = x[:-1], x[1:]
+            ok = np.isfinite(a) & np.isfinite(b)
+            if ok.sum() > 100 and np.std(a[ok]) > 0 and np.std(b[ok]) > 0:
+                z.append(np.corrcoef(a[ok], b[ok])[0, 1] * np.sqrt(ok.sum()))
+        return len(z) >= 3 and float(np.mean(np.array(z) > 4)) > 0.5
 
     def _detect_time(self, X, U):
         if self.time_col != "auto":
