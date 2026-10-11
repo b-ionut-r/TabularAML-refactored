@@ -72,7 +72,7 @@ _SPEC_WORK = {
     "SlotBag": 5, "SlotTE": 5, "TextStats": 5, "EntityLag": 10, "GroupSeq": 10, "LaggedTargetMean": 10,
     "EventRecency": 14, "LinResid": 60, "LinearOOF": 60, "Projection": 60, "FamilyCount": 400, "FamilyNB": 400,
     "TextSVD": 500, "CrossLinearOOF": 1000, "TextLinearOOF": 1000, "KNNClassDist": 1300, "ClientProfile": 1300,
-    "KNNTarget": 1700,
+    "KNNTarget": 1900,
 }
 _SPEC_WORK_DEFAULT = 20
 
@@ -2935,7 +2935,12 @@ class FeatureForge:
         def work(s):
             """A candidate's building cost on the work clock (thread seconds), from its family and rows."""
             rows = len(W) + (_WU_ROW_SHARE * len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else 0)
-            return _SPEC_WORK.get(type(s).__name__, _SPEC_WORK_DEFAULT) * rows * _ROW_PASS_S
+            w = _SPEC_WORK.get(type(s).__name__, _SPEC_WORK_DEFAULT) * rows * _ROW_PASS_S
+            if isinstance(s, (KNNTarget, KNNClassDist)):
+                # Brute-force neighbours: every row against every row, over the subspace's columns
+                # (thread seconds per candidate: IEEE-CIS 151k rows 45-59, Home Credit 246k rows 193).
+                w *= rows / 150_000 * (len(s.parents) + 8) / 18
+            return w
 
         def compute(s):
             t_s = time.time()
