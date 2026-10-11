@@ -37,34 +37,50 @@ def find_panel(X: pd.DataFrame, U: Optional[pd.DataFrame] = None, sample: int = 
     S = X.iloc[:sample] if len(X) > sample else X
     ints = [c for c in X.columns if _intlike(X[c]) and X[c].notna().mean() > 0.99]
     nu = {c: S[c].nunique() for c in ints}
-    # A day the test rows have not seen (time-split data); without one there is nothing to look for.
-    days = [c for c in ints if U is not None and c in U.columns and U[c].isin(set(X[c].unique())).mean() <= 0.1]
-    if U is not None and not days:
+    # Share of the test rows whose level was seen in training (read once per column).
+    seen = {c: U[c].isin(set(X[c].unique())).mean() for c in ints if c in U.columns} if U is not None else {}
+    # A day the test rows have not seen (time-split data); without one there is nothing to look for. A day holds
+    # several rows of an entity (checked below), so it holds 5+ rows on average: an id column, new in every test row,
+    # is not a day.
+    new = [c for c in seen if seen[c] <= 0.1]
+    days = [c for c in new if len(S) / max(nu[c], 1) >= 5]
+    if U is not None and (not new or (not days and all(c in U.columns for c in ints))):
         return None
     ents = [c for c in ints if 10 <= nu[c] <= 5000]
     if U is not None:
-        ents = [c for c in ents if c in U.columns and U[c].isin(set(X[c].unique())).mean() >= 0.9]
+        ents = [c for c in ents if c in seen and seen[c] >= 0.9]
+    together = {}
+
+    def grouped(m):
+        """A moment's rows sit together in the file (recorded a moment at a time); read once per moment."""
+        t = tuple(m)
+        if t not in together:
+            k = S[m].to_numpy()
+            together[t] = bool((k[1:] == k[:-1]).all(axis=1).mean() >= 0.5)
+        return together[t]
+
     for e in sorted(ents, key=lambda c: nu[c]):
         others = [c for c in ints if c != e and nu[c] >= 2]
         cands = [[m] for m in others if nu[m] >= 20 and len(S) / nu[m] >= 10] + \
                 [list(p) for p in combinations(others[:8], 2) if nu[p[0]] * nu[p[1]] >= 20]
         for m in cands:
+            # Recorded a moment at a time: a moment's rows sit together in the file (not a stock's days).
+            if not grouped(m):
+                continue
             g = S.groupby(m, sort=False, observed=True)[e]
             per = g.size()
             if len(per) < 20 or per.mean() < 10 or S.duplicated(m + [e]).mean() > 0.001:
-                continue
-            # Recorded a moment at a time: a moment's rows sit together in the file (not a stock's days).
-            k = S[m].to_numpy()
-            if (k[1:] == k[:-1]).all(axis=1).mean() < 0.5:
                 continue
             # A day: a column fixed within each moment, holding several moments of an entity.
             for d in [c for c in m + others if c != e]:
                 if len(m) == 1 and d == m[0]:
                     continue
+                if U is not None and d in U.columns and not seen.get(d, 1.0) <= 0.1:
+                    continue   # the day is time: the test rows' days are new
+                if len(S) / max(nu[d], 1) < 5:
+                    continue   # fewer than 5 rows per day: no entity has 5 rows on a day
                 if (S.groupby(m, sort=False, observed=True)[d].nunique() > 1).any():
                     continue
-                if U is not None and d in U.columns and not U[d].isin(set(X[d].unique())).mean() <= 0.1:
-                    continue   # the day is time: the test rows' days are new
                 steps = S.groupby([e, d], sort=False, observed=True).size()
                 if steps.mean() >= 5:
                     return {"entity": e, "moment": m, "day": d}

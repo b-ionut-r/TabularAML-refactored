@@ -510,7 +510,8 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
 
 
 def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
-                   main_time: Optional[str] = None, windows: Sequence[int] = (30, 90, 180)) -> pd.DataFrame:
+                   main_time: Optional[str] = None, windows: Sequence[int] = (30, 90, 180),
+                   ordinal: bool = False) -> pd.DataFrame:
     """Child rows of the same key that also share a main row's value in other columns.
 
     A customer's purchases in the offer's category, from its company, of its brand (Acquire
@@ -519,13 +520,19 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
     of each numeric child column over them, all-time and, when the main row has a date and the
     child a time, over the last ``windows`` days before that date (child rows dated on or after
     it are left out). One output row per main row; label-free.
+
+    ``ordinal``: the times are positions in a sequence the main row also carries (Instacart's order
+    number): only child rows strictly earlier count, and the gap to the latest match is in those units.
     """
     out = pd.DataFrame(index=main.index)
     df = ch.df
     nums = [c for c in df.columns if c not in (key, ch.time) and c not in cols and c not in ch.drop
             and pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 2][:4]
     t_child = t_main = None
-    if main_time is not None and ch.time is not None:
+    if ordinal and main_time is not None and ch.time is not None:
+        t_child, t_main = time_values(df[ch.time]), time_values(main[main_time])
+        windows = ()
+    elif main_time is not None and ch.time is not None:
         t_child = pd.to_datetime(as_text(df[ch.time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
         t_main = pd.to_datetime(as_text(main[main_time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
     rows = pd.DataFrame({"__r": np.arange(len(main)), key: main[key].to_numpy()})
@@ -548,6 +555,6 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
                 out[f"{base}__{_safe(v)}_sum"] = g[v].sum().reindex(np.arange(len(main))).fillna(0).to_numpy(dtype=np.float32)
         if t_child is not None:
             last = m.groupby("__r")["__age"].min().reindex(np.arange(len(main)))
-            out[f"{ch.name}__same_{_safe(c)}__days_since"] = last.to_numpy(dtype=np.float32)
+            out[f"{ch.name}__same_{_safe(c)}__{'since' if ordinal else 'days_since'}"] = last.to_numpy(dtype=np.float32)
         del m, j
     return out

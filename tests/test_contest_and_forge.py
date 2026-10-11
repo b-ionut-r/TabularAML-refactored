@@ -312,6 +312,26 @@ def test_forge_search_respects_small_budget():
     assert time.time() - t0 < 60
 
 
+def test_forge_picks_do_not_depend_on_the_clock(monkeypatch):
+    # A budget that binds: the same search on a machine whose clock races ahead (every reading
+    # a minute later than the last) must build, rank and keep exactly the same features.
+    import time
+    X, rng = _frame(3000)
+    y = np.log(X.a / X.b) * 3 + X.c + rng.normal(scale=0.3, size=len(X))
+    kw = dict(task="regression", time_budget=0.1, n_jobs=2, verbose=False)
+    a = FeatureForge(**kw).fit(X, y)
+    real, t = time.time, [time.time()]
+
+    def racing():
+        t[0] += 60.0
+        return t[0]
+    monkeypatch.setattr(time, "time", racing)
+    b = FeatureForge(**kw).fit(X, y)
+    monkeypatch.setattr(time, "time", real)
+    assert a.new_columns_ == b.new_columns_
+    assert a.history_ == b.history_
+
+
 def test_forge_search_subsample_keeps_output_on_every_row():
     rng = np.random.default_rng(0)
     X = pd.DataFrame(rng.normal(size=(6000, 4)), columns=list("abcd"))
@@ -455,6 +475,33 @@ def test_group_sequences_get_running_sums_when_test_holds_new_groups():
     assert any(c.startswith("seq_cumsum__u") or c.startswith("seq_area__u") for c in f.new_columns_)
     v = GroupSeq("g", "t", "u", "cumsum").transform(X[~tr].reset_index(drop=True), None)
     assert np.allclose(v, pd.Series(u[~tr]).groupby(g[~tr]).cumsum().to_numpy())
+
+
+def test_row_order_rule_fires_on_series_not_on_shuffled_or_label_sorted_files():
+    rng = np.random.default_rng(0)
+    n = 5000
+    X = pd.DataFrame({f"x{i}": np.cumsum(rng.normal(size=n)) for i in range(8)})
+    y = rng.normal(size=n)
+    ff = FeatureForge()
+    ff.base_cols_, ff.cat_cols_ = list(X.columns), []
+    assert ff._row_ordered(X, y)
+    p = rng.permutation(n)
+    assert not ff._row_ordered(X.iloc[p].reset_index(drop=True), y[p])
+    assert not ff._row_ordered(X, np.sort(y))  # sorted by the label: a file layout, not a series
+
+
+def test_row_order_rule_needs_test_rows_beyond_the_training_rows():
+    rng = np.random.default_rng(1)
+    n = 6000
+    X = pd.DataFrame({f"x{i}": np.cumsum(rng.normal(size=n)) for i in range(8)})
+    y = rng.normal(size=n)
+    ff = FeatureForge()
+    ff.base_cols_, ff.cat_cols_ = list(X.columns), []
+    ff._log = lambda *a, **k: None
+    later = np.arange(n) >= int(0.8 * n)
+    assert ff._row_ordered(X[~later].reset_index(drop=True), y[~later], X[later])
+    held = rng.random(n) < 0.2  # a random holdout from a file kept in order (Forest Cover's)
+    assert not ff._row_ordered(X[~held].reset_index(drop=True), y[~held], X[held])
 
 
 def test_field_missing_from_unlabeled_rows_is_left_out():

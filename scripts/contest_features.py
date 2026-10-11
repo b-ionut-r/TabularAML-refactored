@@ -151,7 +151,8 @@ def match_cols(main: pd.DataFrame, ch: Child) -> list[str]:
     integer or text codes with 20+ levels whose main-table values mostly occur in the child."""
     out = []
     for c in ch.df.columns:
-        if c == ch.key or c == ch.time or c in ch.drop or c not in main.columns or any(h in c.lower() for h in TIME_HINTS):
+        # An id the main row also carries (Instacart's product_id) is matched on, though never aggregated as a number.
+        if c == ch.key or c == ch.time or c not in main.columns or any(h in c.lower() for h in TIME_HINTS):
             continue
         s = ch.df[c]
         if pd.api.types.is_float_dtype(s) and not np.all(np.mod(s.dropna().to_numpy()[:10000], 1) == 0):
@@ -351,12 +352,16 @@ def main():
             if not cols:
                 continue
             ct = ch.time if ch.time is not None else date_col(ch.df.drop(columns=[ch.key]))
-            if both_main[ch.key].duplicated().any() and (mt is None or ct is None):
+            # An event log ordered by a time the main rows carry (order number, timestamp): count matches strictly
+            # before each row in that time.
+            ordinal = ch.name in asof and (mt is None or ct is None)
+            if both_main[ch.key].duplicated().any() and not ordinal and (mt is None or ct is None):
                 continue  # repeated keys without dates could match a row's own later events
             chm = Child(ch.name, ch.df, key=ch.key, time=ct, drop=ch.drop)
             t = time.time()
-            Mf = match_features(both_main, ch.key, chm, cols, main_time=mt if ct is not None else None)
-            print(f"table {ch.name}: same-{'/'.join(cols)} matches{' before ' + mt if mt and ct else ''}: "
+            Mf = match_features(both_main, ch.key, chm, cols, main_time=asof[ch.name] if ordinal else (mt if ct is not None else None),
+                                ordinal=ordinal)
+            print(f"table {ch.name}: same-{'/'.join(cols)} matches{' before ' + (asof[ch.name] if ordinal else mt) if (ordinal or (mt and ct)) else ''}: "
                   f"{Mf.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
             A.append(Mf)
         for lk in lookups:
@@ -391,9 +396,10 @@ def main():
                 M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)
                 A.append(M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
                 print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
-        for Fa in A:
-            rel_tr = pd.concat([rel_tr, Fa.iloc[:len(tr)].reset_index(drop=True)], axis=1)
-            rel_te = pd.concat([rel_te, Fa.iloc[len(tr):].reset_index(drop=True)], axis=1)
+        # One concat per side, not one per block: each pairwise concat copied every column so far.
+        if A:
+            rel_tr = pd.concat([rel_tr] + [Fa.iloc[:len(tr)].reset_index(drop=True) for Fa in A], axis=1)
+            rel_te = pd.concat([rel_te] + [Fa.iloc[len(tr):].reset_index(drop=True) for Fa in A], axis=1)
         print(f"related tables: {rel_tr.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)
         if cache is not None:
             cache.mkdir(parents=True, exist_ok=True)
@@ -455,19 +461,51 @@ def main():
     if rel_tr is not None:
         # The search sees the related columns a quick model uses most; all are written out.
         import lightgbm as lgb
-        both = pd.concat([Xtr.reset_index(drop=True), rel_tr], axis=1)
-        for c in both.columns:
-            if not (pd.api.types.is_numeric_dtype(both[c]) or isinstance(both[c].dtype, pd.CategoricalDtype)):
-                both[c] = as_text(both[c]).astype("category")
+        # The matrix LightGBM would make of main + related columns, filled column by column: the
+        # concatenated frame, its category-code copy and LightGBM's own conversion were three
+        # copies of 1,330 columns at once (Home Credit: 13.4 GB, killed on the 15 GB bench).
+        Xtr = Xtr.reset_index(drop=True)
+        for c in Xtr.columns:
+            if not (pd.api.types.is_numeric_dtype(Xtr[c]) or isinstance(Xtr[c].dtype, pd.CategoricalDtype)):
+                Xtr[c] = as_text(Xtr[c]).astype("category")
+        # (rel_tr itself is written out as it is; the search's copies of its text columns are categories)
+        conv = {c: as_text(rel_tr[c]).astype("category") for c in rel_tr.columns
+                if not (pd.api.types.is_numeric_dtype(rel_tr[c]) or isinstance(rel_tr[c].dtype, pd.CategoricalDtype))}
+        names = list(Xtr.columns) + list(rel_tr.columns)
+        srcs = [Xtr[c] for c in Xtr.columns] + [conv.get(c, rel_tr[c]) for c in rel_tr.columns]
+        cats = [c for c, s_ in zip(names, srcs) if isinstance(s_.dtype, pd.CategoricalDtype) and not s_.cat.ordered]
+        # Single precision when every value is exactly a float32 (float32 columns, category codes,
+        # integers within 2**24): LightGBM bins the same numbers, from half the matrix. Home
+        # Credit's 40 integer columns made it float64, 3.3 GB.
+        def exact32(s_):
+            if isinstance(s_.dtype, pd.CategoricalDtype) or s_.dtype in (np.float32, np.float16, bool):
+                return True
+            v = s_.to_numpy(dtype=np.float64, na_value=np.nan)
+            return bool(np.all((v.astype(np.float32).astype(np.float64) == v) | np.isnan(v)))
+        dt = np.float32 if all(exact32(s_) for s_ in srcs) else np.float64
+        M = np.empty((len(Xtr), len(names)), dtype=dt)
+        for j, s_ in enumerate(srcs):
+            if isinstance(s_.dtype, pd.CategoricalDtype):
+                k = s_.cat.codes.to_numpy()
+                M[:, j] = np.where(k < 0, np.nan, k)
+            else:
+                M[:, j] = s_.to_numpy(dtype=dt, na_value=np.nan)
+        del srcs
         obj = dict(objective="multiclass", num_class=len(labels)) if labels is not None else \
             dict(objective="binary" if y.nunique() == 2 else "regression")
-        b = lgb.train(dict(obj, learning_rate=0.1, num_leaves=31, feature_fraction=0.5, verbose=-1),
-                      lgb.Dataset(both, log_y(y) if a.log_target else y), 300)
-        gain = pd.Series(b.feature_importance("gain"), index=both.columns)[rel_tr.columns]
+        params = dict(obj, learning_rate=0.1, num_leaves=31, feature_fraction=0.5, verbose=-1)
+        # Bin first and drop the matrix before boosting: LightGBM keeps only its binned copy.
+        ds = lgb.Dataset(M, log_y(y) if a.log_target else y, feature_name=names, categorical_feature=cats,
+                         params=params).construct()
+        del M
+        b = lgb.train(params, ds, 300)
+        del ds
+        gain = pd.Series(b.feature_importance("gain"), index=names)[rel_tr.columns]
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
-        Xtr = both[list(Xtr.columns) + top]
+        Xtr = pd.concat([Xtr, pd.DataFrame({c: conv.get(c, rel_tr[c]) for c in top})], axis=1)
+        del conv
         Xte = pd.concat([Xte.reset_index(drop=True), rel_te[top]], axis=1)
-        del both, b
+        del b
     if forecasting:
         # On top of the forecasting columns the search's gate rows stop resembling the test
         # horizon: its picks lost held-out (Favorita 0.669 -> 0.689, Recruit 0.519 -> 0.525,
