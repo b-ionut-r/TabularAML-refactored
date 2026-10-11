@@ -12,8 +12,7 @@ cross-fitted histogram Newton gain on the current model's gradients that Feature
 with, minus the better of its two parents' gains, all candidates of a chunk in one vectorised
 pass. Only the top few pairs become ordinary candidates; screening, CV and the gate then decide.
 """
-import time
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,15 +50,19 @@ def _gains(M: np.ndarray, g: np.ndarray, h: np.ndarray, fold: np.ndarray, K: int
 def scan_pairs(W: pd.DataFrame, num_cols: Sequence[str], strong: Sequence[str], g: np.ndarray,
                h: np.ndarray, loss_fn, margin: np.ndarray, *, n_rows: int = 20_000, min_corr: float = 0.9,
                max_pairs: int = 20_000, top: int = 12, chunk: int = 512, time_budget: float = 120.0,
-               min_rel_gain: float = 1e-3, seed: int = 0) -> List[Tuple[str, str, str, float]]:
+               cell_s: float = 2e-7, spent: Optional[list] = None, min_rel_gain: float = 1e-3,
+               seed: int = 0) -> List[Tuple[str, str, str, float]]:
     """Rank ``(op, a, b)`` difference / ratio pairs by novel residual gain.
 
     ``g``, ``h`` and ``margin`` are the current model's gradients, hessians and margin on the
     rows of ``W`` (binary / regression: 1-D). ``loss_fn(margin)`` returns the mean loss on a
     subsample's labels. Returns at most ``top`` tuples ``(op, a, b, novel_gain)`` whose novel gain
     exceeds ``min_rel_gain`` times the current loss, best first; ``op`` is ``"sub"`` or ``"div"`` (``a / b``).
+    ``time_budget`` is work, not wall-clock time: each chunk of pairs costs ``cell_s`` seconds per
+    subsample row and candidate column, so the pairs scanned are the same on every run and machine.
+    The work spent is added to ``spent[0]`` when given.
     """
-    t0 = time.time()
+    work = 0.0
     rng = np.random.default_rng(seed + 11)
     n = len(W)
     rows = np.sort(rng.choice(n, n_rows, replace=False)) if n > n_rows else np.arange(n)
@@ -100,9 +103,10 @@ def scan_pairs(W: pd.DataFrame, num_cols: Sequence[str], strong: Sequence[str], 
     scores: Dict[Tuple[str, str, str], float] = {}
     with np.errstate(all="ignore"):
         for start in range(0, len(plist), chunk):
-            if time.time() - t0 > time_budget:
+            if work > time_budget:
                 break
             P = np.array(plist[start:start + chunk])
+            work += cell_s * len(rows) * 2 * len(P)
             A, B = X[:, P[:, 0]], X[:, P[:, 1]]
             pmax = np.maximum(parent[P[:, 0]], parent[P[:, 1]])
             for op, V in (("sub", A - B), ("div", A / np.where(B == 0, np.nan, B))):
@@ -110,6 +114,8 @@ def scan_pairs(W: pd.DataFrame, num_cols: Sequence[str], strong: Sequence[str], 
                 gain = _gains(V, g, h, fold, K, lam, n_bins, loss, base, margin) - pmax
                 for (i, j), v in zip(P, gain):
                     scores[(op, cols[i], cols[j])] = float(v)
+    if spent is not None:
+        spent[0] += work
     # A pair must cut the loss by at least ``min_rel_gain`` of it: on Home Credit the best pair
     # gained 1e-5 and only took the place of search time.
     best = sorted((k for k in scores if scores[k] > min_rel_gain * base), key=scores.get, reverse=True)

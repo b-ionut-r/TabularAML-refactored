@@ -312,6 +312,26 @@ def test_forge_search_respects_small_budget():
     assert time.time() - t0 < 60
 
 
+def test_forge_picks_do_not_depend_on_the_clock(monkeypatch):
+    # A budget that binds: the same search on a machine whose clock races ahead (every reading
+    # a minute later than the last) must build, rank and keep exactly the same features.
+    import time
+    X, rng = _frame(3000)
+    y = np.log(X.a / X.b) * 3 + X.c + rng.normal(scale=0.3, size=len(X))
+    kw = dict(task="regression", time_budget=0.1, n_jobs=2, verbose=False)
+    a = FeatureForge(**kw).fit(X, y)
+    real, t = time.time, [time.time()]
+
+    def racing():
+        t[0] += 60.0
+        return t[0]
+    monkeypatch.setattr(time, "time", racing)
+    b = FeatureForge(**kw).fit(X, y)
+    monkeypatch.setattr(time, "time", real)
+    assert a.new_columns_ == b.new_columns_
+    assert a.history_ == b.history_
+
+
 def test_forge_search_subsample_keeps_output_on_every_row():
     rng = np.random.default_rng(0)
     X = pd.DataFrame(rng.normal(size=(6000, 4)), columns=list("abcd"))
