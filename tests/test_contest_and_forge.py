@@ -454,27 +454,3 @@ def test_group_sequences_get_running_sums_when_test_holds_new_groups():
     assert any(c.startswith("seq_cumsum__u") or c.startswith("seq_area__u") for c in f.new_columns_)
     v = GroupSeq("g", "t", "u", "cumsum").transform(X[~tr].reset_index(drop=True), None)
     assert np.allclose(v, pd.Series(u[~tr]).groupby(g[~tr]).cumsum().to_numpy())
-
-
-def test_version_strings_give_lag_behind_peers():
-    # Signature files are dotted versions; machines whose signatures are far behind the
-    # newest one seen on their OS build are infected. The raw strings only carry this
-    # through thousands of category levels.
-    from tabularaml.generate.forge import VerLag, _dotted_versions
-    rng = np.random.default_rng(0)
-    n = 6000
-    os_i = rng.integers(0, 8, n)
-    newest = 200 + 30 * os_i
-    behind = rng.integers(0, 60, n)
-    sig = newest - behind
-    X = pd.DataFrame({"sig": [f"1.{273 + s // 100}.{s % 100}.0" for s in sig],
-                      "osv": [f"10.0.{17000 + 100 * o}.1" for o in os_i],
-                      "x": rng.normal(size=n)})
-    y = pd.Series(((behind > 30) ^ (rng.random(n) < 0.05)).astype(int))
-    assert _dotted_versions(X["sig"]) == 4
-    f = FeatureForge(task="binary", time_budget=60, random_state=0, n_jobs=2, verbose=False).fit(
-        X.iloc[:4000], y.iloc[:4000], X_unlabeled=X.iloc[4000:].reset_index(drop=True))
-    assert set(f.versions_) == {"sig", "osv"}
-    assert any(c.startswith("verlag__sig__by__osv") or c.startswith("verord__sig") for c in f.new_columns_)
-    lag = VerLag("sig", "osv").fit(X, None, None).transform(X, None)
-    assert np.corrcoef(lag, behind)[0, 1] > 0.95

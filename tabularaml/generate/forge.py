@@ -1659,104 +1659,6 @@ class StrNum(Spec):
         return self.parse(df[self.parents[0]])
 
 
-_VER_RE = r"^\d{1,12}(?:\.\d{1,12}){1,5}$"
-
-
-def _dotted_versions(s: pd.Series) -> int:
-    """Number of parts when a string column holds dotted version numbers ("4.18.1807.18075"),
-    else 0. Software and signature versions are issued in order: how far a row's version
-    sits behind the newest one its peers run is the usual contest feature."""
-    v = pd.Series(pd.unique(s.astype(str)))
-    v = v[v != "__NA__"]
-    if len(v) < 3:
-        return 0
-    ok = v.str.match(_VER_RE)
-    if ok.mean() < 0.95:
-        return 0
-    return int(v[ok].str.count(r"\.").max()) + 1
-
-
-def _ver_table(s: pd.Series):
-    """Row codes into the distinct values, and those values' numeric parts (NaN beyond a
-    value's length, a NaN row last for missing or malformed values)."""
-    codes, uniq = pd.factorize(s)
-    u = pd.Series(np.asarray(uniq, dtype=object)).astype(str)
-    P = u.str.split(".", expand=True).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float, copy=True) \
-        if len(u) else np.zeros((0, 1))
-    P[~u.str.match(_VER_RE).to_numpy()] = np.nan
-    P = np.vstack([P, np.full((1, P.shape[1]), np.nan)])
-    return np.where(codes < 0, len(u), codes), P
-
-
-def _ver_keys(P: np.ndarray) -> np.ndarray:
-    """Sortable keys: parts zero-padded, so string order is version order."""
-    out = np.empty(len(P), dtype=object)
-    for i, row in enumerate(P):
-        out[i] = None if np.isnan(row[0]) else "".join(f"{int(x):012d}" for x in np.nan_to_num(row, nan=0))
-    return out
-
-
-class VerPart(Spec):
-    """One numeric part of a dotted version string (major, minor, build)."""
-
-    def __init__(self, col: str, i: int):
-        super().__init__([col])
-        self.i = i
-        self.name = f"verpart{i}__{col}"
-
-    def transform(self, df, ctx):
-        codes, P = _ver_table(df[self.parents[0]])
-        return P[:, self.i][codes] if self.i < P.shape[1] else np.full(len(codes), np.nan)
-
-
-class VerOrd(Spec):
-    """Where a version sits in the order of all versions seen (label-free, so the unlabeled
-    rows' newer versions are known); an unseen version falls between its neighbours."""
-
-    def __init__(self, col: str):
-        super().__init__([col])
-        self.name = f"verord__{col}"
-
-    def fit(self, df, y, ctx):
-        _, P = _ver_table(df[self.parents[0]])
-        k = _ver_keys(P)
-        self.vocab_ = np.array(sorted(x for x in set(k) if x is not None))
-        return self
-
-    def transform(self, df, ctx):
-        codes, P = _ver_table(df[self.parents[0]])
-        k = _ver_keys(P)
-        r = np.full(len(k), np.nan)
-        ok = np.array([x is not None for x in k], dtype=bool)
-        if ok.any() and len(self.vocab_):
-            r[ok] = np.searchsorted(self.vocab_, np.array(list(k[ok])), side="left")
-        return r[codes]
-
-
-class VerLag(Spec):
-    """How many versions of ``col`` a row is behind the newest one among rows sharing ``key``
-    (machines on the same OS build running an older signature file)."""
-
-    def __init__(self, col: str, key: str):
-        super().__init__([col, key])
-        self.name = f"verlag__{col}__by__{key}"
-
-    def _keys(self):
-        return self.parents[1:]
-
-    def fit(self, df, y, ctx):
-        self.ord_ = VerOrd(self.parents[0]).fit(df, None, ctx)
-        k = self._fit_codes(df)
-        cat, levels = _grouper(df, self._keys(), k)
-        v = pd.Series(self.ord_.transform(df, ctx))
-        self.a_ = pd.Series(v.groupby(cat, observed=True).max().to_numpy(), index=levels)
-        return self
-
-    def transform(self, df, ctx):
-        a = self.a_.reindex(self._codes(df)).to_numpy(dtype=float)
-        return a - self.ord_.transform(df, ctx)
-
-
 def _numbered_codes(s: pd.Series) -> bool:
     """A string column whose values are one shared prefix and a number."""
     v = pd.Series(pd.unique(as_text(s)))
@@ -2558,15 +2460,6 @@ class FeatureForge:
                     add(Digits(c, "mod100"))
             for c in self.numbered_:
                 add(StrNum(c))
-            vers = list(getattr(self, "versions_", {}))
-            for c in vers:
-                add(VerOrd(c))
-                for i in range(min(self.versions_[c], 4)):
-                    add(VerPart(c, i))
-                if W[c].nunique() > 10:
-                    for k in dict.fromkeys(vers + list(top_keys[:4])):
-                        if k != c:
-                            add(VerLag(c, k))
             for a, b in combinations(top_num, 2):
                 for op in self.arith_ops:
                     add(Arith(op, a, b))
@@ -3271,9 +3164,6 @@ class FeatureForge:
         X = self._compact(X)
         # Coded strings that carry a number ("location 118") are offered as that number.
         self.numbered_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and _numbered_codes(X[c])]
-        # Dotted version strings ("4.18.1807.18075"), with their number of parts.
-        self.versions_ = {c: n for c in self.cat_cols_ if c not in self.text_cols_
-                          for n in [_dotted_versions(X[c])] if n}
         # Native categorical splits on many-level columns overfit; frequency-rank codes
         # are the usual contest alternative. Which one wins is measured, not assumed.
         self.hc_cols_ = [c for c in self.cat_cols_ if X[c].nunique() > self.hc_threshold]
