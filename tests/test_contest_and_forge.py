@@ -467,3 +467,17 @@ def test_row_order_rule_fires_on_series_not_on_shuffled_or_label_sorted_files():
     p = rng.permutation(n)
     assert not ff._row_ordered(X.iloc[p].reset_index(drop=True), y[p])
     assert not ff._row_ordered(X, np.sort(y))  # sorted by the label: a file layout, not a series
+
+
+def test_row_order_rule_needs_test_rows_beyond_the_training_rows():
+    rng = np.random.default_rng(1)
+    n = 6000
+    X = pd.DataFrame({f"x{i}": np.cumsum(rng.normal(size=n)) for i in range(8)})
+    y = rng.normal(size=n)
+    ff = FeatureForge()
+    ff.base_cols_, ff.cat_cols_ = list(X.columns), []
+    ff._log = lambda *a, **k: None
+    later = np.arange(n) >= int(0.8 * n)
+    assert ff._row_ordered(X[~later].reset_index(drop=True), y[~later], X[later])
+    held = rng.random(n) < 0.2  # a random holdout from a file kept in order (Forest Cover's)
+    assert not ff._row_ordered(X[~held].reset_index(drop=True), y[~held], X[held])

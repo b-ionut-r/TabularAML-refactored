@@ -3176,7 +3176,7 @@ class FeatureForge:
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
         if (self.time_col_ is None and self.time_col == "auto" and X_unlabeled is not None
-                and self._row_ordered(X, y_np) and self._detect_group(X, X_unlabeled) is None):
+                and self._row_ordered(X, y_np, X_unlabeled) and self._detect_group(X, X_unlabeled) is None):
             # Rows in file order form a series (each row nearly repeats the one before: minute bars
             # without their timestamps, as DRW's crypto file came): random gate rows and folds would
             # sit between their neighbours, and neighbour / target features pass on a gate the later
@@ -3944,10 +3944,12 @@ class FeatureForge:
                 return c
         return None
 
-    def _row_ordered(self, X, y, max_rows=200_000) -> bool:
+    def _row_ordered(self, X, y, U=None, max_rows=200_000) -> bool:
         """Most numeric columns carry over from each row to the next: their lag-1 correlation
         is beyond chance (z > 4, which a shuffled file passes in about 3 columns per 100,000),
-        and the labels are not sorted. Shuffled files never qualify; time-ordered ones do."""
+        the labels are not sorted, and the test rows lie beyond the training rows rather than
+        among them. Shuffled files never qualify; time-ordered ones do. A file kept in some other
+        order (Forest Cover's, by area) whose test rows were drawn from among its rows does not."""
         num = [c for c in self.base_cols_ if c not in self.cat_cols_ and X[c].nunique() > 10][:200]
         if len(num) < 3 or len(X) < 1000:
             return False
@@ -3961,7 +3963,38 @@ class FeatureForge:
             ok = np.isfinite(a) & np.isfinite(b)
             if ok.sum() > 100 and np.std(a[ok]) > 0 and np.std(b[ok]) > 0:
                 z.append(np.corrcoef(a[ok], b[ok])[0, 1] * np.sqrt(ok.sum()))
-        return len(z) >= 3 and float(np.mean(np.array(z) > 4)) > 0.5
+        if not (len(z) >= 3 and float(np.mean(np.array(z) > 4)) > 0.5):
+            return False
+        return U is None or self._test_beyond(X, U, num)
+
+    def _test_beyond(self, X, U, num, m=2000, seed=0) -> bool:
+        """Test rows sit farther from the training rows than training rows sit from each other.
+        Equal-sized samples of training and test rows find their nearest neighbour among the other
+        training rows (columns as ranks); a test drawn from among the training rows (a random
+        holdout, however the file is ordered) gives the two the same distances, a later period
+        gives the test larger ones. One-sided rank test, z > 4."""
+        from scipy.stats import mannwhitneyu
+        from sklearn.neighbors import NearestNeighbors
+        cols = [c for c in num if c in U.columns][:50]
+        if len(cols) < 3 or len(U) < 100:
+            return True
+        A = pd.concat([X[cols], U[cols]], ignore_index=True).apply(pd.to_numeric, errors="coerce")
+        A = A.rank(pct=True).fillna(0.5).to_numpy(dtype=np.float32)
+        tr, te = A[:len(X)], A[len(X):]
+        rng = np.random.default_rng(seed)
+        k = min(m, len(te), len(tr) // 4)
+        perm = rng.permutation(len(tr))
+        q_tr, ref = tr[perm[:k]], tr[perm[k:]]
+        if len(ref) > 100_000:
+            ref = ref[rng.choice(len(ref), 100_000, replace=False)]
+        q_te = te[rng.choice(len(te), k, replace=False)]
+        nn = NearestNeighbors(n_neighbors=1).fit(ref)
+        d_tr, d_te = nn.kneighbors(q_tr)[0][:, 0], nn.kneighbors(q_te)[0][:, 0]
+        u = mannwhitneyu(d_te, d_tr, alternative="greater").statistic
+        z = (u - k * k / 2) / np.sqrt(k * k * (2 * k + 1) / 12)
+        self._log(f"file-order check: test rows {'beyond' if z > 4 else 'among'} the training rows "
+                  f"(nearest-row distance z={z:+.1f})")
+        return bool(z > 4)
 
     def _detect_time(self, X, U):
         if self.time_col != "auto":
