@@ -728,6 +728,31 @@ def column_families(cols: Sequence[str], min_size: int = 3) -> Dict[str, List[st
     return {k: sorted(v, key=idx.get) for k, v in fam.items() if len(v) >= min_size}
 
 
+def _winsor(d, y=None, q=0.01):
+    """Clip paired per-row loss differences at their ``q`` / ``1 - q`` quantiles, so a handful
+    of extreme rows cannot carry a gate decision. For class labels the quantiles are taken
+    within each class: with rare positives every positive row sat in the global tails (H&M,
+    0.4% positives: a set with a worse mean loss scored z=+190 once they were clipped)."""
+    d = np.asarray(d, dtype=float)
+    if y is None:
+        lo, hi = np.quantile(d, [q, 1 - q])
+        return np.clip(d, lo, hi)
+    out = d.copy()
+    y = np.asarray(y)
+    for k in np.unique(y):
+        m = y == k
+        lo, hi = np.quantile(d[m], [q, 1 - q])
+        out[m] = np.clip(d[m], lo, hi)
+    return out
+
+
+def _later_half(dw, t):
+    """Mean of the paired differences over the later half of the gate rows by time: the test
+    rows come after the gate, so a gain that has already reversed there does not carry."""
+    order = np.argsort(np.asarray(t, dtype=float), kind="stable")
+    return float(dw[order[len(order) // 2:]].mean())
+
+
 def _block_z(d, blocks):
     """One-sided z of the mean paired difference with each block (period) as one observation."""
     m = np.bincount(blocks, weights=d) / np.maximum(np.bincount(blocks), 1)
@@ -3857,6 +3882,10 @@ class FeatureForge:
                 codes = np.empty(len(tg), dtype=int)
                 codes[order] = np.arange(len(tg)) * 30 // len(tg)
             blocks = codes if codes.max() >= 4 else None
+        yc = yg if self.task_ != "regression" else None
+        tg_all = (Xg[self.time_col_].to_numpy(dtype=float)
+                  if self.time_col_ is not None and self.time_col_ in Xg.columns else None)
+        self._gate_yt = (yc, tg_all)
         # The baseline is always the raw columns as given (native categoricals).
         raw_rows = gate_loss(self.base_cols_, recode=False)
         raw_l = float(raw_rows.mean())
@@ -3910,16 +3939,19 @@ class FeatureForge:
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
             rows = gate_loss(cols, rc)
             d = raw_rows - rows
-            # Winsorise so a handful of extreme rows cannot carry the decision.
-            lo, hi = np.quantile(d, [0.01, 0.99])
-            dw = np.clip(d, lo, hi)
+            dw = _winsor(d, yc)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
             zb = _block_z(dw, blocks) if blocks is not None else None
+            late = _later_half(dw, tg_all) if tg_all is not None else None
             self._log(f"  gate {label}{' (recoded)' if self.recode_ and rc is None else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
-                      f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
+                      f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "")
+                      + (f", later half {late:+.2e}" if late is not None else "") + f", need {z_needed:.2f})")
             if self.gate_by_period and zb is not None:
                 z = zb
-            if rows.mean() < best_l and z >= z_needed:
+            # Time-ordered gates: the gain must still hold over the later half of the gate rows
+            # (Hull Tactical, 1,086 daily gate rows: z=+1.59 overall, +2.47 / -1.35 by half;
+            # held-out Pearson 0.072 -> 0.038).
+            if rows.mean() < best_l and z >= z_needed and (late is None or late > 0):
                 best_set, best_l, best_z = specs, float(rows.mean()), z
                 best_recode = self.recode_ if rc is None else rc
         self.recode_ = best_recode
@@ -3970,9 +4002,12 @@ class FeatureForge:
         def score(specs):
             rows = gate_loss(self.raw_cols_ + [c for sp in specs for c in sp.out_names()])
             d = raw_rows - rows
-            lo, hi = np.quantile(d, [0.01, 0.99])
-            dw = np.clip(d, lo, hi)
-            return float(rows.mean()), float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
+            yc, tg = getattr(self, "_gate_yt", (None, None))
+            dw = _winsor(d, yc)
+            z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
+            if tg is not None and _later_half(dw, tg) <= 0:
+                z = min(z, 0.0)   # reversed over the later gate rows: never clears the gate
+            return float(rows.mean()), z
 
         cur = closed(list(self.selected_))
         while len({fam(sp) for sp in cur}) > 1:
