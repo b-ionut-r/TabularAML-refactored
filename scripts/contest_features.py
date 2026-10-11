@@ -31,9 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
 from tabularaml.generate.lists import as_lists, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.returns import return_features  # noqa: E402
+from tabularaml.generate.stream import aggregation_bytes, chunks, memory_bytes  # noqa: E402
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
+from tabularaml.generate.strs import as_text  # noqa: E402
 
 TIME_HINTS = ("days", "day", "month", "date", "time", "week", "year")
 
@@ -45,7 +47,10 @@ def log_y(y: pd.Series) -> np.ndarray:
 
 
 def read(path: str) -> pd.DataFrame:
-    df = pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path, low_memory=False)
+    return normalise(pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path, low_memory=False))
+
+
+def normalise(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         if df[c].dtype == object and isinstance(df[c].dropna().iloc[:1].tolist()[0] if df[c].notna().any() else None,
                                                 (list, tuple, np.ndarray)):
@@ -54,7 +59,7 @@ def read(path: str) -> pd.DataFrame:
                               if isinstance(v, (list, tuple, np.ndarray)) else v)
         if df[c].dtype == object:
             # Mixed 0 / "0" (pandas reads a CSV column chunk by chunk) become one level.
-            df[c] = df[c].where(df[c].isna(), df[c].astype(str)).astype("category")
+            df[c] = df[c].where(df[c].isna(), as_text(df[c])).astype("category")
         elif df[c].dtype == np.float64:
             df[c] = df[c].astype(np.float32)
     return df
@@ -63,8 +68,22 @@ def read(path: str) -> pd.DataFrame:
 def parse_table(spec: str, main: pd.DataFrame, id_col: str | None) -> Child:
     name, rest = spec.split("=", 1)
     parts = rest.split(":")
-    df = read(parts[0])
     key = parts[1] if len(parts) > 1 and parts[1] else None
+    need = aggregation_bytes(parts[0], key) if key else None
+    big = need is not None and need > STREAM_SHARE * memory_bytes() and stream_rows(parts[0]) > STREAM_MIN_ROWS
+    if big and key in main.columns and main[key].is_unique:
+        # (one main row per key only: a key repeating in the main table is an event log aggregated as of each row)
+        # Too big to aggregate whole (Optiver's 160M-row order book): read a key range at a time.
+        from tabularaml.generate.stream import _dataset
+        df = normalise(_dataset(parts[0]).head(200_000).to_pandas())
+        tcol = parts[2] if len(parts) > 2 else next(
+            (c for c in df.columns if c != key and pd.api.types.is_numeric_dtype(df[c])
+             and any(h in c.lower() for h in TIME_HINTS)), None)
+        drop = [c for c in df.columns if c != key and (c.upper().startswith(("SK_ID", "ID_")) or c.lower().endswith("_id"))]
+        print(f"table {name}: {_dataset(parts[0]).count_rows()} rows, key={key}, read by key range "
+              f"(whole: {need / 2**30:.0f} GB to aggregate)", flush=True)
+        return Child(name, df, key=key, time=tcol, drop=drop, source=parts[0])
+    df = read(parts[0])
     if key is None:
         shared = [c for c in df.columns if c in main.columns]
         key = id_col if id_col in df.columns else (shared[0] if len(shared) == 1 else None)
@@ -82,12 +101,44 @@ def parse_table(spec: str, main: pd.DataFrame, id_col: str | None) -> Child:
     return Child(name, df, key=key, time=tcol, drop=[c for c in drop if c != key])
 
 
+STREAM_SHARE, STREAM_BUDGET_SHARE = 0.4, 0.2   # of the machine's memory
+# Whole tables aggregated fine up to Elo's 29M transactions (and Amex's 5.5M wide statements); Optiver's book ran a
+# 15 GB machine out of memory from 34M rows on.
+STREAM_MIN_ROWS = 30_000_000
+
+
+def stream_rows(path: str) -> int:
+    from tabularaml.generate.stream import _dataset
+    return _dataset(path).count_rows()
+
+
+def streamed_features(ch: Child, history: bool) -> list[pd.DataFrame]:
+    """RelatedTables, price-path and latest-state history features of a streamed child, a key range at a time
+    (each key's rows sit in one range, so this equals aggregating the table whole)."""
+    rt, plan, hist = RelatedTables([], drop_const=False), {}, None
+    F, R, H = [], [], []
+    t = time.time()
+    for i, df in enumerate(chunks(ch.source, ch.key, max(1, int(STREAM_BUDGET_SHARE * memory_bytes())), normalise)):
+        c = Child(ch.name, df, key=ch.key, time=ch.time, drop=ch.drop)
+        F.append(rt._aggregate(c, ch.key))
+        R.append(return_features(df.drop(columns=[d for d in ch.drop if d in df.columns]), ch.key, ch.name,
+                                 ch.time, plan=plan))
+        hist = (history and repeats(c)) if hist is None else hist
+        if hist:
+            H.append(history_features(c))
+        print(f"table {ch.name}: key range {i + 1} ({len(df)} rows) aggregated, {time.time() - t:.0f}s", flush=True)
+        del df, c
+    F = pd.concat(F)
+    F = F[[c for c in F.columns if F[c].notna().mean() > 0.01 and F[c].nunique() > 1]]
+    return [x for x in (F, pd.concat(R) if R and R[0].shape[1] else None, pd.concat(H) if H else None) if x is not None]
+
+
 def date_col(df: pd.DataFrame) -> str | None:
     """The first text column holding calendar dates (2013-04-22, 2016-01-01 19:00:00)."""
     for c in df.columns:
         if pd.api.types.is_numeric_dtype(df[c]):
             continue
-        v = df[c].dropna().astype(str).head(1000)
+        v = as_text(df[c].dropna().head(1000))
         if len(v) and v.str.match(r"^\d{4}-\d{2}-\d{2}").mean() > 0.95:
             return c
     return None
@@ -105,8 +156,8 @@ def match_cols(main: pd.DataFrame, ch: Child) -> list[str]:
             continue
         if s.nunique() < 20:
             continue
-        vals = pd.unique(main[c].dropna().astype(str))
-        if len(vals) and np.isin(vals, pd.unique(s.dropna().astype(str))).mean() >= 0.5:
+        vals = pd.unique(as_text(main[c].dropna()))
+        if len(vals) and np.isin(vals, pd.unique(as_text(s.dropna()))).mean() >= 0.5:
             out.append(c)
     return out
 
@@ -137,7 +188,7 @@ def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
     for X in (base, full):
         for c in X.columns:
             if not (pd.api.types.is_numeric_dtype(X[c]) or isinstance(X[c].dtype, pd.CategoricalDtype)):
-                X[c] = X[c].astype(str).astype("category")
+                X[c] = as_text(X[c]).astype("category")
     yv = y.to_numpy(dtype=float)
     rows = np.arange(len(yv))
     if len(rows) > max_rows:
@@ -214,7 +265,8 @@ def main():
         children = [ch for ch in children if ch not in lookups]
         # One row per key: attributes of the main row (a tube's dimensions, its bill of
         # materials), joined as columns before anything is aggregated or looked up.
-        for ch in [ch for ch in children if ch.key in tr.columns and not ch.df[ch.key].duplicated().any()]:
+        for ch in [ch for ch in children if ch.source is None and ch.key in tr.columns
+                   and not ch.df[ch.key].duplicated().any()]:
             cols = [c for c in ch.df.columns if c == ch.key or c not in tr.columns]
             tr = tr.merge(ch.df[cols], on=ch.key, how="left")
             te = te.merge(ch.df[cols], on=ch.key, how="left")
@@ -222,7 +274,7 @@ def main():
             print(f"table {ch.name}: one row per {ch.key}, joined as columns", flush=True)
         both_main = pd.concat([tr, te[[c for c in tr.columns if c in te.columns]]], ignore_index=True)
         asof = {ch.name: main_time(tr, ch, a.time) for ch in children
-                if ch.time is not None and ch.key in tr.columns and tr[ch.key].duplicated().any()}
+                if ch.source is None and ch.time is not None and ch.key in tr.columns and tr[ch.key].duplicated().any()}
         asof = {k: v for k, v in asof.items() if v is not None}
         keyed = [ch for ch in children if ch.name not in asof]
         F = pd.DataFrame()
@@ -246,8 +298,16 @@ def main():
         if a.child_models and keyed:
             # as-of children would see later rows' outcomes; labels per key are ambiguous
             # when the key repeats
-            cm_tables = [ch for ch in keyed if tr[ch.key].is_unique]
+            # (not for a table read by key range: its rows never sit in memory together)
+            cm_tables = [ch for ch in keyed if tr[ch.key].is_unique and ch.source is None]
         for ch in keyed:
+            if ch.source is not None:
+                for j, Fs in enumerate(streamed_features(ch, a.history == "auto")):
+                    Fs = Fs.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
+                    for c in [c for c in Fs.columns if c.endswith("__count")]:
+                        Fs[c] = Fs[c].fillna(0)
+                    A.insert(j, Fs)
+                continue
             Fk = RelatedTables([ch]).features()
             Fk = Fk.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
             for c in [c for c in Fk.columns if c.endswith("__count")]:
@@ -268,7 +328,7 @@ def main():
         # Child rows that also share the main row's code values (a customer's purchases of the
         # offer's brand), counted before the main row's date when both tables carry dates.
         mt = date_col(both_main)
-        for ch in keyed + [ch for ch in children if ch.name in asof]:
+        for ch in [ch for ch in keyed if ch.source is None] + [ch for ch in children if ch.name in asof]:
             cols = match_cols(both_main, ch)
             if not cols:
                 continue
@@ -359,7 +419,7 @@ def main():
         both = pd.concat([Xtr.reset_index(drop=True), rel_tr], axis=1)
         for c in both.columns:
             if not (pd.api.types.is_numeric_dtype(both[c]) or isinstance(both[c].dtype, pd.CategoricalDtype)):
-                both[c] = both[c].astype(str).astype("category")
+                both[c] = as_text(both[c]).astype("category")
         b = lgb.train(dict(objective="binary" if y.nunique() == 2 else "regression", learning_rate=0.1,
                            num_leaves=31, feature_fraction=0.5, verbose=-1), lgb.Dataset(both, log_y(y) if a.log_target else y), 300)
         gain = pd.Series(b.feature_importance("gain"), index=both.columns)[rel_tr.columns]

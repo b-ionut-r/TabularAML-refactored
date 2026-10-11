@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 import warnings
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from tabularaml.generate.strs import as_text, as_text_frame
 
 TE_SMOOTHING = 20.0
 GROUP_STATS = ("mean", "std", "min", "max", "dev", "z")
@@ -850,7 +851,7 @@ def slot_families(df: pd.DataFrame, cat_cols: Sequence[str]) -> List[tuple]:
         na = [df[c].isna().mean() + (_as_str(df[c]) == "__NA__").mean() for c in cols]
         if na[-1] < na[0] + 0.2:
             continue
-        sets = [set(pd.unique(df[c].dropna().astype(str))) - {"__NA__"} for c in cols[:3]]
+        sets = [set(pd.unique(as_text(df[c].dropna()))) - {"__NA__"} for c in cols[:3]]
         if len(sets[0]) < 5 or len(sets[0] & sets[1]) < 0.2 * min(len(sets[0]), len(sets[1]) or 1):
             continue
         slots = [idx(c) for c in cols]
@@ -1146,7 +1147,7 @@ def _is_date_like(s: pd.Series) -> bool:
         return True
     if not (s.dtype == object or pd.api.types.is_string_dtype(s)):
         return False
-    sample = s.dropna().astype(str).head(500)
+    sample = as_text(s.dropna().head(500))
     if len(sample) < 20 or not sample.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}").mean() > 0.95:
         return False
     return pd.to_datetime(sample, errors="coerce").notna().mean() > 0.95
@@ -1312,7 +1313,7 @@ def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
     (titles, descriptions, comments), as opposed to codes, ids or category labels."""
     if not _is_cat(s) or len(s) < 100:
         return False
-    v = s.dropna().astype(str)
+    v = as_text(s.dropna())
     if len(v) > n_sample:
         v = v.sample(n_sample, random_state=0)
     if len(v) < 50 or v.nunique() < max(50, 0.05 * len(v)):
@@ -1323,7 +1324,7 @@ def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
 
 
 def _text_values(df, c, clip: Optional[int] = None) -> pd.Series:
-    t = df[c].astype(str)
+    t = as_text(df[c])
     t = t.where(t != "__NA__", "")
     # Long fields (review dumps) cost n-gram time quadratically in nothing but their tails.
     return t if clip is None else t.str.slice(0, clip)
@@ -1429,13 +1430,13 @@ class TextLinearOOF(Spec):
         if self.keys:
             from sklearn.preprocessing import OneHotEncoder
             self.ohe_ = OneHotEncoder(handle_unknown="ignore", min_frequency=2, dtype=np.float32).fit(
-                df[self.keys].astype(str))
+                as_text_frame(df[self.keys]))
 
     def _design(self, df):
         from scipy import sparse
         blocks = [v.transform(_text_values(df, c, TEXT_CLIP)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
         if self.keys:
-            blocks.append(self.ohe_.transform(df[self.keys].astype(str)))
+            blocks.append(self.ohe_.transform(as_text_frame(df[self.keys])))
         return sparse.hstack(blocks, format="csr")
 
     def _query(self, A, y, B):
@@ -1619,7 +1620,7 @@ class StrNum(Spec):
 
     @staticmethod
     def parse(s: pd.Series) -> np.ndarray:
-        return pd.to_numeric(s.astype(str).str.extract(r"(\d+)\s*$")[0], errors="coerce").to_numpy(dtype=float)
+        return pd.to_numeric(as_text(s).str.extract(r"(\d+)\s*$")[0], errors="coerce").to_numpy(dtype=float)
 
     def transform(self, df, ctx):
         return self.parse(df[self.parents[0]])
@@ -1627,7 +1628,7 @@ class StrNum(Spec):
 
 def _numbered_codes(s: pd.Series) -> bool:
     """A string column whose values are one shared prefix and a number."""
-    v = pd.Series(pd.unique(s.astype(str)))
+    v = pd.Series(pd.unique(as_text(s)))
     v = v[v != "__NA__"]
     if len(v) <= 10:
         return False
@@ -2090,19 +2091,30 @@ class FeatureForge:
                 X[c] = pd.Categorical(_as_str(X[c]), categories=self.cat_levels_[c])
         return X
 
-    def _fit_rank_maps(self, X: pd.DataFrame):
-        """Frequency rank of each level of the high-cardinality categoricals (1 = most common)."""
+    def _fit_rank_maps(self, *frames: pd.DataFrame):
+        """Frequency rank of each level of the high-cardinality categoricals (1 = most common),
+        counted over the rows of all ``frames`` (counted per frame, so categoricals are never
+        stacked into per-row strings)."""
         self.rank_maps_ = {}
         for c in self.hc_cols_:
-            vc = _as_str(X[c]).value_counts()
+            vc = None
+            for F in frames:
+                col = F[c] if isinstance(F[c].dtype, pd.CategoricalDtype) else F[c].astype(object)
+                v = col.value_counts(dropna=False)
+                v.index = np.where(pd.isna(v.index.to_numpy(dtype=object)), "__NA__", v.index.astype(object).astype(str))
+                v = v.groupby(level=0).sum()
+                vc = v if vc is None else vc.add(v, fill_value=0)
+            vc = vc[vc > 0]
             # Ranked by frequency, ties by value; levels seen at most twice share one rank per count:
             # ordering them by value spread the many once-seen device IPs over a meaningless range
             # a tree then splits on.
-            order = sorted(vc.index, key=lambda v: (-vc[v], v))
-            r = pd.Series(np.arange(1, len(order) + 1, dtype=float), index=order)
-            rare = vc[order].to_numpy() <= 2
+            t = pd.DataFrame({"v": vc.index.to_numpy(dtype=object), "n": vc.to_numpy()}).sort_values(
+                ["n", "v"], ascending=[False, True], kind="mergesort")
+            r = pd.Series(np.arange(1, len(t) + 1, dtype=float), index=t["v"].to_numpy())
+            n_ = t["n"].to_numpy()
+            rare = n_ <= 2
             if rare.any():
-                r[rare] = r[rare].groupby(vc[order].to_numpy()[rare]).transform("min").to_numpy()
+                r[rare] = r[rare].groupby(n_[rare]).transform("min").to_numpy()
             self.rank_maps_[c] = r
 
     def _rank(self, s: pd.Series, c: str) -> np.ndarray:
@@ -3208,7 +3220,7 @@ class FeatureForge:
                                   f"between them feed only label-free statistics)")
         elif self.gate_frac and n >= 200 and self.group_col_ is not None:
             gx = X[self.group_col_].to_numpy()
-            levels, codes = np.unique(gx.astype(str) if gx.dtype == object else gx, return_inverse=True)
+            levels, codes = np.unique(as_text(pd.Series(gx)).to_numpy() if gx.dtype == object else gx, return_inverse=True)
             in_gate = np.random.default_rng(self.random_state).random(len(levels)) < self.gate_frac
             idx_sel, idx_gate = np.flatnonzero(~in_gate[codes]), np.flatnonzero(in_gate[codes])
         elif self.gate_frac and n >= 200:
@@ -3234,7 +3246,7 @@ class FeatureForge:
                 if self.time_col_ is not None:
                     keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
                 elif self.group_col_ is not None:
-                    g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                    g = pd.factorize(as_text(X[self.group_col_]).to_numpy()[idx_sel])[0]
                     perm = rng.permutation(g.max() + 1)
                     r = perm[g]
                     keep = idx_sel[np.argsort(r, kind="stable")[:m]]
@@ -3247,7 +3259,7 @@ class FeatureForge:
             W = X.iloc[idx_sel].reset_index(drop=True)
             yW = y_np[idx_sel]
             if self.group_col_ is not None:
-                gx = X[self.group_col_].astype(str).to_numpy()
+                gx = as_text(X[self.group_col_]).to_numpy()
                 self._groups = {len(W): gx[idx_sel], n: gx}
             self.U_search_ = self.WU_ = None
             extra = np.concatenate([idx_out, idx_gate]).astype(int)
@@ -3331,8 +3343,7 @@ class FeatureForge:
             new_share = max((~_as_str(later[c]).isin(set(_as_str(W[c])))).mean() if len(later) else 0.0
                             for c in self.hc_cols_)
             if new_share > 0.1:
-                self._fit_rank_maps(pd.concat([X[self.hc_cols_]] + ([] if U_ is None else [U_[self.hc_cols_]]),
-                                              ignore_index=True))
+                self._fit_rank_maps(X, *([] if U_ is None else [U_]))
             else:
                 self._fit_rank_maps(W)
             self._log(f"frequency ranks: {100 * new_share:.0f}% of later rows hold levels the search rows "
@@ -3823,7 +3834,7 @@ class FeatureForge:
 
     def _fit_full(self, X, y, U=None):
         if self.recode_:
-            self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
+            self._fit_rank_maps(X, *([] if U is None else [U]))
         folds = self._te_folds(X, y, self.random_state + 1)
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy()

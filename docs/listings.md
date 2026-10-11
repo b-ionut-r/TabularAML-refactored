@@ -65,3 +65,22 @@ Samples 0 / 1:
 | price paths without the size-weighted price | 0.357 / 0.348 | 26-27 min |
 | **price paths with it** | **0.316 / 0.341** | 23-25 min, 9.6 GB |
 | shuffled targets (price paths with it) | 0.852 (constant 0.840) | |
+
+### All 112 stocks: child tables read a key range at a time (`tabularaml/generate/stream.py`)
+
+A keyed parquet child table of over 30M rows whose aggregation would take more than 40% of memory (rows x
+(numeric columns + 2 x same-unit pairs) x 12 bytes) is read a key range at a time: RelatedTables (levels and columns
+fixed by the first range), price paths and latest-state history are computed per range and stacked, equal to the
+whole-table result (tests/test_stream.py); child-row models and same-code matches are skipped for it. Optiver's full
+book (167M rows, 62 GB to aggregate whole) runs in 20 ranges. Same holdout (random 20% of buckets), 112 stocks,
+samples 0 / 1:
+
+| Arm | RMSPE | Build, peak memory |
+|---|---|---|
+| raw (stock_id) | 0.605 / 0.616 | |
+| winners' public features | 0.242 / 0.245 | 12 min, 1.3 GB |
+| **FeatureForge** | **0.230 / 0.233** | 36-44 min, 6.7 GB |
+| shuffled targets | 0.816 (constant 0.816) | |
+
+On 12 stocks the streamed run (no child-row models) scored 0.317 / 0.324 in 8-12 min at 3.8 GB, against 0.316 / 0.341
+whole (25 min, 9.6 GB).
