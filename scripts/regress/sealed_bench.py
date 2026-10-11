@@ -319,8 +319,10 @@ for c in Xtr.columns:
     if pd.api.types.is_datetime64_any_dtype(Xtr[c]):
         Xtr[c] = (Xtr[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float); Xte[c] = (Xte[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float)
     elif not pd.api.types.is_numeric_dtype(Xtr[c]):
-        cats = pd.Index(pd.unique(Xtr[c].astype(str)))
-        Xtr[c] = pd.Categorical(Xtr[c].astype(str), categories=cats); Xte[c] = pd.Categorical(Xte[c].astype(str), categories=cats)
+        # object -> str per value: astype(str) on a category of long rule texts makes a fixed-width array (118 GiB on MCTS)
+        _s = lambda v: v.astype(object).map(str)
+        cats = pd.Index(pd.unique(_s(Xtr[c])))
+        Xtr[c] = pd.Categorical(_s(Xtr[c]), categories=cats); Xte[c] = pd.Categorical(_s(Xte[c]), categories=cats)
 import lightgbm as lgb
 obj = 'binary' if P['task'] == 'binary' else 'regression'
 Pm = dict(objective=obj, learning_rate=0.05, num_leaves=63, min_child_samples=20 if len(Xtr) < 5000 else 100,
