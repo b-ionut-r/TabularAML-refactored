@@ -47,6 +47,29 @@ TE_SMOOTHING = 20.0
 GROUP_STATS = ("mean", "std", "min", "max", "dev", "z")
 ARITH_OPS = ("add", "sub", "mul", "div", "rdiv")
 
+# Work clock. Every budget decision (how many candidates get built, which families are cut, how
+# many prefixes and rounds run, whether the search shrinks its rows) counts work, not wall-clock
+# seconds: timed decisions picked different features on the same data from run to run (Home
+# Credit kept 12 features or none at one commit, as 9-11 neighbour candidates fitted in the time)
+# and would pick differently again on a faster or busier machine. Work is charged in seconds of
+# the 4-core reference container, from row and column counts only, so ``time_budget`` keeps its
+# meaning there. Measured on Home Credit, IEEE-CIS, Santander and Porto Seguro builds:
+_CV_CELL_S = 3e-7       # one 5-fold CV fit, per search row and model column
+_ROW_PASS_S = 2e-7      # building one candidate of unit cost, per row (thread time)
+_PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
+_KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
+_REF_THREADS = 4        # candidate building runs on this many threads there
+# Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
+_SPEC_WORK = {
+    "Arith": 1, "Expr": 1, "Digits": 1, "DatePart": 1, "Rotate": 1, "GroupStat": 2, "StrNum": 2, "GeoPair": 2,
+    "TargetEnc": 3, "KeyBinTE": 3, "MixedTE": 3, "MixedCount": 3, "BinnedPairTE": 4, "Count": 5, "RowStat": 5,
+    "SlotBag": 5, "SlotTE": 5, "TextStats": 5, "EntityLag": 10, "GroupSeq": 10, "LaggedTargetMean": 10,
+    "EventRecency": 14, "LinResid": 60, "LinearOOF": 60, "Projection": 60, "FamilyCount": 400, "FamilyNB": 400,
+    "TextSVD": 500, "CrossLinearOOF": 1000, "TextLinearOOF": 1000, "KNNClassDist": 1300, "ClientProfile": 1300,
+    "KNNTarget": 1700,
+}
+_SPEC_WORK_DEFAULT = 20
+
 
 # ============================================================================
 # Column helpers
@@ -1941,16 +1964,18 @@ class FeatureForge:
         (group statistics, counts, encodings, neighbours, anchors). Such statistics would
         hand each row its own label through the entity's later rows.
     family_time_share : float
-        Largest share of the candidate-building time one family may take (1 disables).
+        Largest share of the candidate-building work one family may take (1 disables).
     gate_by_period : bool
         On time-ordered data, test the gate's paired improvement with each period (gate
         time value, or one of 30 time blocks) as one observation instead of each row; rows
         of one period share its shocks. The period-level z is logged either way.
     time_budget : float
-        Wall-clock budget in seconds for the search. The first round always gets sixteen
-        CV fits (timed on the base fit), eight of them kept for screening and the prefix
-        ladder; later rounds start only while ten fit in the budget. Cheap candidate
-        families are built first. The base fit, the gate and the final fits always run.
+        Search budget in seconds of work on the reference container (the work clock: costs
+        come from row, column and candidate counts, never from timing, so a run picks the same
+        features on any machine). The first round always gets sixteen CV fits, eight of them
+        kept for screening and the prefix ladder; later rounds start only while ten fit in the
+        budget. Cheap candidate families are built first. The base fit, the gate and the final
+        fits always run.
     n_rounds : int
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
@@ -2111,8 +2136,16 @@ class FeatureForge:
             print(f"[FeatureForge {time.time() - self._t0:6.1f}s] {msg}", flush=True)
 
     def _time_left(self) -> float:
-        deadline = getattr(self, "_deadline", None) or self._t0 + self.time_budget
-        return deadline - time.time()
+        """Budget left on the work clock (reference-container seconds; see ``_CV_CELL_S``)."""
+        deadline = getattr(self, "_deadline", None) or self.time_budget
+        return deadline - getattr(self, "_work", 0.0)
+
+    def _charge(self, seconds: float):
+        self._work = getattr(self, "_work", 0.0) + seconds
+
+    @staticmethod
+    def _cv_cost(n_rows: int, n_cols: int, n_fits: int) -> float:
+        return _CV_CELL_S * n_rows * max(n_cols, 1) * n_fits / 5
 
     def _threads(self) -> int:
         import os
@@ -2297,8 +2330,8 @@ class FeatureForge:
         ``mat``: the frame as ``(float32 matrix, categorical positions, column names)``,
         used instead of ``X`` (then None); an optional fourth item picks the matrix's
         columns, so no full copy of the selected columns is kept.
-        ``give_up`` (seconds): when the first fold shows the whole fit would take longer, stop
-        and return None, keeping the projected duration in ``_cv_projected``.
+        ``give_up`` (work-clock seconds): when the fit's cost (``_cv_cost``) is larger, return None
+        without fitting, keeping the cost in ``_cv_projected``.
         """
         import lightgbm as lgb
         M, cats, cols, *pick = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
@@ -2307,6 +2340,13 @@ class FeatureForge:
         def rows(r):
             return M[r] if pick is None else M[np.ix_(r, pick)]
         n = len(M)
+        n_fits = sum(len(f) for f in repeats)
+        cost = self._cv_cost(n, M.shape[1] if pick is None else len(pick), n_fits)
+        self._last_cv_cost = cost
+        if give_up and cost > give_up:
+            self._cv_projected = cost
+            return None
+        self._charge(cost)
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
@@ -2320,14 +2360,9 @@ class FeatureForge:
             # validation rows are read from ``M`` again.
             D = lgb.Dataset(M if pick is None else M[:, pick], np.asarray(y), categorical_feature=cats,
                             params=self._lgb_params(lr)).construct()
-        n_fits = sum(len(f) for f in repeats)
-        t_start = time.time()
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
             for f_i, (tr, va) in enumerate(folds):
-                if give_up and (r_i or f_i) and (time.time() - t_start) * n_fits / (r_i * len(folds) + f_i) > give_up:
-                    self._cv_projected = (time.time() - t_start) * n_fits / (r_i * len(folds) + f_i)
-                    return None
                 if D is not None:
                     b = self._fit_eval_rows(D, tr, va, lr=lr)
                     Mva = rows(va)
@@ -2727,9 +2762,10 @@ class FeatureForge:
         num = [c for c in self.raw_cols_ if c not in self.cat_cols_ and c in W.columns]
         strong = [c for c in imp.sort_values(ascending=False).index if c in num][:60]
         g, h = self._grad_hess(y, margin)
-        t = time.time()
+        t, spent = time.time(), [0.0]
         out = scan_pairs(W, num, strong, g, h, lambda m, rows: _loss(self.task_, y[rows], m), margin,
-                         time_budget=budget, seed=self.random_state)
+                         time_budget=budget, cell_s=_PAIR_CELL_S, spent=spent, seed=self.random_state)
+        self._charge(spent[0])
         self._log(f"pair scan: {len(num)} numerics, {time.time() - t:.0f}s -> "
                   + (", ".join(f"{a} {op} {b} ({v:.4f})" for op, a, b, v in out[:6]) or "nothing"))
         return out
@@ -2790,19 +2826,23 @@ class FeatureForge:
         raw = set(self.raw_cols_)
         if getattr(self, "WU_", None) is not None:
             WU = self.WU_
-        spent: Dict[str, list] = {}
-        # No family of candidates may take over a third of the time left for building them
+        spent: Dict[str, list] = {}      # family -> [candidates, thread seconds measured] (log only)
+        # No family of candidates may take over a third of the work left for building them
         # (a few slow ones, neighbour features on large tables, otherwise starve the rest).
         # Screening, the joint ranking fit and the prefix ladder: eight CV fits, at most half
-        # the time left (when the first round's time is capped by the budget).
+        # the work left (when the first round's work is capped by the budget).
         reserve = min(8 * getattr(self, "_cv_s", 0.0), 0.5 * max(self._time_left(), 0.0))
-        # Thread time: candidates are built on ``_threads()`` threads at once.
-        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share * max(1, self._threads())
-        capped = set()
+        n_threads = max(1, self._threads())
+        # Thread work: candidates are built on several threads at once, counted as the reference
+        # container's four whatever this machine has, so the same candidates are built everywhere.
+        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share * _REF_THREADS
+
+        def work(s):
+            """A candidate's building cost on the work clock (thread seconds), from its family and rows."""
+            rows = len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else len(W)
+            return _SPEC_WORK.get(type(s).__name__, _SPEC_WORK_DEFAULT) * rows * _ROW_PASS_S
 
         def compute(s):
-            if type(s).__name__ in capped:
-                return None
             t_s = time.time()
             try:
                 if s.target_dep:
@@ -2824,31 +2864,40 @@ class FeatureForge:
                 st = spent.setdefault(type(s).__name__, [0, 0.0])
                 st[0] += 1
                 st[1] += time.time() - t_s
-                if self.time_budget and st[1] > fam_cap and type(s).__name__ not in capped:
-                    capped.add(type(s).__name__)
-                    self._log(f"budget: {type(s).__name__} candidates took {st[1]:.0f}s; the rest of them skipped")
 
-        n_threads = max(1, self._threads())
-        batch = 4 * n_threads
-        # Cheap candidates first: one of each family is built and timed, then the rest go
-        # family by family from the cheapest per candidate.
+        # Which candidates get built is decided up front on the work clock, the same on every run
+        # and machine: one of each family first, then family by family from the cheapest per
+        # candidate; a family stops at its share, and building stops where the ranking's reserve
+        # begins.
         fams: Dict[str, list] = {}
         for sp in specs:
             fams.setdefault(type(sp).__name__, []).append(sp)
-        firsts = [g[0] for g in fams.values()]
-        n_first = len(firsts)
         order = {sp.name: i for i, sp in enumerate(specs)}
-        specs = list(firsts)
+        n_all = len(specs)
+        plan, fam_work, capped, total = [], {}, set(), 0.0
+        firsts = [g[0] for g in fams.values()]
+        rest = [sp for f in sorted(fams, key=lambda f: work(fams[f][0])) for sp in fams[f][1:]]
+        for sp in firsts + rest:
+            f = type(sp).__name__
+            if f in capped:
+                continue
+            w = work(sp)
+            if self.time_budget and self._time_left() - (total + w) / _REF_THREADS < reserve:
+                break
+            if self.time_budget and fam_work.get(f, 0.0) + w > fam_cap and f in fam_work:
+                capped.add(f)
+                self._log(f"budget: {f} candidates would take {fam_work[f] + w:.0f}s of work; the rest of them skipped")
+                continue
+            fam_work[f] = fam_work.get(f, 0.0) + w
+            total += w
+            plan.append(sp)
+        if len(plan) < n_all:
+            self._log(f"budget: built {len(plan)} of {n_all} candidates")
+        self._charge(total / _REF_THREADS)
+        batch = 4 * n_threads
         with ThreadPoolExecutor(n_threads) as pool:
-            i = 0
-            while i < len(specs):
-                # Leave room in the budget for ranking the built candidates (about eight CV fits:
-                # otherwise a few seconds of timing noise decide how many prefixes get tried).
-                if self._time_left() < reserve:
-                    self._log(f"budget: built {i} of {sum(map(len, fams.values()))} candidates")
-                    break
-                end = n_first if i < n_first else i + batch
-                chunk = specs[i:end]
+            for i in range(0, len(plan), batch):
+                chunk = plan[i:i + batch]
                 for s, r in zip(chunk, pool.map(compute, chunk)):
                     if r is None:
                         _release(s)
@@ -2858,12 +2907,8 @@ class FeatureForge:
                         _release(s)
                         continue
                     out[s.name] = v
-                i = end
-                if i == n_first:
-                    cost = lambda f: spent.get(f, [1, 0.0])[1] / max(spent.get(f, [1, 0.0])[0], 1)
-                    specs += [sp for f in sorted(fams, key=cost) for sp in fams[f][1:]]
-        # Back in generation order: families are built cheapest first by measured time, so
-        # the order they finished in varied from run to run, and with it the joint model's
+        # Back in generation order: families are built cheapest first, so the order they
+        # finished in varied from run to run, and with it the joint model's
         # column order, its split-gain ranking and the round's picks (Airline: the same commit
         # kept 41 features or none on alternate runs).
         out = dict(sorted(out.items(), key=lambda kv: order.get(kv[0], len(order))))
@@ -3163,6 +3208,7 @@ class FeatureForge:
         contest trick. Target statistics only ever use labeled rows.
         """
         self._t0 = time.time()
+        self._work = 0.0
         self._deadline = None
         self.wide_ = []
         self.addons_ = {}
@@ -3393,28 +3439,8 @@ class FeatureForge:
             # The model's view of the search rows as one float32 matrix (``_lgb_matrix``), with
             # its categorical positions and column names; rounds append the chosen features.
             Mw = (*self._lgb_matrix(self._model_frame(W)), list(W.columns))
-            if attempt == 0 and self.time_budget and len(W) > 150_000:
-                # A CV fit on 50k rows, scaled up, flags tables where one full fit would
-                # take hours before paying for it. Scaling up overstates the full fit (its
-                # fixed costs do not grow with rows: 132s estimated against 94s measured on
-                # IEEE-CIS's 472k rows), so it only acts when the estimate is twice over the
-                # ceiling; otherwise the full fit's measured time below decides.
-                pr = np.sort(np.random.default_rng(self.random_state).choice(len(W), 50_000, replace=False))
-                t_p = time.time()
-                self._cv(None, yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)],
-                         mat=(Mw[0][pr], Mw[1], Mw[2]))
-                est = (time.time() - t_p) * len(W) / 50_000
-                if 16 * est > 6 * self.time_budget:
-                    m_cap = max(100_000, int(len(W) * 3 * self.time_budget / (16 * est) * 0.8))
-                    if m_cap < len(W):
-                        self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
-                        continue
-            t_cv = time.time()
             # The first round is promised sixteen CV fits; when they would take more than three times
-            # the budget, the search runs on fewer rows (sized from this fit, not below 100k). The
-            # first fold already shows it: the 50k-row probe can miss that bigger samples train for
-            # more rounds (Microsoft Malware's 5.7M rows: a fit inside the ceiling estimated, about
-            # 2000s measured), so the fit stops there rather than paying for every fold.
+            # the budget on the work clock, the search runs on fewer rows (not below 100k).
             room = 3 * self.time_budget
             shrinkable = attempt < 2 and self.time_budget and len(W) > 150_000
             out = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw,
@@ -3423,12 +3449,12 @@ class FeatureForge:
                 self._cv_s = self._cv_projected
             else:
                 margin, cur_loss, imp = out
-                # One CV fit's duration: the search stops when fewer than two are left in the budget.
-                self._cv_s = time.time() - t_cv
+                # One CV fit's work: the search stops when fewer than two are left in the budget.
+                self._cv_s = self._last_cv_cost
             if shrinkable and 16 * self._cv_s > room:
                 m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
                 if m_cap < len(W):
-                    self._log(f"budget: one CV fit takes {self._cv_s:.0f}s on {len(W)} rows; searching fewer rows")
+                    self._log(f"budget: one CV fit costs {self._cv_s:.0f}s of work on {len(W)} rows; searching fewer rows")
                     continue
             break
         if self.n_interactions:
@@ -3471,7 +3497,7 @@ class FeatureForge:
             self._deadline = None
             if r == 0 and self._time_left() < 16 * self._cv_s:
                 floor = min(16 * self._cv_s, 3 * self.time_budget)
-                self._deadline = time.time() + floor
+                self._deadline = self._work + floor
                 self._log(f"budget: first round given {floor:.0f}s")
             if r > 0 and self._time_left() < 10 * self._cv_s:
                 self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
@@ -4252,10 +4278,10 @@ class FeatureForge:
             f = v[np.isfinite(v)]
             return len(f) > 0 and not np.any(f != np.round(f))
         # Wide anonymous tables have hundreds of time-like columns: try the most distinct
-        # ones, within a minute (Loan Default's 700 columns took hours otherwise).
+        # ones, within a minute of work (Loan Default's 700 columns took hours otherwise).
         times = sorted([c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0],
                        key=lambda c: -X[c].nunique())[:20]
-        t_stop = time.time() + 60
+        key_work = [0.0]   # work-clock seconds spent counting keys
         deltas = sorted([c for c in num if c not in getattr(self, "echo_cols_", ()) and is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
                         key=lambda c: -X[c].nunique())[:80]
         ids = []
@@ -4268,10 +4294,11 @@ class FeatureForge:
                 return 0
             # Codes, not values: columns of huge magnitude overflow int64.
             code = idc[ok] * (1 << 32) + pd.factorize(v[ok])[0].astype(np.int64)
+            key_work[0] += _KEY_ROW_S * len(code)
             return len(np.unique(code))
         found = []
         for t in times:
-            if time.time() > t_stop:
+            if key_work[0] > 60:
                 break
             tv = vals[t]
             for s in (1, 60, 3600, 86400, 604800):
