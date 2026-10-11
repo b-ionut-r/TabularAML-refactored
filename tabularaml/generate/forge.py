@@ -2383,6 +2383,11 @@ class FeatureForge:
                 if len(W) <= 300_000:
                     ks = (5, 20, 100) if self.n_classes_ <= 2 else (10, 50)
                     add(KNNTarget([la, lo], ks, self.n_classes_, f"geo_{la}"))
+            # Structured strings: character n-grams, and molecule descriptors when they parse as SMILES.
+            if self.seq_cols_:
+                from .seqstr import seq_specs
+                for sp in seq_specs(self.seq_cols_, self.smiles_cols_, self.n_classes_):
+                    add(sp)
             # Free text: how it is written, its topics, and a sparse linear model on its words.
             for c in self.text_cols_:
                 add(TextStats(c))
@@ -3121,6 +3126,10 @@ class FeatureForge:
             X[c] = _as_str(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
+        # Structured strings (molecules, sequences, segmented codes): read character by character.
+        from .seqstr import is_seq_string, is_smiles
+        self.seq_cols_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and is_seq_string(X[c])] if self.text else []
+        self.smiles_cols_ = [c for c in self.seq_cols_ if is_smiles(X[c])]
         # Coded strings that carry a number ("location 118") are offered as that number.
         self.numbered_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and _numbered_codes(X[c])]
         # Native categorical splits on many-level columns overfit; frequency-rank codes
@@ -3150,6 +3159,9 @@ class FeatureForge:
         self.key_cols_ = [c for c in self.key_cols_ if c not in self.text_cols_]
         if self.text_cols_:
             self._log(f"free text: {', '.join(self.text_cols_)}")
+        if self.seq_cols_:
+            self._log(f"structured strings: {', '.join(self.seq_cols_)}"
+                      + (f" (molecules: {', '.join(self.smiles_cols_)})" if self.smiles_cols_ else ""))
         self.ctx_ = Context(self.task_, self.n_classes_, self.random_state)
         self.ctx_.fold_avg_te = self.fold_avg_te
 
