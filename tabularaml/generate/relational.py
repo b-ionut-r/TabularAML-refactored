@@ -162,7 +162,9 @@ class RelatedTables:
             out.append(df.groupby(key, sort=False)[c].nunique().rename(f"{c}_nunique").to_frame())
         if ch.time is not None and self.recent and dense:
             # Rank within the entity: rows sorted by time, most recent first.
-            r = W.assign(_t=df[ch.time].to_numpy()).sort_values([key, "_t"], ascending=[True, False])
+            # Only the columns averaged: the one-hot and spread columns made this copy gigabytes
+            # on an 8.4M-row keystroke log.
+            r = W[[key] + dense].assign(_t=df[ch.time].to_numpy()).sort_values([key, "_t"], ascending=[True, False])
             r = r[r.groupby(key, sort=False).cumcount() < self.recent]
             a = r.groupby(key, sort=False)[dense].mean()
             a.columns = [f"{c}_last{self.recent}" for c in a.columns]
