@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pandas as pd
 import pytest
@@ -481,3 +482,36 @@ def test_row_order_rule_needs_test_rows_beyond_the_training_rows():
     assert ff._row_ordered(X[~later].reset_index(drop=True), y[~later], X[later])
     held = rng.random(n) < 0.2  # a random holdout from a file kept in order (Forest Cover's)
     assert not ff._row_ordered(X[~held].reset_index(drop=True), y[~held], X[held])
+
+
+def test_field_missing_from_unlabeled_rows_is_left_out():
+    # "z" is measured on training rows but a -9 placeholder on almost every unlabeled row.
+    rng = np.random.default_rng(0)
+    n = 2000
+    X = pd.DataFrame({"x": rng.normal(size=n), "z": rng.uniform(0, 2, n)})
+    y = pd.Series((X.x + X.z > 1).astype(int))
+    U = pd.DataFrame({"x": rng.normal(size=500), "z": np.where(rng.random(500) < 0.95, -9.0, rng.uniform(0, 2, 500))})
+    f = FeatureForge(task="binary", time_budget=20, random_state=0, n_jobs=1, verbose=False).fit(X, y, X_unlabeled=U)
+    assert f.shifted_ == ["z"]
+    assert "z" not in f.transform(U).columns and "z" not in f.transform_train(X).columns
+
+
+def test_json_object_columns_are_flattened_into_fields():
+    from tabularaml.generate.lists import json_fields
+    rng = np.random.default_rng(0)
+    rows = [json.dumps({"hits": str(int(h)), "src": {"medium": m}, "same": "x"})
+            for h, m in zip(rng.integers(1, 9, 300), rng.choice(["organic", "cpc"], 300))]
+    tr = pd.DataFrame({"totals": rows[:200], "other": rng.normal(size=200)})
+    te = pd.DataFrame({"totals": rows[200:], "other": rng.normal(size=100)})
+    a, b, found = json_fields(tr, te)
+    assert found == ["totals"]
+    assert list(a.columns) == ["totals.hits", "totals.src_medium"]   # the constant field is left out
+    assert a["totals.hits"].dtype == np.float32 and len(b) == 100
+    assert a["totals.hits"].iloc[0] == float(json.loads(rows[0])["hits"])
+    assert json_fields(tr[["other"]], te[["other"]])[2] == []
+    cat = pd.DataFrame({"c": pd.Series(["a", "b"] * 100, dtype="category")})
+    assert json_fields(cat, cat.iloc[:10])[2] == []
+    from tabularaml.generate.lists import list_features
+    assert list_features(cat, cat.iloc[:10])[2] == []
+    a2, _, found2 = json_fields(tr.astype({"totals": "category"}), te.astype({"totals": "category"}))
+    assert found2 == ["totals"] and a2.equals(a)

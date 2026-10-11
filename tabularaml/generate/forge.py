@@ -32,6 +32,7 @@ Typical use::
 """
 from __future__ import annotations
 
+import os
 import time
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence
@@ -59,6 +60,38 @@ def _is_cat(s: pd.Series) -> bool:
 def _as_str(s: pd.Series) -> pd.Series:
     """String view of a column with missing values mapped to an explicit level."""
     return s.astype(object).where(s.notna(), "__NA__").astype(str)
+
+
+def _as_str_frame_col(s: pd.Series) -> pd.Series:
+    """``_as_str`` for a column of a frame, as the ``category`` column ``_compact`` would make of it
+    when it already is one (sorted string levels, missing as "__NA__"): one string per row of
+    Bosch's 2,140 categorical fields was 9 GB on 240k rows."""
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        names = s.cat.categories.astype(object).map(str)
+        if names.is_unique:
+            s = s.cat.rename_categories(names)
+            if s.isna().any():
+                if "__NA__" not in names:
+                    s = s.cat.add_categories("__NA__")
+                s = s.fillna("__NA__")
+            s = s.cat.remove_unused_categories()
+            return s.cat.reorder_categories(sorted(s.cat.categories))
+    return _as_str(s)
+
+
+def _concat_cats(parts: List[pd.DataFrame]) -> pd.DataFrame:
+    """Row-wise concat that keeps ``category`` columns as categories (on the union of the parts'
+    levels): pandas otherwise falls back to one string object per row, gigabytes on 9M rows."""
+    parts = [p.copy(deep=False) for p in parts]
+    for c in parts[0].columns:
+        if all(c in p.columns and isinstance(p[c].dtype, pd.CategoricalDtype) for p in parts):
+            cats = parts[0][c].cat.categories
+            for p in parts[1:]:
+                cats = cats.union(p[c].cat.categories)
+            for p in parts:
+                if not p[c].cat.categories.equals(cats):
+                    p[c] = p[c].cat.set_categories(cats)
+    return pd.concat(parts, ignore_index=True)
 
 
 def _key_values(s: pd.Series) -> np.ndarray:
@@ -1333,6 +1366,19 @@ def _text_values(df, c, clip: Optional[int] = None) -> pd.Series:
     return t if clip is None else t.str.slice(0, clip)
 
 
+def _text_parts(df, c, clip: Optional[int] = None):
+    """``_text_values`` as its distinct texts and each row's index into them: texts repeated over
+    many rows (a game's rules on each of its matches) are transformed once, not once per row."""
+    s = df[c]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        codes, u = s.cat.codes.to_numpy().astype(np.int64), pd.Series(s.cat.categories.astype(object))
+    else:
+        codes, u = pd.factorize(s)
+        u = pd.Series(np.asarray(u, dtype=object))
+    u = pd.concat([u, pd.Series([np.nan], dtype=object)], ignore_index=True)
+    return _text_values(pd.DataFrame({c: u}), c, clip), np.where(codes < 0, len(u) - 1, codes)
+
+
 TEXT_CLIP = 1500
 
 
@@ -1346,7 +1392,7 @@ class TextStats(Spec):
         self.name = f"txtstat__{col}"
 
     def transform(self, df, ctx):
-        t = _text_values(df, self.parents[0])
+        t, codes = _text_parts(df, self.parents[0])
         n_ch = t.str.len().to_numpy(dtype=float)
         words = t.str.lower().str.findall(r"\w+")
         n_w = words.str.len().to_numpy(dtype=float)
@@ -1356,7 +1402,7 @@ class TextStats(Spec):
         pun = t.str.count(r"[^\w\s]").to_numpy(dtype=float)
         den = np.maximum(n_ch, 1.0)
         return np.column_stack([n_ch, n_w, dig / den, up / den, pun / den,
-                                n_u / np.maximum(n_w, 1.0), (n_ch == 0).astype(float)]).astype(np.float32)
+                                n_u / np.maximum(n_w, 1.0), (n_ch == 0).astype(float)]).astype(np.float32)[codes]
 
 
 def _tfidf(kind: str, max_features: int):
@@ -1395,7 +1441,8 @@ class TextSVD(Spec):
         return self
 
     def transform(self, df, ctx):
-        return self.svd_.transform(self.vec_.transform(_text_values(df, self.parents[0], TEXT_CLIP))).astype(np.float32)
+        t, codes = _text_parts(df, self.parents[0], TEXT_CLIP)
+        return self.svd_.transform(self.vec_.transform(t)).astype(np.float32)[codes]
 
 
 class TextLinearOOF(Spec):
@@ -1437,7 +1484,10 @@ class TextLinearOOF(Spec):
 
     def _design(self, df):
         from scipy import sparse
-        blocks = [v.transform(_text_values(df, c, TEXT_CLIP)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
+        blocks = []
+        for c, vs in zip(self.text_cols, self.vecs_):
+            t, codes = _text_parts(df, c, TEXT_CLIP)
+            blocks += [v.transform(t)[codes] for v in vs]
         if self.keys:
             blocks.append(self.ohe_.transform(as_text_frame(df[self.keys])))
         return sparse.hstack(blocks, format="csr")
@@ -1448,7 +1498,7 @@ class TextLinearOOF(Spec):
             mu = y.mean()
             return (Ridge(alpha=3.0, solver="sparse_cg").fit(A, y - mu).predict(B) + mu)[:, None]
         if self.n_classes == 2:
-            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3).fit(A, y.astype(int))
+            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3, random_state=0).fit(A, y.astype(int))
             return m.decision_function(B)[:, None]
         Y = np.eye(self.n_classes)[y.astype(int)]
         return Ridge(alpha=3.0, solver="sparse_cg").fit(A, Y - Y.mean(0)).predict(B) + Y.mean(0)
@@ -1523,7 +1573,7 @@ class CrossLinearOOF(Spec):
         if self.n_classes > 2:
             return LogisticRegression(C=0.5, max_iter=300)
         # Wide one-hot designs solve much faster in the dual.
-        return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0])
+        return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0], random_state=0)
 
     def _query(self, S_ref, y_ref, S_q):
         A, B = self._design(S_ref, S_ref), self._design(S_ref, S_q)
@@ -1627,6 +1677,22 @@ class StrNum(Spec):
 
     def transform(self, df, ctx):
         return self.parse(df[self.parents[0]])
+
+
+def _absent_in_test(X: pd.DataFrame, U: pd.DataFrame) -> List[str]:
+    """Columns at least 80% one value in ``U`` that at most 5% of ``X`` holds, while ``X`` has 10+ values."""
+    out = []
+    for c in X.columns:
+        if c not in U.columns or len(U) < 50:
+            continue
+        vb = U[c].value_counts(dropna=False, normalize=True)
+        if not len(vb) or vb.iloc[0] < 0.8 or X[c].nunique(dropna=False) < 10:
+            continue
+        v = vb.index[0]
+        s_tr = float(X[c].isna().mean()) if pd.isna(v) else float((X[c] == v).mean())
+        if s_tr <= 0.05:
+            out.append(c)
+    return out
 
 
 def _numbered_codes(s: pd.Series) -> bool:
@@ -2132,6 +2198,12 @@ class FeatureForge:
                  # the two sum in a different order: on Airline the same commit's round-one
                  # ranking split on that and kept 41 features or none on alternate runs.
                  deterministic=True, force_col_wise=True)
+        # LightGBM bins from a sample of up to 200k rows held as doubles, about 13 bytes per
+        # sampled cell: 7-11 GB on Bosch's 4,264 columns. Wide frames bin from fewer rows;
+        # frames under ~1,000 columns keep the default.
+        width = getattr(self, "model_width_", 0)
+        if width and 2.5e9 / (13 * width) < 200_000:
+            p["bin_construct_sample_cnt"] = max(20_000, int(2.5e9 / (13 * width)))
         p.update(kw)
         return p
 
@@ -2220,7 +2292,7 @@ class FeatureForge:
             self._nested_cache[ck] = (np.asarray(vt, dtype=np.float32), np.asarray(vv, dtype=np.float32))
         return self._nested_cache[ck]
 
-    def _cv(self, X: Optional[pd.DataFrame], y, repeats, lr=0.1, mine=False, nested=None, mat=None):
+    def _cv(self, X: Optional[pd.DataFrame], y, repeats, lr=0.1, mine=False, nested=None, mat=None, give_up=None):
         """Repeated K-fold: OOF raw margins (averaged over repeats), mean loss, summed gain importance.
 
         ``nested`` maps target-encoding specs to the frame they were built on;
@@ -2228,6 +2300,8 @@ class FeatureForge:
         ``mat``: the frame as ``(float32 matrix, categorical positions, column names)``,
         used instead of ``X`` (then None); an optional fourth item picks the matrix's
         columns, so no full copy of the selected columns is kept.
+        ``give_up`` (seconds): when the first fold shows the whole fit would take longer, stop
+        and return None, keeping the projected duration in ``_cv_projected``.
         """
         import lightgbm as lgb
         M, cats, cols, *pick = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
@@ -2249,9 +2323,14 @@ class FeatureForge:
             # validation rows are read from ``M`` again.
             D = lgb.Dataset(M if pick is None else M[:, pick], np.asarray(y), categorical_feature=cats,
                             params=self._lgb_params(lr)).construct()
+        n_fits = sum(len(f) for f in repeats)
+        t_start = time.time()
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
             for f_i, (tr, va) in enumerate(folds):
+                if give_up and (r_i or f_i) and (time.time() - t_start) * n_fits / (r_i * len(folds) + f_i) > give_up:
+                    self._cv_projected = (time.time() - t_start) * n_fits / (r_i * len(folds) + f_i)
+                    return None
                 if D is not None:
                     b = self._fit_eval_rows(D, tr, va, lr=lr)
                     Mva = rows(va)
@@ -3099,6 +3178,7 @@ class FeatureForge:
         self.addons_ = {}
         X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
+        self.model_width_ = X.shape[1] + 3 * self.max_new_features   # widest frame a model sees
         self.n_synthetic_ = 0
         if X_unlabeled is not None and self.drop_synthetic:
             fake = synthetic_rows(X, X_unlabeled)
@@ -3107,6 +3187,14 @@ class FeatureForge:
                 self._log(f"unlabeled rows: {self.n_synthetic_} of {len(fake)} look synthetic "
                           "(no value unique among all rows); left out of label-free statistics")
                 X_unlabeled = X_unlabeled[~fake]
+        # Fields the unlabeled rows lack: almost constant there on a value training rows (almost) never
+        # hold, while varied in training (PLAsTiCC's spectroscopic redshift: -9 on 97% of test objects,
+        # measured on 70% of training ones). A model trained on them meets a value it never saw.
+        self.shifted_ = [] if X_unlabeled is None else _absent_in_test(X, X_unlabeled)
+        if self.shifted_:
+            self._log(f"left out, almost constant in the unlabeled rows on a value training rarely holds: {self.shifted_}")
+            X = X.drop(columns=self.shifted_)
+            X_unlabeled = X_unlabeled.drop(columns=[c for c in self.shifted_ if c in X_unlabeled.columns])
         if self.task is None:
             from tabularaml.contest.solver import infer_task
             self.task_ = infer_task(y)
@@ -3128,13 +3216,14 @@ class FeatureForge:
             X[c] = _to_days(X[c])
         self.cat_cols_ = [c for c in X.columns if _is_cat(X[c])]
         for c in self.cat_cols_:
-            X[c] = _as_str(X[c])
+            X[c] = _as_str_frame_col(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
         # Structured strings (molecules, sequences, segmented codes): read character by character.
         from .seqstr import is_seq_string, is_smiles
         self.seq_cols_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and is_seq_string(X[c])] if self.text else []
         self.smiles_cols_ = [c for c in self.seq_cols_ if is_smiles(X[c])]
+        X = self._compact(X)
         # Coded strings that carry a number ("location 118") are offered as that number.
         self.numbered_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and _numbered_codes(X[c])]
         # Native categorical splits on many-level columns overfit; frequency-rank codes
@@ -3268,8 +3357,15 @@ class FeatureForge:
         # budget for several rounds; the rows left out still feed label-free statistics.
         idx_out = self.embargo_
         m_cap = None
+        # Memory: each round holds up to four times ``keep`` candidate columns over the search
+        # rows next to the model's matrix. When labels carry little signal, fits stop early and
+        # the time rule above never shrinks the search (Malware's 5.9M search rows with shuffled
+        # labels: killed at 14 GB in the first round), so the rows are also capped by memory.
+        mem_cap = self._mem_rows(len(self.raw_cols_))
+        if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
+            self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
-            m = m_cap or self.max_search_rows or len(idx_sel)
+            m = min(m_cap or self.max_search_rows or len(idx_sel), mem_cap or len(idx_sel))
             if len(idx_sel) > m:
                 rng = np.random.default_rng(self.random_state)
                 if self.time_col_ is not None:
@@ -3343,13 +3439,22 @@ class FeatureForge:
                         self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
                         continue
             t_cv = time.time()
-            margin, cur_loss, imp = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw)
-            # One CV fit's duration: the search stops when fewer than two are left in the budget.
-            self._cv_s = time.time() - t_cv
             # The first round is promised sixteen CV fits; when they would take more than three times
-            # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
+            # the budget, the search runs on fewer rows (sized from this fit, not below 100k). The
+            # first fold already shows it: the 50k-row probe can miss that bigger samples train for
+            # more rounds (Microsoft Malware's 5.7M rows: a fit inside the ceiling estimated, about
+            # 2000s measured), so the fit stops there rather than paying for every fold.
             room = 3 * self.time_budget
-            if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
+            shrinkable = attempt < 2 and self.time_budget and len(W) > 150_000
+            out = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw,
+                           give_up=room / 16 if shrinkable else None)
+            if out is None:
+                self._cv_s = self._cv_projected
+            else:
+                margin, cur_loss, imp = out
+                # One CV fit's duration: the search stops when fewer than two are left in the budget.
+                self._cv_s = time.time() - t_cv
+            if shrinkable and 16 * self._cv_s > room:
                 m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
                 if m_cap < len(W):
                     self._log(f"budget: one CV fit takes {self._cv_s:.0f}s on {len(W)} rows; searching fewer rows")
@@ -3609,6 +3714,30 @@ class FeatureForge:
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
         return self
 
+    def _mem_rows(self, n_cols, share=0.3):
+        """Search rows whose candidate columns, their build-time copies and the model's matrix
+        (float32) fit in ``share`` of the memory still free under the limit (the container's
+        cgroup limit when set), or None when it is unknown. Malware: about 6 KB per search row
+        in the first round on top of the 7 GB its tables already take."""
+        lim = []
+        for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                v = open(f).read().strip()
+                if v.isdigit() and int(v) < 1 << 60:
+                    lim.append(int(v))
+            except OSError:
+                pass
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            lim.append(page * os.sysconf("SC_PHYS_PAGES"))
+            rss = int(open("/proc/self/statm").read().split()[1]) * page
+        except (ValueError, OSError, AttributeError, IndexError):
+            rss = 0
+        if not lim:
+            return None
+        keep = min(80, 3 * self.max_new_features)
+        return int(share * max(min(lim) - rss, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
+
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
         for the label-free statistics of candidates (the rows beyond the search rows are a
@@ -3617,8 +3746,8 @@ class FeatureForge:
         self.U_search_ = self.WU_ = None
         if on and getattr(self, "_wu_src", None) is not None:
             X, idx_gate, U = self._wu_src
-            self.WU_ = pd.concat([W[self.raw_cols_], X.iloc[idx_gate]] + ([] if U is None else [self._prep(U)[self.raw_cols_]]),
-                                 ignore_index=True)
+            parts = [W[self.raw_cols_], X.iloc[idx_gate][self.raw_cols_]] + ([] if U is None else [self._prep(U)[self.raw_cols_]])
+            self.WU_ = _concat_cats(parts)
             self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
         self.ctx_.extra_rows = self.U_search_
 
@@ -3872,14 +4001,20 @@ class FeatureForge:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
             elif U is not None:
-                s.fit(pd.concat([F, U], ignore_index=True), None, self.ctx_)
+                # Only the spec's columns: a copy of the whole growing frame per feature is
+                # gigabytes at a time on Microsoft Malware's 9M rows.
+                cols = list(dict.fromkeys(s.parents))
+                s.fit(_concat_cats([F[cols], U[cols]]), None, self.ctx_)
                 v = s.transform(F, self.ctx_)
             else:
                 v = s.fit(F, y, self.ctx_).transform(F, self.ctx_)
             if U is not None:
                 vu = s.transform(U, self.ctx_)
+                vu = np.asarray(vu, dtype=np.float32)
                 for j, col in enumerate(s.out_names()):
                     U[col] = vu if np.ndim(vu) == 1 else vu[:, j]
+            # float32, as the search saw them (and half the memory of the growing frame).
+            v = np.asarray(v, dtype=np.float32)
             for j, col in enumerate(s.out_names()):
                 F[col] = v if np.ndim(v) == 1 else v[:, j]
         self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
@@ -3887,12 +4022,24 @@ class FeatureForge:
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
-        X = X.reset_index(drop=True)
+        X = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
-            X[c] = _as_str(X[c])
-        return self._add_anchors(X)
+            X[c] = _as_str_frame_col(X[c])
+        return self._add_anchors(self._compact(X))
+
+    def _compact(self, X):
+        """Short-text categoricals held as ``category`` (a code per row) rather than one string per
+        row: the same values, an eighth of the memory (Microsoft Malware's 30 string columns over
+        9M rows were 5 GB per copy of the frame)."""
+        for c in self.cat_cols_:
+            if c in X.columns and not isinstance(X[c].dtype, pd.CategoricalDtype):
+                # Free text too when it repeats (MCTS: a game's rules, thousands of characters,
+                # on each of its matches; one string per row was gigabytes per frame copy).
+                if c not in self.text_cols_ or X[c].nunique() <= 0.5 * len(X):
+                    X[c] = X[c].astype("category")
+        return X
 
     def _detect_group(self, X, U):
         """A column whose test values are (almost) all unseen in training while it
@@ -4257,7 +4404,7 @@ class FeatureForge:
         return out
 
     def _recode_out(self, X):
-        out = X.reset_index(drop=True).copy()
+        out = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         if self.recode_:
             for c in self.rank_maps_:
                 out[c] = self._rank(out[c], c)

@@ -29,11 +29,12 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tabularaml.generate.forge import FeatureForge  # noqa: E402
-from tabularaml.generate.lists import as_lists, list_features, unit_ratio_features  # noqa: E402
+from tabularaml.generate.lists import as_lists, json_fields, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.returns import return_features  # noqa: E402
+from tabularaml.generate.panel import panel_features  # noqa: E402
 from tabularaml.generate.stream import aggregation_bytes, chunks, memory_bytes  # noqa: E402
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
-from tabularaml.generate.relational import (Child, RelatedTables, asof_features, child_model_features,  # noqa: E402
+from tabularaml.generate.relational import (Child, RelatedTables, asof_features, time_values, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
 from tabularaml.generate.strs import as_text  # noqa: E402
 
@@ -243,6 +244,9 @@ def main():
                     help="history families (tabularaml/generate/history.py), on from structure: latest state of keyed "
                          "child tables with a time column (last, last - mean, last - previous), and outcome history "
                          "of as-of event logs that carry the target (earlier outcomes, strictly before each row)")
+    ap.add_argument("--panel", default="auto", choices=["auto", "off"],
+                    help="intraday panels: each entity against all at the same moment and its own last steps of the "
+                         "day, tabularaml/generate/panel.py; on from structure")
     ap.add_argument("--lists", default="auto", choices=["auto", "off"],
                     help="list columns (item counts and common-item indicators) and per-unit amounts (a skewed amount "
                          "over small counts and their total), tabularaml/generate/lists.py; on from structure")
@@ -251,6 +255,11 @@ def main():
     t0 = time.time()
     tr, te = read(a.train), read(a.test)
     y = tr.pop(a.target)
+    labels = None
+    if a.task == "multiclass" or (a.task is None and not pd.api.types.is_numeric_dtype(y) and y.nunique() > 2):
+        # Class names (Santander's product codes) become 0..K-1 for the search; written back as given.
+        codes, labels = pd.factorize(as_text(y), sort=True)
+        y, a.task = pd.Series(codes, name=a.target), "multiclass"
     ids_tr = tr[a.id].to_numpy() if a.id else np.arange(len(tr))
     ids_te = te[a.id].to_numpy() if a.id else np.arange(len(tr), len(tr) + len(te))
     rel_tr = rel_te = None
@@ -313,6 +322,11 @@ def main():
             for c in [c for c in Fk.columns if c.endswith("__count")]:
                 Fk[c] = Fk[c].fillna(0)
             A.insert(0, Fk)
+            # Whole-history summaries (price paths, latest state) of an as-of table see only the rows before every
+            # main row: a later snapshot would hold the very outcome of an earlier labelled row.
+            if ch.name in asof:
+                tmin = np.nanmin(time_values(both_main[asof[ch.name]]))
+                ch = Child(ch.name, ch.df[time_values(ch.df[ch.time]) < tmin], key=ch.key, time=ch.time, drop=ch.drop)
             # Price paths (an order book, a trade log): realized volatility per parent.
             t = time.time()
             Rk = return_features(ch.df.drop(columns=[c for c in ch.drop if c in ch.df.columns]), ch.key, ch.name, ch.time)
@@ -345,7 +359,7 @@ def main():
             L = lookup_features(both_main, lk.df, lk.key, lk.name)
             print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
             A.append(L)
-        if cm_tables:
+        if cm_tables and a.task != "multiclass":   # (child-row models are binary or regression)
             task = a.task or ("binary" if y.nunique() == 2 else "regression")
             obj = "binary" if task == "binary" else "regression"
             # Decide on a sample of training parents with few child rows per fit first: on
@@ -391,6 +405,12 @@ def main():
     n_main = tr.shape[1]
     if a.lists == "auto":
         t = time.time()
+        Jtr, Jte, jfound = json_fields(Xtr, Xte)
+        if jfound:
+            Xtr = pd.concat([Xtr.drop(columns=jfound).reset_index(drop=True), Jtr], axis=1)
+            Xte = pd.concat([Xte.drop(columns=jfound).reset_index(drop=True), Jte], axis=1)
+            print(f"JSON fields: {jfound} -> {Jtr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+            del Jtr, Jte
         Ltr, Lte, found = list_features(Xtr, Xte)
         for c in found:  # downstream families read them as text: items joined
             J = as_lists(pd.concat([Xtr[c], Xte[c]], ignore_index=True)).map(" ; ".join).to_numpy()
@@ -401,6 +421,13 @@ def main():
             Xte = pd.concat([Xte.reset_index(drop=True), Lte, Ute], axis=1)
             print(f"lists: {found} -> {Ltr.shape[1]} columns; per-unit amounts: {Utr.shape[1]} columns "
                   f"in {time.time() - t:.0f}s", flush=True)
+    if a.panel == "auto":
+        t = time.time()
+        Ptr, Pte, P = panel_features(Xtr, Xte)
+        if P is not None:
+            Xtr = pd.concat([Xtr.reset_index(drop=True), Ptr], axis=1)
+            Xte = pd.concat([Xte.reset_index(drop=True), Pte], axis=1)
+            print(f"panel: {P} -> {Ptr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
     del tr, te  # a second copy of both tables is gigabytes on IEEE-CIS
     forecasting = False
     if a.forecast == "auto":
@@ -420,8 +447,10 @@ def main():
         for c in both.columns:
             if not (pd.api.types.is_numeric_dtype(both[c]) or isinstance(both[c].dtype, pd.CategoricalDtype)):
                 both[c] = as_text(both[c]).astype("category")
-        b = lgb.train(dict(objective="binary" if y.nunique() == 2 else "regression", learning_rate=0.1,
-                           num_leaves=31, feature_fraction=0.5, verbose=-1), lgb.Dataset(both, log_y(y) if a.log_target else y), 300)
+        obj = dict(objective="multiclass", num_class=len(labels)) if labels is not None else \
+            dict(objective="binary" if y.nunique() == 2 else "regression")
+        b = lgb.train(dict(obj, learning_rate=0.1, num_leaves=31, feature_fraction=0.5, verbose=-1),
+                      lgb.Dataset(both, log_y(y) if a.log_target else y), 300)
         gain = pd.Series(b.feature_importance("gain"), index=both.columns)[rel_tr.columns]
         top = list(gain.sort_values(ascending=False).index[:a.top_related])
         Xtr = both[list(Xtr.columns) + top]
@@ -441,7 +470,7 @@ def main():
         rest = [c for c in rel_tr.columns if c not in out_tr.columns]
         out_tr = pd.concat([out_tr, rel_tr[rest]], axis=1)
         out_te = pd.concat([out_te, rel_te[rest]], axis=1)
-    out_tr[a.target] = y.to_numpy()
+    out_tr[a.target] = labels[y.to_numpy()] if labels is not None else y.to_numpy()
     if a.id:
         out_tr.insert(0, a.id, ids_tr)
         out_te.insert(0, a.id, ids_te)
