@@ -118,6 +118,13 @@ for _c, _base in [("hc", "hc"), ("sct", "sct"), ("wnv", "wnv"), ("porto", "porto
                   ("fav", "fav")]:
     CONTESTS[f"{_c}_g6"] = dict(CONTESTS[_base], raw=CONTESTS[_base].get("raw", _base), repo=G6_REPO, base=_base)
 
+# Work-clock search budget on top of 6c034b5 (deterministic picks), wt_det.
+W_REPO = "/tmp/claude-0/wt_det"
+CONTESTS["ieee_w"] = dict(CONTESTS["ieee_v6"], repo=W_REPO)
+CONTESTS["ieee_w2"] = dict(CONTESTS["ieee_v6"], repo=W_REPO)
+for _c in ["sct", "wnv", "hc"]:
+    CONTESTS[f"{_c}_w"] = dict(CONTESTS[_c], raw=CONTESTS[_c].get("raw", _c), repo=W_REPO, base=_c)
+
 
 def download(c: str) -> Path:
     d = ROOT / CONTESTS[c].get("raw", c) / "raw"
