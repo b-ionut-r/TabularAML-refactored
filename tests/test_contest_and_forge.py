@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pandas as pd
 import pytest
@@ -466,3 +467,18 @@ def test_field_missing_from_unlabeled_rows_is_left_out():
     f = FeatureForge(task="binary", time_budget=20, random_state=0, n_jobs=1, verbose=False).fit(X, y, X_unlabeled=U)
     assert f.shifted_ == ["z"]
     assert "z" not in f.transform(U).columns and "z" not in f.transform_train(X).columns
+
+
+def test_json_object_columns_are_flattened_into_fields():
+    from tabularaml.generate.lists import json_fields
+    rng = np.random.default_rng(0)
+    rows = [json.dumps({"hits": str(int(h)), "src": {"medium": m}, "same": "x"})
+            for h, m in zip(rng.integers(1, 9, 300), rng.choice(["organic", "cpc"], 300))]
+    tr = pd.DataFrame({"totals": rows[:200], "other": rng.normal(size=200)})
+    te = pd.DataFrame({"totals": rows[200:], "other": rng.normal(size=100)})
+    a, b, found = json_fields(tr, te)
+    assert found == ["totals"]
+    assert list(a.columns) == ["totals.hits", "totals.src_medium"]   # the constant field is left out
+    assert a["totals.hits"].dtype == np.float32 and len(b) == 100
+    assert a["totals.hits"].iloc[0] == float(json.loads(rows[0])["hits"])
+    assert json_fields(tr[["other"]], te[["other"]])[2] == []

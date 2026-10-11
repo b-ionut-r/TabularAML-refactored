@@ -10,10 +10,16 @@ counts of their path pieces.
 bathrooms, rooms in total, children): what a contest kernel calls price per room. FeatureForge's search builds
 a / b of two columns but not an amount over a sum of counts.
 
-Both read only the feature columns of train and test rows, never the labels.
+**JSON objects.** A cell that holds a JSON object (Google Analytics' ``device``, ``totals``, ``trafficSource``) is
+a record of named fields. Read as free text it is one long, nearly unique string; winners flattened every field into
+its own column (numbers as numbers). ``json_fields`` does that.
+
+All three read only the feature columns of train and test rows, never the labels.
 """
 from __future__ import annotations
 
+import ast
+import json
 import re
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
@@ -74,6 +80,74 @@ def as_lists(s: pd.Series, sample: int = 5000) -> Optional[pd.Series]:
             continue
         return s.map(lambda x: [i.strip() for i in str(x).split(d) if i.strip()] if isinstance(x, str) else [])
     return None
+
+
+def _as_object(x):
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str) and x[:1] == "{":
+        try:
+            v = json.loads(x)
+        except ValueError:
+            try:
+                v = ast.literal_eval(x)
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                return None
+        return v if isinstance(v, dict) else None
+    return None
+
+
+def _flat(d: dict, pre: str, out: dict) -> dict:
+    for k, v in d.items():
+        if isinstance(v, dict):
+            _flat(v, f"{pre}{k}.", out)
+        else:
+            out[f"{pre}{k}"] = v
+    return out
+
+
+def json_fields(Xtr: pd.DataFrame, Xte: pd.DataFrame, sample: int = 2000, min_share: float = 0.001
+                ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """Every column whose cells are JSON objects, flattened into one column per field (nested fields joined by
+    dots) held by at least ``min_share`` of the rows. A field whose values all read as numbers is numeric,
+    others are text; fields with one value everywhere are left out. Returns the train / test fields and the
+    JSON columns found (which the caller drops)."""
+    n = len(Xtr)
+    out: Dict[str, pd.Series] = {}
+    found = []
+    for c in Xtr.columns:
+        s = Xtr[c]
+        if not (pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s)
+                or isinstance(s.dtype, pd.CategoricalDtype)):
+            continue
+        head = s.dropna().iloc[:sample]
+        if len(head) == 0 or head.map(lambda x: _as_object(x) is not None).mean() < 0.9:
+            continue
+        found.append(c)
+        both = pd.concat([s, Xte[c]], ignore_index=True).astype(object)
+        # One parse per distinct cell: GA repeats the same device record across many sessions.
+        codes, uniq = pd.factorize(both, use_na_sentinel=True)
+        recs = [_flat(_as_object(x) or {}, "", {}) for x in uniq]
+        keys = Counter(k for r in recs for k in r)
+        base = _safe(c)
+        cnt = np.bincount(codes[codes >= 0], minlength=len(uniq))
+        for k in keys:
+            have = np.array([k in r for r in recs])
+            if cnt[have].sum() < min_share * len(both):
+                continue
+            vals = pd.Series([r.get(k) for r in recs], dtype=object)
+            vals = vals.map(lambda v: v if v is None or isinstance(v, (str, int, float, bool)) else json.dumps(v))
+            num = pd.to_numeric(vals, errors="coerce")
+            isnum = num.notna() | vals.isna()
+            col = num.astype(np.float32) if isnum.all() else vals.map(lambda v: None if v is None else str(v))
+            full = col.to_numpy()[np.where(codes >= 0, codes, 0)]
+            full = pd.Series(full, dtype=col.dtype)
+            full[codes < 0] = np.nan if isnum.all() else None
+            if full.nunique(dropna=False) <= 1:
+                continue
+            out[f"{base}.{_safe(k, 60)}"] = full
+    F = pd.DataFrame(out)
+    return F.iloc[:n].reset_index(drop=True), F.iloc[n:].reset_index(drop=True), found
 
 
 def list_features(Xtr: pd.DataFrame, Xte: pd.DataFrame, top: int = 100, min_share: float = 0.005
