@@ -31,3 +31,15 @@ def test_name_families_and_named_columns():
     X = pd.DataFrame(rng.normal(size=(200, 12)), columns=[f"var_{i}" for i in range(12)])
     X = pd.concat([X, pd.DataFrame(rng.lognormal(size=(200, 12)), columns=[f"price_{w}" for w in "abcdefghijkl"])], axis=1)
     assert column_kinds(X) == {"var_dense_signed": [f"var_{i}" for i in range(12)]}
+
+
+def test_rows_help_keeps_signal_drops_noise():
+    from tabularaml.generate.rowstats import row_stat_features, rows_help
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame(np.where(rng.random((3000, 30)) < 0.7, 0.0, rng.exponential(1.0, (3000, 30))),
+                     columns=[f"v{i}" for i in range(30)])
+    R, _, G = row_stat_features(X, X.iloc[:10])
+    assert G
+    y = np.log1p((X > 0).sum(1).to_numpy() * 3.0) + rng.normal(0, 0.1, len(X))
+    assert rows_help(X, R, y, "regression")[0]
+    assert not rows_help(X, R, rng.normal(size=len(X)), "regression")[0]
