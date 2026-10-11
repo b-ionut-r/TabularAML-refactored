@@ -150,7 +150,8 @@ def match_cols(main: pd.DataFrame, ch: Child) -> list[str]:
     integer or text codes with 20+ levels whose main-table values mostly occur in the child."""
     out = []
     for c in ch.df.columns:
-        if c == ch.key or c == ch.time or c in ch.drop or c not in main.columns or any(h in c.lower() for h in TIME_HINTS):
+        # An id the main row also carries (Instacart's product_id) is matched on, though never aggregated as a number.
+        if c == ch.key or c == ch.time or c not in main.columns or any(h in c.lower() for h in TIME_HINTS):
             continue
         s = ch.df[c]
         if pd.api.types.is_float_dtype(s) and not np.all(np.mod(s.dropna().to_numpy()[:10000], 1) == 0):
@@ -347,12 +348,16 @@ def main():
             if not cols:
                 continue
             ct = ch.time if ch.time is not None else date_col(ch.df.drop(columns=[ch.key]))
-            if both_main[ch.key].duplicated().any() and (mt is None or ct is None):
+            # An event log ordered by a time the main rows carry (order number, timestamp): count matches strictly
+            # before each row in that time.
+            ordinal = ch.name in asof and (mt is None or ct is None)
+            if both_main[ch.key].duplicated().any() and not ordinal and (mt is None or ct is None):
                 continue  # repeated keys without dates could match a row's own later events
             chm = Child(ch.name, ch.df, key=ch.key, time=ct, drop=ch.drop)
             t = time.time()
-            Mf = match_features(both_main, ch.key, chm, cols, main_time=mt if ct is not None else None)
-            print(f"table {ch.name}: same-{'/'.join(cols)} matches{' before ' + mt if mt and ct else ''}: "
+            Mf = match_features(both_main, ch.key, chm, cols, main_time=asof[ch.name] if ordinal else (mt if ct is not None else None),
+                                ordinal=ordinal)
+            print(f"table {ch.name}: same-{'/'.join(cols)} matches{' before ' + (asof[ch.name] if ordinal else mt) if (ordinal or (mt and ct)) else ''}: "
                   f"{Mf.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
             A.append(Mf)
         for lk in lookups:

@@ -48,3 +48,12 @@ def test_addresses_are_not_lists_but_tag_sets_are():
     voc = [f"tag{i}" for i in range(30)]
     tags = pd.Series([",".join(rng.choice(voc, rng.integers(1, 6), replace=False)) for _ in range(3000)])
     assert as_lists(tags) is not None
+
+
+def test_categorical_columns_are_read_not_crashed_on():
+    s = pd.Series([f"code{i % 300}" for i in range(1000)] + [None] * 20, dtype="category")
+    assert as_lists(s) is None
+    rng = np.random.default_rng(0)
+    tags = pd.Series([", ".join(f"tag{t}" for t in rng.choice(30, 3, replace=False)) for _ in range(400)],
+                     dtype="category")
+    assert as_lists(tags) is not None

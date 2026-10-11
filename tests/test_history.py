@@ -26,3 +26,14 @@ def test_event_log_strictly_earlier():
     assert F.loc[2, "log__ok__hist_n"] == 3 and F.loc[2, "log__ok__hist_lag1"] == 1 and F.loc[2, "log__ok__hist_since1"] == 4
     assert F.loc[1, "log__ok__hist_item_n"] == 1 and F.loc[1, "log__ok__hist_item_mean"] == 1 and F.loc[2, "log__ok__hist_item_mean"] == 0
     assert F.loc[3, "log__ok__hist_n"] == 1 and F.loc[3, "log__ok__hist_item_n"] == 1
+
+
+def test_same_item_matches_count_only_earlier_orders():
+    from tabularaml.generate.relational import match_features
+    log = pd.DataFrame({"user_id": [1, 1, 1, 2], "product_id": [7, 7, 8, 7], "order_number": [1, 3, 2, 1],
+                        "qty": [1.0, 2.0, 5.0, 4.0]})
+    main = pd.DataFrame({"user_id": [1, 1, 2], "product_id": [7, 7, 7], "order_number": [3, 4, 1]})
+    M = match_features(main, "user_id", Child("log", log, key="user_id", time="order_number"), ["product_id"],
+                       main_time="order_number", ordinal=True)
+    assert M["log__same_product_id__all__n"].tolist() == [1, 2, 0]  # strictly earlier orders only
+    assert M["log__same_product_id__since"].tolist()[:2] == [2, 1]
