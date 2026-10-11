@@ -515,3 +515,20 @@ def test_json_object_columns_are_flattened_into_fields():
     assert list_features(cat, cat.iloc[:10])[2] == []
     a2, _, found2 = json_fields(tr.astype({"totals": "category"}), te.astype({"totals": "category"}))
     assert found2 == ["totals"] and a2.equals(a)
+
+
+def test_event_gaps_find_time_to_next_click_of_a_user():
+    rng = np.random.default_rng(0)
+    m, n = 8000, 6000  # labels from the full log; the file stops before its end, as a contest's does
+    X = pd.DataFrame({"ip": rng.integers(0, 300, m), "app": rng.integers(0, 5, m), "os": rng.integers(0, 4, m),
+                      "t": np.sort(rng.uniform(0, 1300, m))})
+    y = ((X.groupby(["ip", "app"])["t"].shift(-1) - X["t"]) < 60).to_numpy(dtype=int)[:n]
+    X = X.iloc[:n]
+    tr = np.arange(n) < 4800
+    ff = FeatureForge(task="binary", time_budget=20, time_col="t", verbose=False, random_state=0, label_echo=False)
+    ff.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]), X_unlabeled=X[~tr].reset_index(drop=True))
+    assert any(c.startswith("lag_next__ip+app__") for c in ff.new_columns_), ff.new_columns_
+    past = FeatureForge(task="binary", time_budget=20, time_col="t", verbose=False, random_state=0, label_echo=False,
+                        event_gaps="past")
+    past.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]), X_unlabeled=X[~tr].reset_index(drop=True))
+    assert not any(c.startswith("lag_next__") for c in past.new_columns_)

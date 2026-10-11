@@ -1978,6 +1978,10 @@ class FeatureForge:
         Numerics aggregated per entity; whether to add each row's place in its
         entity's history (time since previous / until next row, rows before it)
         when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    event_gaps : "auto" | "past" | "off"
+        With a time column and a repeating many-level key: time since each user's previous
+        row, until their next and rows before it, users being the key with the row's other
+        codes (TalkingData's ip + app + device + os). "past" leaves out the next row.
     group_col : str | "auto" | None
         Column whose test values are new groups (users, patients). "auto": a
         repeating integer / categorical column with under 20% of the unlabeled
@@ -2059,7 +2063,7 @@ class FeatureForge:
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
-                 pair_scan: bool = True, profiles: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
+                 pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
         self.time_budget = time_budget
@@ -2087,6 +2091,7 @@ class FeatureForge:
         self.time_col = time_col
         self.entity_nums = entity_nums
         self.entity_lags = entity_lags
+        self.event_gaps = event_gaps
         self.family_nb = family_nb
         self.events = events
         self.time_cv = time_cv
@@ -2543,6 +2548,7 @@ class FeatureForge:
                 add(Arith(op, a, b))
             self._event_candidates(W, imp, add)
             self._entity_candidates(W, imp, top_num, add)
+            self._event_gap_candidates(W, imp, add)
             self._interaction_candidates(W, add)
         else:
             # Compose selected features with the strongest raw columns.
@@ -2563,6 +2569,38 @@ class FeatureForge:
                 add(Count([k1, k2, k3]))
                 add(TargetEnc([k1, k2, k3], self.n_classes_))
         return cands
+
+    def _event_gap_candidates(self, W, imp, add):
+        """Where each row sits among its user's events: time since the user's previous row, until
+        their next one, and how many came before. A click log names no user; the repeating key with
+        the most levels (a device's ip) together with the row's other codes (app, device, os,
+        channel) does, the way TalkingData's winners keyed time-to-next-click. Offered whenever a
+        time column orders the rows and such a key repeats; the gate decides. ``event_gaps="past"``
+        leaves out the next row (it reads later rows of the same file)."""
+        t = getattr(self, "time_col_", None)
+        if self.event_gaps == "off" or t is None or t == ROW_TIME or not self.id_cols_:
+            return
+        echo = set(getattr(self, "echo_cols_", ()))
+        k = self.id_cols_[0]
+        if k == t or k in echo:
+            return
+
+        def code_like(c):
+            if c in self.cat_cols_:
+                return c not in self.text_cols_
+            x = W[c].to_numpy(dtype=float)
+            x = x[np.isfinite(x)]
+            return len(x) > 0 and bool(np.all(x == np.round(x)))
+        codes = [c for c in sorted(self.raw_cols_, key=lambda c: -imp.get(c, 0.0))
+                 if c not in (k, t) and c not in echo and c not in getattr(self, "date_cols_", [])
+                 and W[c].nunique() > 1 and code_like(c)][:4]
+        users = [(k,)] + [(k, *p) for r in (1, 2, 3) for p in combinations(codes, r)]
+        if len(codes) > 3:
+            users.append((k, *codes))
+        kinds = ("prev", "nth") if self.event_gaps == "past" else ("prev", "next", "nth")
+        for u in users:
+            for kind in kinds:
+                add(EntityLag(list(u) if len(u) > 1 else u[0], t, kind))
 
     def _entity_candidates(self, W, imp, top_num, add):
         """Counts, target maps and group statistics over ID-like columns and over
