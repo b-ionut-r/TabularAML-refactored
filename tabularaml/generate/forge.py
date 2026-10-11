@@ -54,9 +54,10 @@ ARITH_OPS = ("add", "sub", "mul", "div", "rdiv")
 # and would pick differently again on a faster or busier machine. Work is charged in seconds of
 # the 4-core reference container, from row and column counts only, so ``time_budget`` keeps its
 # meaning there. Measured on Home Credit, IEEE-CIS, Santander and Porto Seguro builds:
-_CV_CELL_S = 3e-7       # one 5-fold CV fit, per search row and model column
-_ROW_PASS_S = 4e-7      # building and screening one candidate of unit cost, per row (thread time; on Home
-                        # Credit, building took twice the thread time it logs, as four threads share memory)
+_CV_CELL_S = 3e-7       # prior for one 5-fold CV fit, per search row and model column (before it runs)
+_TREE_CELL_S = 1.6e-9   # one boosting iteration, per training row and model column (Home Credit 320 and 120
+                        # columns, 80k-197k rows, and a 100-column regression all measured 1.5-2.0e-9)
+_ROW_PASS_S = 2e-7      # building and screening one candidate of unit cost, per row (thread time)
 _PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
 _KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
 _REF_THREADS = 4        # candidate building runs on this many threads there
@@ -2370,12 +2371,14 @@ class FeatureForge:
             return M[r] if pick is None else M[np.ix_(r, pick)]
         n = len(M)
         n_fits = sum(len(f) for f in repeats)
-        cost = self._cv_cost(n, M.shape[1] if pick is None else len(pick), n_fits)
-        self._last_cv_cost = cost
-        if give_up and cost > give_up:
-            self._cv_projected = cost
+        width = M.shape[1] if pick is None else len(pick)
+        prior = self._cv_cost(n, width, n_fits)
+        if give_up and prior > give_up:
+            self._cv_projected = prior
             return None
-        self._charge(cost)
+        # Each fold is charged from the iterations it trained (early stopping is deterministic):
+        # a fit of thousands of trees costs that, not the row-by-column prior.
+        self._last_cv_cost = 0.0
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
@@ -2407,6 +2410,9 @@ class FeatureForge:
                     b = lgb.train(self._lgb_params(lr), dtr, 2000, valid_sets=[dva],
                                   callbacks=[lgb.early_stopping(50, verbose=False)])
                     del Mtr, dtr, dva
+                fold_cost = _TREE_CELL_S * b.current_iteration() * len(tr) * width * (self.n_classes_ if self.task_ == "multiclass" else 1)
+                self._last_cv_cost += fold_cost
+                self._charge(fold_cost)
                 oof[va] = b.predict(Mva, num_iteration=b.best_iteration, raw_score=True)
                 imp += pd.Series(b.feature_importance("gain"), index=cols)
                 if mine:
