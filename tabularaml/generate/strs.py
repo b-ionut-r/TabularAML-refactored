@@ -3,8 +3,8 @@
 ``Series.astype(str)`` on a categorical converts its categories to a fixed-width numpy
 unicode array first: one long-text level (MCTS's game rules, a keystroke log's pasted text)
 makes every level that wide, and a few thousand of them ask for tens or hundreds of GiB.
-These helpers map categories through Python strings instead, with the same values
-``astype(str)`` gives ("nan" for missing).
+These helpers map categories through Python strings instead, with the values pandas 2's
+``astype(str)`` gives ("nan" for missing) on pandas 2 and 3 alike.
 """
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ def as_text(s) -> pd.Series:
         ok = codes >= 0
         out[ok] = cats[codes[ok]]
         return pd.Series(out, index=s.index, name=s.name, dtype=object)
-    return s.astype(object).astype(str)
+    # Missing values as "nan" on every pandas version (pandas 3's astype(str) keeps them missing).
+    return s.astype(object).where(s.notna(), "nan").map(str).astype(object)
 
 
 def as_text_frame(df: pd.DataFrame) -> pd.DataFrame:
