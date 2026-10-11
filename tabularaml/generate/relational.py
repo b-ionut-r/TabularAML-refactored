@@ -39,6 +39,7 @@ import re
 
 import numpy as np
 import pandas as pd
+from tabularaml.generate.strs import as_text
 
 
 def _safe(name: str) -> str:
@@ -56,6 +57,7 @@ class Child:
     time: Optional[str] = None     # larger = more recent
     children: List["Child"] = field(default_factory=list)
     drop: Sequence[str] = ()       # ids that are not features (other foreign keys)
+    source: Optional[str] = None   # a parquet path read a key range at a time (df holds a sample)
 
 
 def _stem(c: str) -> str:
@@ -88,8 +90,12 @@ def _row_pairs(df: pd.DataFrame, num: Sequence[str], max_pairs: int) -> pd.DataF
 class RelatedTables:
     def __init__(self, children: Sequence[Child], stats=("mean", "max", "min", "sum", "std"),
                  recent: int = 3, top_levels: int = 8, max_pairs: int = 12, row_pairs: bool = True,
-                 n_split: int = 0):
+                 n_split: int = 0, drop_const: bool = True):
         self.children = list(children)
+        self.drop_const = drop_const
+        # Levels picked per (table, column) on the first call: a table aggregated chunk by chunk gets the
+        # same columns from every chunk.
+        self.levels_ = {}
         self.stats = tuple(stats)
         self.recent = recent
         self.top_levels = top_levels
@@ -118,14 +124,30 @@ class RelatedTables:
             parts.append(df[num].astype(np.float32))
         if self.row_pairs and len(num) >= 2:
             parts.append(_row_pairs(df, num, self.max_pairs).astype(np.float32))
+        # A long-format child (one attribute column, maybe a value per row: Telstra's
+        # log_feature / volume, event_type) is a bag of attributes per entity: every level
+        # seen 20 times gets its own column, and the values are spread by level (the pivot
+        # contest winners used); wide children keep their most common levels.
+        bag = len(cats) == 1 and len(feats) <= 3
         for c in cats:
-            s = df[c].astype(str)
-            for lv in s.value_counts().index[:self.top_levels]:
+            s = as_text(df[c])
+            if (ch.name, c) not in self.levels_:
+                vc = s.value_counts()
+                self.levels_[(ch.name, c)] = list(vc.index[vc >= 20][:300] if bag else vc.index[:self.top_levels])
+            for lv in self.levels_[(ch.name, c)]:
                 parts.append(pd.DataFrame({f"{c}={lv}": (s == lv).astype(np.float32)}, index=df.index))
+        if bag and num:
+            s = as_text(df[cats[0]])
+            for lv in self.levels_[(ch.name, cats[0])]:
+                m = (s == lv).to_numpy()
+                for c in num:
+                    parts.append(pd.DataFrame({f"{c}@{cats[0]}={lv}": np.where(m, df[c].to_numpy(dtype=float), 0.0)
+                                               .astype(np.float32)}, index=df.index))
         W = pd.concat(parts, axis=1)
         vals = [c for c in W.columns if c != key]
         dense = [c for c in vals if "=" not in c]
-        onehot = [c for c in vals if "=" in c]
+        onehot = [c for c in vals if "=" in c and "@" not in c]
+        spread = [c for c in vals if "@" in c]
         g = W.groupby(key, sort=False)
         out = [g.size().rename("count").to_frame()]
         if dense:
@@ -134,11 +156,15 @@ class RelatedTables:
             out.append(a)
         if onehot:
             out.append(g[onehot].mean())
+        if spread:
+            out.append(g[spread].sum())
         for c in cats:
             out.append(df.groupby(key, sort=False)[c].nunique().rename(f"{c}_nunique").to_frame())
         if ch.time is not None and self.recent and dense:
             # Rank within the entity: rows sorted by time, most recent first.
-            r = W.assign(_t=df[ch.time].to_numpy()).sort_values([key, "_t"], ascending=[True, False])
+            # Only the columns averaged: the one-hot and spread columns made this copy gigabytes
+            # on an 8.4M-row keystroke log.
+            r = W[[key] + dense].assign(_t=df[ch.time].to_numpy()).sort_values([key, "_t"], ascending=[True, False])
             r = r[r.groupby(key, sort=False).cumcount() < self.recent]
             a = r.groupby(key, sort=False)[dense].mean()
             a.columns = [f"{c}_last{self.recent}" for c in a.columns]
@@ -148,20 +174,46 @@ class RelatedTables:
         # refused applications).
         splits = []
         for c in cats:
-            vc = df[c].astype(str).value_counts(normalize=True)
+            vc = as_text(df[c]).value_counts(normalize=True)
             if 2 <= len(vc) <= 6 and vc.iloc[0] < 0.9:
                 splits.append((vc.iloc[0], c, list(vc.index[:2])))
         for _, c, levels in sorted(splits)[:self.n_split]:
-            s = df[c].astype(str).to_numpy()
+            s = as_text(df[c]).to_numpy()
             for lv in levels:
                 sub = W.loc[s == lv, [key] + dense]
                 a = sub.groupby(key, sort=False)[dense].agg(["mean", "max", "sum"])
                 a.columns = [f"{c}={lv}:{v}_{st}" for v, st in a.columns]
                 cnt = sub.groupby(key, sort=False).size().rename(f"{c}={lv}:count")
                 out += [a, cnt.to_frame()]
+        # Readings split by channel: an integer column of 3 to 8 levels, each on at least 5% of rows (a light
+        # curve's passband, a sensor id, a book side), gets each raw numeric's statistics per level, the
+        # per-band summaries astronomy and sensor contests are won with. Decided on the first chunk.
+        if (ch.name, "__channels__") not in self.levels_:
+            chans = []
+            for c in num:
+                if c == ch.time:
+                    continue
+                v = df[c]
+                if not pd.api.types.is_integer_dtype(v):
+                    continue
+                vc = v.value_counts(normalize=True)
+                if 3 <= len(vc) <= 8 and vc.min() >= 0.05:
+                    chans.append((c, sorted(vc.index.tolist())))
+            vals_ = [c for c in num if c != ch.time and c not in {cc for cc, _ in chans}][:6]
+            self.levels_[(ch.name, "__channels__")] = (chans[:1], vals_)
+        chans, vals_ = self.levels_[(ch.name, "__channels__")]
+        for c, levels in chans:
+            lv_of = df[c].to_numpy()
+            for lv in levels:
+                sub = df.loc[lv_of == lv, [key] + vals_]
+                a = sub.groupby(key, sort=False)[vals_].agg(["mean", "max", "min", "std"])
+                a.columns = [f"{v}@{c}{lv}_{st}" for v, st in a.columns]
+                out.append(a)
         res = pd.concat(out, axis=1)
         res.columns = [_safe(f"{ch.name}:{c}") for c in res.columns]
         res = res.loc[:, ~res.columns.duplicated()]
+        if not self.drop_const:
+            return res.astype(np.float32)
         # Drop constant and almost-empty columns.
         keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
         return res[keep].astype(np.float32)
@@ -205,7 +257,10 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
     if len(num) >= 2:
         X = pd.concat([X, _row_pairs(df, num, 12).astype(np.float32)], axis=1)
     for c in X.columns:
-        if not pd.api.types.is_numeric_dtype(X[c]):
+        if pd.api.types.is_datetime64_any_dtype(X[c]):
+            # days since the epoch: LightGBM cannot serialise Timestamp categories
+            X[c] = (X[c] - pd.Timestamp("1970-01-01")).dt.total_seconds().astype(np.float64) / 86400.0
+        elif not pd.api.types.is_numeric_dtype(X[c]):
             X[c] = X[c].astype("category")
     X.columns = [_safe(c) for c in X.columns]
     X = X.loc[:, ~X.columns.duplicated()]
@@ -247,6 +302,17 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
     return res.astype(np.float32)
 
 
+def time_values(s: pd.Series) -> np.ndarray:
+    """A time column as floats: numbers as they are, dates (datetime or text such as 2015-01-28) as nanoseconds."""
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+        return s.to_numpy(dtype=float)
+    if not pd.api.types.is_datetime64_any_dtype(s):
+        s = pd.to_datetime(as_text(s), errors="coerce")
+    v = s.to_numpy("datetime64[ns]").astype(np.int64).astype(float)
+    v[s.isna().to_numpy()] = np.nan
+    return v
+
+
 def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Sequence[int] = (5, 20),
                   top_levels: int = 12, stats: Sequence[str] = ("mean", "sum", "max", "min", "std")) -> pd.DataFrame:
     """Aggregations of a child event table as of each main row's time: only child rows of
@@ -267,9 +333,9 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
     ck = keys.get_indexer(df[key])
     keep = ck >= 0
     df, ck = df.loc[keep], ck[keep]
-    ct = df[ch.time].to_numpy(dtype=float)
+    ct = time_values(df[ch.time])
     mk = keys.get_indexer(main[key])
-    mt = main[time].to_numpy(dtype=float)
+    mt = time_values(main[time])
     # Positions in the child sorted by (key, time): a time rank over child and main times
     # makes the pair one sortable integer.
     allt = np.unique(np.concatenate([ct[np.isfinite(ct)], mt[np.isfinite(mt)]]))
@@ -325,7 +391,7 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
                 cum = (s.groupby(blk).cummax() if st == "max" else s.groupby(blk).cummin()).to_numpy()
                 out[f"{pre}__{c}_{st}"] = np.where(has, cum[np.maximum(p - 1, 0)], np.nan)
     for c in cats:
-        s = df[c].astype(str).to_numpy()[order]
+        s = as_text(df[c]).to_numpy()[order]
         for lv in pd.Series(s).value_counts().index[:top_levels]:
             S = prefix((s == lv).astype(float))
             with np.errstate(all="ignore"):
@@ -352,14 +418,14 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
     """
     from tabularaml.generate.forge import column_families
     tab = table.drop_duplicates(key).set_index(key)
-    keys = set(tab.index.astype(str))
+    keys = set(as_text(tab.index))
     num = [c for c in tab.columns if pd.api.types.is_numeric_dtype(tab[c])]
     cat = [c for c in tab.columns if c not in num and 2 <= tab[c].nunique() <= 30]
 
     def hits(cols):
         # The columns hold the table's keys: most of their values are keys, or (a table
         # covering one kind of component among many) most of the table's keys occur in them.
-        v = pd.concat([main[c].dropna().astype(str) for c in cols])
+        v = pd.concat([as_text(main[c].dropna()) for c in cols])
         if len(v) == 0:
             return False
         seen = set(pd.unique(v))
@@ -381,9 +447,9 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
     nfam = column_families([c for c in main.columns if pd.api.types.is_numeric_dtype(main[c])])
     out = {}
     T = tab.copy()
-    T.index = T.index.astype(str)
+    T.index = as_text(T.index)
     for c in [c for c in cand if c not in in_fam]:
-        A = T.reindex(main[c].astype(str).to_numpy())
+        A = T.reindex(as_text(main[c]).to_numpy())
         for a in num:
             out[f"{name}__{c}__{a}"] = A[a].to_numpy(dtype=float)
         for a in cat:
@@ -392,7 +458,7 @@ def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str
     idx = lambda c: re.match(r"^.*?(\d+)$", str(c)).group(1)
     for stem, cols in fams.items():
         pair = next((v for v in nfam.values() if [idx(x) for x in v] == [idx(x) for x in cols]), None)
-        V = np.column_stack([main[c].astype(str).where(main[c].notna(), None).to_numpy() for c in cols])
+        V = np.column_stack([as_text(main[c]).where(main[c].notna(), None).to_numpy() for c in cols])
         filled = np.column_stack([main[c].notna().to_numpy() for c in cols])
         Q = (np.nan_to_num(np.column_stack([main[c].to_numpy(dtype=float) for c in pair]), nan=0.0)
              if pair else filled.astype(float))
@@ -433,8 +499,8 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
             and pd.api.types.is_numeric_dtype(df[c]) and df[c].nunique() > 2][:4]
     t_child = t_main = None
     if main_time is not None and ch.time is not None:
-        t_child = pd.to_datetime(df[ch.time].astype(str), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
-        t_main = pd.to_datetime(main[main_time].astype(str), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
+        t_child = pd.to_datetime(as_text(df[ch.time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
+        t_main = pd.to_datetime(as_text(main[main_time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
     rows = pd.DataFrame({"__r": np.arange(len(main)), key: main[key].to_numpy()})
     for c in cols:
         rows[c] = main[c].to_numpy()

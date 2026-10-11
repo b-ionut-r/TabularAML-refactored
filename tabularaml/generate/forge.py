@@ -32,6 +32,7 @@ Typical use::
 """
 from __future__ import annotations
 
+import os
 import time
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence
@@ -40,10 +41,35 @@ import numpy as np
 import pandas as pd
 import warnings
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from tabularaml.generate.strs import as_text, as_text_frame
 
 TE_SMOOTHING = 20.0
 GROUP_STATS = ("mean", "std", "min", "max", "dev", "z")
 ARITH_OPS = ("add", "sub", "mul", "div", "rdiv")
+
+# Work clock. Every budget decision (how many candidates get built, which families are cut, how
+# many prefixes and rounds run, whether the search shrinks its rows) counts work, not wall-clock
+# seconds: timed decisions picked different features on the same data from run to run (Home
+# Credit kept 12 features or none at one commit, as 9-11 neighbour candidates fitted in the time)
+# and would pick differently again on a faster or busier machine. Work is charged in seconds of
+# the 4-core reference container, from row and column counts only, so ``time_budget`` keeps its
+# meaning there. Measured on Home Credit, IEEE-CIS, Santander and Porto Seguro builds:
+_CV_CELL_S = 3e-7       # one 5-fold CV fit, per search row and model column
+_ROW_PASS_S = 4e-7      # building and screening one candidate of unit cost, per row (thread time; on Home
+                        # Credit, building took twice the thread time it logs, as four threads share memory)
+_PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
+_KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
+_REF_THREADS = 4        # candidate building runs on this many threads there
+# Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
+_SPEC_WORK = {
+    "Arith": 1, "Expr": 1, "Digits": 1, "DatePart": 1, "Rotate": 1, "GroupStat": 2, "StrNum": 2, "GeoPair": 2,
+    "TargetEnc": 3, "KeyBinTE": 3, "MixedTE": 3, "MixedCount": 3, "BinnedPairTE": 4, "Count": 5, "RowStat": 5,
+    "SlotBag": 5, "SlotTE": 5, "TextStats": 5, "EntityLag": 10, "GroupSeq": 10, "LaggedTargetMean": 10,
+    "EventRecency": 14, "LinResid": 60, "LinearOOF": 60, "Projection": 60, "FamilyCount": 400, "FamilyNB": 400,
+    "TextSVD": 500, "CrossLinearOOF": 1000, "TextLinearOOF": 1000, "KNNClassDist": 1300, "ClientProfile": 1300,
+    "KNNTarget": 1700,
+}
+_SPEC_WORK_DEFAULT = 20
 
 
 # ============================================================================
@@ -58,6 +84,38 @@ def _is_cat(s: pd.Series) -> bool:
 def _as_str(s: pd.Series) -> pd.Series:
     """String view of a column with missing values mapped to an explicit level."""
     return s.astype(object).where(s.notna(), "__NA__").astype(str)
+
+
+def _as_str_frame_col(s: pd.Series) -> pd.Series:
+    """``_as_str`` for a column of a frame, as the ``category`` column ``_compact`` would make of it
+    when it already is one (sorted string levels, missing as "__NA__"): one string per row of
+    Bosch's 2,140 categorical fields was 9 GB on 240k rows."""
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        names = s.cat.categories.astype(object).map(str)
+        if names.is_unique:
+            s = s.cat.rename_categories(names)
+            if s.isna().any():
+                if "__NA__" not in names:
+                    s = s.cat.add_categories("__NA__")
+                s = s.fillna("__NA__")
+            s = s.cat.remove_unused_categories()
+            return s.cat.reorder_categories(sorted(s.cat.categories))
+    return _as_str(s)
+
+
+def _concat_cats(parts: List[pd.DataFrame]) -> pd.DataFrame:
+    """Row-wise concat that keeps ``category`` columns as categories (on the union of the parts'
+    levels): pandas otherwise falls back to one string object per row, gigabytes on 9M rows."""
+    parts = [p.copy(deep=False) for p in parts]
+    for c in parts[0].columns:
+        if all(c in p.columns and isinstance(p[c].dtype, pd.CategoricalDtype) for p in parts):
+            cats = parts[0][c].cat.categories
+            for p in parts[1:]:
+                cats = cats.union(p[c].cat.categories)
+            for p in parts:
+                if not p[c].cat.categories.equals(cats):
+                    p[c] = p[c].cat.set_categories(cats)
+    return pd.concat(parts, ignore_index=True)
 
 
 def _key_values(s: pd.Series) -> np.ndarray:
@@ -193,6 +251,8 @@ class Spec:
     """A generated feature. ``transform`` returns an (n,) or (n, k) float array."""
     target_dep = False
     n_out = 1
+    # Skips the one-column residual screen; the joint model and CV judge it instead.
+    screen_exempt = False
 
     def __init__(self, parents: Sequence[str]):
         self.parents = list(parents)
@@ -425,11 +485,30 @@ class KNNClassDist(KNNTarget):
     sits to each class's manifold, a margin-like signal trees cannot form
     from raw axes. Out of fold on training rows.
     """
-
     def __init__(self, cols, ks, n_classes, label, weights=None):
         super().__init__(cols, ks, n_classes, label, weights)
         self.n_out = len(self.ks) * n_classes
         self.name = f"knnd__{label}"
+        # With several classes its signal is which class sits nearest, read across the
+        # per-class columns; one column at a time the residual probe scores it near zero, so
+        # the screen dropped it by chance (wine_white: +12% CV in the joint model, novelty
+        # -0.003 to +0.001 between runs). Binary targets keep the screen (churn lost 2-8%).
+        self.screen_exempt = n_classes > 2
+
+    def fit_transform_oof(self, df, y, ctx, folds):
+        self.folds_ = [np.asarray(tr) for tr, _ in folds]
+        return super().fit_transform_oof(df, y, ctx, folds)
+
+    def transform(self, df, ctx):
+        # Distances shrink as the reference grows: a training row's out-of-fold distances
+        # come from (k-1)/k of the rows, so new rows are measured against the same fold
+        # references and averaged. Measured against all rows, they sat nearer every class
+        # than any training row (Telstra held-out: +0.004 / +0.028 log loss with them).
+        folds = getattr(self, "folds_", None)
+        if not folds:
+            return super().transform(df, ctx)
+        M_q = self._matrix(df)
+        return sum(self._query(self.M_[tr], self.Y_[tr], M_q) for tr in folds) / len(folds)
 
     def _query(self, M_ref, Y_ref, M_q):
         from sklearn.neighbors import NearestNeighbors
@@ -829,7 +908,7 @@ def slot_families(df: pd.DataFrame, cat_cols: Sequence[str]) -> List[tuple]:
         na = [df[c].isna().mean() + (_as_str(df[c]) == "__NA__").mean() for c in cols]
         if na[-1] < na[0] + 0.2:
             continue
-        sets = [set(pd.unique(df[c].dropna().astype(str))) - {"__NA__"} for c in cols[:3]]
+        sets = [set(pd.unique(as_text(df[c].dropna()))) - {"__NA__"} for c in cols[:3]]
         if len(sets[0]) < 5 or len(sets[0] & sets[1]) < 0.2 * min(len(sets[0]), len(sets[1]) or 1):
             continue
         slots = [idx(c) for c in cols]
@@ -1050,6 +1129,62 @@ class EntityLag(Spec):
         return r
 
 
+class GroupSeq(Spec):
+    """A row's place in its group's sequence: earlier and later values of a column (lags,
+    leads, differences), its running sum and its time-weighted running sum (area), and the
+    row's step within the group. Groups are whole sequences (breaths, sessions) whose rows
+    the test holds in full; label-free, computed inside each group of the frame it sees.
+    The per-breath lags and u_in cumsum of the Ventilator winners."""
+
+    def __init__(self, key: str, order: str, col: Optional[str], kind: str):
+        super().__init__([key, order] + ([col] if col else []))
+        self.key, self.order, self.col, self.kind = key, order, col, kind
+        self.name = f"seq_{kind}__{col or order}__{key}"
+
+    @property
+    def novelty_parents(self):
+        # The group and its order scope the feature; it re-expresses the column.
+        return [self.col or self.order]
+
+    def transform(self, df, ctx):
+        g = pd.factorize(df[self.key].to_numpy())[0]
+        t = df[self.order].to_numpy(dtype=float)
+        o = np.lexsort((t, g))
+        gs, ts = g[o], t[o]
+        start = np.r_[True, gs[1:] != gs[:-1]]
+        first = np.maximum.accumulate(np.where(start, np.arange(len(gs)), 0))
+        step = np.arange(len(gs)) - first
+        k = self.kind
+        if k == "step":
+            r = step.astype(float)
+        elif k == "dt":
+            r = np.where(start, 0.0, np.diff(ts, prepend=np.nan))
+        else:
+            x = df[self.col].to_numpy(dtype=float)[o]
+            if k.startswith(("lag", "lead", "diff")):
+                m = int(k.lstrip("abcdefghijklmnopqrstuvwxyz"))
+                sh = -m if k.startswith("lead") else m
+                idx = np.arange(len(gs)) - sh
+                ok = (idx >= 0) & (idx < len(gs))
+                idx = np.clip(idx, 0, len(gs) - 1)
+                ok &= gs[idx] == gs
+                prev = np.where(ok, x[idx], np.nan)
+                r = x - prev if k.startswith("diff") else prev
+            elif k in ("cumsum", "area"):
+                v = np.nan_to_num(x)
+                if k == "area":
+                    v = v * np.where(start, 0.0, np.diff(ts, prepend=np.nan))
+                c = np.cumsum(v)
+                r = c - (c - v)[first]
+            elif k == "cummax":
+                r = pd.Series(x).groupby(gs).cummax().to_numpy(dtype=float)
+            else:
+                raise ValueError(k)
+        out = np.empty(len(gs))
+        out[o] = r
+        return out
+
+
 _DAY = 86400.0
 _DATE_PARTS = ("dow", "dom", "month", "year", "doy", "woy", "to_month_end")
 
@@ -1069,7 +1204,7 @@ def _is_date_like(s: pd.Series) -> bool:
         return True
     if not (s.dtype == object or pd.api.types.is_string_dtype(s)):
         return False
-    sample = s.dropna().astype(str).head(500)
+    sample = as_text(s.dropna().head(500))
     if len(sample) < 20 or not sample.str.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}").mean() > 0.95:
         return False
     return pd.to_datetime(sample, errors="coerce").notna().mean() > 0.95
@@ -1235,7 +1370,7 @@ def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
     (titles, descriptions, comments), as opposed to codes, ids or category labels."""
     if not _is_cat(s) or len(s) < 100:
         return False
-    v = s.dropna().astype(str)
+    v = as_text(s.dropna())
     if len(v) > n_sample:
         v = v.sample(n_sample, random_state=0)
     if len(v) < 50 or v.nunique() < max(50, 0.05 * len(v)):
@@ -1246,10 +1381,23 @@ def _is_text(s: pd.Series, n_sample: int = 20_000) -> bool:
 
 
 def _text_values(df, c, clip: Optional[int] = None) -> pd.Series:
-    t = df[c].astype(str)
+    t = as_text(df[c])
     t = t.where(t != "__NA__", "")
     # Long fields (review dumps) cost n-gram time quadratically in nothing but their tails.
     return t if clip is None else t.str.slice(0, clip)
+
+
+def _text_parts(df, c, clip: Optional[int] = None):
+    """``_text_values`` as its distinct texts and each row's index into them: texts repeated over
+    many rows (a game's rules on each of its matches) are transformed once, not once per row."""
+    s = df[c]
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        codes, u = s.cat.codes.to_numpy().astype(np.int64), pd.Series(s.cat.categories.astype(object))
+    else:
+        codes, u = pd.factorize(s)
+        u = pd.Series(np.asarray(u, dtype=object))
+    u = pd.concat([u, pd.Series([np.nan], dtype=object)], ignore_index=True)
+    return _text_values(pd.DataFrame({c: u}), c, clip), np.where(codes < 0, len(u) - 1, codes)
 
 
 TEXT_CLIP = 1500
@@ -1265,7 +1413,7 @@ class TextStats(Spec):
         self.name = f"txtstat__{col}"
 
     def transform(self, df, ctx):
-        t = _text_values(df, self.parents[0])
+        t, codes = _text_parts(df, self.parents[0])
         n_ch = t.str.len().to_numpy(dtype=float)
         words = t.str.lower().str.findall(r"\w+")
         n_w = words.str.len().to_numpy(dtype=float)
@@ -1275,7 +1423,7 @@ class TextStats(Spec):
         pun = t.str.count(r"[^\w\s]").to_numpy(dtype=float)
         den = np.maximum(n_ch, 1.0)
         return np.column_stack([n_ch, n_w, dig / den, up / den, pun / den,
-                                n_u / np.maximum(n_w, 1.0), (n_ch == 0).astype(float)]).astype(np.float32)
+                                n_u / np.maximum(n_w, 1.0), (n_ch == 0).astype(float)]).astype(np.float32)[codes]
 
 
 def _tfidf(kind: str, max_features: int):
@@ -1314,7 +1462,8 @@ class TextSVD(Spec):
         return self
 
     def transform(self, df, ctx):
-        return self.svd_.transform(self.vec_.transform(_text_values(df, self.parents[0], TEXT_CLIP))).astype(np.float32)
+        t, codes = _text_parts(df, self.parents[0], TEXT_CLIP)
+        return self.svd_.transform(self.vec_.transform(t)).astype(np.float32)[codes]
 
 
 class TextLinearOOF(Spec):
@@ -1352,13 +1501,16 @@ class TextLinearOOF(Spec):
         if self.keys:
             from sklearn.preprocessing import OneHotEncoder
             self.ohe_ = OneHotEncoder(handle_unknown="ignore", min_frequency=2, dtype=np.float32).fit(
-                df[self.keys].astype(str))
+                as_text_frame(df[self.keys]))
 
     def _design(self, df):
         from scipy import sparse
-        blocks = [v.transform(_text_values(df, c, TEXT_CLIP)) for c, vs in zip(self.text_cols, self.vecs_) for v in vs]
+        blocks = []
+        for c, vs in zip(self.text_cols, self.vecs_):
+            t, codes = _text_parts(df, c, TEXT_CLIP)
+            blocks += [v.transform(t)[codes] for v in vs]
         if self.keys:
-            blocks.append(self.ohe_.transform(df[self.keys].astype(str)))
+            blocks.append(self.ohe_.transform(as_text_frame(df[self.keys])))
         return sparse.hstack(blocks, format="csr")
 
     def _query(self, A, y, B):
@@ -1367,7 +1519,7 @@ class TextLinearOOF(Spec):
             mu = y.mean()
             return (Ridge(alpha=3.0, solver="sparse_cg").fit(A, y - mu).predict(B) + mu)[:, None]
         if self.n_classes == 2:
-            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3).fit(A, y.astype(int))
+            m = LogisticRegression(C=1.0, solver="liblinear", tol=1e-3, random_state=0).fit(A, y.astype(int))
             return m.decision_function(B)[:, None]
         Y = np.eye(self.n_classes)[y.astype(int)]
         return Ridge(alpha=3.0, solver="sparse_cg").fit(A, Y - Y.mean(0)).predict(B) + Y.mean(0)
@@ -1442,7 +1594,7 @@ class CrossLinearOOF(Spec):
         if self.n_classes > 2:
             return LogisticRegression(C=0.5, max_iter=300)
         # Wide one-hot designs solve much faster in the dual.
-        return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0])
+        return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0], random_state=0)
 
     def _query(self, S_ref, y_ref, S_q):
         A, B = self._design(S_ref, S_ref), self._design(S_ref, S_q)
@@ -1525,6 +1677,55 @@ class Digits(Spec):
             if self.kind == "frac100":   # cents
                 return np.mod(np.round(x * 100), 100)
         raise ValueError(self.kind)
+
+
+class StrNum(Spec):
+    """The number written inside a coded string ("location 118", "feature 68"): codes
+    issued in order put neighbouring numbers close, which the category alone hides."""
+    # Its worth is in interactions (Telstra's location number: hand +0.02 log loss, no
+    # residual gain on its own), so it is also offered to the gate on top of each feature
+    # set. Exempt from the screen instead, it took a joint-model slot on West Nile's trap
+    # code and the search stopped a round early (21 features, gate +7.2% -> 12, +2.9%).
+    gate_addon = True
+
+    def __init__(self, col: str):
+        super().__init__([col])
+        self.name = f"strnum__{col}"
+
+    @staticmethod
+    def parse(s: pd.Series) -> np.ndarray:
+        return pd.to_numeric(as_text(s).str.extract(r"(\d+)\s*$")[0], errors="coerce").to_numpy(dtype=float)
+
+    def transform(self, df, ctx):
+        return self.parse(df[self.parents[0]])
+
+
+def _absent_in_test(X: pd.DataFrame, U: pd.DataFrame) -> List[str]:
+    """Columns at least 80% one value in ``U`` that at most 5% of ``X`` holds, while ``X`` has 10+ values."""
+    out = []
+    for c in X.columns:
+        if c not in U.columns or len(U) < 50:
+            continue
+        vb = U[c].value_counts(dropna=False, normalize=True)
+        if not len(vb) or vb.iloc[0] < 0.8 or X[c].nunique(dropna=False) < 10:
+            continue
+        v = vb.index[0]
+        s_tr = float(X[c].isna().mean()) if pd.isna(v) else float((X[c] == v).mean())
+        if s_tr <= 0.05:
+            out.append(c)
+    return out
+
+
+def _numbered_codes(s: pd.Series) -> bool:
+    """A string column whose values are one shared prefix and a number."""
+    v = pd.Series(pd.unique(as_text(s)))
+    v = v[v != "__NA__"]
+    if len(v) <= 10:
+        return False
+    m = v.str.extract(r"^(\D*?)\s*(\d+)\s*$")
+    ok = m[1].notna()
+    pre = m.loc[ok, 0]
+    return bool(ok.mean() >= 0.95 and pre.nunique() == 1 and pre.iloc[0].strip().isalpha())
 
 
 def geo_points(cols: Sequence[str]) -> List[tuple]:
@@ -1727,6 +1928,10 @@ def _expr_eval(t, df):
         return a / np.where(b == 0, np.nan, b)
 
 
+# Features computed from a row's own values only (no other rows enter them).
+_SAME_ROW = (Arith, RowStat, Digits, Rotate, Expr, DatePart, TextStats, GeoPair)
+
+
 class FeatureForge:
     """Residual-guided automated feature engineering.
 
@@ -1740,17 +1945,38 @@ class FeatureForge:
         groups when test rows are new entities, else a random sample); the rest still
         count in label-free statistics, and the output is computed on every row. Off by
         default: a 300k cap lost M5's and Favorita's gains.
+    gate_wide : bool
+        The gate also scores up to two wider prefixes of the last round's ranking that the
+        search CV placed close behind the chosen one (within half its gain), and keeps
+        whichever set wins on the time-ordered gate rows. Off by default: on full IEEE-CIS
+        the gate preferred the CV's pick anyway (same held-out AUC, about 5 minutes more).
+    gate_families : bool | "auto"
+        When the full set fails the gate, drop feature families one at a time and keep the
+        best remaining set that clears the gate by one more standard error. "auto" (default):
+        only when the test starts after a gap from the training rows, where the gate also
+        starts the same time after the search rows; there a family that leans on the latest
+        labelled rows (neighbours' labels, cross-linear key models on IEEE-CIS) fails while the
+        client encodings and profiles still carry over.
+    label_echo : bool
+        Find columns that carry earlier rows' labels (running means or counts of past
+        answers in an event log: within an entity, or a pair of entities such as student and
+        question, the next row's change tracks this row's label; or lagged answers: a row a
+        few rows later holds this row's label) and keep them, and features built on them, out of every cross-row feature
+        (group statistics, counts, encodings, neighbours, anchors). Such statistics would
+        hand each row its own label through the entity's later rows.
     family_time_share : float
-        Largest share of the candidate-building time one family may take (1 disables).
+        Largest share of the candidate-building work one family may take (1 disables).
     gate_by_period : bool
         On time-ordered data, test the gate's paired improvement with each period (gate
         time value, or one of 30 time blocks) as one observation instead of each row; rows
         of one period share its shocks. The period-level z is logged either way.
     time_budget : float
-        Wall-clock budget in seconds for the search. The first round always gets sixteen
-        CV fits (timed on the base fit), eight of them kept for screening and the prefix
-        ladder; later rounds start only while ten fit in the budget. Cheap candidate
-        families are built first. The base fit, the gate and the final fits always run.
+        Search budget in seconds of work on the reference container (the work clock: costs
+        come from row, column and candidate counts, never from timing, so a run picks the same
+        features on any machine). The first round always gets sixteen CV fits, eight of them
+        kept for screening and the prefix ladder; later rounds start only while ten fit in the
+        budget. Cheap candidate families are built first. The base fit, the gate and the final
+        fits always run.
     n_rounds : int
         Search rounds; round r>1 composes previously selected features.
     max_new_features : int
@@ -1854,8 +2080,8 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families: bool = False, past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
                  pair_scan: bool = True, profiles: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -1895,6 +2121,8 @@ class FeatureForge:
         self.max_search_rows = max_search_rows
         self.gate_by_period = gate_by_period
         self.family_time_share = family_time_share
+        self.label_echo = label_echo
+        self.gate_wide = gate_wide
         self.gate_families = gate_families
         self.past_te = past_te
         self.pair_scan = pair_scan
@@ -1909,8 +2137,16 @@ class FeatureForge:
             print(f"[FeatureForge {time.time() - self._t0:6.1f}s] {msg}", flush=True)
 
     def _time_left(self) -> float:
-        deadline = getattr(self, "_deadline", None) or self._t0 + self.time_budget
-        return deadline - time.time()
+        """Budget left on the work clock (reference-container seconds; see ``_CV_CELL_S``)."""
+        deadline = getattr(self, "_deadline", None) or self.time_budget
+        return deadline - getattr(self, "_work", 0.0)
+
+    def _charge(self, seconds: float):
+        self._work = getattr(self, "_work", 0.0) + seconds
+
+    @staticmethod
+    def _cv_cost(n_rows: int, n_cols: int, n_fits: int) -> float:
+        return _CV_CELL_S * n_rows * max(n_cols, 1) * n_fits / 5
 
     def _threads(self) -> int:
         import os
@@ -1955,13 +2191,31 @@ class FeatureForge:
                 X[c] = pd.Categorical(_as_str(X[c]), categories=self.cat_levels_[c])
         return X
 
-    def _fit_rank_maps(self, X: pd.DataFrame):
-        """Frequency rank of each level of the high-cardinality categoricals (1 = most common)."""
+    def _fit_rank_maps(self, *frames: pd.DataFrame):
+        """Frequency rank of each level of the high-cardinality categoricals (1 = most common),
+        counted over the rows of all ``frames`` (counted per frame, so categoricals are never
+        stacked into per-row strings)."""
         self.rank_maps_ = {}
         for c in self.hc_cols_:
-            vc = _as_str(X[c]).value_counts()
-            order = sorted(vc.index, key=lambda v: (-vc[v], v))
-            self.rank_maps_[c] = pd.Series(np.arange(1, len(order) + 1, dtype=float), index=order)
+            vc = None
+            for F in frames:
+                col = F[c] if isinstance(F[c].dtype, pd.CategoricalDtype) else F[c].astype(object)
+                v = col.value_counts(dropna=False)
+                v.index = np.where(pd.isna(v.index.to_numpy(dtype=object)), "__NA__", v.index.astype(object).astype(str))
+                v = v.groupby(level=0).sum()
+                vc = v if vc is None else vc.add(v, fill_value=0)
+            vc = vc[vc > 0]
+            # Ranked by frequency, ties by value; levels seen at most twice share one rank per count:
+            # ordering them by value spread the many once-seen device IPs over a meaningless range
+            # a tree then splits on.
+            t = pd.DataFrame({"v": vc.index.to_numpy(dtype=object), "n": vc.to_numpy()}).sort_values(
+                ["n", "v"], ascending=[False, True], kind="mergesort")
+            r = pd.Series(np.arange(1, len(t) + 1, dtype=float), index=t["v"].to_numpy())
+            n_ = t["n"].to_numpy()
+            rare = n_ <= 2
+            if rare.any():
+                r[rare] = r[rare].groupby(n_[rare]).transform("min").to_numpy()
+            self.rank_maps_[c] = r
 
     def _rank(self, s: pd.Series, c: str) -> np.ndarray:
         return self.rank_maps_[c].reindex(_as_str(s).to_numpy()).to_numpy(dtype=float)
@@ -1970,7 +2224,17 @@ class FeatureForge:
         p = dict(_lgb_objective(self.task_, self.n_classes_), learning_rate=lr, num_leaves=31,
                  min_data_in_leaf=20, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
                  lambda_l2=1.0, verbosity=-1, seed=self.random_state, data_random_seed=self.random_state,
-                 num_threads=threads or self._threads(), max_cat_to_onehot=8)
+                 num_threads=threads or self._threads(), max_cat_to_onehot=8,
+                 # LightGBM otherwise picks row- or column-wise histograms by timing both, and
+                 # the two sum in a different order: on Airline the same commit's round-one
+                 # ranking split on that and kept 41 features or none on alternate runs.
+                 deterministic=True, force_col_wise=True)
+        # LightGBM bins from a sample of up to 200k rows held as doubles, about 13 bytes per
+        # sampled cell: 7-11 GB on Bosch's 4,264 columns. Wide frames bin from fewer rows;
+        # frames under ~1,000 columns keep the default.
+        width = getattr(self, "model_width_", 0)
+        if width and 2.5e9 / (13 * width) < 200_000:
+            p["bin_construct_sample_cnt"] = max(20_000, int(2.5e9 / (13 * width)))
         p.update(kw)
         return p
 
@@ -2059,7 +2323,7 @@ class FeatureForge:
             self._nested_cache[ck] = (np.asarray(vt, dtype=np.float32), np.asarray(vv, dtype=np.float32))
         return self._nested_cache[ck]
 
-    def _cv(self, X: Optional[pd.DataFrame], y, repeats, lr=0.1, mine=False, nested=None, mat=None):
+    def _cv(self, X: Optional[pd.DataFrame], y, repeats, lr=0.1, mine=False, nested=None, mat=None, give_up=None):
         """Repeated K-fold: OOF raw margins (averaged over repeats), mean loss, summed gain importance.
 
         ``nested`` maps target-encoding specs to the frame they were built on;
@@ -2067,6 +2331,8 @@ class FeatureForge:
         ``mat``: the frame as ``(float32 matrix, categorical positions, column names)``,
         used instead of ``X`` (then None); an optional fourth item picks the matrix's
         columns, so no full copy of the selected columns is kept.
+        ``give_up`` (work-clock seconds): when the fit's cost (``_cv_cost``) is larger, return None
+        without fitting, keeping the cost in ``_cv_projected``.
         """
         import lightgbm as lgb
         M, cats, cols, *pick = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
@@ -2075,6 +2341,13 @@ class FeatureForge:
         def rows(r):
             return M[r] if pick is None else M[np.ix_(r, pick)]
         n = len(M)
+        n_fits = sum(len(f) for f in repeats)
+        cost = self._cv_cost(n, M.shape[1] if pick is None else len(pick), n_fits)
+        self._last_cv_cost = cost
+        if give_up and cost > give_up:
+            self._cv_projected = cost
+            return None
+        self._charge(cost)
         if mine:
             self.pair_gain_, self.triple_gain_ = {}, {}
         oof_mean = np.zeros((n, self.n_classes_)) if self.task_ == "multiclass" else np.zeros(n)
@@ -2127,9 +2400,16 @@ class FeatureForge:
         time_keys = {self.time_col_, self.group_col_, *self.date_cols_, *getattr(self, "time_like_", [])} - {None}
 
         time_cols = {self.time_col_, *self.date_cols_} - {None}
+        echo = set(getattr(self, "echo_cols_", ()))
+        for sp in selected:
+            if echo & set(sp.parents):
+                echo |= set(sp.out_names()) | {sp.name}
 
         def add(spec):
             if spec.target_dep and time_keys & set(spec.parents) and not getattr(spec, "time_safe", False):
+                return
+            # Label-echo columns (and features built on them) only in same-row features.
+            if echo and echo & set(spec.parents) and not isinstance(spec, _SAME_ROW):
                 return
             # A group's statistic of the date itself (deviation of a row's date from its group's
             # mean date) only tracks where the group sits in time; it drifts by construction.
@@ -2141,6 +2421,16 @@ class FeatureForge:
 
         sel_names = [s.name for s in selected if s.n_out == 1 and s.name in num_cols]
         label_free = {s.name for s in selected if not s.target_dep}
+        seq = getattr(self, "seq_order_", None)
+        if round_idx == 0 and seq is not None:
+            g = self.group_col_
+            add(GroupSeq(g, seq, None, "step"))
+            add(GroupSeq(g, seq, None, "dt"))
+            varying = [c for c in num_rank if c not in (g, seq) and c in self.base_cols_
+                       and W.groupby(g, sort=False)[c].nunique().mean() > 1.5]
+            for c in varying[:4]:
+                for kind in ("lag1", "lag2", "lag3", "lead1", "lead2", "diff1", "diff2", "cumsum", "area", "cummax"):
+                    add(GroupSeq(g, seq, c, kind))
         if round_idx == 0:
             raw_num = [c for c in self.base_cols_ if c not in self.cat_cols_]
             for stem, cols in column_families(raw_num).items():
@@ -2243,6 +2533,8 @@ class FeatureForge:
                 elif np.nanmax(np.abs(fin)) >= 100:
                     add(Digits(c, "mod10"))
                     add(Digits(c, "mod100"))
+            for c in self.numbered_:
+                add(StrNum(c))
             for a, b in combinations(top_num, 2):
                 for op in self.arith_ops:
                     add(Arith(op, a, b))
@@ -2318,7 +2610,7 @@ class FeatureForge:
                 if d_ not in seen and t_ in W.columns and d_ in W.columns:
                     seen.add(d_)
                     rebase.append((t_, s_, d_))
-            exclude = {getattr(self, "time_col_", None)} - {None}
+            exclude = ({getattr(self, "time_col_", None)} | set(getattr(self, "echo_cols_", ()))) - {None}
             for sp in profile_candidates(W, ids, self.anchors_, rebase[:12],
                                          [c for c in rank if c in W.columns and c not in self.cat_cols_],
                                          [c for c in rank if c in self.cat_cols_ and c not in self.text_cols_],
@@ -2326,6 +2618,12 @@ class FeatureForge:
                                          time_col=getattr(self, "time_col_", None)):
                 add(sp)
         t = getattr(self, "time_col_", None)
+        if t is not None:
+            # Rows of the entity (or entity pair) at the same time value: clicks by one device in
+            # the same hour or day (Avazu, TalkingData).
+            for e in [(k,) for k in ids] + list(combinations(ids[:3], 2)):
+                if t not in e:
+                    add(Count(list(e) + [t]))
         for e in ents:
             if self.entity_lags and t is not None and t not in e:
                 tw = W[t].to_numpy(dtype=float)
@@ -2465,9 +2763,10 @@ class FeatureForge:
         num = [c for c in self.raw_cols_ if c not in self.cat_cols_ and c in W.columns]
         strong = [c for c in imp.sort_values(ascending=False).index if c in num][:60]
         g, h = self._grad_hess(y, margin)
-        t = time.time()
+        t, spent = time.time(), [0.0]
         out = scan_pairs(W, num, strong, g, h, lambda m, rows: _loss(self.task_, y[rows], m), margin,
-                         time_budget=budget, seed=self.random_state)
+                         time_budget=budget, cell_s=_PAIR_CELL_S, spent=spent, seed=self.random_state)
+        self._charge(spent[0])
         self._log(f"pair scan: {len(num)} numerics, {time.time() - t:.0f}s -> "
                   + (", ".join(f"{a} {op} {b} ({v:.4f})" for op, a, b, v in out[:6]) or "nothing"))
         return out
@@ -2528,19 +2827,23 @@ class FeatureForge:
         raw = set(self.raw_cols_)
         if getattr(self, "WU_", None) is not None:
             WU = self.WU_
-        spent: Dict[str, list] = {}
-        # No family of candidates may take over a third of the time left for building them
+        spent: Dict[str, list] = {}      # family -> [candidates, thread seconds measured] (log only)
+        # No family of candidates may take over a third of the work left for building them
         # (a few slow ones, neighbour features on large tables, otherwise starve the rest).
         # Screening, the joint ranking fit and the prefix ladder: eight CV fits, at most half
-        # the time left (when the first round's time is capped by the budget).
+        # the work left (when the first round's work is capped by the budget).
         reserve = min(8 * getattr(self, "_cv_s", 0.0), 0.5 * max(self._time_left(), 0.0))
-        # Thread time: candidates are built on ``_threads()`` threads at once.
-        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share * max(1, self._threads())
-        capped = set()
+        n_threads = max(1, self._threads())
+        # Thread work: candidates are built on several threads at once, counted as the reference
+        # container's four whatever this machine has, so the same candidates are built everywhere.
+        fam_cap = max(self._time_left() - reserve, 0.0) * self.family_time_share * _REF_THREADS
+
+        def work(s):
+            """A candidate's building cost on the work clock (thread seconds), from its family and rows."""
+            rows = len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else len(W)
+            return _SPEC_WORK.get(type(s).__name__, _SPEC_WORK_DEFAULT) * rows * _ROW_PASS_S
 
         def compute(s):
-            if type(s).__name__ in capped:
-                return None
             t_s = time.time()
             try:
                 if s.target_dep:
@@ -2562,30 +2865,40 @@ class FeatureForge:
                 st = spent.setdefault(type(s).__name__, [0, 0.0])
                 st[0] += 1
                 st[1] += time.time() - t_s
-                if self.time_budget and st[1] > fam_cap and type(s).__name__ not in capped:
-                    capped.add(type(s).__name__)
-                    self._log(f"budget: {type(s).__name__} candidates took {st[1]:.0f}s; the rest of them skipped")
 
-        n_threads = max(1, self._threads())
-        batch = 4 * n_threads
-        # Cheap candidates first: one of each family is built and timed, then the rest go
-        # family by family from the cheapest per candidate.
+        # Which candidates get built is decided up front on the work clock, the same on every run
+        # and machine: one of each family first, then family by family from the cheapest per
+        # candidate; a family stops at its share, and building stops where the ranking's reserve
+        # begins.
         fams: Dict[str, list] = {}
         for sp in specs:
             fams.setdefault(type(sp).__name__, []).append(sp)
+        order = {sp.name: i for i, sp in enumerate(specs)}
+        n_all = len(specs)
+        plan, fam_work, capped, total = [], {}, set(), 0.0
         firsts = [g[0] for g in fams.values()]
-        n_first = len(firsts)
-        specs = list(firsts)
+        rest = [sp for f in sorted(fams, key=lambda f: work(fams[f][0])) for sp in fams[f][1:]]
+        for sp in firsts + rest:
+            f = type(sp).__name__
+            if f in capped:
+                continue
+            w = work(sp)
+            if self.time_budget and self._time_left() - (total + w) / _REF_THREADS < reserve:
+                break
+            if self.time_budget and fam_work.get(f, 0.0) + w > fam_cap and f in fam_work:
+                capped.add(f)
+                self._log(f"budget: {f} candidates would take {fam_work[f] + w:.0f}s of work; the rest of them skipped")
+                continue
+            fam_work[f] = fam_work.get(f, 0.0) + w
+            total += w
+            plan.append(sp)
+        if len(plan) < n_all:
+            self._log(f"budget: built {len(plan)} of {n_all} candidates")
+        self._charge(total / _REF_THREADS)
+        batch = 4 * n_threads
         with ThreadPoolExecutor(n_threads) as pool:
-            i = 0
-            while i < len(specs):
-                # Leave room in the budget for ranking the built candidates (about eight CV fits:
-                # otherwise a few seconds of timing noise decide how many prefixes get tried).
-                if self._time_left() < reserve:
-                    self._log(f"budget: built {i} of {sum(map(len, fams.values()))} candidates")
-                    break
-                end = n_first if i < n_first else i + batch
-                chunk = specs[i:end]
+            for i in range(0, len(plan), batch):
+                chunk = plan[i:i + batch]
                 for s, r in zip(chunk, pool.map(compute, chunk)):
                     if r is None:
                         _release(s)
@@ -2595,15 +2908,17 @@ class FeatureForge:
                         _release(s)
                         continue
                     out[s.name] = v
-                i = end
-                if i == n_first:
-                    cost = lambda f: spent.get(f, [1, 0.0])[1] / max(spent.get(f, [1, 0.0])[0], 1)
-                    specs += [sp for f in sorted(fams, key=cost) for sp in fams[f][1:]]
+        # Back in generation order: families are built cheapest first, so the order they
+        # finished in varied from run to run, and with it the joint model's
+        # column order, its split-gain ranking and the round's picks (Airline: the same commit
+        # kept 41 features or none on alternate runs).
+        out = dict(sorted(out.items(), key=lambda kv: order.get(kv[0], len(order))))
         _CODE_CACHE.clear()  # factorised keys of large frames add up to gigabytes
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
         top = sorted(spent.items(), key=lambda kv: -kv[1][1])[:6]
-        self._log("  materialised (thread time): " + ", ".join(f"{k} {n}x {t:.0f}s" for k, (n, t) in top))
+        self._log("  materialised (thread time): " + ", ".join(f"{k} {n}x {t:.0f}s" for k, (n, t) in top)
+                  + f" ({self._work:.0f}s of work)")
         return out
 
     # ------------------------------------------------------------ screening
@@ -2878,7 +3193,8 @@ class FeatureForge:
         gains = {nm: g for nm, (g, _) in scores.items()}
         novelty = {nm: v for nm, (_, v) in scores.items()}
         ranked = sorted([nm for nm in novelty if nm in values], key=novelty.get, reverse=True)
-        alive = [nm for nm in ranked if novelty[nm] > 0][:keep]
+        alive = [nm for nm in ranked if novelty[nm] > 0 and not getattr(specs[nm], "screen_exempt", False)][:keep]
+        alive = [nm for nm in ranked if getattr(specs[nm], "screen_exempt", False)] + alive
         self._log(f"  screened {len(novelty)} candidates on {n} rows (5-fold cross-fitted) "
                   f"-> {sum(g > 0 for g in novelty.values())} novel, {len(alive)} kept")
         self._last_gains, self._last_novelty = gains, novelty
@@ -2894,9 +3210,13 @@ class FeatureForge:
         contest trick. Target statistics only ever use labeled rows.
         """
         self._t0 = time.time()
+        self._work = 0.0
         self._deadline = None
+        self.wide_ = []
+        self.addons_ = {}
         X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
+        self.model_width_ = X.shape[1] + 3 * self.max_new_features   # widest frame a model sees
         self.n_synthetic_ = 0
         if X_unlabeled is not None and self.drop_synthetic:
             fake = synthetic_rows(X, X_unlabeled)
@@ -2905,6 +3225,14 @@ class FeatureForge:
                 self._log(f"unlabeled rows: {self.n_synthetic_} of {len(fake)} look synthetic "
                           "(no value unique among all rows); left out of label-free statistics")
                 X_unlabeled = X_unlabeled[~fake]
+        # Fields the unlabeled rows lack: almost constant there on a value training rows (almost) never
+        # hold, while varied in training (PLAsTiCC's spectroscopic redshift: -9 on 97% of test objects,
+        # measured on 70% of training ones). A model trained on them meets a value it never saw.
+        self.shifted_ = [] if X_unlabeled is None else _absent_in_test(X, X_unlabeled)
+        if self.shifted_:
+            self._log(f"left out, almost constant in the unlabeled rows on a value training rarely holds: {self.shifted_}")
+            X = X.drop(columns=self.shifted_)
+            X_unlabeled = X_unlabeled.drop(columns=[c for c in self.shifted_ if c in X_unlabeled.columns])
         if self.task is None:
             from tabularaml.contest.solver import infer_task
             self.task_ = infer_task(y)
@@ -2914,7 +3242,10 @@ class FeatureForge:
             self.n_classes_ = 0
             y_np = y.to_numpy(dtype=float)
             if self.log_target:
-                y_np = np.log1p(y_np)
+                # log1p of a small positive target (a volatility of 0.003) is the target itself: the
+                # search would chase absolute errors. log keeps it a relative-error search.
+                small = np.nanmin(y_np) > 0 and np.nanmedian(y_np) < 1
+                y_np = np.log(y_np) if small else np.log1p(y_np)
         else:
             self.classes_, y_np = np.unique(y.to_numpy(), return_inverse=True)
             self.n_classes_ = len(self.classes_)
@@ -2923,9 +3254,12 @@ class FeatureForge:
             X[c] = _to_days(X[c])
         self.cat_cols_ = [c for c in X.columns if _is_cat(X[c])]
         for c in self.cat_cols_:
-            X[c] = _as_str(X[c])
+            X[c] = _as_str_frame_col(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
+        X = self._compact(X)
+        # Coded strings that carry a number ("location 118") are offered as that number.
+        self.numbered_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and _numbered_codes(X[c])]
         # Native categorical splits on many-level columns overfit; frequency-rank codes
         # are the usual contest alternative. Which one wins is measured, not assumed.
         self.hc_cols_ = [c for c in self.cat_cols_ if X[c].nunique() > self.hc_threshold]
@@ -2933,12 +3267,22 @@ class FeatureForge:
         self.rank_maps_ = {}
         self.base_cols_ = list(X.columns)
         self.id_cols_ = self._id_columns(X)
+        self.echo_cols_ = self._label_echo_cols(X, y_np) if self.label_echo else set()
+        if self.echo_cols_:
+            self._log(f"label-echo columns (kept out of cross-row features): {sorted(self.echo_cols_)}")
         self.anchors_ = self._find_anchors(X) if self.entities else []
         X = self._add_anchors(X)
         self.raw_cols_ = list(X.columns)
         self.key_cols_ = [c for c in X.columns
                           if 2 <= X[c].nunique() <= (0.5 * len(X) if c in self.cat_cols_
                                                      else self.max_key_cardinality)]
+        # Integer codes with many levels (Amazon's RESOURCE and MGR_ID, card numbers) are
+        # categories written as numbers: their crosses and target maps are what contest
+        # winners built, so they join the keys while staying numeric for the trees.
+        self.code_cols_ = [c for c in self._code_columns(X) if c not in self.key_cols_]
+        if self.code_cols_:
+            self._log(f"integer codes used as keys: {self.code_cols_}")
+        self.key_cols_ += self.code_cols_
         self.key_cols_ += [a[3] for a in self.anchors_]
         self.key_cols_ = [c for c in self.key_cols_ if c not in self.text_cols_]
         if self.text_cols_:
@@ -2952,10 +3296,14 @@ class FeatureForge:
         strat = y_np if self.task_ != "regression" else None
         self.time_col_ = self._detect_time(X, X_unlabeled)
         self.horizon_ = 0.0
+        self.embargo_ = np.array([], dtype=int)
         self._groups = {}
         self.group_col_ = None if self.time_col_ is not None else self._detect_group(X, X_unlabeled)
         if self.group_col_ is not None:
             self._log(f"test rows are new {self.group_col_} groups: grouped gate, folds and screening")
+        self.seq_order_ = None if self.group_col_ is None else self._detect_order(X, self.group_col_)
+        if self.seq_order_ is not None:
+            self._log(f"{self.group_col_} groups are sequences ordered by {self.seq_order_}: lags, leads, running sums")
         if self.time_col_ is not None:
             # Levels of the time column never recur later: no target maps over it (label-
             # free counts and group statistics per date still carry over to test dates).
@@ -2976,9 +3324,40 @@ class FeatureForge:
                     n_h = int(np.sum(tx > np.nanmax(tx) - horizon))
                     n_gate = int(np.clip(n_h, 0.05 * n, n_gate))
             idx_sel, idx_gate = np.sort(order[:n - n_gate]), np.sort(order[n - n_gate:])
+            if X_unlabeled is not None and self.time_col_ in X_unlabeled:
+                # The test begins some time after the last labelled row: the gate starts the
+                # same time after the search rows, so features that lean on rows just before
+                # (neighbours' labels, a client's last few outcomes) are judged as the test
+                # will see them. The skipped rows still feed label-free statistics.
+                gap = np.nanmin(tu) - np.nanmax(tx)
+                step = np.diff(np.unique(tx[np.isfinite(tx)]))
+                # A real gap: well beyond the time column's own spacing (daily data whose test
+                # starts the next day has none) and at least 2% of the training span.
+                big = (len(step) and gap > 2 * np.median(step)
+                       and gap >= 0.02 * (np.nanmax(tx) - np.nanmin(tx)))
+                if np.isfinite(gap) and big and len(idx_gate):
+                    # The gate sits as far after the search rows, on average, as the test sits
+                    # after training: the gap plus half the difference between the test's span
+                    # and the gate's (IEEE-CIS: a month's gap, then six months of test rows,
+                    # where neighbour-label features that still help a month out stop helping).
+                    # The search keeps at least a quarter of the rows.
+                    t_g = np.nanmin(tx[idx_gate])
+                    span_u = np.nanmax(tu) - np.nanmin(tu)
+                    span_g = np.nanmax(tx[idx_gate]) - t_g
+                    emb_len = gap + max(0.0, (span_u - span_g) / 2)
+                    emb = idx_sel[tx[idx_sel] > t_g - emb_len]
+                    room = len(idx_sel) - int(0.25 * n)
+                    if len(emb) > room:
+                        emb = np.sort(emb[np.argsort(tx[emb], kind="stable")[len(emb) - max(room, 0):]])
+                    if len(emb):
+                        self.embargo_ = emb
+                        idx_sel = np.setdiff1d(idx_sel, emb)
+                        self._log(f"gate starts {np.nanmin(tx[idx_gate]) - np.nanmax(tx[idx_sel]):.0f} after the search rows, "
+                                  f"as the test sits {gap + span_u / 2:.0f} after training on average ({len(emb)} rows "
+                                  f"between them feed only label-free statistics)")
         elif self.gate_frac and n >= 200 and self.group_col_ is not None:
             gx = X[self.group_col_].to_numpy()
-            levels, codes = np.unique(gx.astype(str) if gx.dtype == object else gx, return_inverse=True)
+            levels, codes = np.unique(as_text(pd.Series(gx)).to_numpy() if gx.dtype == object else gx, return_inverse=True)
             in_gate = np.random.default_rng(self.random_state).random(len(levels)) < self.gate_frac
             idx_sel, idx_gate = np.flatnonzero(~in_gate[codes]), np.flatnonzero(in_gate[codes])
         elif self.gate_frac and n >= 200:
@@ -2995,16 +3374,23 @@ class FeatureForge:
         # Large tables: the search runs on the latest rows (time-ordered data), whole random
         # groups (new-entity tests) or a random sample, so that its CV fits leave room in the
         # budget for several rounds; the rows left out still feed label-free statistics.
-        idx_out = np.array([], dtype=int)
+        idx_out = self.embargo_
         m_cap = None
+        # Memory: each round holds up to four times ``keep`` candidate columns over the search
+        # rows next to the model's matrix. When labels carry little signal, fits stop early and
+        # the time rule above never shrinks the search (Malware's 5.9M search rows with shuffled
+        # labels: killed at 14 GB in the first round), so the rows are also capped by memory.
+        mem_cap = self._mem_rows(len(self.raw_cols_))
+        if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
+            self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
-            m = m_cap or self.max_search_rows or len(idx_sel)
+            m = min(m_cap or self.max_search_rows or len(idx_sel), mem_cap or len(idx_sel))
             if len(idx_sel) > m:
                 rng = np.random.default_rng(self.random_state)
                 if self.time_col_ is not None:
                     keep = idx_sel[np.argsort(X[self.time_col_].to_numpy(dtype=float)[idx_sel], kind="stable")[-m:]]
                 elif self.group_col_ is not None:
-                    g = pd.factorize(X[self.group_col_].astype(str).to_numpy()[idx_sel])[0]
+                    g = pd.factorize(as_text(X[self.group_col_]).to_numpy()[idx_sel])[0]
                     perm = rng.permutation(g.max() + 1)
                     r = perm[g]
                     keep = idx_sel[np.argsort(r, kind="stable")[:m]]
@@ -3017,7 +3403,7 @@ class FeatureForge:
             W = X.iloc[idx_sel].reset_index(drop=True)
             yW = y_np[idx_sel]
             if self.group_col_ is not None:
-                gx = X[self.group_col_].astype(str).to_numpy()
+                gx = as_text(X[self.group_col_]).to_numpy()
                 self._groups = {len(W): gx[idx_sel], n: gx}
             self.U_search_ = self.WU_ = None
             extra = np.concatenate([idx_out, idx_gate]).astype(int)
@@ -3055,33 +3441,22 @@ class FeatureForge:
             # The model's view of the search rows as one float32 matrix (``_lgb_matrix``), with
             # its categorical positions and column names; rounds append the chosen features.
             Mw = (*self._lgb_matrix(self._model_frame(W)), list(W.columns))
-            if attempt == 0 and self.time_budget and len(W) > 150_000:
-                # A CV fit on 50k rows, scaled up, flags tables where one full fit would
-                # take hours before paying for it. Scaling up overstates the full fit (its
-                # fixed costs do not grow with rows: 132s estimated against 94s measured on
-                # IEEE-CIS's 472k rows), so it only acts when the estimate is twice over the
-                # ceiling; otherwise the full fit's measured time below decides.
-                pr = np.sort(np.random.default_rng(self.random_state).choice(len(W), 50_000, replace=False))
-                t_p = time.time()
-                self._cv(None, yW[pr], [self._folds(50_000, yW[pr], self.cv, self.random_state)],
-                         mat=(Mw[0][pr], Mw[1], Mw[2]))
-                est = (time.time() - t_p) * len(W) / 50_000
-                if 16 * est > 6 * self.time_budget:
-                    m_cap = max(100_000, int(len(W) * 3 * self.time_budget / (16 * est) * 0.8))
-                    if m_cap < len(W):
-                        self._log(f"budget: a CV fit would take about {est:.0f}s on {len(W)} rows; searching fewer rows")
-                        continue
-            t_cv = time.time()
-            margin, cur_loss, imp = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw)
-            # One CV fit's duration: the search stops when fewer than two are left in the budget.
-            self._cv_s = time.time() - t_cv
             # The first round is promised sixteen CV fits; when they would take more than three times
-            # the budget, the search runs on fewer rows (sized from this fit, not below 100k).
+            # the budget on the work clock, the search runs on fewer rows (not below 100k).
             room = 3 * self.time_budget
-            if attempt < 2 and self.time_budget and 16 * self._cv_s > room and len(W) > 150_000:
+            shrinkable = attempt < 2 and self.time_budget and len(W) > 150_000
+            out = self._cv(None, yW, folds, mine=self.n_interactions > 0, mat=Mw,
+                           give_up=room / 16 if shrinkable else None)
+            if out is None:
+                self._cv_s = self._cv_projected
+            else:
+                margin, cur_loss, imp = out
+                # One CV fit's work: the search stops when fewer than two are left in the budget.
+                self._cv_s = self._last_cv_cost
+            if shrinkable and 16 * self._cv_s > room:
                 m_cap = max(100_000, int(len(W) * room / (16 * self._cv_s) * 0.8))
                 if m_cap < len(W):
-                    self._log(f"budget: one CV fit takes {self._cv_s:.0f}s on {len(W)} rows; searching fewer rows")
+                    self._log(f"budget: one CV fit costs {self._cv_s:.0f}s of work on {len(W)} rows; searching fewer rows")
                     continue
             break
         if self.n_interactions:
@@ -3090,7 +3465,22 @@ class FeatureForge:
         self._yW = yW  # search rows' labels, for checks that keep labels out of label-free specs
         self.base_cv_loss_ = cur_loss
         if self.hc_cols_:
-            self._fit_rank_maps(W)
+            # Where later rows bring many levels the search rows never saw (new devices and cards
+            # in a click log's or IEEE-CIS's later period), ranks count every row whose features are
+            # known, as the final fit does; else those rows go unranked and the gate judges a recode
+            # the transform never produces. Otherwise they are fitted on the search rows: over the
+            # test file too, a large test of known levels (West Nile's is 11x the training file)
+            # set the ranks and the search found less.
+            U_ = None if X_unlabeled is None else self._prep(X_unlabeled)
+            later = U_ if U_ is not None else X.drop(index=W.index, errors="ignore")
+            new_share = max((~_as_str(later[c]).isin(set(_as_str(W[c])))).mean() if len(later) else 0.0
+                            for c in self.hc_cols_)
+            if new_share > 0.1:
+                self._fit_rank_maps(X, *([] if U_ is None else [U_]))
+            else:
+                self._fit_rank_maps(W)
+            self._log(f"frequency ranks: {100 * new_share:.0f}% of later rows hold levels the search rows "
+                      f"lack -> fitted on {'all known rows' if new_share > 0.1 else 'the search rows'}")
             Wr = (*self._lgb_matrix(self._model_frame(W, recode=True)), list(W.columns))
             m_r, loss_r, imp_r = self._cv(None, yW, folds, mat=Wr)
             self._log(f"high-cardinality recode of {len(self.hc_cols_)} columns: CV loss "
@@ -3099,7 +3489,7 @@ class FeatureForge:
                 self.recode_ = True
                 Mw, margin, cur_loss, imp = Wr, m_r, loss_r, imp_r
         self._log(f"task={self.task_} rows={n} (search {len(W)}, gate {len(idx_gate)}) "
-                  f"cols={X.shape[1]} base CV loss={cur_loss:.6f}")
+                  f"cols={X.shape[1]} base CV loss={cur_loss:.6f} (one CV fit {self._cv_s:.0f}s of work)")
 
         for r in range(self.n_rounds):
             if len(selected) >= self.max_new_features:
@@ -3109,7 +3499,7 @@ class FeatureForge:
             self._deadline = None
             if r == 0 and self._time_left() < 16 * self._cv_s:
                 floor = min(16 * self._cv_s, 3 * self.time_budget)
-                self._deadline = time.time() + floor
+                self._deadline = self._work + floor
                 self._log(f"budget: first round given {floor:.0f}s")
             if r > 0 and self._time_left() < 10 * self._cv_s:
                 self._log(f"budget: {max(self._time_left(), 0):.0f}s left, one CV fit takes {self._cv_s:.0f}s; "
@@ -3131,10 +3521,15 @@ class FeatureForge:
             def keep_fn(spec, v, out, score):
                 g, nov = score
                 scores[spec.name] = (g, nov)
+                if getattr(spec, "gate_addon", False) and spec.name not in self.addons_:
+                    self.addons_[spec.name] = (spec, v)
+                if getattr(spec, "screen_exempt", False):
+                    return True
                 if nov <= 0:
                     return False
-                if len(out) >= 4 * keep:
-                    worst = min(out, key=lambda nm: scores[nm][1])
+                rivals = [nm for nm in out if not getattr(spec_by_name[nm], "screen_exempt", False)]
+                if len(rivals) >= 4 * keep:
+                    worst = min(rivals, key=lambda nm: scores[nm][1])
                     if scores[worst][1] >= nov:
                         return False
                     del out[worst]
@@ -3211,6 +3606,7 @@ class FeatureForge:
                 orders.append(("label-free", free_rank, (6, 25)))
             best_k, best_loss, best_fit, best_rank = 0, cur_loss, None, rank
             tried = set()
+            ladder_res = []
             for label, order, steps in orders:
                 ladder = [k for k in steps if k < min(len(order), room)]
                 if label == "gain":
@@ -3225,6 +3621,7 @@ class FeatureForge:
                     cols = list(base_cols) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
                     oof_k, loss_k, imp_k = self._cv(None, yW, folds, nested=nested, mat=sub(cols, copy=False))
                     self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
+                    ladder_res.append((label, k, loss_k, order))
                     if loss_k < best_loss:
                         best_k, best_loss, best_fit, best_rank = k, loss_k, (oof_k, imp_k, cols), order
             rank = best_rank
@@ -3234,6 +3631,23 @@ class FeatureForge:
             chosen = [spec_by_name[nm] for nm in rank[:best_k]]
             for sp in chosen:
                 sp.round_ = r
+            # Wider prefixes of the same order that the CV ranked close behind: the time-ordered
+            # gate also scores them (the CV, inflated by target statistics, favours few features).
+            wide = []
+            if self.gate_wide:
+                gain_best = cur_loss - best_loss
+                for label, k, loss_k, order in ladder_res:
+                    if order is rank and k > best_k and cur_loss - loss_k >= 0.5 * gain_best:
+                        extra = [spec_by_name[nm] for nm in order[best_k:k]]
+                        arrs = {}
+                        for sp in extra:
+                            sp.round_ = r
+                            v = values.get(sp.name)
+                            for j, col in enumerate(sp.out_names()):
+                                arrs[col] = (Mj[:, jpos[col]].copy() if v is None
+                                             else v if v.ndim == 1 else v[:, j])
+                        wide.append((f"rounds<={r + 1} + {label} top-{k}", extra, arrs))
+            self.wide_ = wide[:2]
             selected.extend(chosen)
             Mw = sub(best_fit[2])
             for s in chosen:
@@ -3244,11 +3658,25 @@ class FeatureForge:
             margin, imp = best_fit[0], best_fit[1]
             self.history_.append(dict(round=r + 1, n_candidates=n_values, n_added=best_k,
                                       cv_loss_before=cur_loss, cv_loss_after=best_loss))
-            self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f}")
+            self._log(f"round {r + 1}: +{best_k} features, CV loss {cur_loss:.6f} -> {best_loss:.6f} ({self._work:.0f}s of work)")
+            if chosen:
+                self._log(f"  round {r + 1} picks: {', '.join(sp.name for sp in chosen)[:600]}")
             cur_loss = best_loss
 
         self._deadline = None
         self.search_cv_loss_ = cur_loss
+        # Wider sets offered to the gate only belong to the last round that added features.
+        last_r = max((sp.round_ for sp in selected), default=None)
+        self.wide_ = [w for w in getattr(self, "wide_", []) if w[1] and w[1][0].round_ == last_r]
+        for _, _, arrs in self.wide_:
+            for col, v in arrs.items():
+                W[col] = v
+        chosen_names = {sp.name for sp in selected}
+        self.addons_ = {nm: av for nm, av in self.addons_.items() if nm not in chosen_names}
+        for sp, v in self.addons_.values():
+            sp.round_ = last_r if last_r is not None else 0
+            for j, col in enumerate(sp.out_names()):
+                W[col] = v if v.ndim == 1 else v[:, j]
         self.selected_ = selected
         # Candidate values of the last round can be gigabytes on large tables.
         values = cands = Mw = None
@@ -3260,6 +3688,8 @@ class FeatureForge:
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
             self.gate_passed_ = best_set is not None
+            self.wide_ = []  # their search-row values are not needed after the gate
+            self.addons_ = {}
             if self.gate_passed_:
                 self.selected_ = list(best_set)
             else:
@@ -3280,8 +3710,32 @@ class FeatureForge:
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
         self.elapsed_ = time.time() - self._t0
-        self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s")
+        self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s ({self._work:.0f}s of work)")
         return self
+
+    def _mem_rows(self, n_cols, share=0.3):
+        """Search rows whose candidate columns, their build-time copies and the model's matrix
+        (float32) fit in ``share`` of the memory still free under the limit (the container's
+        cgroup limit when set), or None when it is unknown. Malware: about 6 KB per search row
+        in the first round on top of the 7 GB its tables already take."""
+        lim = []
+        for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                v = open(f).read().strip()
+                if v.isdigit() and int(v) < 1 << 60:
+                    lim.append(int(v))
+            except OSError:
+                pass
+        try:
+            page = os.sysconf("SC_PAGE_SIZE")
+            lim.append(page * os.sysconf("SC_PHYS_PAGES"))
+            rss = int(open("/proc/self/statm").read().split()[1]) * page
+        except (ValueError, OSError, AttributeError, IndexError):
+            rss = 0
+        if not lim:
+            return None
+        keep = min(80, 3 * self.max_new_features)
+        return int(share * max(min(lim) - rss, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
@@ -3291,8 +3745,8 @@ class FeatureForge:
         self.U_search_ = self.WU_ = None
         if on and getattr(self, "_wu_src", None) is not None:
             X, idx_gate, U = self._wu_src
-            self.WU_ = pd.concat([W[self.raw_cols_], X.iloc[idx_gate]] + ([] if U is None else [self._prep(U)[self.raw_cols_]]),
-                                 ignore_index=True)
+            parts = [W[self.raw_cols_], X.iloc[idx_gate][self.raw_cols_]] + ([] if U is None else [self._prep(U)[self.raw_cols_]])
+            self.WU_ = _concat_cats(parts)
             self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
         self.ctx_.extra_rows = self.U_search_
 
@@ -3360,7 +3814,10 @@ class FeatureForge:
         Xg = X.iloc[idx_gate].reset_index(drop=True)
         ys, yg = y[idx_sel], y[idx_gate]
         Fs, Fg = W, Xg.copy()
-        for s in self.selected_:
+        addons = [sp for sp, _ in getattr(self, "addons_", {}).values()]
+        for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra] + addons:
+            if all(c in Fg.columns for c in s.out_names()):
+                continue
             vg = s.transform(Fg, self.ctx_)
             for j, col in enumerate(s.out_names()):
                 Fg[col] = vg if np.ndim(vg) == 1 else vg[:, j]
@@ -3419,27 +3876,78 @@ class FeatureForge:
                 free = [s for s in full if not s.target_dep]
                 if free and len(free) < len(full):
                     cands.append((f"rounds<={r + 1} label-free", free))
-        for label, specs in cands:
+        # Picks that skipped the residual screen (kNN class distances, numbered codes) reach
+        # the gate untested on their own: each set is also offered without each such family,
+        # so one that does not carry over cannot ride on the others (Telstra: kNN distances
+        # passed with the location number and cost 0.025 log loss held-out).
+        for label, specs in list(cands):
+            for f in sorted({type(sp).__name__ for sp in specs if getattr(sp, "screen_exempt", False)}):
+                gone, rest = set(), []
+                for sp in specs:
+                    if type(sp).__name__ == f or any(p in gone for p in sp.parents):
+                        gone.update(sp.out_names())
+                    else:
+                        rest.append(sp)
+                if rest:
+                    cands.append((f"{label} without {f}", rest))
+        # Numbered codes the screen passed over (their worth is in interactions) are offered on
+        # top of each set.
+        if addons:
+            cands += [(f"{label} + {', '.join(sp.name for sp in addons)}", list(specs) + addons)
+                      for label, specs in list(cands) if specs and not label.endswith(" without StrNum")]
+        if self.selected_:
+            for label, extra, _ in getattr(self, "wide_", []):
+                cands.append((label, list(self.selected_) + list(extra)))
+        # The recode was chosen on the search rows; each feature set is also offered on the
+        # native categoricals, so features that need them are not sunk by it (Telstra: the
+        # location's number lost with "location" rank-coded, gained with it native).
+        if self.recode_:
+            cands += [(label + " native", specs, False) for label, specs in cands if specs]
+        best_recode = self.recode_
+        for label, specs, *rc in cands:
+            rc = rc[0] if rc else None
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
-            rows = gate_loss(cols)
+            rows = gate_loss(cols, rc)
             d = raw_rows - rows
             # Winsorise so a handful of extreme rows cannot carry the decision.
             lo, hi = np.quantile(d, [0.01, 0.99])
             dw = np.clip(d, lo, hi)
             z = float(dw.mean() / (dw.std(ddof=1) / np.sqrt(len(dw)) + 1e-300))
             zb = _block_z(dw, blocks) if blocks is not None else None
-            self._log(f"  gate {label}{' (recoded)' if self.recode_ else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
+            self._log(f"  gate {label}{' (recoded)' if self.recode_ and rc is None else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
                       f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "") + f", need {z_needed:.2f})")
             if self.gate_by_period and zb is not None:
                 z = zb
             if rows.mean() < best_l and z >= z_needed:
                 best_set, best_l, best_z = specs, float(rows.mean()), z
-        if best_set is None and self.gate_families:
+                best_recode = self.recode_ if rc is None else rc
+        self.recode_ = best_recode
+        fam_on = self.gate_families is True or (self.gate_families == "auto" and (
+            len(getattr(self, "embargo_", ())) or (len(idx_gate) >= 20_000 and self._sparse_te(X))))
+        # Under an embargo the families are checked even when the whole set passes: on
+        # IEEE-CIS the set passed while dropping kNN and cross-linear target features
+        # cut the gate loss further (0.1152 -> 0.1081) and lifted held-out AUC 0.926 -> 0.937.
+        if fam_on and self.selected_:
             best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
         return best_set, raw_l, best_l
 
+    def _sparse_te(self, X) -> bool:
+        """A selected target statistic keyed on a thin key (under 20 rows a level). Its
+        out-of-fold values carry each training row's own label against its group's (KDD Cup
+        2012: within-group correlation -0.16 to -0.32), which group statistics on the same
+        key let the model read; held-out rows have no such signal (0.7500 -> 0.7476 AUC with
+        both families). The family pass finds the set without the pair. Only on large gates:
+        on Amazon's 5k gate rows it dropped families on noise (held-out -0.003 / -0.001 AUC)."""
+        keys = set(self.key_cols_)
+        for sp in self.selected_:
+            if sp.target_dep:
+                for p in sp.parents:
+                    if p in keys and p in X.columns and len(X) / max(X[p].nunique(), 1) < 20:
+                        return True
+        return False
+
     def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
-        """When the whole set fails the gate, drop feature families (target encodings, group
+        """When the whole set fails the gate (or always, under an embargo), drop feature families (target encodings, group
         statistics, event recencies, ...) one at a time, each time the one whose removal helps
         the gate rows most, and keep the best remaining set if it clears the gate by one more
         standard error than usual (the families were chosen on the gate rows). One family
@@ -3483,7 +3991,7 @@ class FeatureForge:
 
     def _fit_full(self, X, y, U=None):
         if self.recode_:
-            self._fit_rank_maps(X if U is None else pd.concat([X, U[self.raw_cols_]], ignore_index=True))
+            self._fit_rank_maps(X, *([] if U is None else [U]))
         folds = self._te_folds(X, y, self.random_state + 1)
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy()
@@ -3492,14 +4000,20 @@ class FeatureForge:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
             elif U is not None:
-                s.fit(pd.concat([F, U], ignore_index=True), None, self.ctx_)
+                # Only the spec's columns: a copy of the whole growing frame per feature is
+                # gigabytes at a time on Microsoft Malware's 9M rows.
+                cols = list(dict.fromkeys(s.parents))
+                s.fit(_concat_cats([F[cols], U[cols]]), None, self.ctx_)
                 v = s.transform(F, self.ctx_)
             else:
                 v = s.fit(F, y, self.ctx_).transform(F, self.ctx_)
             if U is not None:
                 vu = s.transform(U, self.ctx_)
+                vu = np.asarray(vu, dtype=np.float32)
                 for j, col in enumerate(s.out_names()):
                     U[col] = vu if np.ndim(vu) == 1 else vu[:, j]
+            # float32, as the search saw them (and half the memory of the growing frame).
+            v = np.asarray(v, dtype=np.float32)
             for j, col in enumerate(s.out_names()):
                 F[col] = v if np.ndim(v) == 1 else v[:, j]
         self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
@@ -3507,12 +4021,24 @@ class FeatureForge:
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
-        X = X.reset_index(drop=True)
+        X = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
-            X[c] = _as_str(X[c])
-        return self._add_anchors(X)
+            X[c] = _as_str_frame_col(X[c])
+        return self._add_anchors(self._compact(X))
+
+    def _compact(self, X):
+        """Short-text categoricals held as ``category`` (a code per row) rather than one string per
+        row: the same values, an eighth of the memory (Microsoft Malware's 30 string columns over
+        9M rows were 5 GB per copy of the frame)."""
+        for c in self.cat_cols_:
+            if c in X.columns and not isinstance(X[c].dtype, pd.CategoricalDtype):
+                # Free text too when it repeats (MCTS: a game's rules, thousands of characters,
+                # on each of its matches; one string per row was gigabytes per frame copy).
+                if c not in self.text_cols_ or X[c].nunique() <= 0.5 * len(X):
+                    X[c] = X[c].astype("category")
+        return X
 
     def _detect_group(self, X, U):
         """A column whose test values are (almost) all unseen in training while it
@@ -3540,6 +4066,29 @@ class FeatureForge:
             if ov < best_ov:
                 best, best_ov = c, ov
         return best
+
+    def _detect_order(self, X, key):
+        """A numeric column that orders each group's rows: distinct within nearly every group
+        and rising in row order (time steps of a breath, event times of a session)."""
+        g = pd.factorize(X[key].to_numpy())[0]
+        sizes = np.bincount(g)
+        if np.median(sizes) < 5:
+            return None
+        rng = np.random.default_rng(0)
+        pick = rng.choice(g.max() + 1, min(2000, g.max() + 1), replace=False)
+        rows = np.flatnonzero(np.isin(g, pick))
+        gs = g[rows]
+        for c in X.columns:
+            if c == key or c in self.cat_cols_ or not pd.api.types.is_numeric_dtype(X[c]):
+                continue
+            x = X[c].to_numpy(dtype=float)[rows]
+            if not np.isfinite(x).all():
+                continue
+            same = gs[1:] == gs[:-1]
+            rising = (np.diff(x) > 0)[same].mean() if same.any() else 0.0
+            if rising > 0.98:
+                return c
+        return None
 
     def _detect_time(self, X, U):
         if self.time_col != "auto":
@@ -3570,6 +4119,91 @@ class FeatureForge:
         return best
 
     # ------------------------------------------------------------- entities
+    def _label_echo_cols(self, X, y, min_corr=0.2, max_lag=5, max_rows=300_000):
+        """Columns that carry earlier rows' labels. Rows of an entity (an ID-like column, or a
+        pair of them such as student and question) are taken in file order, which event logs
+        keep chronological. Two signatures:
+
+        - running statistic: the change from a row to the entity's next row tracks the first
+          row's label (running mean, count or accuracy of past answers);
+        - lagged label: the value ``k`` rows later (k <= ``max_lag``) tracks this row's label
+          far more than the row's own value does (the previous, 2nd previous ... answer).
+
+        Statistics over an entity's other rows would hand a row its own label through the
+        later rows' values, so these columns stay out of every cross-row feature."""
+        if y is None or self.n_classes_ > 2 or not self.id_cols_:
+            return set()
+        yv = np.asarray(y, dtype=float)
+        n = len(X)
+        num = [c for c in X.columns if c not in self.cat_cols_ and c not in self.id_cols_]
+        if not num:
+            return set()
+        vals = {c: X[c].to_numpy(dtype=float) for c in num}
+        ids = list(self.id_cols_[:3])
+        codes = {k: pd.factorize(X[k])[0] for k in ids}
+        groups = [codes[k] for k in ids]
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                gi, gj = codes[ids[i]], codes[ids[j]]
+                pair = pd.factorize(gi.astype(np.int64) * (gj.max() + 2) + gj)[0]
+                pair[(gi < 0) | (gj < 0)] = -1
+                groups.append(pair)
+        rng = np.random.default_rng(0)
+
+        def corr(a, b):
+            m = np.isfinite(a) & np.isfinite(b)
+            if m.sum() < 200 or np.std(a[m]) == 0 or np.std(b[m]) == 0:
+                return 0.0
+            r = np.corrcoef(a[m], b[m])[0, 1]
+            return float(r) if np.isfinite(r) else 0.0
+
+        echo = set()
+        for g in groups:
+            # next occurrence of the same entity, rows in file order
+            order = np.argsort(g, kind="stable")
+            nxt = np.full(n, -1)
+            same = (g[order[1:]] == g[order[:-1]]) & (g[order[:-1]] >= 0)
+            nxt[order[:-1][same]] = order[1:][same]
+            rows = np.flatnonzero(nxt >= 0)
+            if len(rows) < 200:
+                continue
+            if len(rows) > max_rows:
+                rows = np.sort(rng.choice(rows, max_rows, replace=False))
+            # k-th next occurrence for the sampled rows
+            ahead = [rows]
+            for _ in range(max_lag):
+                prev = ahead[-1]
+                cur = np.where(prev >= 0, nxt[np.maximum(prev, 0)], -1)
+                ahead.append(cur)
+            r1, y0 = ahead[1], yv[rows]
+            y1 = yv[r1]
+            for c in num:
+                if c in echo:
+                    continue
+                v = vals[c]
+                # running statistic of past labels (sign too: a running mean over many
+                # earlier answers moves by little, but always toward the latest answer)
+                d = v[r1] - v[rows]
+                for dd in (d, np.sign(d)):
+                    r = corr(dd, y0)
+                    if abs(r) >= min_corr and abs(r) >= 3 * abs(corr(dd, y1)):
+                        echo.add(c)
+                        break
+                if c in echo:
+                    continue
+                # lagged label: the entity's k-th next row holds this row's label
+                r_own = abs(corr(v[rows], y0))
+                for k in range(1, max_lag + 1):
+                    rk = ahead[k]
+                    ok = rk >= 0
+                    if ok.sum() < 200:
+                        break
+                    r = abs(corr(v[rk[ok]], y0[ok]))
+                    if r >= min_corr and r >= 3 * r_own:
+                        echo.add(c)
+                        break
+        return echo
+
     def _id_columns(self, X, cap=8):
         """Integer or categorical columns with many levels that repeat: card numbers,
         addresses, customer or store ids. Most levels first."""
@@ -3578,9 +4212,14 @@ class FeatureForge:
             if c in getattr(self, "date_cols_", []) or c in getattr(self, "text_cols_", []):
                 continue
             nu = X[c].nunique()
-            if not (100 <= nu <= n / 5):
+            if nu < 100:
                 continue
             vc = X[c].value_counts(normalize=True)
+            # Over n/5 levels it is still an id when most rows sit in levels seen three or more
+            # times: click logs' device IPs (Avazu: a quarter of rows are distinct levels, yet 78%
+            # of rows belong to repeating devices). Near-unique row ids fail this.
+            if nu > n / 5 and vc[vc * n >= 3].sum() < 0.5:
+                continue
             if vc.iloc[0] > 0.5:  # mostly one value: a count or flag, not an id
                 continue
             if c not in self.cat_cols_:
@@ -3592,6 +4231,35 @@ class FeatureForge:
                 if pd.Series(vc.index.to_numpy(dtype=float)).corr(pd.Series(vc.to_numpy(dtype=float)),
                                                                   method="spearman") < -0.3:
                     continue
+            out.append((nu, c))
+        return [c for _, c in sorted(out, reverse=True)][:cap]
+
+    def _code_columns(self, X, cap=12):
+        """Integer columns past the key cardinality whose levels behave like codes, not
+        quantities: thinly spread over a wide range (Amazon's ROLE_TITLE: 343 levels
+        between 117,000 and 311,000), not piled up at the low end as counts and amounts
+        are, and not rounded to tens as prices and areas written by people are."""
+        n, out = len(X), []
+        for c in X.columns:
+            if c in self.cat_cols_ or c in getattr(self, "date_cols_", []):
+                continue
+            nu = X[c].nunique()
+            # From 300 levels: Kick's WarrantyCost (281 prices of warranty plans) lost
+            # 0.4% log loss as a key on all three seeds.
+            if not (max(300, self.max_key_cardinality) <= nu <= n / 3):
+                continue
+            x = X[c].to_numpy(dtype=float)
+            fin = x[np.isfinite(x)]
+            if len(fin) < 0.5 * n or np.any(fin != np.round(fin)):
+                continue
+            if X[c].value_counts(normalize=True).iloc[0] > 0.5:
+                continue
+            u = np.unique(fin)
+            if np.gcd.reduce(np.diff(u).astype(np.int64)) > 1:  # quantised: a measurement in steps
+                continue
+            span = u[-1] - u[0]
+            if span / len(u) < 10 or np.quantile(u, 0.9) - u[0] < 0.2 * span or np.mean(u % 10 == 0) >= 0.2:
+                continue
             out.append((nu, c))
         return [c for _, c in sorted(out, reverse=True)][:cap]
 
@@ -3612,11 +4280,11 @@ class FeatureForge:
             f = v[np.isfinite(v)]
             return len(f) > 0 and not np.any(f != np.round(f))
         # Wide anonymous tables have hundreds of time-like columns: try the most distinct
-        # ones, within a minute (Loan Default's 700 columns took hours otherwise).
+        # ones, within a minute of work (Loan Default's 700 columns took hours otherwise).
         times = sorted([c for c in num if X[c].nunique() > 0.2 * n and np.nanmin(vals[c]) >= 0],
                        key=lambda c: -X[c].nunique())[:20]
-        t_stop = time.time() + 60
-        deltas = sorted([c for c in num if is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
+        key_work = [0.0]   # work-clock seconds spent counting keys
+        deltas = sorted([c for c in num if c not in getattr(self, "echo_cols_", ()) and is_int(vals[c]) and 50 <= X[c].nunique() <= 0.2 * n],
                         key=lambda c: -X[c].nunique())[:80]
         ids = []
         for c in self.id_cols_[:3]:
@@ -3628,10 +4296,11 @@ class FeatureForge:
                 return 0
             # Codes, not values: columns of huge magnitude overflow int64.
             code = idc[ok] * (1 << 32) + pd.factorize(v[ok])[0].astype(np.int64)
+            key_work[0] += _KEY_ROW_S * len(code)
             return len(np.unique(code))
         found = []
         for t in times:
-            if time.time() > t_stop:
+            if key_work[0] > 60:
                 break
             tv = vals[t]
             for s in (1, 60, 3600, 86400, 604800):
@@ -3683,7 +4352,7 @@ class FeatureForge:
         return out
 
     def _recode_out(self, X):
-        out = X.reset_index(drop=True).copy()
+        out = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         if self.recode_:
             for c in self.rank_maps_:
                 out[c] = self._rank(out[c], c)

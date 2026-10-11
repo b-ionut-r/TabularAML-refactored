@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pandas as pd
 import pytest
@@ -311,6 +312,26 @@ def test_forge_search_respects_small_budget():
     assert time.time() - t0 < 60
 
 
+def test_forge_picks_do_not_depend_on_the_clock(monkeypatch):
+    # A budget that binds: the same search on a machine whose clock races ahead (every reading
+    # a minute later than the last) must build, rank and keep exactly the same features.
+    import time
+    X, rng = _frame(3000)
+    y = np.log(X.a / X.b) * 3 + X.c + rng.normal(scale=0.3, size=len(X))
+    kw = dict(task="regression", time_budget=0.1, n_jobs=2, verbose=False)
+    a = FeatureForge(**kw).fit(X, y)
+    real, t = time.time, [time.time()]
+
+    def racing():
+        t[0] += 60.0
+        return t[0]
+    monkeypatch.setattr(time, "time", racing)
+    b = FeatureForge(**kw).fit(X, y)
+    monkeypatch.setattr(time, "time", real)
+    assert a.new_columns_ == b.new_columns_
+    assert a.history_ == b.history_
+
+
 def test_forge_search_subsample_keeps_output_on_every_row():
     rng = np.random.default_rng(0)
     X = pd.DataFrame(rng.normal(size=(6000, 4)), columns=list("abcd"))
@@ -321,6 +342,33 @@ def test_forge_search_subsample_keeps_output_on_every_row():
                      time_col="t", max_search_rows=2000).fit(X, y, X_unlabeled=U)
     assert len(f.transform_train(X)) == len(X) and len(f.transform(U)) == len(U)
     assert any("a" in c and "b" in c for c in f.new_columns_)
+
+
+def test_label_echo_columns_stay_out_of_cross_row_features():
+    rng = np.random.default_rng(0)
+    rows, q_hist = [], {}
+    for u in range(300):
+        skill, past, uq = rng.normal(), [], {}
+        for t in range(30):
+            q = int(rng.integers(0, 120))
+            y = int(rng.random() < 1 / (1 + np.exp(-(skill - (q % 7 - 3) / 3))))
+            qh, mine = q_hist.setdefault(q, []), uq.setdefault(q, [])
+            rows.append((u, q, np.mean(past) if past else np.nan,
+                         past[-3] if len(past) >= 3 else np.nan,         # 3rd previous answer
+                         np.mean(qh) if qh else np.nan,                  # question's earlier accuracy
+                         np.mean(mine) if mine else np.nan,              # this user on this question
+                         rng.normal(), q % 7, y))
+            past.append(y)
+            qh.append(y)
+            mine.append(y)
+    cols = ["user", "q", "prior_mean", "lag3", "q_acc", "uq_acc", "noise", "difficulty", "y"]
+    D = pd.DataFrame(rows, columns=cols)
+    y = D.pop("y")
+    f = FeatureForge(task="binary", time_budget=20, n_rounds=1, n_jobs=1, verbose=False)
+    f.task_, f.n_classes_, f.cat_cols_ = "binary", 2, []
+    f.id_cols_ = f._id_columns(D)
+    assert f.id_cols_[:2] == ["user", "q"]
+    assert f._label_echo_cols(D, y.to_numpy(float)) == {"prior_mean", "lag3", "q_acc", "uq_acc"}
 
 
 def test_pair_scan_finds_hidden_difference_of_near_duplicate_columns():
@@ -378,3 +426,85 @@ def test_label_history_columns_are_kept_out_of_client_profiles():
     df = df.iloc[perm].reset_index(drop=True)
     bad = label_history_cols(df, df["y"].to_numpy(), ["user"], ["elapsed", "past_mean"], time_col="t")
     assert bad == ["past_mean"]
+
+
+def test_child_model_features_accept_datetime_child_columns():
+    # Amex: a parsed statement date in the child table used to become Timestamp categories,
+    # which LightGBM cannot serialise.
+    from tabularaml.generate.relational import Child, child_model_features
+    rng = np.random.default_rng(0)
+    n = 3000
+    df = pd.DataFrame({"k": rng.integers(0, 300, n), "v": rng.normal(size=n), "c": rng.choice(list("abc"), n),
+                       "d": pd.Timestamp("2020-01-01") + pd.to_timedelta(rng.integers(0, 500, n), unit="D")})
+    y = pd.Series(rng.integers(0, 2, 250).astype(float), index=np.arange(250))
+    out = child_model_features(Child("t", df, key="k", time="d"), y, np.arange(250, 300), task="binary")
+    assert len(out) == 300 and out.notna().any().all()
+
+
+def test_id_columns_accept_repeating_many_level_keys_and_tied_frequency_ranks():
+    rng = np.random.default_rng(0)
+    n = 3000
+    # Device-like key: 900 levels (over n/5) but most rows on devices seen 3+ times.
+    dev = np.concatenate([rng.integers(0, 300, 2400), np.arange(1000, 1600)]).astype(str)
+    X = pd.DataFrame({"dev": dev, "row_id": np.arange(n).astype(str), "x": rng.normal(size=n)})
+    f = FeatureForge(task="binary")
+    f.cat_cols_, f.date_cols_, f.text_cols_ = ["dev", "row_id"], [], []
+    ids = f._id_columns(X)
+    assert "dev" in ids and "row_id" not in ids
+    f.hc_cols_ = ["dev"]
+    f._fit_rank_maps(X)
+    once = f.rank_maps_["dev"][[str(i) for i in range(1000, 1600)]]
+    assert once.nunique() == 1  # levels seen equally often share one rank
+
+
+def test_group_sequences_get_running_sums_when_test_holds_new_groups():
+    # Each "breath" is a sequence ordered by t; the target is the running sum of u inside it,
+    # which no single-row or per-group statistic gives.
+    from tabularaml.generate.forge import GroupSeq
+    rng = np.random.default_rng(0)
+    n_g, L = 400, 20
+    g = np.repeat(np.arange(n_g), L)
+    t = np.tile(np.arange(L, dtype=float), n_g)
+    u = rng.uniform(0, 1, n_g * L)
+    y = pd.Series(u).groupby(g).cumsum().to_numpy() + rng.normal(scale=0.05, size=n_g * L)
+    X = pd.DataFrame({"g": g, "t": t, "u": u, "r": np.repeat(rng.integers(0, 3, n_g), L)})
+    tr = np.isin(g, rng.choice(n_g, 300, replace=False))  # test breaths interleave with training ones
+    f = FeatureForge(task="regression", time_budget=60, random_state=0, n_jobs=2, verbose=False).fit(
+        X[tr].reset_index(drop=True), y[tr], X_unlabeled=X[~tr].reset_index(drop=True))
+    assert f.seq_order_ == "t"
+    assert any(c.startswith("seq_cumsum__u") or c.startswith("seq_area__u") for c in f.new_columns_)
+    v = GroupSeq("g", "t", "u", "cumsum").transform(X[~tr].reset_index(drop=True), None)
+    assert np.allclose(v, pd.Series(u[~tr]).groupby(g[~tr]).cumsum().to_numpy())
+
+
+def test_field_missing_from_unlabeled_rows_is_left_out():
+    # "z" is measured on training rows but a -9 placeholder on almost every unlabeled row.
+    rng = np.random.default_rng(0)
+    n = 2000
+    X = pd.DataFrame({"x": rng.normal(size=n), "z": rng.uniform(0, 2, n)})
+    y = pd.Series((X.x + X.z > 1).astype(int))
+    U = pd.DataFrame({"x": rng.normal(size=500), "z": np.where(rng.random(500) < 0.95, -9.0, rng.uniform(0, 2, 500))})
+    f = FeatureForge(task="binary", time_budget=20, random_state=0, n_jobs=1, verbose=False).fit(X, y, X_unlabeled=U)
+    assert f.shifted_ == ["z"]
+    assert "z" not in f.transform(U).columns and "z" not in f.transform_train(X).columns
+
+
+def test_json_object_columns_are_flattened_into_fields():
+    from tabularaml.generate.lists import json_fields
+    rng = np.random.default_rng(0)
+    rows = [json.dumps({"hits": str(int(h)), "src": {"medium": m}, "same": "x"})
+            for h, m in zip(rng.integers(1, 9, 300), rng.choice(["organic", "cpc"], 300))]
+    tr = pd.DataFrame({"totals": rows[:200], "other": rng.normal(size=200)})
+    te = pd.DataFrame({"totals": rows[200:], "other": rng.normal(size=100)})
+    a, b, found = json_fields(tr, te)
+    assert found == ["totals"]
+    assert list(a.columns) == ["totals.hits", "totals.src_medium"]   # the constant field is left out
+    assert a["totals.hits"].dtype == np.float32 and len(b) == 100
+    assert a["totals.hits"].iloc[0] == float(json.loads(rows[0])["hits"])
+    assert json_fields(tr[["other"]], te[["other"]])[2] == []
+    cat = pd.DataFrame({"c": pd.Series(["a", "b"] * 100, dtype="category")})
+    assert json_fields(cat, cat.iloc[:10])[2] == []
+    from tabularaml.generate.lists import list_features
+    assert list_features(cat, cat.iloc[:10])[2] == []
+    a2, _, found2 = json_fields(tr.astype({"totals": "category"}), te.astype({"totals": "category"}))
+    assert found2 == ["totals"] and a2.equals(a)

@@ -27,6 +27,10 @@ ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_
 ap.add_argument('--budget', type=float, default=1200); ap.add_argument('--kw', default='{}'); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/dsb/'); ap.add_argument('--log', default='dsb.jsonl')
 ap.add_argument('--draws', type=int, default=20); ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--pick-transform', action='store_true',
+                help="transform each draw's picked assessments alone, so no held-out child's later rows are visible (test parity)")
+ap.add_argument('--shuffle-history', action='store_true',
+                help="permute the event codes of assessment events (the attempts that make up the outcome), independently of the labels")
 a = ap.parse_args()
 D = Path(a.data)
 lab = pd.read_csv(D / 'train_labels.csv.gz')
@@ -48,6 +52,11 @@ if not cache.exists():
     ev['event_code'] = ev['event_code'].astype(str).astype('category')
     ev.to_parquet(cache); del parts; gc.collect()
 ev = pd.read_parquet(cache)
+if a.shuffle_history:
+    m = (ev['event_type'].astype(str) == 'Assessment').to_numpy()
+    codes = ev['event_code'].astype(str).to_numpy().copy()
+    codes[m] = np.random.default_rng(5).permutation(codes[m])
+    ev['event_code'] = pd.Categorical(codes)
 st = ev.groupby('game_session', observed=True).agg(start=('timestamp', 'min'), world=('world', 'first'))
 main = lab[['installation_id', 'game_session', 'title', 'accuracy_group']].merge(st, left_on='game_session', right_index=True)
 main = main.sort_values('start').reset_index(drop=True)
@@ -80,13 +89,20 @@ if a.arm.endswith('forge'):
     f = FeatureForge(task='regression', time_budget=a.budget, random_state=a.seed, n_jobs=4, verbose=True,
                      **json.loads(a.kw)).fit(Xtr, ytr, X_unlabeled=Xho.iloc[picks[0]].reset_index(drop=True))
     info.update(n_added=len(f.new_columns_), gate=f.gate_passed_, group_col=f.group_col_, time_col=f.time_col_, feats=f.new_columns_[:30])
+    Xho_raw = Xho
     Xtr, Xho = f.transform_train(Xtr), f.transform(Xho)
 fe_t = time.time() - t0
 g_tr = Xtr.pop('installation_id').astype(str).to_numpy(); Xho = Xho.drop(columns=['installation_id'])
+catmap = {}
 for c in Xtr.columns:
     if Xtr[c].dtype == object or isinstance(Xtr[c].dtype, pd.CategoricalDtype):
-        cats = pd.Index(pd.unique(Xtr[c].astype(str)))
+        cats = pd.Index(pd.unique(Xtr[c].astype(str))); catmap[c] = cats
         Xtr[c] = pd.Categorical(Xtr[c].astype(str), categories=cats); Xho[c] = pd.Categorical(Xho[c].astype(str), categories=cats)
+def prep_ho(Xh):
+    Xh = Xh.drop(columns=['installation_id'])[Xtr.columns]
+    for c, cats in catmap.items():
+        Xh[c] = pd.Categorical(Xh[c].astype(str), categories=cats)
+    return Xh
 P = dict(objective='regression', learning_rate=0.03, num_leaves=31, min_child_samples=50, feature_fraction=0.6,
          bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, num_threads=4, verbose=-1, seed=a.seed)
 gu = np.unique(g_tr); va_g = set(np.random.default_rng(a.seed + 1).choice(gu, int(0.15 * len(gu)), replace=False))
@@ -97,9 +113,16 @@ p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict
 share = np.cumsum(np.bincount(ytr.astype(int), minlength=4) / len(ytr))[:3]
 tr_cuts = np.quantile(b.predict(Xtr[va]), share)
 kap = lambda yy, pp, cuts: cohen_kappa_score(yy.astype(int), np.digitize(pp, cuts), weights='quadratic')
-qwk_draw = [kap(yho[i], p[i], np.quantile(p[i], share)) for i in picks]
-qwk_trcut = [kap(yho[i], p[i], tr_cuts) for i in picks]
-res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, qwk=float(np.mean(qwk_draw)),
+if a.pick_transform and a.arm.endswith('forge'):
+    model = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1)
+    pk = [model.predict(prep_ho(f.transform(Xho_raw.iloc[i].reset_index(drop=True)))) for i in picks]
+    qwk_draw = [kap(yho[i], q, np.quantile(q, share)) for i, q in zip(picks, pk)]
+    qwk_trcut = [kap(yho[i], q, tr_cuts) for i, q in zip(picks, pk)]
+else:
+    qwk_draw = [kap(yho[i], p[i], np.quantile(p[i], share)) for i in picks]
+if not (a.pick_transform and a.arm.endswith('forge')):
+    qwk_trcut = [kap(yho[i], p[i], tr_cuts) for i in picks]
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else '') + ('_shufhist' if a.shuffle_history else '') + ('_pick' if a.pick_transform else ''), seed=a.seed, qwk=float(np.mean(qwk_draw)),
            qwk_sd=float(np.std(qwk_draw)), qwk_trcut=float(np.mean(qwk_trcut)), qwk_all=float(kap(yho, p, np.quantile(p, share))), rmse=float(np.sqrt(np.mean((p - yho) ** 2))), best_it=b.best_iteration,
            fe_s=round(fe_t), total_s=round(time.time() - t0), n_tr=len(Xtr), n_ho=len(Xho), n_cols=Xtr.shape[1], **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')

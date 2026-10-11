@@ -56,12 +56,23 @@ elif a.arm.startswith('hand'):
         for keys in (['store_nbr', 'item_nbr'],):
             sp = LaggedTargetMean(keys, 'date', w, 16).fit(Xtr, ytr, None)
             Xtr[sp.name], Xho[sp.name] = sp.fit_transform_oof(Xtr, ytr, None, None), sp.transform(Xho, None)
+elif a.arm == 'fc':
+    # Forecasting family alone (tabularaml/generate/forecast.py) on top of the raw columns.
+    from tabularaml.generate.forecast import forecast_features
+    Ftr, Fho, ff = forecast_features(Xtr, ytr, Xho, **json.loads(a.kw))
+    Xtr, Xho = pd.concat([raw(Xtr), Ftr], axis=1), pd.concat([raw(Xho), Fho], axis=1)
+    info = dict(n_fc=Ftr.shape[1])
 elif a.arm == 'forge':
     from tabularaml.generate.forge import FeatureForge
     kw = dict(time_col='date'); kw.update(json.loads(a.kw))
     f = FeatureForge(task='regression', time_budget=a.budget, random_state=0, n_jobs=4, verbose=True, **kw).fit(Xtr, ytr, X_unlabeled=U)
     info = dict(n_added=len(f.new_columns_), gate=f.gate_passed_, feats=f.new_columns_[:80])
     Xtr, Xho = raw(f.transform_train(Xtr)), raw(f.transform(Xho))
+if a.arm == 'pipe':
+    sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+    from _pipe import pipe_features
+    Xtr, Xho, info = pipe_features(Xtr, ytr, Xho, budget=a.budget)
+    Xtr, Xho = raw(Xtr), raw(Xho)
 fe_t = time.time() - t0
 P = dict(objective='regression', learning_rate=0.05, num_leaves=63, min_child_samples=100, feature_fraction=0.7,
          bagging_fraction=0.8, bagging_freq=1, num_threads=4, verbose=-1, seed=0)
