@@ -17,7 +17,7 @@ Arms (same bagged LightGBM: early stopping on 15% of the training rows, then 3 s
 
     python scripts/telstra_bench.py --arm ff --seed 0
 """
-import sys, time, json, warnings, argparse, subprocess, tempfile, shutil
+import sys, re, time, json, warnings, argparse, subprocess, tempfile, shutil
 from pathlib import Path
 warnings.filterwarnings('ignore'); sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np, pandas as pd, lightgbm as lgb
@@ -27,6 +27,8 @@ ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_
 ap.add_argument('--budget', type=float, default=900); ap.add_argument('--extra', default=''); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='/tmp/claude-0/data/telstra/'); ap.add_argument('--log', default='telstra.jsonl')
 ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--drop-re', default='', help='ablation: drop blind columns matching this regex')
+ap.add_argument('--ff-cache', default='', help='directory to keep / reuse the blind output (ablation arms ff+group,...)')
 a = ap.parse_args()
 D = Path(a.data)
 tr, te_real = pd.read_csv(D / 'train.csv'), pd.read_csv(D / 'test.csv')
@@ -41,19 +43,51 @@ tables = {n: pd.read_csv(D / f'{n}.csv') for n in ('event_type', 'log_feature', 
 t0 = time.time()
 def num(s):
     return s.str.split(' ').str[-1].astype(int)
-if a.arm == 'ff':
-    tmp = Path(tempfile.mkdtemp(dir='/tmp/claude-0'))
-    Xtr.assign(fault_severity=ytr).to_parquet(tmp / 'train.parquet'); Xun.to_parquet(tmp / 'test.parquet')
-    cmd = [sys.executable, str(Path(__file__).resolve().parent / 'contest_features.py'), '--train', str(tmp / 'train.parquet'),
-           '--test', str(tmp / 'test.parquet'), '--target', 'fault_severity', '--id', 'id', '--task', 'multiclass',
-           '--budget', str(a.budget), '--out-dir', str(tmp / 'out')]
-    for n, T in tables.items():
-        T.to_parquet(tmp / f'{n}.parquet'); cmd += ['--table', f'{n}={tmp / (n + ".parquet")}:id']
-    subprocess.run(cmd + (a.extra.split() if a.extra else []), check=True)
-    Ftr = pd.read_parquet(tmp / 'out' / 'train_features.parquet'); Fun = pd.read_parquet(tmp / 'out' / 'test_features.parquet')
+def hand_groups(A):
+    G = {'loc': pd.DataFrame({'loc': num(A.location)})}
+    G['loc_count'] = pd.DataFrame({'loc_count': G['loc']['loc'].map(G['loc']['loc'].value_counts())})
+    for n in ('event_type', 'resource_type', 'severity_type'):
+        P = pd.crosstab(tables[n].id, tables[n][n]); P.columns = [f'{n}_{num(pd.Series(P.columns)).iloc[i]}' for i in range(P.shape[1])]
+        G[n] = A[['id']].merge(P, left_on='id', right_index=True, how='left').drop(columns='id')
+    L = tables['log_feature']
+    P = L.pivot_table(index='id', columns='log_feature', values='volume', aggfunc='sum', fill_value=0)
+    P.columns = [f'log_{num(pd.Series([c])).iloc[0]}' for c in P.columns]
+    G['log'] = A[['id']].merge(P, left_on='id', right_index=True, how='left').drop(columns='id')
+    agg = L.groupby('id')['volume'].agg(['count', 'sum', 'max']).add_prefix('vol_')
+    G['vol'] = A[['id']].merge(agg, left_on='id', right_index=True, how='left').drop(columns='id')
+    return {k: v.reset_index(drop=True) for k, v in G.items()}
+if a.arm.startswith('ff'):
+    cache = Path(a.ff_cache) if a.ff_cache else None
+    if cache and (cache / 'train_features.parquet').exists():
+        Ftr = pd.read_parquet(cache / 'train_features.parquet'); Fun = pd.read_parquet(cache / 'test_features.parquet')
+    else:
+        tmp = Path(tempfile.mkdtemp(dir='/tmp/claude-0'))
+        Xtr.assign(fault_severity=ytr).to_parquet(tmp / 'train.parquet'); Xun.to_parquet(tmp / 'test.parquet')
+        cmd = [sys.executable, str(Path(__file__).resolve().parent / 'contest_features.py'), '--train', str(tmp / 'train.parquet'),
+               '--test', str(tmp / 'test.parquet'), '--target', 'fault_severity', '--id', 'id', '--task', 'multiclass',
+               '--budget', str(a.budget), '--out-dir', str(tmp / 'out')]
+        for n, T in tables.items():
+            T.to_parquet(tmp / f'{n}.parquet'); cmd += ['--table', f'{n}={tmp / (n + ".parquet")}:id']
+        subprocess.run(cmd + (a.extra.split() if a.extra else []), check=True)
+        Ftr = pd.read_parquet(tmp / 'out' / 'train_features.parquet'); Fun = pd.read_parquet(tmp / 'out' / 'test_features.parquet')
+        if cache:
+            cache.mkdir(parents=True, exist_ok=True); Ftr.to_parquet(cache / 'train_features.parquet'); Fun.to_parquet(cache / 'test_features.parquet')
+        shutil.rmtree(tmp, ignore_errors=True)
     assert (Ftr.id.to_numpy() == Xtr.id.to_numpy()).all() and (Fun.id.to_numpy() == Xun.id.to_numpy()).all()
-    Xtr = Ftr.drop(columns=['id', 'fault_severity']); Xho = Fun.drop(columns=['id'])[Xtr.columns].iloc[:len(Xho)].reset_index(drop=True)
-    shutil.rmtree(tmp, ignore_errors=True)
+    nho = len(Xho)
+    if '+' in a.arm:  # ablation: add hand groups to the blind output
+        G = hand_groups(pd.concat([Xtr, Xun], ignore_index=True))
+        add = pd.concat([G[g].add_prefix('h_') for g in a.arm.split('+', 1)[1].split(',')], axis=1)
+        Ftr = pd.concat([Ftr.reset_index(drop=True), add.iloc[:len(Xtr)].reset_index(drop=True)], axis=1)
+        Fun = pd.concat([Fun.reset_index(drop=True), add.iloc[len(Xtr):].reset_index(drop=True)], axis=1)
+    Xtr = Ftr.drop(columns=['id', 'fault_severity']); Xho = Fun.drop(columns=['id'])[Xtr.columns].iloc[:nho].reset_index(drop=True)
+    if a.drop_re:
+        keep = [c for c in Xtr.columns if not re.search(a.drop_re, c)]; Xtr, Xho = Xtr[keep], Xho[keep]
+elif a.arm.startswith('hg'):  # ablation: the hand groups minus the listed ones (hg-log,vol)
+    A = pd.concat([Xtr, Xun], ignore_index=True); G = hand_groups(A)
+    drop = a.arm.split('-', 1)[1].split(',') if '-' in a.arm else []
+    F = pd.concat([v for k, v in G.items() if k not in drop], axis=1)
+    Xtr, Xho = F.iloc[:len(Xtr)].reset_index(drop=True), F.iloc[len(Xtr):len(Xtr) + len(Xho)].reset_index(drop=True)
 elif a.arm.startswith('hand'):
     A = pd.concat([Xtr, Xun], ignore_index=True)
     F = pd.DataFrame({'id': A.id, 'loc': num(A.location)})
@@ -93,6 +127,6 @@ b = lgb.train(dict(P, seed=0), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 10000, vali
 p = np.zeros((len(Xho), 3))
 for s in range(3):
     p += lgb.train(dict(P, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xho) / 3
-res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, mlogloss=log_loss(yho, p, labels=[0, 1, 2]),
+res = dict(arm=a.arm + a.tag + (f'_drop[{a.drop_re}]' if a.drop_re else '') + ('_shuffled' if a.shuffle else ''), seed=a.seed, mlogloss=log_loss(yho, p, labels=[0, 1, 2]),
            best_it=b.best_iteration, n_cols=Xtr.shape[1], fe_s=round(fe_t), total_s=round(time.time() - t0))
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')
