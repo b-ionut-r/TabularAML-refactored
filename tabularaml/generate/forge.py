@@ -62,6 +62,23 @@ def _as_str(s: pd.Series) -> pd.Series:
     return s.astype(object).where(s.notna(), "__NA__").astype(str)
 
 
+def _as_str_frame_col(s: pd.Series) -> pd.Series:
+    """``_as_str`` for a column of a frame, as the ``category`` column ``_compact`` would make of it
+    when it already is one (sorted string levels, missing as "__NA__"): one string per row of
+    Bosch's 2,140 categorical fields was 9 GB on 240k rows."""
+    if isinstance(s.dtype, pd.CategoricalDtype):
+        names = s.cat.categories.astype(object).map(str)
+        if names.is_unique:
+            s = s.cat.rename_categories(names)
+            if s.isna().any():
+                if "__NA__" not in names:
+                    s = s.cat.add_categories("__NA__")
+                s = s.fillna("__NA__")
+            s = s.cat.remove_unused_categories()
+            return s.cat.reorder_categories(sorted(s.cat.categories))
+    return _as_str(s)
+
+
 def _concat_cats(parts: List[pd.DataFrame]) -> pd.DataFrame:
     """Row-wise concat that keeps ``category`` columns as categories (on the union of the parts'
     levels): pandas otherwise falls back to one string object per row, gigabytes on 9M rows."""
@@ -2178,6 +2195,12 @@ class FeatureForge:
                  # the two sum in a different order: on Airline the same commit's round-one
                  # ranking split on that and kept 41 features or none on alternate runs.
                  deterministic=True, force_col_wise=True)
+        # LightGBM bins from a sample of up to 200k rows held as doubles, about 13 bytes per
+        # sampled cell: 7-11 GB on Bosch's 4,264 columns. Wide frames bin from fewer rows;
+        # frames under ~1,000 columns keep the default.
+        width = getattr(self, "model_width_", 0)
+        if width and 2.5e9 / (13 * width) < 200_000:
+            p["bin_construct_sample_cnt"] = max(20_000, int(2.5e9 / (13 * width)))
         p.update(kw)
         return p
 
@@ -3145,6 +3168,7 @@ class FeatureForge:
         self.addons_ = {}
         X = X.reset_index(drop=True)
         y = pd.Series(np.asarray(y))
+        self.model_width_ = X.shape[1] + 3 * self.max_new_features   # widest frame a model sees
         self.n_synthetic_ = 0
         if X_unlabeled is not None and self.drop_synthetic:
             fake = synthetic_rows(X, X_unlabeled)
@@ -3182,7 +3206,7 @@ class FeatureForge:
             X[c] = _to_days(X[c])
         self.cat_cols_ = [c for c in X.columns if _is_cat(X[c])]
         for c in self.cat_cols_:
-            X[c] = _as_str(X[c])
+            X[c] = _as_str_frame_col(X[c])
         self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
         X = self._compact(X)
@@ -3973,7 +3997,7 @@ class FeatureForge:
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
-            X[c] = _as_str(X[c])
+            X[c] = _as_str_frame_col(X[c])
         return self._add_anchors(self._compact(X))
 
     def _compact(self, X):
