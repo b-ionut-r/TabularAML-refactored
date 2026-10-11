@@ -65,6 +65,8 @@ else:
            '--budget', str(a.budget), '--out-dir', str(tmp / 'out'),
            '--table', f'log={tmp / "log.parquet"}:user_id:timestamp'] + (a.extra.split() if a.extra else [])
     subprocess.run(cmd, check=True)
+    import resource
+    PEAK = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024  # MB, the feature build's peak
     Xtr = pd.read_parquet(tmp / 'out' / 'train_features.parquet').drop(columns=['answered_correctly'])
     Xte = pd.read_parquet(tmp / 'out' / 'test_features.parquet')[Xtr.columns]
     Xtr, Xte = Xtr.drop(columns=['user_id'], errors='ignore'), Xte.drop(columns=['user_id'], errors='ignore')
@@ -84,7 +86,7 @@ p = np.zeros(len(Xte))
 for s in range(3):
     p += lgb.train(dict(P, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
 isnew = te.user_id.isin(new).to_numpy()
-res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, auc=float(roc_auc_score(yte, p)),
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, peak_mb=globals().get('PEAK'), users=a.users, auc=float(roc_auc_score(yte, p)),
            auc_continuing=float(roc_auc_score(yte[~isnew], p[~isnew])), auc_new=float(roc_auc_score(yte[isnew], p[isnew])),
            best_it=b.best_iteration, n_cols=Xtr.shape[1], fe_s=round(fe_t), total_s=round(time.time() - t0), n_tr=len(Xtr), n_te=len(Xte))
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')
