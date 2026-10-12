@@ -106,6 +106,19 @@ _SPEC_WORK_DEFAULT = 20
 # Column helpers
 # ============================================================================
 
+def _unique_names(cols) -> list:
+    """Column names as strings, a repeated name numbered (``a``, ``a.1``) as pandas numbers a CSV's."""
+    out, seen = [], set()
+    for c in cols:
+        name, k = str(c), 0
+        while name in seen:
+            k += 1
+            name = f"{c}.{k}"
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def _is_cat(s: pd.Series) -> bool:
     return (s.dtype == object or s.dtype == bool or isinstance(s.dtype, pd.CategoricalDtype)
             or pd.api.types.is_string_dtype(s))
