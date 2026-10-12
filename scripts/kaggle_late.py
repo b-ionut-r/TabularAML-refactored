@@ -145,6 +145,7 @@ CONTESTS["sct_hd"] = dict(CONTESTS["sct"], raw="sct", repo="/tmp/claude-0/wt_b_e
 CONTESTS["sct_dd"] = dict(CONTESTS["sct"], raw="sct", repo="/tmp/claude-0/wt_b_dde2778", base="sct")
 # Home Credit at faster's b6c1275: leak fix (target-derived columns only in same-row features) + clock fix.
 CONTESTS["hc_v5"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_b6c1275", base="hc")
+CONTESTS["hc_v6"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_cw", base="hc")
 
 
 def download(c: str) -> Path:
