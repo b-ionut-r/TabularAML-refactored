@@ -2231,6 +2231,10 @@ class FeatureForge:
         Numerics aggregated per entity; whether to add each row's place in its
         entity's history (time since previous / until next row, rows before it)
         when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    event_gaps : "auto" | "past" | "off"
+        With a time column and a repeating many-level key: time since each user's previous
+        row, until their next and rows before it, users being the key with the row's other
+        codes (TalkingData's ip + app + device + os). "past" leaves out the next row.
     group_col : str | "auto" | None
         Column whose test values are new groups (users, patients). "auto": a
         repeating integer / categorical column with under 20% of the unlabeled
@@ -2312,7 +2316,7 @@ class FeatureForge:
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
-                 pair_scan: bool = True, profiles: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
+                 pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
         self.time_budget = time_budget
@@ -2340,6 +2344,7 @@ class FeatureForge:
         self.time_col = time_col
         self.entity_nums = entity_nums
         self.entity_lags = entity_lags
+        self.event_gaps = event_gaps
         self.family_nb = family_nb
         self.events = events
         self.time_cv = time_cv
@@ -2810,6 +2815,7 @@ class FeatureForge:
                 add(Arith(op, a, b))
             self._event_candidates(W, imp, add)
             self._entity_candidates(W, imp, top_num, add)
+            self._event_gap_candidates(W, imp, add)
             self._interaction_candidates(W, add)
         else:
             # Compose selected features with the strongest raw columns.
@@ -2830,6 +2836,44 @@ class FeatureForge:
                 add(Count([k1, k2, k3]))
                 add(TargetEnc([k1, k2, k3], self.n_classes_))
         return cands
+
+    def _event_gap_candidates(self, W, imp, add):
+        """Where each row sits among its user's events: time since the user's previous row, until
+        their next one, and how many came before. A click log names no user; the repeating key with
+        the most levels (a device's ip) together with the row's other codes (app, device, os,
+        channel) does, the way TalkingData's winners keyed time-to-next-click. Offered whenever a
+        time column orders the rows and such a key repeats; the gate decides. ``event_gaps="past"``
+        leaves out the next row (it reads later rows of the same file).
+
+        Only with the test rows passed to ``fit`` (``X_unlabeled``): the gaps are read from the history
+        fit holds, so test rows that arrive later in batches (an API feeding Jane Street's or Optiver's
+        test) would find their own neighbours missing: no next row at all, and a previous row taken
+        from training rather than their batch, unlike every training row."""
+        t = getattr(self, "time_col_", None)
+        if (self.event_gaps == "off" or t is None or t == ROW_TIME or not self.id_cols_
+                or not getattr(self, "has_test_", False)):
+            return
+        echo = set(getattr(self, "echo_cols_", ()))
+        k = self.id_cols_[0]
+        if k == t or k in echo:
+            return
+
+        def code_like(c):
+            if c in self.cat_cols_:
+                return c not in self.text_cols_
+            x = W[c].to_numpy(dtype=float)
+            x = x[np.isfinite(x)]
+            return len(x) > 0 and bool(np.all(x == np.round(x)))
+        codes = [c for c in sorted(self.raw_cols_, key=lambda c: -imp.get(c, 0.0))
+                 if c not in (k, t) and c not in echo and c not in getattr(self, "date_cols_", [])
+                 and W[c].nunique() > 1 and code_like(c)][:4]
+        users = [(k,)] + [(k, *p) for r in (1, 2, 3) for p in combinations(codes, r)]
+        if len(codes) > 3:
+            users.append((k, *codes))
+        kinds = ("prev", "nth") if self.event_gaps == "past" else ("prev", "next", "nth")
+        for u in users:
+            for kind in kinds:
+                add(EntityLag(list(u) if len(u) > 1 else u[0], t, kind))
 
     def _entity_candidates(self, W, imp, top_num, add):
         """Counts, target maps and group statistics over ID-like columns and over
@@ -2866,7 +2910,8 @@ class FeatureForge:
                 if t not in e:
                     add(Count(list(e) + [t]))
         for e in ents:
-            if self.entity_lags and t is not None and t not in e:
+            # Read from the history fit holds: only with the test rows at fit (see _event_gap_candidates).
+            if self.entity_lags and t is not None and t not in e and getattr(self, "has_test_", False):
                 tw = W[t].to_numpy(dtype=float)
                 R = float(np.nanmax(tw) - np.nanmin(tw))
                 wins = [f"{p}{R * f:.6g}" for f in (0.001, 0.01, 0.05) for p in ("win", "fwd")] if R > 0 else []
@@ -2910,6 +2955,10 @@ class FeatureForge:
                      and 2 <= W[f].nunique() <= 7
                      and W.groupby(ids[0], sort=False)[f].nunique().mean() >= 1.5][:3]
             self._lagged_target_candidates(W, ids[:2], flags, add)
+        if not getattr(self, "has_test_", False):
+            # Times to an entity's last / next flagged row are read from the history fit holds: test rows
+            # sent later in batches would miss their own batch's rows (see _event_gap_candidates).
+            return
         for f in self.base_cols_:
             if f == t or f in ids or f in self.date_cols_:
                 continue
@@ -3494,6 +3543,7 @@ class FeatureForge:
         # hold, while varied in training (PLAsTiCC's spectroscopic redshift: -9 on 97% of test objects,
         # measured on 70% of training ones). A model trained on them meets a value it never saw.
         self.shifted_ = [] if X_unlabeled is None else _absent_in_test(X, X_unlabeled)
+        self.has_test_ = X_unlabeled is not None and len(X_unlabeled) > 0
         if self.shifted_:
             self._log(f"left out, almost constant in the unlabeled rows on a value training rarely holds: {self.shifted_}")
             X = X.drop(columns=self.shifted_)
