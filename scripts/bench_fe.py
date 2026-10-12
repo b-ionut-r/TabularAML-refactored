@@ -108,7 +108,22 @@ def fe_openfe(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
     return A, B[A.columns], dict(n_added=A.shape[1] - X_tr.shape[1])
 
 
-ARMS = {"raw": fe_raw, "forge": fe_forge, "tabularaml": fe_tabularaml, "openfe": fe_openfe}
+def fe_forge_rows(X_tr, y_tr, X_te, task, metric, seed, budget, threads):
+    """Row statistics (as scripts/contest_features.py adds them before the search), then FeatureForge."""
+    from tabularaml.generate.rowstats import row_stat_features, rows_help
+    R_tr, R_te, groups = row_stat_features(X_tr, X_te)
+    keep, gain, z = (rows_help(X_tr, R_tr, np.log1p(y_tr) if metric == "rmsle" else (
+        np.asarray(y_tr, dtype=float) if task == "regression" else pd.factorize(pd.Series(y_tr), sort=True)[0]), task)
+        if groups else (False, 0.0, 0.0))
+    if not keep:
+        R_tr, R_te = R_tr.iloc[:, :0], R_te.iloc[:, :0]
+    A = pd.concat([X_tr.reset_index(drop=True), R_tr], axis=1)
+    B = pd.concat([X_te.reset_index(drop=True), R_te], axis=1)
+    A_out, B_out, info = fe_forge(A, y_tr, B, task, metric, seed, budget, threads)
+    return A_out, B_out, dict(info, row_groups=groups, rows_kept=keep, rows_gain=round(gain, 3), rows_z=round(z, 2))
+
+
+ARMS = {"raw": fe_raw, "forge": fe_forge, "forge_rows": fe_forge_rows, "tabularaml": fe_tabularaml, "openfe": fe_openfe}
 
 
 def evaluate_repo(X_tr, y_tr, X_te, y_te, task, metric, seed, threads):
