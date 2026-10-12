@@ -273,6 +273,8 @@ def cmd_run(a):
         if miss:
             print(f'skip {cname}: missing {miss}', flush=True); continue
         for sample in case['samples']:
+            if a.samples and sample not in a.samples.split(','):
+                continue
             if not a.no_raw:
                 run_job(case, cname, sample, 'raw', repos[shas[0]], rawdir)
             for sha in shas:
@@ -362,7 +364,7 @@ def main():
     sp = ap.add_subparsers(dest='cmd', required=True)
     r = sp.add_parser('run'); r.add_argument('--commit', required=True, help='one commit or a comma list'); r.add_argument('--tier', default='fast')
     r.add_argument('--cases', default=''); r.add_argument('--shuffled', action='store_true')
-    r.add_argument('--no-raw', action='store_true')
+    r.add_argument('--no-raw', action='store_true'); r.add_argument('--samples', default='', help='only these samples')
     c = sp.add_parser('compare'); c.add_argument('--ref', required=True); c.add_argument('--new', required=True)
     c.add_argument('--tier', default='fast'); c.add_argument('--cases', default=''); c.add_argument('--out', default='')
     pr = sp.add_parser('probe'); pr.add_argument('--commit', required=True); pr.add_argument('--tier', default='fast')

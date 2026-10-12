@@ -17,7 +17,7 @@ import numpy as np, pandas as pd
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--contest', required=True); ap.add_argument('--arm', default='raw'); ap.add_argument('--seed', type=int, default=0)
-ap.add_argument('--shuffle', action='store_true'); ap.add_argument('--budget', default='900'); ap.add_argument('--extra', default='')
+ap.add_argument('--shuffle', action='store_true'); ap.add_argument('--perm', type=int, default=0); ap.add_argument('--budget', default='900'); ap.add_argument('--extra', default='')
 ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[1]))
 ap.add_argument('--data', default=os.environ.get('SEALED_DATA', '/home/user/data/sealed'))
 ap.add_argument('--log', default='/home/user/logs/sealed.jsonl')
@@ -358,7 +358,7 @@ X, y, ho = P['X'], np.asarray(P['y'], float), P['ho']
 Xtr, Xte = X[~ho].reset_index(drop=True), X[ho].reset_index(drop=True)
 ytr, yte = y[~ho], y[ho]
 if a.shuffle:
-    ytr = np.random.default_rng(0).permutation(ytr)
+    ytr = np.random.default_rng(a.perm).permutation(ytr)  # read several perms (3-5) on rare-positive contests
 t0 = time.time()
 idc = P.get('id')
 if a.arm == 'hand':
@@ -377,6 +377,10 @@ if a.arm == 'ff':
                '--out-dir', str(tmp / 'out')] + (['--id', idc] if idc else [])
         for name, (tab, key, tcol) in P.get('tables', {}).items():
             tab.to_parquet(tmp / f'{name}.parquet'); cmd += ['--table', f'{name}={tmp / (name + ".parquet")}:{key}' + (f':{tcol}' if tcol else '')]
+        # The frames are on disk now: free this process's copies so FeatureForge gets the box.
+        del X, Xtr, Xte; P['X'] = None; P.pop('tables', None); tab = None; import gc; gc.collect()
+        try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)  # hand freed pages back to the OS
+        except OSError: pass
         subprocess.run(cmd + (a.extra.split() if a.extra else []), check=True, cwd=a.repo)
         Ftr = pd.read_parquet(tmp / 'out' / 'train_features.parquet').drop(columns=['__y'])
         Fte = pd.read_parquet(tmp / 'out' / 'test_features.parquet')[Ftr.columns]
@@ -410,7 +414,7 @@ b = lgb.train(dict(Pm, seed=0), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 5000, vali
 p = np.zeros((len(Xte), P['n_class']) if obj == 'multiclass' else len(Xte))
 for s in range(3):
     p += lgb.train(dict(Pm, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
-res = dict(contest=a.contest, arm=a.arm + ('_shuffled' if a.shuffle else ''), seed=a.seed, metric=P['metric'],
+res = dict(contest=a.contest, arm=a.arm + (f'_shuffled{a.perm or ""}' if a.shuffle else ''), seed=a.seed, metric=P['metric'],
            score=P['score'](yte, p), n_tr=len(Xtr), n_te=len(Xte), n_cols=Xtr.shape[1], best_it=b.best_iteration,
            fe_s=round(fe_t), total_s=round(time.time() - t0))
 print('RESULT', json.dumps(res)); open(a.log, 'a').write(json.dumps(res) + '\n')
