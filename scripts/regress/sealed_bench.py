@@ -349,6 +349,9 @@ if a.contest in SEALED and a.arm != 'prep' and not os.environ.get('UNSEAL'):
     sys.exit(f'{a.contest} is sealed until the final variant is declared (set UNSEAL=1 then)')
 if a.contest in HELDBACK and a.arm == 'ff' and not os.environ.get('HELDBACK_FF'):
     sys.exit(f'{a.contest} is held back for a family hash: set HELDBACK_FF=1 to run FeatureForge on it')
+# Arrow's own allocator keeps freed pages for reuse (GBs after reading a wide parquet); the system one returns them.
+try: import pyarrow as pa; pa.set_memory_pool(pa.system_memory_pool())
+except ImportError: pass
 P = globals()[f'prep_{a.contest}']()
 if a.arm == 'prep':  # shapes only: no model, no label statistics
     print(dict(contest=a.contest, rows=len(P['X']), cols=P['X'].shape[1], held_out=int(P['ho'].sum()),
@@ -356,13 +359,14 @@ if a.arm == 'prep':  # shapes only: no model, no label statistics
     sys.exit()
 X, y, ho = P['X'], np.asarray(P['y'], float), P['ho']
 Xtr, Xte = X[~ho].reset_index(drop=True), X[ho].reset_index(drop=True)
+del X; P['X'] = None  # every arm works from the two halves; the joint frame is a third copy
 ytr, yte = y[~ho], y[ho]
 if a.shuffle:
     ytr = np.random.default_rng(a.perm).permutation(ytr)  # read several perms (3-5) on rare-positive contests
 t0 = time.time()
 idc = P.get('id')
 if a.arm == 'hand':
-    _hf = globals()[f'hand_{a.contest}']; del X, P['X']
+    _hf = globals()[f'hand_{a.contest}']
     if getattr(_hf, 'rowwise', False):  # per-row features: no joint copy of a wide frame
         Xtr, Xte = _hf(Xtr), _hf(Xte)
     else:
@@ -378,12 +382,14 @@ if a.arm == 'ff':
         for name, (tab, key, tcol) in P.get('tables', {}).items():
             tab.to_parquet(tmp / f'{name}.parquet'); cmd += ['--table', f'{name}={tmp / (name + ".parquet")}:{key}' + (f':{tcol}' if tcol else '')]
         # The frames are on disk now: free this process's copies so FeatureForge gets the box.
-        del X, Xtr, Xte; P['X'] = None; P.pop('tables', None); tab = None; import gc; gc.collect()
+        del Xtr, Xte; P.pop('tables', None); tab = None; import gc; gc.collect()
         try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)  # hand freed pages back to the OS
         except OSError: pass
         subprocess.run(cmd + (a.extra.split() if a.extra else []), check=True, cwd=a.repo)
-        Ftr = pd.read_parquet(tmp / 'out' / 'train_features.parquet').drop(columns=['__y'])
-        Fte = pd.read_parquet(tmp / 'out' / 'test_features.parquet')[Ftr.columns]
+        import pyarrow.parquet as pq  # self_destruct: arrow buffers freed column by column, not a second full copy
+        _rd = lambda f: pq.read_table(f).to_pandas(self_destruct=True, split_blocks=True)
+        Ftr = _rd(tmp / 'out' / 'train_features.parquet').drop(columns=['__y'])
+        Fte = _rd(tmp / 'out' / 'test_features.parquet')[Ftr.columns]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     Xtr, Xte = Ftr, Fte; del Ftr, Fte
@@ -409,12 +415,34 @@ if P.get('time'):
     fit, va = np.arange(int(0.85 * n)), np.arange(int(0.85 * n), n)
 else:
     perm = np.random.default_rng(a.seed + 1).permutation(n); fit, va = np.sort(perm[:int(0.85 * n)]), np.sort(perm[int(0.85 * n):])
-b = lgb.train(dict(Pm, seed=0), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 5000, valid_sets=[lgb.Dataset(Xtr.iloc[va], ytr[va])],
-              callbacks=[lgb.early_stopping(200, verbose=False)])
-p = np.zeros((len(Xte), P['n_class']) if obj == 'multiclass' else len(Xte))
+# The matrix LightGBM would build from the frames (its _data_from_pandas: category codes, -1 -> NaN, dtype by
+# its rule), filled column-major one column at a time, the frames freed before any fit, and handed over as numpy:
+# a wide frame is never held as frame + row-subset copy + LightGBM's own conversion at once. Same values, same model.
+cat_cols = [c for c in Xtr.columns if isinstance(Xtr[c].dtype, pd.CategoricalDtype) and not Xtr[c].cat.ordered]
+_tdt = np.result_type(*[np.float64 if isinstance(t, pd.CategoricalDtype) else t.type for t in Xtr.dtypes], np.float32)
+names = [str(c) for c in Xtr.columns]
+def _mat(F):
+    A = np.empty(F.shape, dtype=_tdt, order='F')
+    for j, c in enumerate(F.columns):
+        v = F[c]
+        if isinstance(v.dtype, pd.CategoricalDtype):
+            v = v.cat.codes.to_numpy().astype(np.float64); v[v == -1] = np.nan
+        else:
+            v = v.to_numpy(dtype=_tdt, na_value=np.nan)
+        A[:, j] = v
+    return A
+_ds = lambda A, y: lgb.Dataset(A, y, feature_name=names, categorical_feature=cat_cols, free_raw_data=True)
+n_cols = Xtr.shape[1]; Atr = _mat(Xtr); del Xtr; Ate = _mat(Xte); del Xte
+import gc; gc.collect()
+try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)
+except OSError: pass
+d_fit = _ds(Atr[fit], ytr[fit]); d_va = _ds(Atr[va], ytr[va])  # built by lgb.train with Pm, as before
+b = lgb.train(dict(Pm, seed=0), d_fit, 5000, valid_sets=[d_va], callbacks=[lgb.early_stopping(200, verbose=False)])
+del d_fit, d_va
+p = np.zeros((len(Ate), P['n_class']) if obj == 'multiclass' else len(Ate))
 for s in range(3):
-    p += lgb.train(dict(Pm, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
+    p += lgb.train(dict(Pm, seed=s), _ds(Atr, ytr), int(b.best_iteration * 1.1) + 1).predict(Ate) / 3
 res = dict(contest=a.contest, arm=a.arm + (f'_shuffled{a.perm or ""}' if a.shuffle else ''), seed=a.seed, metric=P['metric'],
-           score=P['score'](yte, p), n_tr=len(Xtr), n_te=len(Xte), n_cols=Xtr.shape[1], best_it=b.best_iteration,
+           score=P['score'](yte, p), n_tr=len(Atr), n_te=len(Ate), n_cols=n_cols, best_it=b.best_iteration,
            fe_s=round(fe_t), total_s=round(time.time() - t0))
 print('RESULT', json.dumps(res)); open(a.log, 'a').write(json.dumps(res) + '\n')
