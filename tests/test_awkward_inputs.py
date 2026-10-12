@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 
-from tabularaml.generate.forge import FeatureForge
+from tabularaml.generate.forge import FeatureForge, _tree_col_s, _TREE_CELL_S
 
 
 def _frame(n=400, seed=0):
@@ -35,3 +35,10 @@ def test_duplicated_column_names():
     A = _fit(X, y)
     assert {"a", "a.1"} <= set(A.columns)
 
+
+def test_small_wide_fits_charged_for_split_finding():
+    # 3,000 training rows: 36 us per iteration and column measured, the row term alone charged 4.8 us.
+    assert _tree_col_s(3000) > 6 * _TREE_CELL_S * 3000
+    # Large tables are charged as before.
+    for n in (30_000, 200_000):
+        assert _tree_col_s(n) == _TREE_CELL_S * n
