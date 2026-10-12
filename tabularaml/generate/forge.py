@@ -509,6 +509,15 @@ class TargetEnc(Spec):
         return out[:, 0] if self.n_out == 1 else out
 
 
+def _one_blas_thread():
+    """BLAS on one thread: a ridge fit or a PLS projection sums in an order set by the BLAS thread
+    count, so its last bits (and the picks they tip) followed the machine's core count (PLS on
+    128,000 x 24: four different results on 1, 2, 3 and 4 threads). Candidates are built on
+    several threads at once anyway."""
+    from threadpoolctl import threadpool_limits
+    return threadpool_limits(limits=1, user_api="blas")
+
+
 def _nn_algo(M) -> str:
     """kd-trees degrade sharply past ~5 dimensions; blocked brute force does not."""
     return "brute" if M.shape[1] > 5 else "auto"
@@ -3643,6 +3652,10 @@ class FeatureForge:
         computed over training plus unlabeled rows, a standard transductive
         contest trick. Target statistics only ever use labeled rows.
         """
+        with _one_blas_thread():
+            return self._fit(X, y, X_unlabeled)
+
+    def _fit(self, X: pd.DataFrame, y, X_unlabeled: Optional[pd.DataFrame] = None):
         self._t0 = time.time()
         self._work = 0.0
         self._deadline = None
@@ -4980,6 +4993,10 @@ class FeatureForge:
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Add features to new rows using statistics from all training rows."""
+        with _one_blas_thread():
+            return self._transform(X)
+
+    def _transform(self, X: pd.DataFrame) -> pd.DataFrame:
         X = self._named(X)
         F = self._prep(X)
         for s in self.selected_:
