@@ -209,7 +209,8 @@ def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
         rows = np.sort(np.random.default_rng(seed).choice(rows, max_rows, replace=False))
     binary = (task or ("binary" if y.nunique() == 2 else "regression")) == "binary"
     P = dict(objective="binary" if binary else "regression", learning_rate=0.1, num_leaves=31,
-             min_child_samples=50, feature_fraction=0.5, verbose=-1, num_threads=4, seed=seed)
+             min_child_samples=50, feature_fraction=0.5, verbose=-1, num_threads=4, seed=seed,
+             deterministic=True, force_col_wise=True)  # histogram mode not chosen by timing (load)
     split = (StratifiedKFold(3, shuffle=True, random_state=seed).split(rows, yv[rows]) if binary
              else KFold(3, shuffle=True, random_state=seed).split(rows))
     gains = []
@@ -500,7 +501,8 @@ def main():
         del srcs
         obj = dict(objective="multiclass", num_class=len(labels)) if labels is not None else \
             dict(objective="binary" if y.nunique() == 2 else "regression")
-        params = dict(obj, learning_rate=0.1, num_leaves=31, feature_fraction=0.5, verbose=-1)
+        params = dict(obj, learning_rate=0.1, num_leaves=31, feature_fraction=0.5, verbose=-1,
+                      deterministic=True, force_col_wise=True)  # histogram mode not chosen by timing (load)
         # Bin first and drop the matrix before boosting: LightGBM keeps only its binned copy.
         ds = lgb.Dataset(M, log_y(y) if a.log_target else y, feature_name=names, categorical_feature=cats,
                          params=params).construct()

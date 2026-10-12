@@ -273,7 +273,10 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
     is_test = pd.Index(test_keys).get_indexer(k) >= 0
     pred = np.full(len(df), np.nan)
     P = dict(objective=task, learning_rate=0.1, num_leaves=63, min_data_in_leaf=200, feature_fraction=0.8,
-             bagging_fraction=0.8, bagging_freq=1, verbose=-1, seed=seed, num_threads=4)
+             bagging_fraction=0.8, bagging_freq=1, verbose=-1, seed=seed, num_threads=4,
+             # Not left to LightGBM's timing of row- against column-wise histograms, which
+             # depends on the machine's load and sums in a different order.
+             deterministic=True, force_col_wise=True)
 
     def fit(rows):
         if len(rows) > max_rows:
