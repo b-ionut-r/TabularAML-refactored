@@ -352,44 +352,69 @@ if a.contest in HELDBACK and a.arm == 'ff' and not os.environ.get('HELDBACK_FF')
 # Arrow's own allocator keeps freed pages for reuse (GBs after reading a wide parquet); the system one returns them.
 try: import pyarrow as pa; pa.set_memory_pool(pa.system_memory_pool())
 except ImportError: pass
-P = globals()[f'prep_{a.contest}']()
-if a.arm == 'prep':  # shapes only: no model, no label statistics
-    print(dict(contest=a.contest, rows=len(P['X']), cols=P['X'].shape[1], held_out=int(P['ho'].sum()),
-               tables={k: v[0].shape for k, v in P.get('tables', {}).items()}))
-    sys.exit()
-X, y, ho = P['X'], np.asarray(P['y'], float), P['ho']
-Xtr, Xte = X[~ho].reset_index(drop=True), X[ho].reset_index(drop=True)
-del X; P['X'] = None  # every arm works from the two halves; the joint frame is a third copy
-ytr, yte = y[~ho], y[ho]
-if a.shuffle:
-    ytr = np.random.default_rng(a.perm).permutation(ytr)  # read several perms (3-5) on rare-positive contests
-t0 = time.time()
-idc = P.get('id')
-if a.arm == 'hand':
-    _hf = globals()[f'hand_{a.contest}']
-    if getattr(_hf, 'rowwise', False):  # per-row features: no joint copy of a wide frame
-        Xtr, Xte = _hf(Xtr), _hf(Xte)
-    else:
-        _H = _hf(pd.concat([Xtr, Xte], ignore_index=True))
-        Xtr, Xte = _H.iloc[:len(Xtr)].reset_index(drop=True), _H.iloc[len(Xtr):].reset_index(drop=True); del _H
-if a.arm == 'ff':
-    tmp = Path(tempfile.mkdtemp(dir='/home/user/tmp'))
+import gc, pyarrow.parquet as pq
+
+
+def _trim():
+    gc.collect()
+    try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)  # hand freed pages back to the OS
+    except OSError: pass
+
+
+# The FF arm's build and judge run in this same process re-executed (BENCH_JUDGE_FROM): the prep leaves ~2 GB of
+# heap behind that no trim returns, and on the wide case (4k+ columns) that is the margin between fitting and the kill.
+JUDGE = os.environ.get('BENCH_JUDGE_FROM')
+if JUDGE:
+    tmp = Path(JUDGE); meta = json.loads((tmp / 'judge.json').read_text())
+    t0, idc, task, n_class, is_time = meta['t0'], meta['id'], meta['task'], meta['n_class'], meta['time']
+    ytr = np.load(tmp / 'ytr.npy')
     try:
-        Xtr.assign(__y=ytr).to_parquet(tmp / 'train.parquet'); Xte.to_parquet(tmp / 'test.parquet')
-        cmd = [sys.executable, str(Path(a.repo) / 'scripts' / 'contest_features.py'), '--train', str(tmp / 'train.parquet'),
-               '--test', str(tmp / 'test.parquet'), '--target', '__y', '--task', P['task'], '--budget', a.budget,
-               '--out-dir', str(tmp / 'out')] + (['--id', idc] if idc else [])
-        for name, (tab, key, tcol) in P.get('tables', {}).items():
-            tab.to_parquet(tmp / f'{name}.parquet'); cmd += ['--table', f'{name}={tmp / (name + ".parquet")}:{key}' + (f':{tcol}' if tcol else '')]
-        # The frames are on disk now: free this process's copies so FeatureForge gets the box.
-        del Xtr, Xte; P.pop('tables', None); tab = None; import gc; gc.collect()
-        try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)  # hand freed pages back to the OS
-        except OSError: pass
-        subprocess.run(cmd + (a.extra.split() if a.extra else []), check=True, cwd=a.repo)
+        if not (tmp / 'out' / 'train_features.parquet').exists():
+            subprocess.run(meta['cmd'], check=True, cwd=a.repo)
+        if os.environ.get('BENCH_KEEP_FF_OUT'):  # keep FeatureForge's output to rerun the judge without the build
+            shutil.copytree(tmp / 'out', os.environ['BENCH_KEEP_FF_OUT'], dirs_exist_ok=True)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True); raise
-fe_t = time.time() - t0
-import pyarrow.parquet as pq
+    fe_t = meta.get('fe_t', time.time() - t0)
+else:
+    P = globals()[f'prep_{a.contest}']()
+    if a.arm == 'prep':  # shapes only: no model, no label statistics
+        print(dict(contest=a.contest, rows=len(P['X']), cols=P['X'].shape[1], held_out=int(P['ho'].sum()),
+                   tables={k: v[0].shape for k, v in P.get('tables', {}).items()}))
+        sys.exit()
+    X, y, ho = P['X'], np.asarray(P['y'], float), P['ho']
+    Xtr, Xte = X[~ho].reset_index(drop=True), X[ho].reset_index(drop=True)
+    del X; P['X'] = None  # every arm works from the two halves; the joint frame is a third copy
+    ytr, yte = y[~ho], y[ho]
+    if a.shuffle:
+        ytr = np.random.default_rng(a.perm).permutation(ytr)  # read several perms (3-5) on rare-positive contests
+    t0 = time.time()
+    idc, task, n_class, is_time = P.get('id'), P['task'], P.get('n_class'), bool(P.get('time'))
+    if a.arm == 'hand':
+        _hf = globals()[f'hand_{a.contest}']
+        if getattr(_hf, 'rowwise', False):  # per-row features: no joint copy of a wide frame
+            Xtr, Xte = _hf(Xtr), _hf(Xte)
+        else:
+            _H = _hf(pd.concat([Xtr, Xte], ignore_index=True))
+            Xtr, Xte = _H.iloc[:len(Xtr)].reset_index(drop=True), _H.iloc[len(Xtr):].reset_index(drop=True); del _H
+    if a.arm == 'ff':
+        tmp = Path(tempfile.mkdtemp(dir='/home/user/tmp'))
+        try:
+            Xtr.assign(__y=ytr).to_parquet(tmp / 'train.parquet'); Xte.to_parquet(tmp / 'test.parquet')
+            cmd = [sys.executable, str(Path(a.repo) / 'scripts' / 'contest_features.py'), '--train', str(tmp / 'train.parquet'),
+                   '--test', str(tmp / 'test.parquet'), '--target', '__y', '--task', task, '--budget', a.budget,
+                   '--out-dir', str(tmp / 'out')] + (['--id', idc] if idc else [])
+            for name, (tab, key, tcol) in P.get('tables', {}).items():
+                tab.to_parquet(tmp / f'{name}.parquet'); cmd += ['--table', f'{name}={tmp / (name + ".parquet")}:{key}' + (f':{tcol}' if tcol else '')]
+            np.save(tmp / 'ytr.npy', ytr)
+            (tmp / 'judge.json').write_text(json.dumps(dict(t0=t0, id=idc, task=task, n_class=n_class, time=is_time,
+                                                            cmd=cmd + (a.extra.split() if a.extra else []))))
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True); raise
+        # The inputs are on disk: FeatureForge and then the judge run from a fresh image of this process.
+        sys.stdout.flush(); sys.stderr.flush()
+        os.execve(sys.executable, [sys.executable, str(Path(sys.argv[0]).resolve())] + sys.argv[1:], dict(os.environ, BENCH_JUDGE_FROM=str(tmp)))
+    fe_t = time.time() - t0
 
 
 def _conv(Ftr, Fte):
@@ -406,67 +431,80 @@ def _conv(Ftr, Fte):
 
 
 # The judge is fed the matrix LightGBM's pandas path would build from these frames (category codes, -1 -> NaN,
-# its dtype rule), as numpy. The FF arm's output (4k+ columns on the wide case, 4 GB per copy) is read from its
-# parquet a block of columns at a time straight into that matrix, so it never exists as a whole frame as well.
+# its dtype rule), as numpy, filled one column at a time and built afresh for each fit, so only the Dataset being
+# constructed owns one. The FF arm's output (4k+ columns on the wide case, 4 GB per copy) is read from its parquet
+# 256 columns at a time straight into that matrix, so it never exists as a whole frame. Same values, same models.
 _lt = lambda t: np.float64 if isinstance(t, pd.CategoricalDtype) or pd.api.types.is_datetime64_any_dtype(t) or \
     not pd.api.types.is_numeric_dtype(t) else t.type
-if a.arm == 'ff':
+if JUDGE:
     _ftr, _fte = tmp / 'out' / 'train_features.parquet', tmp / 'out' / 'test_features.parquet'
     _sch = pq.read_schema(_ftr).empty_table().to_pandas()
     cols = [c for c in _sch.columns if c != '__y' and c != idc]
     dts = [_sch[c].dtype for c in cols]
     n_tr, n_te = pq.read_metadata(_ftr).num_rows, pq.read_metadata(_fte).num_rows
     _rd = lambda f, cs: pq.read_table(f, columns=cs).to_pandas(self_destruct=True, split_blocks=True)
-    blocks = lambda: ((_rd(_ftr, cols[i:i + 256]), _rd(_fte, cols[i:i + 256])) for i in range(0, len(cols), 256))
+    blocks = lambda: (_conv(_rd(_ftr, cols[i:i + 256]), _rd(_fte, cols[i:i + 256])) for i in range(0, len(cols), 256))
 else:
     if idc:
         Xtr, Xte = Xtr.drop(columns=[idc], errors='ignore'), Xte.drop(columns=[idc], errors='ignore')
     cols, dts, n_tr, n_te = list(Xtr.columns), list(Xtr.dtypes), len(Xtr), len(Xte)
-    _blk = [(Xtr, Xte)]; del Xtr, Xte
-    blocks = lambda: (_blk.pop() for _ in range(1))
+    Xtr, Xte = _conv(Xtr, Xte)
+    blocks = lambda: iter([(Xtr, Xte)])
 _tdt = np.result_type(*[_lt(t) for t in dts], np.float32)
-names, cat_cols = [str(c) for c in cols], []
-Atr, Ate = np.empty((n_tr, len(cols)), dtype=_tdt, order='F'), np.empty((n_te, len(cols)), dtype=_tdt, order='F')
-j = 0
-for Ftr, Fte in blocks():
-    Ftr, Fte = _conv(Ftr, Fte)
-    for c in Ftr.columns:
-        for F, A in ((Ftr, Atr), (Fte, Ate)):
+names = [str(c) for c in cols]
+
+
+def _fill(rows=None, test=False):
+    """Train rows `rows` (all when None) or the test rows, as the column-major matrix LightGBM gets."""
+    A = np.empty((n_te if test else n_tr if rows is None else len(rows), len(cols)), dtype=_tdt, order='F'); j = 0
+    for Ftr, Fte in blocks():
+        F = Fte if test else Ftr
+        for c in F.columns:
             v = F[c]
             if isinstance(v.dtype, pd.CategoricalDtype):
                 v = v.cat.codes.to_numpy().astype(np.float64); v[v == -1] = np.nan
             else:
                 v = v.to_numpy(dtype=_tdt, na_value=np.nan)
-            A[:, j] = v
-        if isinstance(Ftr[c].dtype, pd.CategoricalDtype) and not Ftr[c].cat.ordered:
-            cat_cols.append(str(c))
-        j += 1
-    del Ftr, Fte
-assert j == len(cols)
-if a.arm == 'ff':
-    shutil.rmtree(tmp, ignore_errors=True)
-import gc; gc.collect()
-try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)
-except OSError: pass
+            A[:, j] = v if rows is None else v[rows]; j += 1
+        del Ftr, Fte, F
+    assert j == len(cols)
+    if os.environ.get('BENCH_MEM_LOG'):
+        print('judge matrix', A.shape, 'rss %.2f GB' % (int(open('/proc/self/status').read().split('VmRSS:')[1].split()[0]) / 2 ** 20), flush=True)
+    return A
+
+
+cat_cols = []
+for Ftr, _ in blocks():
+    cat_cols += [str(c) for c in Ftr.columns if isinstance(Ftr[c].dtype, pd.CategoricalDtype) and not Ftr[c].cat.ordered]
+del Ftr, _
+_trim()
 import lightgbm as lgb
-obj = {'binary': 'binary', 'multiclass': 'multiclass'}.get(P['task'], 'regression')
-Pm = dict(objective=obj, **({'num_class': P['n_class']} if obj == 'multiclass' else {}), learning_rate=0.05, num_leaves=63, min_child_samples=20 if n_tr < 5000 else 100,
+obj = {'binary': 'binary', 'multiclass': 'multiclass'}.get(task, 'regression')
+Pm = dict(objective=obj, **({'num_class': n_class} if obj == 'multiclass' else {}), learning_rate=0.05, num_leaves=63, min_child_samples=20 if n_tr < 5000 else 100,
           feature_fraction=0.5, bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, num_threads=4, verbose=-1,
           max_cat_to_onehot=8, cat_smooth=50)
 n = n_tr
-if P.get('time'):
+if is_time:
     fit, va = np.arange(int(0.85 * n)), np.arange(int(0.85 * n), n)
 else:
     perm = np.random.default_rng(a.seed + 1).permutation(n); fit, va = np.sort(perm[:int(0.85 * n)]), np.sort(perm[int(0.85 * n):])
 _ds = lambda A, y: lgb.Dataset(A, y, feature_name=names, categorical_feature=cat_cols, free_raw_data=True)
-n_cols = len(cols)
-d_fit = _ds(Atr[fit], ytr[fit]); d_va = _ds(Atr[va], ytr[va])  # built by lgb.train with Pm, as before
-b = lgb.train(dict(Pm, seed=0), d_fit, 5000, valid_sets=[d_va], callbacks=[lgb.early_stopping(200, verbose=False)])
-del d_fit, d_va
-p = np.zeros((len(Ate), P['n_class']) if obj == 'multiclass' else len(Ate))
+b = lgb.train(dict(Pm, seed=0), _ds(_fill(fit), ytr[fit]), 5000, valid_sets=[_ds(_fill(va), ytr[va])],  # built by lgb.train with Pm
+              callbacks=[lgb.early_stopping(200, verbose=False)])
+best_it = b.best_iteration; del b; _trim()
+models = []
 for s in range(3):
-    p += lgb.train(dict(Pm, seed=s), _ds(Atr, ytr), int(b.best_iteration * 1.1) + 1).predict(Ate) / 3
+    models.append(lgb.train(dict(Pm, seed=s), _ds(_fill(), ytr), int(best_it * 1.1) + 1)); _trim()
+Ate = _fill(test=True)
+p = np.zeros((n_te, n_class) if obj == 'multiclass' else n_te)
+for m in models:
+    p += m.predict(Ate) / 3
+del Ate, models, blocks; _trim()
+if JUDGE:  # the labels and the metric come from the prep, run now that the judge's memory is free
+    P = globals()[f'prep_{a.contest}'](); yte = np.asarray(P['y'], float)[P['ho']]; P['X'] = None
 res = dict(contest=a.contest, arm=a.arm + (f'_shuffled{a.perm or ""}' if a.shuffle else ''), seed=a.seed, metric=P['metric'],
-           score=P['score'](yte, p), n_tr=len(Atr), n_te=len(Ate), n_cols=n_cols, best_it=b.best_iteration,
+           score=P['score'](yte, p), n_tr=n_tr, n_te=n_te, n_cols=len(cols), best_it=best_it,
            fe_s=round(fe_t), total_s=round(time.time() - t0))
+if JUDGE:
+    shutil.rmtree(tmp, ignore_errors=True)
 print('RESULT', json.dumps(res)); open(a.log, 'a').write(json.dumps(res) + '\n')
