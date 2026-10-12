@@ -2638,7 +2638,8 @@ class FeatureForge:
         used instead of ``X`` (then None); an optional fourth item picks the matrix's
         columns, so no full copy of the selected columns is kept.
         ``give_up`` (work-clock seconds): when the fit's cost (``_cv_cost``) is larger, return None
-        without fitting, keeping the cost in ``_cv_projected``.
+        without fitting, keeping the cost in ``_cv_projected``; likewise, after any fold, when the
+        folds fitted so far, per fold, price the whole fit above it.
         """
         import lightgbm as lgb
         M, cats, cols, *pick = mat if mat is not None else (*self._lgb_matrix(X), list(X.columns))
@@ -2695,6 +2696,14 @@ class FeatureForge:
                 fold_cost = _tree_col_s(len(tr)) * b.current_iteration() * width * (self.n_classes_ if self.task_ == "multiclass" else 1)
                 self._last_cv_cost += fold_cost
                 self._charge(fold_cost)
+                done = r_i * len(folds) + f_i + 1
+                if give_up and done < n_fits and self._last_cv_cost / done * n_fits > give_up:
+                    # Priced from the folds fitted so far, the fit would be discarded for one on fewer
+                    # rows (Expedia 3%: 803 s of wall time on 510k rows, all of it thrown away).
+                    self._cv_projected = self._last_cv_cost / done * n_fits
+                    D = b = None
+                    _trim_heap()
+                    return None
                 oof[va] = b.predict(Mva, num_iteration=b.best_iteration, raw_score=True)
                 imp += pd.Series(b.feature_importance("gain"), index=cols)
                 if mine:
