@@ -138,6 +138,11 @@ def _as_str_frame_col(s: pd.Series) -> pd.Series:
     return _as_str(s)
 
 
+# Resident memory beyond the data frames (the interpreter, numpy, pandas, scikit-learn, LightGBM,
+# Arrow's pool after reading the files): 0.63-0.73 GB on an Avazu-shaped table (_mem_rows).
+_BASE_RSS = 0.8e9
+
+
 def _renumbered(X: pd.DataFrame) -> pd.DataFrame:
     """``X.reset_index(drop=True)`` without copying the data: a shallow copy whose columns are
     replaced, never written into, by what follows (Bosch: a second copy of a 4,264-column frame
@@ -3529,6 +3534,9 @@ class FeatureForge:
         X = _renumbered(self._named(X))
         if X_unlabeled is not None:
             X_unlabeled = self._named(X_unlabeled)
+        # The caller's frames, which stay in memory through the fit (see _mem_rows).
+        self._in_bytes = sum(float(F.memory_usage(index=True, deep=True).sum())
+                             for F in (X, X_unlabeled) if F is not None)
         y = pd.Series(np.asarray(y))
         self.model_width_ = X.shape[1] + 3 * self.max_new_features   # widest frame a model sees
         self.n_synthetic_ = 0
@@ -3720,7 +3728,8 @@ class FeatureForge:
         mu = X.memory_usage(index=False, deep=False)
         all_rows = float(mu[[c for c in self.raw_cols_ if c in mu.index]].sum()) * (
             1 + (0 if X_unlabeled is None else len(X_unlabeled) / max(len(X), 1)))
-        mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows)
+        mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows,
+                                 held=self._in_bytes + float(X.memory_usage(index=True, deep=False).sum()))
         if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
             self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
@@ -4056,12 +4065,18 @@ class FeatureForge:
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s ({self._work:.0f}s of work)")
         return self
 
-    def _mem_rows(self, n_cols, share=0.3, fixed=0.0):
+    def _mem_rows(self, n_cols, share=0.3, fixed=0.0, held=0.0):
         """Search rows whose candidate columns, their build-time copies and the model's matrix
-        (float32) fit in ``share`` of the memory still free under the limit (the container's
-        cgroup limit when set), or None when it is unknown. Malware: about 6 KB per search row
-        in the first round on top of the 7 GB its tables already take. ``fixed``: bytes needed
-        whatever the search rows."""
+        (float32) fit in ``share`` of the memory left under the limit (the container's cgroup
+        limit when set), or None when it is unknown. Malware: about 6 KB per search row in the
+        first round on top of the 7 GB its tables already take. ``fixed``: bytes needed whatever
+        the search rows. ``held``: bytes the data already takes (the caller's frames and the
+        fit's own), which with ``_BASE_RSS`` for the interpreter and its libraries stands in for
+        the memory in use: read live, it moved the cap, and every pick after it, from run to run
+        of one commit (TalkingData: 919,814 vs 920,499 search rows, 40 minutes apart). The
+        result is rounded down to two significant digits. The live reading remains a guard:
+        when the rows would take more than twice ``share`` of what is actually free, they are
+        cut to that, and the log says so."""
         lim = []
         for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
             try:
@@ -4079,7 +4094,17 @@ class FeatureForge:
         if not lim:
             return None
         keep = min(80, 3 * self.max_new_features)
-        return int(share * max(min(lim) - rss - fixed, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
+        row = 4 * (16 * keep + 2 * n_cols + 16)
+        n = int(share * max(min(lim) - _BASE_RSS - held - fixed, 0) / row)
+        if n >= 100:
+            step = 10 ** (len(str(n)) - 2)
+            n = n // step * step
+        live = int(2 * share * max(min(lim) - rss - fixed, 0) / row) if rss else n
+        if live < n:
+            self._log(f"memory guard: {n} search rows would not fit in the memory free now; cut to {live} "
+                      f"(this run's rows, and the picks after them, depend on the memory in use)")
+            n = live
+        return n
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
