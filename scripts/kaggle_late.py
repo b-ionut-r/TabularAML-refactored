@@ -141,7 +141,7 @@ for _c, _base in [("ross", "ross_fc"), ("fav", "fav"), ("m5", "m5"), ("sct", "sc
 CONTESTS["ieee_ea"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_ea185ae")
 # Clock fix: label-free families first in a rescue the budget cannot pay for (f78dffb, on dde2778).
 CONTESTS["ieee_rs"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_f78dffb")
-CONTESTS["sct_rs"] = dict(CONTESTS["sct"], raw="sct", repo="/tmp/claude-0/wt_b_f78dffb", base="sct")
+CONTESTS["sct_hd"] = dict(CONTESTS["sct"], raw="sct", repo="/tmp/claude-0/wt_b_eb43cc4", base="sct")
 CONTESTS["sct_dd"] = dict(CONTESTS["sct"], raw="sct", repo="/tmp/claude-0/wt_b_dde2778", base="sct")
 
 
