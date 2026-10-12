@@ -1767,7 +1767,10 @@ class CrossLinearOOF(Spec):
         if self.n_classes == 0:
             return Ridge(alpha=3.0, solver="sparse_cg")
         if self.n_classes > 2:
-            return LogisticRegression(C=0.5, max_iter=300)
+            # Multinomial lbfgs costs a full pass over rows x classes per iteration and needs hundreds of them on a
+            # wide one-hot design (100 classes: ~9 s an iteration on 170k rows); a few seeded SAGA epochs reach a
+            # lower held-out loss at a fixed cost.
+            return LogisticRegression(C=0.5, solver="saga", tol=1e-3, max_iter=10, random_state=0)
         # Wide one-hot designs solve much faster in the dual.
         return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0], random_state=0)
 
