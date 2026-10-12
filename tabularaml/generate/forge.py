@@ -388,6 +388,19 @@ class Count(Spec):
         return self.table_.reindex(k).fillna(0).to_numpy(dtype=float)
 
 
+class _OneHot:
+    """``np.eye(n)[y]`` for TargetEnc, kept as the labels: it is only ever summed per key."""
+
+    def __init__(self, y: np.ndarray, n: int):
+        self.y, self.n = y, n
+
+    def __getitem__(self, idx):
+        return _OneHot(self.y[idx], self.n)
+
+    def __len__(self):
+        return len(self.y)
+
+
 class TargetEnc(Spec):
     """Smoothed target mean of a key (or key pair); out-of-fold on training rows."""
     target_dep = True
@@ -401,22 +414,40 @@ class TargetEnc(Spec):
     def _targets(self, y):
         y = np.asarray(y, dtype=float)
         if self.n_out > 1:
-            return np.eye(self.n_classes)[y.astype(int)]
+            return _OneHot(y.astype(int), self.n_classes)
         return y[:, None]
 
     def _stats(self, k, Y):
+        if isinstance(Y, _OneHot):
+            # Per-key sums of one-hot rows are class counts: counted directly, the same
+            # numbers without the rows x classes matrix (a hundred classes over 637k rows is
+            # half a gigabyte per copy, and every fold took several).
+            keys, inv = np.unique(k, return_inverse=True)
+            n_k = len(keys)
+            sums = np.bincount(inv * Y.n + Y.y, minlength=n_k * Y.n).reshape(n_k, Y.n).astype(float)
+            prior = np.bincount(Y.y, minlength=Y.n) / len(Y.y)
+            return (pd.DataFrame(sums, index=pd.Index(keys, name="_k")),
+                    pd.Series(np.bincount(inv, minlength=n_k), index=pd.Index(keys, name="_k")), prior)
         frame = pd.DataFrame(Y)
         frame["_k"] = k
         g = frame.groupby("_k")
         return g.sum(), g.size(), Y.mean(axis=0)
 
     def _apply(self, k, sums, counts, prior):
-        s = sums.reindex(k).to_numpy()
-        c = counts.reindex(k).to_numpy(dtype=float)[:, None]
-        s = np.where(np.isnan(s), 0.0, s)
-        c = np.where(np.isnan(c), 0.0, c)
-        out = (s + TE_SMOOTHING * prior) / (c + TE_SMOOTHING)
-        return out[:, 0] if self.n_out == 1 else out
+        pos = sums.index.get_indexer(k)
+        miss = pos < 0
+        if len(sums) == 0:
+            pos = np.zeros(len(k), dtype=np.intp)
+            sums, counts = pd.DataFrame(np.zeros((1, sums.shape[1]))), pd.Series([0.0])
+        s = sums.to_numpy(dtype=float)[pos]
+        c = counts.to_numpy(dtype=float)[pos][:, None]
+        s[miss] = np.nan
+        c[miss] = np.nan
+        s[np.isnan(s)] = 0.0
+        c[np.isnan(c)] = 0.0
+        s += TE_SMOOTHING * prior
+        s /= c + TE_SMOOTHING
+        return s[:, 0] if self.n_out == 1 else s
 
     def fit(self, df, y, ctx):
         k = self._fit_codes(df)
