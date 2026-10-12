@@ -137,6 +137,8 @@ CONTESTS["ieee_t"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_det2")
 CONTESTS["hc_t"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_76132f0", base="hc")
 for _c, _base in [("ross", "ross_fc"), ("fav", "fav"), ("m5", "m5"), ("sct", "sct"), ("porto", "porto")]:
     CONTESTS[f"{_c}_t"] = dict(CONTESTS[_base], raw=CONTESTS[_base].get("raw", _base), repo="/tmp/claude-0/wt_b_76132f0", base=_base)
+# Round-1 head ea185ae: family budget (rescue exempt), copy fix, pins, event-gap port.
+CONTESTS["ieee_ea"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_ea185ae")
 
 
 def download(c: str) -> Path:
