@@ -4337,9 +4337,11 @@ class FeatureForge:
         if self.recode_:
             self._fit_rank_maps(X, *([] if U is None else [U]))
         folds = self._te_folds(X, y, self.random_state + 1)
+        # Shallow copies: the features below are added as new columns, never written into the
+        # raw ones, so one copy of the raw columns (the context's) serves both frames.
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
-        F = X.copy()
-        U = None if U is None else U[self.raw_cols_].copy()
+        F = X.copy(deep=False)
+        U = None if U is None else self.ctx_.extra_rows.copy(deep=False)
         for s in self.selected_:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
@@ -4755,7 +4757,12 @@ class FeatureForge:
         return X if list(X.columns) == names else X.set_axis(names, axis=1)
 
     def _recode_out(self, X):
-        out = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
+        # Without copying the data: reset_index and drop each made a deep copy of the whole frame
+        # (two extra copies of a wide float64 table, the 15 GB limit on a 1,900-column contest).
+        out = _renumbered(X)
+        for c in getattr(self, "shifted_", []):
+            if c in out.columns:
+                del out[c]
         if self.recode_:
             for c in self.rank_maps_:
                 out[c] = self._rank(out[c], c)
