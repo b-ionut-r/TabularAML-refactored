@@ -2518,6 +2518,26 @@ class FeatureForge:
         p.update(kw)
         return p
 
+    @staticmethod
+    def _sample_cap(p, n_rows, width):
+        """Dataset parameters for a matrix of ``width`` columns. The rule above sizes the bin
+        sample from the widest frame expected (raw columns plus one per new feature), but a
+        family block adds a column per member: two blocks over a 1,879-column family made the
+        joint and gate matrices ~5,700 columns, and binning them from 92k rows took ~8 GB on top
+        of everything else. The sample is cut to ~4 GB of sampled cells for the actual width;
+        where that is no fewer rows than LightGBM would sample anyway, nothing changes."""
+        cap = max(20_000, int(4e9 / (13 * max(width, 1))))
+        if cap < min(p.get("bin_construct_sample_cnt", 200_000), n_rows):
+            p = dict(p, bin_construct_sample_cnt=cap)
+        return p
+
+    def _train_params(self, D, lr=0.1, **kw):
+        """Training parameters for a prebuilt dataset: its bin sample size as it was built."""
+        p = self._lgb_params(lr, **kw)
+        if "bin_construct_sample_cnt" in (D.params or {}):
+            p["bin_construct_sample_cnt"] = D.params["bin_construct_sample_cnt"]
+        return p
+
     def _fit_eval(self, Xtr, ytr, Xva, yva, lr=0.1, rounds=2000, es=50):
         import lightgbm as lgb
         dtr = lgb.Dataset(Xtr, ytr, free_raw_data=False)
@@ -2549,13 +2569,14 @@ class FeatureForge:
         The raw matrix is not kept: kept, every row subset took its own copy of its rows."""
         import lightgbm as lgb
         M, cats = self._lgb_matrix(X)
-        return lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr)).construct()
+        return lgb.Dataset(M, np.asarray(y), categorical_feature=cats,
+                           params=self._sample_cap(self._lgb_params(lr), *M.shape)).construct()
 
     def _fit_eval_rows(self, D, tr, va, lr=0.1, rounds=2000, es=50):
         """``_fit_eval`` on row subsets of a dataset built by ``_lgb_data``."""
         import lightgbm as lgb
         dtr, dva = D.subset(np.sort(tr)), D.subset(np.sort(va))
-        return lgb.train(self._lgb_params(lr), dtr, rounds, valid_sets=[dva],
+        return lgb.train(self._train_params(D, lr), dtr, rounds, valid_sets=[dva],
                          callbacks=[lgb.early_stopping(es, verbose=False)])
 
     @staticmethod
@@ -2645,7 +2666,7 @@ class FeatureForge:
                    and list(pick) == list(range(pick[0], pick[0] + len(pick))))
             Msel = M if pick is None else M[:, pick[0]:pick[0] + len(pick)] if run else M[:, pick]
             D = lgb.Dataset(Msel, np.asarray(y), categorical_feature=cats,
-                            params=self._lgb_params(lr)).construct()
+                            params=self._sample_cap(self._lgb_params(lr), *Msel.shape)).construct()
             Msel = None
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
@@ -3979,7 +4000,8 @@ class FeatureForge:
             new = None
             import lightgbm as lgb
             # Not keeping the raw matrix: the row subsets would each copy their rows of it.
-            Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params()).construct()
+            Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j),
+                             params=self._sample_cap(self._lgb_params(), *Mj.shape)).construct()
             b = self._fit_eval_rows(Dj, idx_a, idx_b)
             del Dj
             gain = pd.Series(b.feature_importance("gain"), index=jcols)
@@ -4283,7 +4305,7 @@ class FeatureForge:
             for k, (tr, va) in enumerate(es_splits):
                 b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
                 # Refit on all search rows at the early-stopped size, then score the gate rows.
-                full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
+                full = lgb.train(self._train_params(D, 0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
                 iters += b.current_iteration() + full.current_iteration()
