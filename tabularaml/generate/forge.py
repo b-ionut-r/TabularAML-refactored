@@ -4144,13 +4144,17 @@ class FeatureForge:
             # randomness otherwise flips keep-or-drop decisions on small gates.
             D = self._lgb_data(self._model_frame(_columns(Fs, cols), recode), ys, lr=0.05)
             G, _ = self._lgb_matrix(self._model_frame(_columns(Fg, cols), recode))
-            margin = 0.0
+            margin, iters = 0.0, 0
             for k, (tr, va) in enumerate(es_splits):
                 b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
                 # Refit on all search rows at the early-stopped size, then score the gate rows.
                 full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
+                iters += b.current_iteration() + full.current_iteration()
+            # The fit's work, as a CV fold is charged (from the iterations it trained).
+            self._gate_fit_s = _TREE_CELL_S * iters * len(ys) * len(cols) * (
+                self.n_classes_ if self.task_ == "multiclass" else 1)
             D = G = b = full = None
             _trim_heap()
             return _row_loss(self.task_, yg, margin)
@@ -4219,6 +4223,7 @@ class FeatureForge:
         if self.recode_:
             cands += [(label + " native", specs, False) for label, specs in cands if specs]
         best_recode = self.recode_
+        full_ids, full_ok = {id(s) for s in self.selected_}, False
         for label, specs, *rc in cands:
             rc = rc[0] if rc else None
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
@@ -4233,6 +4238,8 @@ class FeatureForge:
                       + (f", later half {late:+.2e}" if late is not None else "") + f", need {z_needed:.2f})")
             if self.gate_by_period and zb is not None:
                 z = zb
+            if specs and {id(s) for s in specs} == full_ids and z >= z_needed and (late is None or late > 0):
+                full_ok = True
             # Time-ordered gates: the gain must still hold over the later half of the gate rows
             # (Hull Tactical, 1,086 daily gate rows: z=+1.59 overall, +2.47 / -1.35 by half;
             # held-out Pearson 0.072 -> 0.038).
@@ -4246,7 +4253,8 @@ class FeatureForge:
         # IEEE-CIS the set passed while dropping kNN and cross-linear target features
         # cut the gate loss further (0.1152 -> 0.1081) and lifted held-out AUC 0.926 -> 0.937.
         if fam_on and self.selected_:
-            best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
+            best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l,
+                                                   budgeted=full_ok)
         return best_set, raw_l, best_l
 
     def _sparse_te(self, X) -> bool:
@@ -4264,7 +4272,7 @@ class FeatureForge:
                         return True
         return False
 
-    def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
+    def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l, budgeted=False):
         """When the whole set fails the gate (or always, under an embargo), drop feature families (target encodings, group
         statistics, event recencies, ...) one at a time, each time the one whose removal helps
         the gate rows most, and keep the best remaining set if it clears the gate by one more
@@ -4284,8 +4292,12 @@ class FeatureForge:
                     have.update(sp.out_names())
             return out
 
+        spent = 0.0
+
         def score(specs):
+            nonlocal spent
             rows = gate_loss(self.raw_cols_ + [c for sp in specs for c in sp.out_names()])
+            spent += getattr(self, "_gate_fit_s", 0.0)
             d = raw_rows - rows
             yc, tg = getattr(self, "_gate_yt", (None, None))
             dw = _winsor(d, yc)
@@ -4295,7 +4307,18 @@ class FeatureForge:
             return float(rows.mean()), z
 
         cur = closed(list(self.selected_))
+        # The pass refits the gate models once per family per step (about F^2/2 fits): on a wide
+        # table each fit is minutes of work (a held-back 1,930-column contest: 1,400 s for the first
+        # step alone). When the whole set already passed the gate the pass only refines it, and it
+        # gets one search budget of work: a step starts only when its fits, at the cost of the last
+        # gate fit, still fit in what is left. When the whole set failed, the pass is a rescue
+        # (IEEE-CIS keeps nothing but anchors without it) and runs to the end.
         while len({fam(sp) for sp in cur}) > 1:
+            step = len({fam(sp) for sp in cur}) * getattr(self, "_gate_fit_s", 0.0)
+            if budgeted and self.time_budget and spent + step > self.time_budget:
+                self._log(f"  gate families: next step takes {step:.0f}s of work, {max(self.time_budget - spent, 0):.0f}s "
+                          f"left of {self.time_budget:.0f}s; pass stops")
+                break
             trials = []
             for f in sorted({fam(sp) for sp in cur}):
                 rest = closed([sp for sp in cur if fam(sp) != f])
