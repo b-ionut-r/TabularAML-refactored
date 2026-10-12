@@ -4425,6 +4425,11 @@ class FeatureForge:
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
         F = X.copy(deep=False)
         U = None if U is None else self.ctx_.extra_rows.copy(deep=False)
+        # A feature's values on the unlabeled rows are only needed here when a later feature is
+        # built from it; transform() computes them for whichever rows it is given. Neighbour
+        # features queried every unlabeled row against every training row for nothing
+        # (Santander Transaction: 335 of the final fit's 620 s, then again for the test file).
+        used = {c for s in self.selected_ for c in s.parents}
         for s in self.selected_:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
@@ -4436,7 +4441,7 @@ class FeatureForge:
                 v = s.transform(F, self.ctx_)
             else:
                 v = s.fit(F, y, self.ctx_).transform(F, self.ctx_)
-            if U is not None:
+            if U is not None and used.intersection(s.out_names()):
                 vu = s.transform(U, self.ctx_)
                 vu = np.asarray(vu, dtype=np.float32)
                 for j, col in enumerate(s.out_names()):
