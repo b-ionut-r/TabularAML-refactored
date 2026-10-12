@@ -57,6 +57,31 @@ ARITH_OPS = ("add", "sub", "mul", "div", "rdiv")
 _CV_CELL_S = 3e-7       # prior for one 5-fold CV fit, per search row and model column (before it runs)
 _TREE_CELL_S = 1.6e-9   # one boosting iteration, per training row and model column (Home Credit 320 and 120
                         # columns, 80k-197k rows, and a 100-column regression all measured 1.5-2.0e-9)
+_TREE_SPLIT_S = 1.1e-6  # one boosting iteration, per model column and leaf: split finding over a column's bins, which
+                        # no row count pays for on small tables (600 x 3,000: 11 s per 5-fold fit charged as 0.3 s, a
+                        # 20 s budget ran 210 s). Leaves grow with rows up to 31 (about one per 80 training rows).
+                        # Measured 3.1 / 14.5 / 36 us per iteration and column at 300 / 1,000 / 3,000 rows; from
+                        # about 21k rows the row term is the larger and charges are as before.
+
+
+def _unique_names(cols) -> list:
+    """Column names as strings, a repeated name numbered (``a``, ``a.1``) as pandas numbers a CSV's."""
+    out, seen = [], set()
+    for c in cols:
+        name, k = str(c), 0
+        while name in seen:
+            k += 1
+            name = f"{c}.{k}"
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _tree_col_s(n_rows: int) -> float:
+    """Work of one boosting iteration on one model column of ``n_rows`` training rows."""
+    return max(_TREE_CELL_S * n_rows, _TREE_SPLIT_S * min(31.0, n_rows / 80))
+
+
 _ROW_PASS_S = 2e-7      # building and screening one candidate of unit cost, per row (thread time)
 _PAIR_CELL_S = 2e-7     # pair scan, per subsample row and candidate column
 _KEY_ROW_S = 1.5e-7     # entity-anchor test, per sampled row and key count
@@ -2188,7 +2213,7 @@ class FeatureForge:
 
     @staticmethod
     def _cv_cost(n_rows: int, n_cols: int, n_fits: int) -> float:
-        return _CV_CELL_S * n_rows * max(n_cols, 1) * n_fits / 5
+        return _CV_CELL_S / _TREE_CELL_S * _tree_col_s(n_rows) * max(n_cols, 1) * n_fits / 5
 
     def _threads(self) -> int:
         import os
@@ -2423,7 +2448,7 @@ class FeatureForge:
                     b = lgb.train(self._lgb_params(lr), dtr, 2000, valid_sets=[dva],
                                   callbacks=[lgb.early_stopping(50, verbose=False)])
                     del Mtr, dtr, dva
-                fold_cost = _TREE_CELL_S * b.current_iteration() * len(tr) * width * (self.n_classes_ if self.task_ == "multiclass" else 1)
+                fold_cost = _tree_col_s(len(tr)) * b.current_iteration() * width * (self.n_classes_ if self.task_ == "multiclass" else 1)
                 self._last_cv_cost += fold_cost
                 self._charge(fold_cost)
                 oof[va] = b.predict(Mva, num_iteration=b.best_iteration, raw_score=True)
@@ -3283,7 +3308,11 @@ class FeatureForge:
         self._deadline = None
         self.wide_ = []
         self.addons_ = {}
-        X = X.reset_index(drop=True)
+        # Column names as unique strings (integer names broke sorting, a repeated name made pandas return a frame
+        # where a column was expected); transform renames new rows' columns the same way.
+        X = self._named(X).reset_index(drop=True)
+        if X_unlabeled is not None:
+            X_unlabeled = self._named(X_unlabeled)
         y = pd.Series(np.asarray(y))
         self.model_width_ = X.shape[1] + 3 * self.max_new_features   # widest frame a model sees
         self.n_synthetic_ = 0
@@ -4492,6 +4521,7 @@ class FeatureForge:
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Add features to new rows using statistics from all training rows."""
+        X = self._named(X)
         F = self._prep(X)
         for s in self.selected_:
             v = s.transform(F, self.ctx_)
@@ -4502,6 +4532,11 @@ class FeatureForge:
             out[c] = F[c].astype(np.float32).to_numpy()
         return out
 
+    @staticmethod
+    def _named(X: pd.DataFrame) -> pd.DataFrame:
+        names = _unique_names(X.columns)
+        return X if list(X.columns) == names else X.set_axis(names, axis=1)
+
     def _recode_out(self, X):
         out = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         if self.recode_:
@@ -4511,7 +4546,7 @@ class FeatureForge:
 
     def transform_train(self, X: pd.DataFrame) -> pd.DataFrame:
         """Training rows with features as fitted (target encodings out-of-fold)."""
-        out = self._recode_out(X)
+        out = self._recode_out(self._named(X))
         if len(out) != len(self._train_frame):
             raise ValueError("transform_train expects the exact frame passed to fit")
         for c in self.new_columns_:
