@@ -143,6 +143,27 @@ def _as_str_frame_col(s: pd.Series) -> pd.Series:
 _BASE_RSS = 0.8e9
 
 
+def _permute_columns(M: np.ndarray, perm) -> None:
+    """Reorder a column-major matrix's columns in place (column i takes old column perm[i]),
+    one column of scratch memory: cycle by cycle, each column is one contiguous copy."""
+    done = np.zeros(M.shape[1], dtype=bool)
+    tmp = np.empty(M.shape[0], dtype=M.dtype)
+    for s in range(M.shape[1]):
+        if done[s] or perm[s] == s:
+            done[s] = True
+            continue
+        tmp[:] = M[:, s]
+        i = s
+        while True:
+            done[i] = True
+            j = perm[i]
+            if j == s:
+                M[:, i] = tmp
+                break
+            M[:, i] = M[:, j]
+            i = j
+
+
 def _renumbered(X: pd.DataFrame) -> pd.DataFrame:
     """``X.reset_index(drop=True)`` without copying the data: a shallow copy whose columns are
     replaced, never written into, by what follows (Bosch: a second copy of a 4,264-column frame
@@ -2618,9 +2639,14 @@ class FeatureForge:
         D = None
         if not specs:
             # One binned dataset; folds train on its row subsets. The raw matrix is not kept:
-            # validation rows are read from ``M`` again.
-            D = lgb.Dataset(M if pick is None else M[:, pick], np.asarray(y), categorical_feature=cats,
+            # validation rows are read from ``M`` again. A run of a column-major matrix's columns is
+            # passed as it is (LightGBM reads it in place; same bins, same model), not copied.
+            run = (pick is not None and M.flags.f_contiguous and len(pick) > 0
+                   and list(pick) == list(range(pick[0], pick[0] + len(pick))))
+            Msel = M if pick is None else M[:, pick[0]:pick[0] + len(pick)] if run else M[:, pick]
+            D = lgb.Dataset(Msel, np.asarray(y), categorical_feature=cats,
                             params=self._lgb_params(lr)).construct()
+            Msel = None
         for r_i, folds in enumerate(repeats):
             oof = np.zeros_like(oof_mean)
             for f_i, (tr, va) in enumerate(folds):
@@ -3938,7 +3964,9 @@ class FeatureForge:
             new = list(dict(new).items())  # one column per name, last wins (as column assignment)
             base_cols = Mw[2]
             jcols = base_cols + [c for c, _ in new if c not in set(base_cols)]
-            Mj = np.empty((len(W), len(jcols)), dtype=np.float32)
+            # Column-major: a run of its columns is a matrix LightGBM reads without a copy (see the
+            # prefix ladder below).
+            Mj = np.empty((len(W), len(jcols)), dtype=np.float32, order="F")
             Mj[:, :len(base_cols)] = Mw[0]
             jpos = {c: i for i, c in enumerate(jcols)}
             for c, v in new:
@@ -3963,6 +3991,14 @@ class FeatureForge:
 
             rank = sorted(survivors, key=lambda nm: -sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()))
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
+            # Survivors' columns in gain order right after the current features: every gain prefix is
+            # then a run of the joint matrix's columns, which the ladder's fits read in place instead
+            # of each copying their columns (5,700 columns over 92,800 rows on a wide table: 2.1 GB
+            # per fit, next to the joint matrix itself).
+            lead = list(dict.fromkeys(list(base_cols) + [c for nm in rank for c in spec_by_name[nm].out_names()]))
+            order_j = lead + [c for c in jcols if c not in set(lead)]
+            _permute_columns(Mj, [jpos[c] for c in order_j])
+            jpos = {c: i for i, c in enumerate(order_j)}
 
             nested = None
             if self.nested_cv is True or (self.nested_cv == "auto" and self.time_col_ is not None and self.time_cv):
