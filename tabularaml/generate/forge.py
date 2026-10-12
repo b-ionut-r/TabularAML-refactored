@@ -2232,6 +2232,10 @@ class FeatureForge:
         starts the same time after the search rows; there a family that leans on the latest
         labelled rows (neighbours' labels, cross-linear key models on IEEE-CIS) fails while the
         client encodings and profiles still carry over.
+    label_cols : sequence of str
+        Columns of ``X`` computed from the labels before ``fit`` (out-of-fold model scores of
+        child rows, outcome histories of an event log): held like label-echo columns, in
+        same-row features only.
     label_echo : bool
         Find columns that carry earlier rows' labels (running means or counts of past
         answers in an event log: within an entity, or a pair of entities such as student and
@@ -2360,7 +2364,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -2402,6 +2406,7 @@ class FeatureForge:
         self.gate_by_period = gate_by_period
         self.family_time_share = family_time_share
         self.label_echo = label_echo
+        self.label_cols = label_cols
         self.gate_wide = gate_wide
         self.gate_families = gate_families
         self.past_te = past_te
@@ -2715,9 +2720,14 @@ class FeatureForge:
         time_keys = {self.time_col_, self.group_col_, *self.date_cols_, *getattr(self, "time_like_", [])} - {None}
 
         time_cols = {self.time_col_, *self.date_cols_} - {None}
+        # Label echoes, target features and anything built on either: same-row features only. A
+        # group statistic of out-of-fold target encodings reads other rows' encodings, which were
+        # fitted on this row's label (Avazu: group means of products of two encodings over
+        # device_ip took search CV from 0.379 to 0.283 while the gate's held-out loss rose from
+        # 0.378 to 0.448).
         echo = set(getattr(self, "echo_cols_", ()))
         for sp in selected:
-            if echo & set(sp.parents):
+            if sp.target_dep or echo & set(sp.parents):
                 echo |= set(sp.out_names()) | {sp.name}
 
         def add(spec):
@@ -3666,6 +3676,7 @@ class FeatureForge:
         self.base_cols_ = list(X.columns)
         self.id_cols_ = self._id_columns(X)
         self.echo_cols_ = self._label_echo_cols(X, y_np) if self.label_echo else set()
+        self.echo_cols_ |= {c for c in self.label_cols if c in X.columns}
         if self.echo_cols_:
             self._log(f"label-echo columns (kept out of cross-row features): {sorted(self.echo_cols_)}")
         self.anchors_ = self._find_anchors(X) if self.entities else []
@@ -4835,7 +4846,7 @@ class FeatureForge:
             return []
         self._t0 = getattr(self, "_t0", time.time())
         S = X.sample(min(n, 100_000), random_state=self.random_state) if n > 100_000 else X
-        num = [c for c in X.columns if c not in self.cat_cols_]
+        num = [c for c in X.columns if c not in self.cat_cols_ and c not in set(self.label_cols)]
         vals = {c: S[c].to_numpy(dtype=float) for c in num}
         def is_int(v):
             f = v[np.isfinite(v)]

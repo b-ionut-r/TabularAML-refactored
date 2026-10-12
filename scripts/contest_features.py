@@ -276,9 +276,12 @@ def main():
     ids_tr = tr[a.id].to_numpy() if a.id else np.arange(len(tr))
     ids_te = te[a.id].to_numpy() if a.id else np.arange(len(tr), len(tr) + len(te))
     rel_tr = rel_te = None
+    label_cols: list = []
     cache = Path(a.related_cache) if a.related_cache else None
     if cache is not None and (cache / "rel_train.parquet").exists():
         rel_tr, rel_te = pd.read_parquet(cache / "rel_train.parquet"), pd.read_parquet(cache / "rel_test.parquet")
+        if (cache / "label_cols.json").exists():
+            label_cols = json.loads((cache / "label_cols.json").read_text())
         tr, te = pd.read_parquet(cache / "main_train.parquet"), pd.read_parquet(cache / "main_test.parquet")
         print(f"related tables: {rel_tr.shape[1]} columns from {cache}", flush=True)
     elif a.table:
@@ -316,6 +319,7 @@ def main():
                                             outcome_values=sorted(pd.unique(y.dropna())))
                     print(f"table {ch.name}: outcome history (item={item}), {El.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
                     A.append(El)
+                    label_cols += list(El.columns)
         cm_tables = []
         if a.child_models and keyed:
             # as-of children would see later rows' outcomes; labels per key are ambiguous
@@ -403,6 +407,7 @@ def main():
                 yk = pd.Series(y.to_numpy(), index=tr[ch.key].to_numpy())
                 M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)
                 A.append(M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
+                label_cols += list(M.columns)
                 print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
         # One concat per side, not one per block: each pairwise concat copied every column so far.
         if A:
@@ -412,6 +417,7 @@ def main():
         if cache is not None:
             cache.mkdir(parents=True, exist_ok=True)
             rel_tr.to_parquet(cache / "rel_train.parquet")
+            (cache / "label_cols.json").write_text(json.dumps(label_cols))
             rel_te.to_parquet(cache / "rel_test.parquet")
             tr.to_parquet(cache / "main_train.parquet")  # with any one-row-per-key tables joined
             te.to_parquet(cache / "main_test.parquet")
@@ -514,8 +520,11 @@ def main():
         print("forecasting family active: FeatureForge search skipped", flush=True)
         out_tr, out_te = Xtr.reset_index(drop=True).copy(), Xte.reset_index(drop=True).copy()
     else:
-        forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target,
-                             **json.loads(a.forge_kw)).fit(Xtr, y, X_unlabeled=Xte)
+        # Columns computed from the labels (child-row model scores, outcome histories) stay out of
+        # FeatureForge's cross-row features: Home Credit's kept cell count over gender x binned
+        # bureau model score read other rows' scores, which were fitted on this row's label.
+        kw = dict(label_cols=[c for c in label_cols if c in Xtr.columns], **json.loads(a.forge_kw))
+        forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **kw).fit(Xtr, y, X_unlabeled=Xte)
         out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
     if rel_tr is not None:
         rest = [c for c in rel_tr.columns if c not in out_tr.columns]
