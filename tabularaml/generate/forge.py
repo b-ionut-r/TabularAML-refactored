@@ -138,6 +138,11 @@ def _as_str_frame_col(s: pd.Series) -> pd.Series:
     return _as_str(s)
 
 
+# Resident memory beyond the data frames (the interpreter, numpy, pandas, scikit-learn, LightGBM,
+# Arrow's pool after reading the files): 0.63-0.73 GB on an Avazu-shaped table (_mem_rows).
+_BASE_RSS = 0.8e9
+
+
 def _renumbered(X: pd.DataFrame) -> pd.DataFrame:
     """``X.reset_index(drop=True)`` without copying the data: a shallow copy whose columns are
     replaced, never written into, by what follows (Bosch: a second copy of a 4,264-column frame
@@ -2187,6 +2192,10 @@ class FeatureForge:
         starts the same time after the search rows; there a family that leans on the latest
         labelled rows (neighbours' labels, cross-linear key models on IEEE-CIS) fails while the
         client encodings and profiles still carry over.
+    label_cols : sequence of str
+        Columns of ``X`` computed from the labels before ``fit`` (out-of-fold model scores of
+        child rows, outcome histories of an event log): held like label-echo columns, in
+        same-row features only.
     label_echo : bool
         Find columns that carry earlier rows' labels (running means or counts of past
         answers in an event log: within an entity, or a pair of entities such as student and
@@ -2315,7 +2324,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
+                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -2357,6 +2366,7 @@ class FeatureForge:
         self.gate_by_period = gate_by_period
         self.family_time_share = family_time_share
         self.label_echo = label_echo
+        self.label_cols = label_cols
         self.gate_wide = gate_wide
         self.gate_families = gate_families
         self.past_te = past_te
@@ -2639,9 +2649,14 @@ class FeatureForge:
         time_keys = {self.time_col_, self.group_col_, *self.date_cols_, *getattr(self, "time_like_", [])} - {None}
 
         time_cols = {self.time_col_, *self.date_cols_} - {None}
+        # Label echoes, target features and anything built on either: same-row features only. A
+        # group statistic of out-of-fold target encodings reads other rows' encodings, which were
+        # fitted on this row's label (Avazu: group means of products of two encodings over
+        # device_ip took search CV from 0.379 to 0.283 while the gate's held-out loss rose from
+        # 0.378 to 0.448).
         echo = set(getattr(self, "echo_cols_", ()))
         for sp in selected:
-            if echo & set(sp.parents):
+            if sp.target_dep or echo & set(sp.parents):
                 echo |= set(sp.out_names()) | {sp.name}
 
         def add(spec):
@@ -3529,6 +3544,9 @@ class FeatureForge:
         X = _renumbered(self._named(X))
         if X_unlabeled is not None:
             X_unlabeled = self._named(X_unlabeled)
+        # The caller's frames, which stay in memory through the fit (see _mem_rows).
+        self._in_bytes = sum(float(F.memory_usage(index=True, deep=True).sum())
+                             for F in (X, X_unlabeled) if F is not None)
         y = pd.Series(np.asarray(y))
         self.model_width_ = X.shape[1] + 3 * self.max_new_features   # widest frame a model sees
         self.n_synthetic_ = 0
@@ -3587,6 +3605,7 @@ class FeatureForge:
         self.base_cols_ = list(X.columns)
         self.id_cols_ = self._id_columns(X)
         self.echo_cols_ = self._label_echo_cols(X, y_np) if self.label_echo else set()
+        self.echo_cols_ |= {c for c in self.label_cols if c in X.columns}
         if self.echo_cols_:
             self._log(f"label-echo columns (kept out of cross-row features): {sorted(self.echo_cols_)}")
         self.anchors_ = self._find_anchors(X) if self.entities else []
@@ -3720,7 +3739,8 @@ class FeatureForge:
         mu = X.memory_usage(index=False, deep=False)
         all_rows = float(mu[[c for c in self.raw_cols_ if c in mu.index]].sum()) * (
             1 + (0 if X_unlabeled is None else len(X_unlabeled) / max(len(X), 1)))
-        mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows)
+        mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows,
+                                 held=self._in_bytes + float(X.memory_usage(index=True, deep=False).sum()))
         if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
             self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
@@ -4056,12 +4076,18 @@ class FeatureForge:
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s ({self._work:.0f}s of work)")
         return self
 
-    def _mem_rows(self, n_cols, share=0.3, fixed=0.0):
+    def _mem_rows(self, n_cols, share=0.3, fixed=0.0, held=0.0):
         """Search rows whose candidate columns, their build-time copies and the model's matrix
-        (float32) fit in ``share`` of the memory still free under the limit (the container's
-        cgroup limit when set), or None when it is unknown. Malware: about 6 KB per search row
-        in the first round on top of the 7 GB its tables already take. ``fixed``: bytes needed
-        whatever the search rows."""
+        (float32) fit in ``share`` of the memory left under the limit (the container's cgroup
+        limit when set), or None when it is unknown. Malware: about 6 KB per search row in the
+        first round on top of the 7 GB its tables already take. ``fixed``: bytes needed whatever
+        the search rows. ``held``: bytes the data already takes (the caller's frames and the
+        fit's own), which with ``_BASE_RSS`` for the interpreter and its libraries stands in for
+        the memory in use: read live, it moved the cap, and every pick after it, from run to run
+        of one commit (TalkingData: 919,814 vs 920,499 search rows, 40 minutes apart). The
+        result is rounded down to two significant digits. The live reading remains a guard:
+        when the rows would take more than twice ``share`` of what is actually free, they are
+        cut to that, and the log says so."""
         lim = []
         for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
             try:
@@ -4079,7 +4105,17 @@ class FeatureForge:
         if not lim:
             return None
         keep = min(80, 3 * self.max_new_features)
-        return int(share * max(min(lim) - rss - fixed, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
+        row = 4 * (16 * keep + 2 * n_cols + 16)
+        n = int(share * max(min(lim) - _BASE_RSS - held - fixed, 0) / row)
+        if n >= 100:
+            step = 10 ** (len(str(n)) - 2)
+            n = n // step * step
+        live = int(2 * share * max(min(lim) - rss - fixed, 0) / row) if rss else n
+        if live < n:
+            self._log(f"memory guard: {n} search rows would not fit in the memory free now; cut to {live} "
+                      f"(this run's rows, and the picks after them, depend on the memory in use)")
+            n = live
+        return n
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
@@ -4194,13 +4230,17 @@ class FeatureForge:
             # randomness otherwise flips keep-or-drop decisions on small gates.
             D = self._lgb_data(self._model_frame(_columns(Fs, cols), recode), ys, lr=0.05)
             G, _ = self._lgb_matrix(self._model_frame(_columns(Fg, cols), recode))
-            margin = 0.0
+            margin, iters = 0.0, 0
             for k, (tr, va) in enumerate(es_splits):
                 b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
                 # Refit on all search rows at the early-stopped size, then score the gate rows.
                 full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
+                iters += b.current_iteration() + full.current_iteration()
+            # The fit's work, as a CV fold is charged (from the iterations it trained).
+            self._gate_fit_s = _TREE_CELL_S * iters * len(ys) * len(cols) * (
+                self.n_classes_ if self.task_ == "multiclass" else 1)
             D = G = b = full = None
             _trim_heap()
             return _row_loss(self.task_, yg, margin)
@@ -4269,6 +4309,7 @@ class FeatureForge:
         if self.recode_:
             cands += [(label + " native", specs, False) for label, specs in cands if specs]
         best_recode = self.recode_
+        full_ids, full_ok = {id(s) for s in self.selected_}, False
         for label, specs, *rc in cands:
             rc = rc[0] if rc else None
             cols = self.raw_cols_ + [c for s in specs for c in s.out_names()]
@@ -4283,6 +4324,8 @@ class FeatureForge:
                       + (f", later half {late:+.2e}" if late is not None else "") + f", need {z_needed:.2f})")
             if self.gate_by_period and zb is not None:
                 z = zb
+            if specs and {id(s) for s in specs} == full_ids and z >= z_needed and (late is None or late > 0):
+                full_ok = True
             # Time-ordered gates: the gain must still hold over the later half of the gate rows
             # (Hull Tactical, 1,086 daily gate rows: z=+1.59 overall, +2.47 / -1.35 by half;
             # held-out Pearson 0.072 -> 0.038).
@@ -4296,7 +4339,8 @@ class FeatureForge:
         # IEEE-CIS the set passed while dropping kNN and cross-linear target features
         # cut the gate loss further (0.1152 -> 0.1081) and lifted held-out AUC 0.926 -> 0.937.
         if fam_on and self.selected_:
-            best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l)
+            best_set, best_l = self._gate_families(gate_loss, raw_rows, z_needed, best_set, best_l,
+                                                   budgeted=full_ok)
         return best_set, raw_l, best_l
 
     def _sparse_te(self, X) -> bool:
@@ -4314,7 +4358,7 @@ class FeatureForge:
                         return True
         return False
 
-    def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l):
+    def _gate_families(self, gate_loss, raw_rows, z_needed, best_set, best_l, budgeted=False):
         """When the whole set fails the gate (or always, under an embargo), drop feature families (target encodings, group
         statistics, event recencies, ...) one at a time, each time the one whose removal helps
         the gate rows most, and keep the best remaining set if it clears the gate by one more
@@ -4334,8 +4378,12 @@ class FeatureForge:
                     have.update(sp.out_names())
             return out
 
+        spent = 0.0
+
         def score(specs):
+            nonlocal spent
             rows = gate_loss(self.raw_cols_ + [c for sp in specs for c in sp.out_names()])
+            spent += getattr(self, "_gate_fit_s", 0.0)
             d = raw_rows - rows
             yc, tg = getattr(self, "_gate_yt", (None, None))
             dw = _winsor(d, yc)
@@ -4345,7 +4393,18 @@ class FeatureForge:
             return float(rows.mean()), z
 
         cur = closed(list(self.selected_))
+        # The pass refits the gate models once per family per step (about F^2/2 fits): on a wide
+        # table each fit is minutes of work (a held-back 1,930-column contest: 1,400 s for the first
+        # step alone). When the whole set already passed the gate the pass only refines it, and it
+        # gets one search budget of work: a step starts only when its fits, at the cost of the last
+        # gate fit, still fit in what is left. When the whole set failed, the pass is a rescue
+        # (IEEE-CIS keeps nothing but anchors without it) and runs to the end.
         while len({fam(sp) for sp in cur}) > 1:
+            step = len({fam(sp) for sp in cur}) * getattr(self, "_gate_fit_s", 0.0)
+            if budgeted and self.time_budget and spent + step > self.time_budget:
+                self._log(f"  gate families: next step takes {step:.0f}s of work, {max(self.time_budget - spent, 0):.0f}s "
+                          f"left of {self.time_budget:.0f}s; pass stops")
+                break
             trials = []
             for f in sorted({fam(sp) for sp in cur}):
                 rest = closed([sp for sp in cur if fam(sp) != f])
@@ -4364,9 +4423,11 @@ class FeatureForge:
         if self.recode_:
             self._fit_rank_maps(X, *([] if U is None else [U]))
         folds = self._te_folds(X, y, self.random_state + 1)
+        # Shallow copies: the features below are added as new columns, never written into the
+        # raw ones, so one copy of the raw columns (the context's) serves both frames.
         self.ctx_.extra_rows = None if U is None else U[self.raw_cols_]
-        F = X.copy()
-        U = None if U is None else U[self.raw_cols_].copy()
+        F = X.copy(deep=False)
+        U = None if U is None else self.ctx_.extra_rows.copy(deep=False)
         # A feature's values on the unlabeled rows are only needed here when a later feature is
         # built from it; transform() computes them for whichever rows it is given. Neighbour
         # features queried every unlabeled row against every training row for nothing
@@ -4703,7 +4764,7 @@ class FeatureForge:
             return []
         self._t0 = getattr(self, "_t0", time.time())
         S = X.sample(min(n, 100_000), random_state=self.random_state) if n > 100_000 else X
-        num = [c for c in X.columns if c not in self.cat_cols_]
+        num = [c for c in X.columns if c not in self.cat_cols_ and c not in set(self.label_cols)]
         vals = {c: S[c].to_numpy(dtype=float) for c in num}
         def is_int(v):
             f = v[np.isfinite(v)]
@@ -4787,7 +4848,12 @@ class FeatureForge:
         return X if list(X.columns) == names else X.set_axis(names, axis=1)
 
     def _recode_out(self, X):
-        out = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
+        # Without copying the data: reset_index and drop each made a deep copy of the whole frame
+        # (two extra copies of a wide float64 table, the 15 GB limit on a 1,900-column contest).
+        out = _renumbered(X)
+        for c in getattr(self, "shifted_", []):
+            if c in out.columns:
+                del out[c]
         if self.recode_:
             for c in self.rank_maps_:
                 out[c] = self._rank(out[c], c)
