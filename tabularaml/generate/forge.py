@@ -546,7 +546,18 @@ class KNNTarget(Spec):
         nn = NearestNeighbors(n_neighbors=kmax, algorithm=_nn_algo(M_ref)).fit(M_ref)
         _, idx = nn.kneighbors(M_q)
         out = np.empty((len(M_q), self.n_out))
-        csum = np.cumsum(Y_ref[idx], axis=1)  # (n, kmax, per)
+        if self.per > 1:
+            # Class counts among the first k neighbours, without the (rows x k x classes) one-hot
+            # gather: 80k query rows x 50 neighbours x 100 classes is 3.2 GB twice over. Counts
+            # are exact integers, so the frequencies equal the one-hot cumulative sums.
+            lab = np.argmax(Y_ref, axis=1)[idx]  # (n, kmax)
+            base = np.arange(len(M_q))[:, None] * self.per
+            for i, k in enumerate(self.ks):
+                k = min(k, kmax)
+                cnt = np.bincount((base + lab[:, :k]).ravel(), minlength=len(M_q) * self.per)
+                out[:, i * self.per:(i + 1) * self.per] = cnt.reshape(len(M_q), self.per) / k
+            return out
+        csum = np.cumsum(Y_ref[idx], axis=1)  # (n, kmax, 1)
         for i, k in enumerate(self.ks):
             k = min(k, kmax)
             out[:, i * self.per:(i + 1) * self.per] = csum[:, k - 1, :] / k
