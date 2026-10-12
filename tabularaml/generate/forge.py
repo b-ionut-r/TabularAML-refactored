@@ -3254,6 +3254,11 @@ class FeatureForge:
                 # (thread seconds per candidate: IEEE-CIS 151k rows 45-59, Home Credit 246k rows 193).
                 w *= rows / 150_000 * (len(s.parents) + 8) / 18
             if self.task_ == "multiclass":
+                if isinstance(s, CrossLinearOOF):
+                    # Multinomial SAGA updates every class's weights for each non-zero: its fit grows with
+                    # the classes (209k rows, 8 keys and their pairs: 20 s binary, 22 s at 12 classes, 92 s
+                    # at 100; single keys 6.5, 7 and 33 s). The family constant is the binary fit's.
+                    w *= 1 + self.n_classes_ / 26
                 # The residual probe scores every output column against every class.
                 w += _CLASS_CELL_S * getattr(s, "n_out", 1) * self.n_classes_ * len(W)
             return w
