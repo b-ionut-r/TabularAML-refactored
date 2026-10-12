@@ -552,3 +552,46 @@ def test_json_object_columns_are_flattened_into_fields():
     assert list_features(cat, cat.iloc[:10])[2] == []
     a2, _, found2 = json_fields(tr.astype({"totals": "category"}), te.astype({"totals": "category"}))
     assert found2 == ["totals"] and a2.equals(a)
+
+
+def test_event_gaps_find_time_to_next_click_of_a_user():
+    rng = np.random.default_rng(0)
+    m, n = 8000, 6000  # labels from the full log; the file stops before its end, as a contest's does
+    X = pd.DataFrame({"ip": rng.integers(0, 300, m), "app": rng.integers(0, 5, m), "os": rng.integers(0, 4, m),
+                      "t": np.sort(rng.uniform(0, 1300, m))})
+    y = ((X.groupby(["ip", "app"])["t"].shift(-1) - X["t"]) < 60).to_numpy(dtype=int)[:n]
+    X = X.iloc[:n]
+    tr = np.arange(n) < 4800
+    ff = FeatureForge(task="binary", time_budget=1, time_col="t", verbose=False, random_state=0, label_echo=False)
+    ff.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]), X_unlabeled=X[~tr].reset_index(drop=True))
+    assert any(c.startswith("lag_next__ip+app__") for c in ff.new_columns_), ff.new_columns_
+    past = FeatureForge(task="binary", time_budget=1, time_col="t", verbose=False, random_state=0, label_echo=False,
+                        event_gaps="past")
+    past.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]), X_unlabeled=X[~tr].reset_index(drop=True))
+    assert not any(c.startswith("lag_next__") for c in past.new_columns_)
+    # Without the test rows at fit (an API that sends them later in batches) the family stays off.
+    blind = FeatureForge(task="binary", time_budget=1, time_col="t", verbose=False, random_state=0, label_echo=False)
+    blind.fit(X[tr].reset_index(drop=True), pd.Series(y[tr]))
+    assert not any(c.startswith("lag_") and "+" in c for c in blind.new_columns_), blind.new_columns_
+
+
+def test_history_families_need_the_test_rows_at_fit():
+    # Times to an entity's last / next flagged row (and single-key entity lags) are read from the history fit
+    # holds; test rows an API sends later in batches would miss their own batch, so these stay off without them.
+    rng = np.random.default_rng(0)
+    n = 3000
+    X = pd.DataFrame({"store": rng.integers(0, 300, n), "promo": rng.integers(0, 2, n), "x": rng.normal(size=n),
+                      "t": np.sort(rng.uniform(0, 100, n))})
+    y = pd.Series(X["x"] + X["promo"] + rng.normal(size=n))
+    ff = FeatureForge(task="regression", time_budget=0.1, time_col="t", verbose=False, random_state=0,
+                      entity_lags=True).fit(X.iloc[:2400].reset_index(drop=True), y.iloc[:2400].reset_index(drop=True),
+                                            X_unlabeled=X.iloc[2400:].reset_index(drop=True))
+    W = ff._prep(X.iloc[:2400])
+    def made(has_test):
+        names = []
+        ff.has_test_ = has_test
+        ff._event_candidates(W, {}, lambda s: names.append(s.name))
+        ff._entity_candidates(W, {}, [], lambda s: names.append(s.name))
+        return names
+    assert any(s.startswith("ev_") for s in made(True)) and any(s.startswith("lag_") for s in made(True))
+    assert not any(s.startswith(("ev_", "lag_")) for s in made(False))

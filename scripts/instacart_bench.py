@@ -10,6 +10,7 @@ ap.add_argument('--users', type=int, default=15000); ap.add_argument('--budget',
 ap.add_argument('--kw', default='{}'); ap.add_argument('--tag', default='')
 ap.add_argument('--data', default='data/instacart/', help='folder with the competition files as parquet')
 ap.add_argument('--log', default='instacart.jsonl'); ap.add_argument('--shuffle', action='store_true')
+ap.add_argument('--window', type=int, default=0, help='1: drop each user\'s train order and predict the last prior order instead (an earlier slice)')
 a = ap.parse_args()
 D = a.data
 orders = pd.read_parquet(D + 'orders.parquet')
@@ -17,6 +18,9 @@ rng = np.random.default_rng(0)
 tr_users = orders.loc[orders.eval_set == 'train', 'user_id'].unique()
 users = rng.choice(tr_users, a.users, replace=False)
 orders = orders[orders.user_id.isin(users)].copy()
+if a.window == 1:  # an earlier slice: the last prior order is the one to predict, from the orders before it
+    orders = orders[orders.eval_set != 'train'].copy()
+    orders.loc[orders.order_number == orders.groupby('user_id').order_number.transform('max'), 'eval_set'] = 'train'
 orders['days_since_prior_order'] = orders['days_since_prior_order'].fillna(0)
 orders['day'] = orders.groupby('user_id')['days_since_prior_order'].cumsum()
 prior_o = orders[orders.eval_set == 'prior']
@@ -24,7 +28,7 @@ op = pd.read_parquet(D + 'order_products__prior.parquet')
 op = op[op.order_id.isin(prior_o.order_id)].merge(prior_o[['order_id', 'user_id', 'order_number', 'order_dow', 'order_hour_of_day', 'days_since_prior_order', 'day']], on='order_id')
 prod = pd.read_parquet(D + 'products.parquet')[['product_id', 'aisle_id', 'department_id']]
 train_o = orders[orders.eval_set == 'train']
-opt = pd.read_parquet(D + 'order_products__train.parquet'); opt = opt[opt.order_id.isin(train_o.order_id)]
+opt = pd.read_parquet(D + ('order_products__train.parquet' if a.window == 0 else 'order_products__prior.parquet')); opt = opt[opt.order_id.isin(train_o.order_id)]
 pairs = op[['user_id', 'product_id']].drop_duplicates()
 pairs = pairs.merge(train_o[['user_id', 'order_number', 'order_dow', 'order_hour_of_day', 'days_since_prior_order', 'day']], on='user_id')
 pairs = pairs.merge(prod, on='product_id', how='left')
@@ -98,5 +102,5 @@ utr = pairs.user_id.to_numpy()[~ho]; uu = np.unique(utr); va_u = np.random.defau
 va = np.isin(utr, va_u)
 b = lgb.train(P, lgb.Dataset(Xtr[~va], ytr[~va]), 5000, valid_sets=[lgb.Dataset(Xtr[va], ytr[va])], callbacks=[lgb.early_stopping(100, verbose=False)])
 p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xho)
-res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, auc=roc_auc_score(yho, p), logloss=log_loss(yho, p), n_cols=Xtr.shape[1], best_it=b.best_iteration, fe_s=round(fe_t), total_s=round(time.time() - t0), **info)
+res = dict(arm=a.arm + a.tag + ('_shuffled' if a.shuffle else ''), seed=a.seed, window=a.window, auc=roc_auc_score(yho, p), logloss=log_loss(yho, p), n_cols=Xtr.shape[1], best_it=b.best_iteration, fe_s=round(fe_t), total_s=round(time.time() - t0), **info)
 print('RESULT', json.dumps(res, default=str)); open(a.log, 'a').write(json.dumps(res, default=str) + '\n')

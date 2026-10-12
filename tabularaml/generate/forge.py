@@ -90,6 +90,11 @@ _SETUP_COL_S = 5e-1     # column screens before the search (codes, keys, label e
 _WU_ROW_SHARE = 0.05    # a label-free candidate fitted over all known rows costs its search rows plus this
                         # share of those rows (IEEE-CIS: 1,698 group statistics over 1.1M rows, 0.09 s each)
 _REF_THREADS = 4        # candidate building runs on this many threads there
+_CLASS_CELL_S = 5e-8    # multiclass only: one residual-probe column or interaction grid, per row and class.
+                        # Each class adds two histogram passes and its share of the softmax loss (4-5.5e-8
+                        # measured at 12 and 100 classes); a 100-output target map is probed column by
+                        # column, so it costs classes squared. Binary and regression costs are in the
+                        # family constants.
 # Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
 _SPEC_WORK = {
     "Arith": 1, "Expr": 1, "Digits": 1, "DatePart": 1, "Rotate": 1, "GroupStat": 2, "StrNum": 2, "GeoPair": 2,
@@ -131,6 +136,15 @@ def _as_str_frame_col(s: pd.Series) -> pd.Series:
             s = s.cat.remove_unused_categories()
             return s.cat.reorder_categories(sorted(s.cat.categories))
     return _as_str(s)
+
+
+def _renumbered(X: pd.DataFrame) -> pd.DataFrame:
+    """``X.reset_index(drop=True)`` without copying the data: a shallow copy whose columns are
+    replaced, never written into, by what follows (Bosch: a second copy of a 4,264-column frame
+    held through the whole search took the build past the container's 15 GB)."""
+    X = X.copy(deep=False)
+    X.index = pd.RangeIndex(len(X))
+    return X
 
 
 def _concat_cats(parts: List[pd.DataFrame]) -> pd.DataFrame:
@@ -276,6 +290,14 @@ def _trim_heap() -> None:
         pass
 
 
+def _columns(F: pd.DataFrame, cols) -> pd.DataFrame:
+    """``F[cols]`` as views of F's columns: selecting copies every column, which on a wide
+    table is gigabytes per gate fit."""
+    if not F.columns.is_unique or len(set(cols)) != len(cols):
+        return F[cols]
+    return pd.DataFrame({c: F[c] for c in cols}, copy=False)
+
+
 def _release(spec) -> None:
     """Drop a candidate's fitted state (attributes ending in ``_``). Thousands of candidates
     per round each holding lookup tables over a million rows (counts of a near-unique value,
@@ -371,6 +393,19 @@ class Count(Spec):
         return self.table_.reindex(k).fillna(0).to_numpy(dtype=float)
 
 
+class _OneHot:
+    """``np.eye(n)[y]`` for TargetEnc, kept as the labels: it is only ever summed per key."""
+
+    def __init__(self, y: np.ndarray, n: int):
+        self.y, self.n = y, n
+
+    def __getitem__(self, idx):
+        return _OneHot(self.y[idx], self.n)
+
+    def __len__(self):
+        return len(self.y)
+
+
 class TargetEnc(Spec):
     """Smoothed target mean of a key (or key pair); out-of-fold on training rows."""
     target_dep = True
@@ -384,22 +419,40 @@ class TargetEnc(Spec):
     def _targets(self, y):
         y = np.asarray(y, dtype=float)
         if self.n_out > 1:
-            return np.eye(self.n_classes)[y.astype(int)]
+            return _OneHot(y.astype(int), self.n_classes)
         return y[:, None]
 
     def _stats(self, k, Y):
+        if isinstance(Y, _OneHot):
+            # Per-key sums of one-hot rows are class counts: counted directly, the same
+            # numbers without the rows x classes matrix (a hundred classes over 637k rows is
+            # half a gigabyte per copy, and every fold took several).
+            keys, inv = np.unique(k, return_inverse=True)
+            n_k = len(keys)
+            sums = np.bincount(inv * Y.n + Y.y, minlength=n_k * Y.n).reshape(n_k, Y.n).astype(float)
+            prior = np.bincount(Y.y, minlength=Y.n) / len(Y.y)
+            return (pd.DataFrame(sums, index=pd.Index(keys, name="_k")),
+                    pd.Series(np.bincount(inv, minlength=n_k), index=pd.Index(keys, name="_k")), prior)
         frame = pd.DataFrame(Y)
         frame["_k"] = k
         g = frame.groupby("_k")
         return g.sum(), g.size(), Y.mean(axis=0)
 
     def _apply(self, k, sums, counts, prior):
-        s = sums.reindex(k).to_numpy()
-        c = counts.reindex(k).to_numpy(dtype=float)[:, None]
-        s = np.where(np.isnan(s), 0.0, s)
-        c = np.where(np.isnan(c), 0.0, c)
-        out = (s + TE_SMOOTHING * prior) / (c + TE_SMOOTHING)
-        return out[:, 0] if self.n_out == 1 else out
+        pos = sums.index.get_indexer(k)
+        miss = pos < 0
+        if len(sums) == 0:
+            pos = np.zeros(len(k), dtype=np.intp)
+            sums, counts = pd.DataFrame(np.zeros((1, sums.shape[1]))), pd.Series([0.0])
+        s = sums.to_numpy(dtype=float)[pos]
+        c = counts.to_numpy(dtype=float)[pos][:, None]
+        s[miss] = np.nan
+        c[miss] = np.nan
+        s[np.isnan(s)] = 0.0
+        c[np.isnan(c)] = 0.0
+        s += TE_SMOOTHING * prior
+        s /= c + TE_SMOOTHING
+        return s[:, 0] if self.n_out == 1 else s
 
     def fit(self, df, y, ctx):
         k = self._fit_codes(df)
@@ -842,6 +895,49 @@ def synthetic_rows(X: pd.DataFrame, U: pd.DataFrame, min_rate: float = 0.9, min_
     return ~uu
 
 
+def _value_table(s: pd.Series, ones: bool = True):
+    """``s.value_counts()`` held as sorted arrays: the repeated values with their counts, and
+    (``ones``) the values seen once. A mapped Series keeps a hash table on its index, and a
+    family of a thousand near-unique columns holds gigabytes of them; repeats are all a mask
+    needs. Non-numeric columns keep the Series."""
+    vc = s.value_counts()
+    if vc.index.dtype.kind not in "iuf" or isinstance(vc.index.dtype, pd.api.extensions.ExtensionDtype):
+        return vc
+    v, k = vc.index.to_numpy(), vc.to_numpy()
+    rep = k > 1
+    o = np.argsort(v[rep], kind="stable")
+    one = np.sort(v[~rep]) if ones else None
+    return v[rep][o], k[rep][o], one
+
+
+def _sorted_hits(table: np.ndarray, x: np.ndarray):
+    """Positions of x in the sorted ``table``, and where they match exactly."""
+    if len(table) == 0:
+        return np.zeros(len(x), dtype=np.intp), np.zeros(len(x), dtype=bool)
+    i = np.minimum(np.searchsorted(table, x), len(table) - 1)
+    return i, table[i] == x
+
+
+def _map_counts(s: pd.Series, vc) -> np.ndarray:
+    """``s.map(vc).to_numpy(dtype=float)`` for a table from ``_value_table`` (NaN where a value
+    was not counted; seen-once values need ``ones``)."""
+    if isinstance(vc, pd.Series):
+        return s.map(vc).to_numpy(dtype=float)
+    v, k, one = vc
+    if s.dtype.kind not in "iuf" or isinstance(s.dtype, pd.api.extensions.ExtensionDtype):
+        full = pd.Series(np.r_[k, np.ones(0 if one is None else len(one), k.dtype)],
+                         index=np.r_[v, [] if one is None else one])
+        return s.map(full).to_numpy(dtype=float)
+    x = s.to_numpy()
+    cnt = np.full(len(x), np.nan)
+    i, hit = _sorted_hits(v, x)
+    cnt[hit] = k[i[hit]]
+    if one is not None:
+        _, hit1 = _sorted_hits(one, x)
+        cnt[hit1] = 1.0
+    return cnt
+
+
 class FamilyCount(Spec):
     """Value frequencies of every column of a homogeneous family, as one block.
 
@@ -864,13 +960,13 @@ class FamilyCount(Spec):
         return [f"fam{self.kind}__{c}" for c in self.parents]
 
     def fit(self, df, y, ctx):
-        self.vc_ = [df[c].value_counts() for c in self.parents]
+        self.vc_ = [_value_table(df[c], ones=self.kind == "count") for c in self.parents]
         return self
 
     def transform(self, df, ctx):
         out = np.empty((len(df), self.n_out), dtype=np.float32)
         for j, (c, vc) in enumerate(zip(self.parents, self.vc_)):
-            cnt = df[c].map(vc).to_numpy(dtype=float)
+            cnt = _map_counts(df[c], vc)
             if self.kind == "count":
                 out[:, j] = np.nan_to_num(cnt, nan=0.0)
             else:
@@ -1497,6 +1593,77 @@ def _tfidf(kind: str, max_features: int):
                            token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
 
 
+def _doc_parts(df, extra, c, clip):
+    """``_text_values`` of ``df`` then ``extra`` (when it has the column) as distinct texts and each
+    row's index into them."""
+    t, k = _text_parts(df, c, clip)
+    if extra is not None and c in extra:
+        t2, k2 = _text_parts(extra, c, clip)
+        t, k = pd.concat([t, t2], ignore_index=True), np.concatenate([k, k2 + len(t)])
+    return t, k
+
+
+def _sample_rows(k, n):
+    """The rows ``Series.sample(n, random_state=0)`` picks from a column of len(k) values."""
+    return pd.Series(k).sample(n, random_state=0).to_numpy() if len(k) > n else k
+
+
+def _fit_counted(vec, texts, k):
+    """``vec.fit(texts[k])`` from the distinct texts alone: the vocabulary and idf ``fit`` learns on
+    the repeated corpus, each distinct text analysed once (MCTS: a game's rules, thousands of
+    characters, on each of its matches; analysing every copy was gigabytes and minutes per
+    vectoriser). Exact while every term's total count stays below 2**24, the float32 sums'
+    exact range; otherwise, and for options this does not reproduce, ``fit`` on the copies."""
+    from collections import Counter
+    from numbers import Integral
+    from sklearn.feature_extraction.text import TfidfTransformer
+    if (vec.vocabulary is not None or vec.binary or not vec.use_idf or vec.max_features is None
+            or np.dtype(vec.dtype) != np.float32):
+        return vec.fit(texts.to_numpy()[k])
+    order = pd.unique(k)                              # distinct texts in order of first use
+    mult = np.bincount(k, minlength=len(texts))[order]
+    analyze = vec.build_analyzer()
+    dfc, tfc = {}, {}
+    for d, m in zip(texts.to_numpy()[order], mult):
+        for term, n in Counter(analyze(d)).items():
+            dfc[term] = dfc.get(term, 0) + int(m)
+            tfc[term] = tfc.get(term, 0) + int(m) * n
+    if not dfc or max(tfc.values()) >= 1 << 24:
+        return vec.fit(texts.to_numpy()[k])
+    n_doc = len(k)
+    terms = sorted(dfc)
+    dfs = np.array([dfc[t] for t in terms], dtype=np.int64)
+    high = vec.max_df if isinstance(vec.max_df, Integral) else vec.max_df * n_doc
+    low = vec.min_df if isinstance(vec.min_df, Integral) else vec.min_df * n_doc
+    if high < low:
+        raise ValueError("max_df corresponds to < documents than min_df")
+    mask = (dfs <= high) & (dfs >= low)
+    if mask.sum() > vec.max_features:                 # as CountVectorizer._limit_features
+        tfs = np.array([tfc[t] for t in terms], dtype=np.float32)
+        inds = (-tfs[mask]).argsort()[:vec.max_features]
+        keep = np.zeros(len(dfs), dtype=bool)
+        keep[np.where(mask)[0][inds]] = True
+        mask = keep
+    if not mask.any():
+        raise ValueError("After pruning, no terms remain. Try a lower min_df or a higher max_df.")
+    new = np.cumsum(mask) - 1
+    pos = {t: i for i, t in enumerate(terms)}
+    seen = dict.fromkeys(t for d in texts.to_numpy()[order] for t in analyze(d))   # first-use order
+    vec.fixed_vocabulary_ = False
+    vec.vocabulary_ = {t: new[pos[t]] for t in seen if mask[pos[t]]}
+    df = dfs[mask].astype(np.float32)                 # as TfidfTransformer.fit
+    df += float(vec.smooth_idf)
+    idf = np.full_like(df, fill_value=n_doc + int(vec.smooth_idf), dtype=np.float32)
+    idf /= df
+    np.log(idf, out=idf)
+    idf += 1.0
+    vec._tfidf = TfidfTransformer(norm=vec.norm, use_idf=vec.use_idf, smooth_idf=vec.smooth_idf,
+                                  sublinear_tf=vec.sublinear_tf)
+    vec._tfidf.idf_ = idf
+    vec._tfidf.n_features_in_ = len(vec.vocabulary_)
+    return vec
+
+
 class TextSVD(Spec):
     """Latent semantic components of a free-text field: TF-IDF of words and word
     pairs reduced by truncated SVD, fitted label-free on every row whose text is
@@ -1511,14 +1678,10 @@ class TextSVD(Spec):
     def fit(self, df, y, ctx):
         from sklearn.decomposition import TruncatedSVD
         c = self.parents[0]
-        extra = getattr(ctx, "extra_rows", None)
-        t = _text_values(df, c, TEXT_CLIP)
-        if extra is not None and c in extra:
-            t = pd.concat([t, _text_values(extra, c, TEXT_CLIP)], ignore_index=True)
-        if len(t) > self.max_fit_rows:
-            t = t.sample(self.max_fit_rows, random_state=0)
-        self.vec_ = _tfidf("word", 50_000).fit(t)
-        T = self.vec_.transform(t)
+        texts, k = _doc_parts(df, getattr(ctx, "extra_rows", None), c, TEXT_CLIP)
+        k = _sample_rows(k, self.max_fit_rows)
+        self.vec_ = _fit_counted(_tfidf("word", 50_000), texts, k)
+        T = self.vec_.transform(texts)[k]
         self.n_out = int(min(self.n_out, max(1, T.shape[1] - 1)))
         self.svd_ = TruncatedSVD(self.n_out, random_state=0, algorithm="randomized", n_iter=4).fit(T)
         return self
@@ -1551,14 +1714,11 @@ class TextLinearOOF(Spec):
         extra = getattr(ctx, "extra_rows", None)
         self.vecs_ = []
         for c in self.text_cols:
-            t = _text_values(df, c, TEXT_CLIP)
-            if extra is not None and c in extra:
-                t = pd.concat([t, _text_values(extra, c, TEXT_CLIP)], ignore_index=True)
-            if len(t) > 300_000:
-                t = t.sample(300_000, random_state=0)
-            vs = [_tfidf("word", 200_000).fit(t)]
-            if self.chars and t.str.len().mean() <= 80:
-                vs.append(_tfidf("char", 100_000).fit(t))
+            texts, k = _doc_parts(df, extra, c, TEXT_CLIP)
+            k = _sample_rows(k, 300_000)
+            vs = [_fit_counted(_tfidf("word", 200_000), texts, k)]
+            if self.chars and pd.Series(texts.str.len().to_numpy()[k]).mean() <= 80:
+                vs.append(_fit_counted(_tfidf("char", 100_000), texts, k))
             self.vecs_.append(vs)
         if self.keys:
             from sklearn.preprocessing import OneHotEncoder
@@ -1655,7 +1815,10 @@ class CrossLinearOOF(Spec):
         if self.n_classes == 0:
             return Ridge(alpha=3.0, solver="sparse_cg")
         if self.n_classes > 2:
-            return LogisticRegression(C=0.5, max_iter=300)
+            # Multinomial lbfgs costs a full pass over rows x classes per iteration and needs hundreds of them on a
+            # wide one-hot design (100 classes: ~9 s an iteration on 170k rows); a few seeded SAGA epochs reach a
+            # lower held-out loss at a fixed cost.
+            return LogisticRegression(C=0.5, solver="saga", tol=1e-3, max_iter=10, random_state=0)
         # Wide one-hot designs solve much faster in the dual.
         return LogisticRegression(C=0.5, solver="liblinear", tol=1e-2, dual=shape[1] > shape[0], random_state=0)
 
@@ -2068,6 +2231,10 @@ class FeatureForge:
         Numerics aggregated per entity; whether to add each row's place in its
         entity's history (time since previous / until next row, rows before it)
         when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    event_gaps : "auto" | "past" | "off"
+        With a time column and a repeating many-level key: time since each user's previous
+        row, until their next and rows before it, users being the key with the row's other
+        codes (TalkingData's ip + app + device + os). "past" leaves out the next row.
     group_col : str | "auto" | None
         Column whose test values are new groups (users, patients). "auto": a
         repeating integer / categorical column with under 20% of the unlabeled
@@ -2149,7 +2316,7 @@ class FeatureForge:
                  family_nb: bool = False, events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False,
-                 pair_scan: bool = True, profiles: bool = True, random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
+                 pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
         self.time_budget = time_budget
@@ -2177,6 +2344,7 @@ class FeatureForge:
         self.time_col = time_col
         self.entity_nums = entity_nums
         self.entity_lags = entity_lags
+        self.event_gaps = event_gaps
         self.family_nb = family_nb
         self.events = events
         self.time_cv = time_cv
@@ -2248,7 +2416,7 @@ class FeatureForge:
         """Model view of a frame: categoricals as ``category`` dtype, or, when the
         high-cardinality recode is active, those columns as frequency-rank numbers."""
         recode = self.recode_ if recode is None else recode
-        X = X.copy()
+        X = X.copy(deep=False)  # columns are replaced, never written into
         for c in self.cat_cols_:
             if c not in X.columns:
                 continue
@@ -2332,12 +2500,11 @@ class FeatureForge:
     def _lgb_data(self, X: pd.DataFrame, y, lr=0.1):
         """One binned LightGBM dataset for a whole frame; folds train on its row subsets.
         Binning once per frame instead of once per fold, from a float32 matrix instead of
-        float64 copies of each fold, is most of the search's memory and a fifth of its time."""
+        float64 copies of each fold, is most of the search's memory and a fifth of its time.
+        The raw matrix is not kept: kept, every row subset took its own copy of its rows."""
         import lightgbm as lgb
         M, cats = self._lgb_matrix(X)
-        D = lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr),
-                        free_raw_data=False).construct()
-        return M, D
+        return lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr)).construct()
 
     def _fit_eval_rows(self, D, tr, va, lr=0.1, rounds=2000, es=50):
         """``_fit_eval`` on row subsets of a dataset built by ``_lgb_data``."""
@@ -2648,6 +2815,7 @@ class FeatureForge:
                 add(Arith(op, a, b))
             self._event_candidates(W, imp, add)
             self._entity_candidates(W, imp, top_num, add)
+            self._event_gap_candidates(W, imp, add)
             self._interaction_candidates(W, add)
         else:
             # Compose selected features with the strongest raw columns.
@@ -2668,6 +2836,44 @@ class FeatureForge:
                 add(Count([k1, k2, k3]))
                 add(TargetEnc([k1, k2, k3], self.n_classes_))
         return cands
+
+    def _event_gap_candidates(self, W, imp, add):
+        """Where each row sits among its user's events: time since the user's previous row, until
+        their next one, and how many came before. A click log names no user; the repeating key with
+        the most levels (a device's ip) together with the row's other codes (app, device, os,
+        channel) does, the way TalkingData's winners keyed time-to-next-click. Offered whenever a
+        time column orders the rows and such a key repeats; the gate decides. ``event_gaps="past"``
+        leaves out the next row (it reads later rows of the same file).
+
+        Only with the test rows passed to ``fit`` (``X_unlabeled``): the gaps are read from the history
+        fit holds, so test rows that arrive later in batches (an API feeding Jane Street's or Optiver's
+        test) would find their own neighbours missing: no next row at all, and a previous row taken
+        from training rather than their batch, unlike every training row."""
+        t = getattr(self, "time_col_", None)
+        if (self.event_gaps == "off" or t is None or t == ROW_TIME or not self.id_cols_
+                or not getattr(self, "has_test_", False)):
+            return
+        echo = set(getattr(self, "echo_cols_", ()))
+        k = self.id_cols_[0]
+        if k == t or k in echo:
+            return
+
+        def code_like(c):
+            if c in self.cat_cols_:
+                return c not in self.text_cols_
+            x = W[c].to_numpy(dtype=float)
+            x = x[np.isfinite(x)]
+            return len(x) > 0 and bool(np.all(x == np.round(x)))
+        codes = [c for c in sorted(self.raw_cols_, key=lambda c: -imp.get(c, 0.0))
+                 if c not in (k, t) and c not in echo and c not in getattr(self, "date_cols_", [])
+                 and W[c].nunique() > 1 and code_like(c)][:4]
+        users = [(k,)] + [(k, *p) for r in (1, 2, 3) for p in combinations(codes, r)]
+        if len(codes) > 3:
+            users.append((k, *codes))
+        kinds = ("prev", "nth") if self.event_gaps == "past" else ("prev", "next", "nth")
+        for u in users:
+            for kind in kinds:
+                add(EntityLag(list(u) if len(u) > 1 else u[0], t, kind))
 
     def _entity_candidates(self, W, imp, top_num, add):
         """Counts, target maps and group statistics over ID-like columns and over
@@ -2704,7 +2910,8 @@ class FeatureForge:
                 if t not in e:
                     add(Count(list(e) + [t]))
         for e in ents:
-            if self.entity_lags and t is not None and t not in e:
+            # Read from the history fit holds: only with the test rows at fit (see _event_gap_candidates).
+            if self.entity_lags and t is not None and t not in e and getattr(self, "has_test_", False):
                 tw = W[t].to_numpy(dtype=float)
                 R = float(np.nanmax(tw) - np.nanmin(tw))
                 wins = [f"{p}{R * f:.6g}" for f in (0.001, 0.01, 0.05) for p in ("win", "fwd")] if R > 0 else []
@@ -2748,6 +2955,10 @@ class FeatureForge:
                      and 2 <= W[f].nunique() <= 7
                      and W.groupby(ids[0], sort=False)[f].nunique().mean() >= 1.5][:3]
             self._lagged_target_candidates(W, ids[:2], flags, add)
+        if not getattr(self, "has_test_", False):
+            # Times to an entity's last / next flagged row are read from the history fit holds: test rows
+            # sent later in batches would miss their own batch's rows (see _event_gap_candidates).
+            return
         for f in self.base_cols_:
             if f == t or f in ids or f in self.date_cols_:
                 continue
@@ -2830,6 +3041,8 @@ class FeatureForge:
                     continue
                 triples[t] = self._cell_gain(ab * sizes[c] + codes[c], sizes[a] * sizes[b] * sizes[c], *args) \
                     - max(pairs[(a, b)] + max(one[a], one[b], 0.0), 0.0)
+        if self.task_ == "multiclass":
+            self._charge(_CLASS_CELL_S * n * self.n_classes_ * (len(one) + len(pairs) + len(triples)))
         return ({k: v for k, v in pairs.items() if v > 0}, {k: v for k, v in triples.items() if v > 0})
 
     def _wide_pairs(self, W, y, margin, imp):
@@ -2925,6 +3138,9 @@ class FeatureForge:
                 # Brute-force neighbours: every row against every row, over the subspace's columns
                 # (thread seconds per candidate: IEEE-CIS 151k rows 45-59, Home Credit 246k rows 193).
                 w *= rows / 150_000 * (len(s.parents) + 8) / 18
+            if self.task_ == "multiclass":
+                # The residual probe scores every output column against every class.
+                w += _CLASS_CELL_S * getattr(s, "n_out", 1) * self.n_classes_ * len(W)
             return w
 
         def compute(s):
@@ -3310,7 +3526,7 @@ class FeatureForge:
         self.addons_ = {}
         # Column names as unique strings (integer names broke sorting, a repeated name made pandas return a frame
         # where a column was expected); transform renames new rows' columns the same way.
-        X = self._named(X).reset_index(drop=True)
+        X = _renumbered(self._named(X))
         if X_unlabeled is not None:
             X_unlabeled = self._named(X_unlabeled)
         y = pd.Series(np.asarray(y))
@@ -3327,6 +3543,7 @@ class FeatureForge:
         # hold, while varied in training (PLAsTiCC's spectroscopic redshift: -9 on 97% of test objects,
         # measured on 70% of training ones). A model trained on them meets a value it never saw.
         self.shifted_ = [] if X_unlabeled is None else _absent_in_test(X, X_unlabeled)
+        self.has_test_ = X_unlabeled is not None and len(X_unlabeled) > 0
         if self.shifted_:
             self._log(f"left out, almost constant in the unlabeled rows on a value training rarely holds: {self.shifted_}")
             X = X.drop(columns=self.shifted_)
@@ -3498,7 +3715,12 @@ class FeatureForge:
         # rows next to the model's matrix. When labels carry little signal, fits stop early and
         # the time rule above never shrinks the search (Malware's 5.9M search rows with shuffled
         # labels: killed at 14 GB in the first round), so the rows are also capped by memory.
-        mem_cap = self._mem_rows(len(self.raw_cols_))
+        # The frame of every row (search, held-out and unlabeled; see _set_wu) is built for each round
+        # whatever the search rows: its size comes off the memory the search rows may use.
+        mu = X.memory_usage(index=False, deep=False)
+        all_rows = float(mu[[c for c in self.raw_cols_ if c in mu.index]].sum()) * (
+            1 + (0 if X_unlabeled is None else len(X_unlabeled) / max(len(X), 1)))
+        mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows)
         if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
             self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
@@ -3518,7 +3740,7 @@ class FeatureForge:
                 idx_out = np.union1d(idx_out, np.setdiff1d(idx_sel, keep))
                 self._log(f"search on {m} of {len(idx_sel)} rows")
                 idx_sel = keep
-            W = X.iloc[idx_sel].reset_index(drop=True)
+            W = _renumbered(X.iloc[idx_sel])
             yW = y_np[idx_sel]
             if self.group_col_ is not None:
                 gx = as_text(X[self.group_col_]).to_numpy()
@@ -3606,6 +3828,9 @@ class FeatureForge:
             if loss_r < cur_loss * (1 - self.min_rel_gain):
                 self.recode_ = True
                 Mw, margin, cur_loss, imp = Wr, m_r, loss_r, imp_r
+            # Mw alone holds the model matrix: the joint ranking releases it, and the round's
+            # largest matrices are built while it would otherwise linger here.
+            Wr = U_ = later = None
         self._log(f"task={self.task_} rows={n} (search {len(W)}, gate {len(idx_gate)}) "
                   f"cols={X.shape[1]} base CV loss={cur_loss:.6f} (one CV fit {self._cv_s:.0f}s of work)")
 
@@ -3687,9 +3912,13 @@ class FeatureForge:
                 Mj[:, jpos[c]] = v
             cats_j = set(Mw[1])
             Mw = None  # its columns lead the joint matrix
+            # The joint matrix holds every survivor's values: keep only what it cannot
+            # (values of another dtype), so they are not held twice from here on.
+            values = {nm: v for nm, v in values.items() if v.dtype != np.float32}
+            new = None
             import lightgbm as lgb
-            Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params(),
-                             free_raw_data=False).construct()
+            # Not keeping the raw matrix: the row subsets would each copy their rows of it.
+            Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params()).construct()
             b = self._fit_eval_rows(Dj, idx_a, idx_b)
             del Dj
             gain = pd.Series(b.feature_importance("gain"), index=jcols)
@@ -3699,10 +3928,6 @@ class FeatureForge:
                 cats = [i for i, j in enumerate(idx) if j in cats_j]
                 return (Mj[:, idx], cats, list(cols)) if copy else (Mj, cats, list(cols), idx)
 
-            # The joint matrix holds every survivor's values: keep only what it cannot
-            # (values of another dtype), so they are not held twice during the ladder.
-            values = {nm: v for nm, v in values.items() if v.dtype != np.float32}
-            new = None
             rank = sorted(survivors, key=lambda nm: -sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()))
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
@@ -3800,7 +4025,7 @@ class FeatureForge:
         values = cands = Mw = None
         _trim_heap()
         if self.parity_check and X_unlabeled is not None and len(idx_gate) and self.selected_:
-            self.selected_ = selected = self._parity_filter(X.iloc[idx_gate].reset_index(drop=True),
+            self.selected_ = selected = self._parity_filter(_renumbered(X.iloc[idx_gate]),
                                                             self._prep(X_unlabeled)[self.raw_cols_], self.selected_)
         self.gate_passed_ = None
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
@@ -3831,11 +4056,12 @@ class FeatureForge:
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s ({self._work:.0f}s of work)")
         return self
 
-    def _mem_rows(self, n_cols, share=0.3):
+    def _mem_rows(self, n_cols, share=0.3, fixed=0.0):
         """Search rows whose candidate columns, their build-time copies and the model's matrix
         (float32) fit in ``share`` of the memory still free under the limit (the container's
         cgroup limit when set), or None when it is unknown. Malware: about 6 KB per search row
-        in the first round on top of the 7 GB its tables already take."""
+        in the first round on top of the 7 GB its tables already take. ``fixed``: bytes needed
+        whatever the search rows."""
         lim = []
         for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
             try:
@@ -3853,7 +4079,7 @@ class FeatureForge:
         if not lim:
             return None
         keep = min(80, 3 * self.max_new_features)
-        return int(share * max(min(lim) - rss, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
+        return int(share * max(min(lim) - rss - fixed, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
@@ -3863,9 +4089,22 @@ class FeatureForge:
         self.U_search_ = self.WU_ = None
         if on and getattr(self, "_wu_src", None) is not None:
             X, idx_gate, U = self._wu_src
-            parts = [W[self.raw_cols_], X.iloc[idx_gate][self.raw_cols_]] + ([] if U is None else [self._prep(U)[self.raw_cols_]])
-            self.WU_ = _concat_cats(parts)
-            self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
+            Up = None if U is None else self._prep(U)
+            cols, pos = list(self.raw_cols_), X.columns.get_indexer(self.raw_cols_)
+            # A few hundred columns at a time: the parts' copies of a wide table (all its rows) were
+            # as large as the frame itself, on top of it (Bosch, 4,264 columns: past the 15 GB limit).
+            # Joined column by column (each a view of its chunk), not consolidated: consolidating copied it all again.
+            out = {}
+            for i in range(0, len(cols), 256):
+                cc = cols[i:i + 256]
+                parts = [W[cc], X.iloc[idx_gate, pos[i:i + 256]]] + ([] if Up is None else [Up[cc]])
+                chunk = _concat_cats(parts)
+                del parts
+                out.update({c: chunk[c] for c in cc})
+            del Up
+            self.WU_ = pd.DataFrame(out, copy=False) if len(cols) > 256 else chunk
+            del out
+            self.U_search_ = _renumbered(self.WU_.iloc[len(W):])
         self.ctx_.extra_rows = self.U_search_
 
     def _parity_filter(self, G, U, specs, max_rows=50_000):
@@ -3929,9 +4168,11 @@ class FeatureForge:
         the search (target features out of fold); every selected spec is still
         fitted on exactly those rows, so the gate rows only need ``transform``.
         """
-        Xg = X.iloc[idx_gate].reset_index(drop=True)
+        # The gate rows once: features are added to a shallow copy (columns inserted, never
+        # written into), not to a second full copy of a wide table.
+        Xg = _renumbered(X.iloc[idx_gate])
         ys, yg = y[idx_sel], y[idx_gate]
-        Fs, Fg = W, Xg.copy()
+        Fs, Fg = W, Xg.copy(deep=False)
         addons = [sp for sp, _ in getattr(self, "addons_", {}).values()]
         for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra] + addons:
             if all(c in Fg.columns for c in s.out_names()):
@@ -3951,8 +4192,8 @@ class FeatureForge:
         def gate_loss(cols, recode=None):
             # A bag of differently seeded / early-stopped models: one model's
             # randomness otherwise flips keep-or-drop decisions on small gates.
-            A, D = self._lgb_data(self._model_frame(Fs[cols], recode), ys, lr=0.05)
-            G, _ = self._lgb_matrix(self._model_frame(Fg[cols], recode))
+            D = self._lgb_data(self._model_frame(_columns(Fs, cols), recode), ys, lr=0.05)
+            G, _ = self._lgb_matrix(self._model_frame(_columns(Fg, cols), recode))
             margin = 0.0
             for k, (tr, va) in enumerate(es_splits):
                 b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
@@ -3960,6 +4201,8 @@ class FeatureForge:
                 full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
+            D = G = b = full = None
+            _trim_heap()
             return _row_loss(self.task_, yg, margin)
 
         # Rows of one period share its shocks, so their paired differences are not
@@ -4149,7 +4392,8 @@ class FeatureForge:
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
-        X = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
+        drop = [c for c in getattr(self, "shifted_", []) if c in X.columns]
+        X = _renumbered(X.drop(columns=drop) if drop else X)
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:
