@@ -273,6 +273,14 @@ def _trim_heap() -> None:
         pass
 
 
+def _columns(F: pd.DataFrame, cols) -> pd.DataFrame:
+    """``F[cols]`` as views of F's columns: selecting copies every column, which on a wide
+    table is gigabytes per gate fit."""
+    if not F.columns.is_unique or len(set(cols)) != len(cols):
+        return F[cols]
+    return pd.DataFrame({c: F[c] for c in cols}, copy=False)
+
+
 def _release(spec) -> None:
     """Drop a candidate's fitted state (attributes ending in ``_``). Thousands of candidates
     per round each holding lookup tables over a million rows (counts of a near-unique value,
@@ -839,6 +847,49 @@ def synthetic_rows(X: pd.DataFrame, U: pd.DataFrame, min_rate: float = 0.9, min_
     return ~uu
 
 
+def _value_table(s: pd.Series, ones: bool = True):
+    """``s.value_counts()`` held as sorted arrays: the repeated values with their counts, and
+    (``ones``) the values seen once. A mapped Series keeps a hash table on its index, and a
+    family of a thousand near-unique columns holds gigabytes of them; repeats are all a mask
+    needs. Non-numeric columns keep the Series."""
+    vc = s.value_counts()
+    if vc.index.dtype.kind not in "iuf" or isinstance(vc.index.dtype, pd.api.extensions.ExtensionDtype):
+        return vc
+    v, k = vc.index.to_numpy(), vc.to_numpy()
+    rep = k > 1
+    o = np.argsort(v[rep], kind="stable")
+    one = np.sort(v[~rep]) if ones else None
+    return v[rep][o], k[rep][o], one
+
+
+def _sorted_hits(table: np.ndarray, x: np.ndarray):
+    """Positions of x in the sorted ``table``, and where they match exactly."""
+    if len(table) == 0:
+        return np.zeros(len(x), dtype=np.intp), np.zeros(len(x), dtype=bool)
+    i = np.minimum(np.searchsorted(table, x), len(table) - 1)
+    return i, table[i] == x
+
+
+def _map_counts(s: pd.Series, vc) -> np.ndarray:
+    """``s.map(vc).to_numpy(dtype=float)`` for a table from ``_value_table`` (NaN where a value
+    was not counted; seen-once values need ``ones``)."""
+    if isinstance(vc, pd.Series):
+        return s.map(vc).to_numpy(dtype=float)
+    v, k, one = vc
+    if s.dtype.kind not in "iuf" or isinstance(s.dtype, pd.api.extensions.ExtensionDtype):
+        full = pd.Series(np.r_[k, np.ones(0 if one is None else len(one), k.dtype)],
+                         index=np.r_[v, [] if one is None else one])
+        return s.map(full).to_numpy(dtype=float)
+    x = s.to_numpy()
+    cnt = np.full(len(x), np.nan)
+    i, hit = _sorted_hits(v, x)
+    cnt[hit] = k[i[hit]]
+    if one is not None:
+        _, hit1 = _sorted_hits(one, x)
+        cnt[hit1] = 1.0
+    return cnt
+
+
 class FamilyCount(Spec):
     """Value frequencies of every column of a homogeneous family, as one block.
 
@@ -861,13 +912,13 @@ class FamilyCount(Spec):
         return [f"fam{self.kind}__{c}" for c in self.parents]
 
     def fit(self, df, y, ctx):
-        self.vc_ = [df[c].value_counts() for c in self.parents]
+        self.vc_ = [_value_table(df[c], ones=self.kind == "count") for c in self.parents]
         return self
 
     def transform(self, df, ctx):
         out = np.empty((len(df), self.n_out), dtype=np.float32)
         for j, (c, vc) in enumerate(zip(self.parents, self.vc_)):
-            cnt = df[c].map(vc).to_numpy(dtype=float)
+            cnt = _map_counts(df[c], vc)
             if self.kind == "count":
                 out[:, j] = np.nan_to_num(cnt, nan=0.0)
             else:
@@ -2309,7 +2360,7 @@ class FeatureForge:
         """Model view of a frame: categoricals as ``category`` dtype, or, when the
         high-cardinality recode is active, those columns as frequency-rank numbers."""
         recode = self.recode_ if recode is None else recode
-        X = X.copy()
+        X = X.copy(deep=False)  # columns are replaced, never written into
         for c in self.cat_cols_:
             if c not in X.columns:
                 continue
@@ -3672,6 +3723,9 @@ class FeatureForge:
             if loss_r < cur_loss * (1 - self.min_rel_gain):
                 self.recode_ = True
                 Mw, margin, cur_loss, imp = Wr, m_r, loss_r, imp_r
+            # Mw alone holds the model matrix: the joint ranking releases it, and the round's
+            # largest matrices are built while it would otherwise linger here.
+            Wr = U_ = later = None
         self._log(f"task={self.task_} rows={n} (search {len(W)}, gate {len(idx_gate)}) "
                   f"cols={X.shape[1]} base CV loss={cur_loss:.6f} (one CV fit {self._cv_s:.0f}s of work)")
 
@@ -3753,6 +3807,10 @@ class FeatureForge:
                 Mj[:, jpos[c]] = v
             cats_j = set(Mw[1])
             Mw = None  # its columns lead the joint matrix
+            # The joint matrix holds every survivor's values: keep only what it cannot
+            # (values of another dtype), so they are not held twice from here on.
+            values = {nm: v for nm, v in values.items() if v.dtype != np.float32}
+            new = None
             import lightgbm as lgb
             Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params(),
                              free_raw_data=False).construct()
@@ -3765,10 +3823,6 @@ class FeatureForge:
                 cats = [i for i, j in enumerate(idx) if j in cats_j]
                 return (Mj[:, idx], cats, list(cols)) if copy else (Mj, cats, list(cols), idx)
 
-            # The joint matrix holds every survivor's values: keep only what it cannot
-            # (values of another dtype), so they are not held twice during the ladder.
-            values = {nm: v for nm, v in values.items() if v.dtype != np.float32}
-            new = None
             rank = sorted(survivors, key=lambda nm: -sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()))
             rank = [nm for nm in rank if sum(gain.get(c, 0) for c in spec_by_name[nm].out_names()) > 0]
 
@@ -4031,8 +4085,8 @@ class FeatureForge:
         def gate_loss(cols, recode=None):
             # A bag of differently seeded / early-stopped models: one model's
             # randomness otherwise flips keep-or-drop decisions on small gates.
-            A, D = self._lgb_data(self._model_frame(Fs[cols], recode), ys, lr=0.05)
-            G, _ = self._lgb_matrix(self._model_frame(Fg[cols], recode))
+            A, D = self._lgb_data(self._model_frame(_columns(Fs, cols), recode), ys, lr=0.05)
+            G, _ = self._lgb_matrix(self._model_frame(_columns(Fg, cols), recode))
             margin = 0.0
             for k, (tr, va) in enumerate(es_splits):
                 b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
@@ -4040,6 +4094,8 @@ class FeatureForge:
                 full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
+            A = D = G = b = full = None
+            _trim_heap()
             return _row_loss(self.task_, yg, margin)
 
         # Rows of one period share its shocks, so their paired differences are not
