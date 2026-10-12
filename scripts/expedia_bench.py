@@ -21,6 +21,7 @@ ap = argparse.ArgumentParser(); ap.add_argument('--arm', default='raw'); ap.add_
 ap.add_argument('--cut', default='2014-07-01'); ap.add_argument('--end', default='2015-01-01'); ap.add_argument('--log', default='expedia.jsonl')
 ap.add_argument('--repo', default=str(Path(__file__).resolve().parents[1])); ap.add_argument('--shuffle', action='store_true')
 ap.add_argument('--shuffle-seed', type=int, default=0); ap.add_argument('--tag', default='')
+ap.add_argument('--budget', default=None, help="contest_features --budget (work-clock seconds; default: its own)")
 a = ap.parse_args()
 d = pd.read_parquet(a.data)
 d['date_time'] = pd.to_datetime(d.date_time)
@@ -62,7 +63,7 @@ else:
         tr.assign(hotel_cluster=ytr).to_parquet(tmp / 'train.parquet'); te.to_parquet(tmp / 'test.parquet')
         subprocess.run([sys.executable, str(Path(a.repo) / 'scripts' / 'contest_features.py'), '--train', str(tmp / 'train.parquet'),
                         '--test', str(tmp / 'test.parquet'), '--target', 'hotel_cluster', '--task', 'multiclass',
-                        '--out-dir', str(tmp / 'out')], check=True, cwd=a.repo)
+                        '--out-dir', str(tmp / 'out')] + (['--budget', a.budget] if a.budget else []), check=True, cwd=a.repo)
         info['peak_mb'] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024
         Xtr = pd.read_parquet(tmp / 'out' / 'train_features.parquet').drop(columns=['hotel_cluster'])
         Xte = pd.read_parquet(tmp / 'out' / 'test_features.parquet')[Xtr.columns]
@@ -85,6 +86,6 @@ p = lgb.train(P, lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict
 top = np.argsort(-p, axis=1)[:, :5]
 hit = top == yte[:, None]
 map5 = float((hit / np.arange(1, 6)).sum(1).mean())
-res = dict(arm=a.arm + a.tag + (f'_shuffled{a.shuffle_seed}' if a.shuffle else ''), map5=map5, n_tr=n, n_te=len(Xte),
+res = dict(budget=a.budget, arm=a.arm + a.tag + (f'_shuffled{a.shuffle_seed}' if a.shuffle else ''), map5=map5, n_tr=n, n_te=len(Xte),
            n_cols=Xtr.shape[1], best_it=b.best_iteration, fe_s=round(fe_t), total_s=round(time.time() - t0), **info)
 print('RESULT', json.dumps(res)); open(a.log, 'a').write(json.dumps(res) + '\n')
