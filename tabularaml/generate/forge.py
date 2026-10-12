@@ -121,6 +121,15 @@ def _as_str_frame_col(s: pd.Series) -> pd.Series:
     return _as_str(s)
 
 
+def _renumbered(X: pd.DataFrame) -> pd.DataFrame:
+    """``X.reset_index(drop=True)`` without copying the data: a shallow copy whose columns are
+    replaced, never written into, by what follows (Bosch: a second copy of a 4,264-column frame
+    held through the whole search took the build past the container's 15 GB)."""
+    X = X.copy(deep=False)
+    X.index = pd.RangeIndex(len(X))
+    return X
+
+
 def _concat_cats(parts: List[pd.DataFrame]) -> pd.DataFrame:
     """Row-wise concat that keeps ``category`` columns as categories (on the union of the parts'
     levels): pandas otherwise falls back to one string object per row, gigabytes on 9M rows."""
@@ -1485,6 +1494,77 @@ def _tfidf(kind: str, max_features: int):
                            token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
 
 
+def _doc_parts(df, extra, c, clip):
+    """``_text_values`` of ``df`` then ``extra`` (when it has the column) as distinct texts and each
+    row's index into them."""
+    t, k = _text_parts(df, c, clip)
+    if extra is not None and c in extra:
+        t2, k2 = _text_parts(extra, c, clip)
+        t, k = pd.concat([t, t2], ignore_index=True), np.concatenate([k, k2 + len(t)])
+    return t, k
+
+
+def _sample_rows(k, n):
+    """The rows ``Series.sample(n, random_state=0)`` picks from a column of len(k) values."""
+    return pd.Series(k).sample(n, random_state=0).to_numpy() if len(k) > n else k
+
+
+def _fit_counted(vec, texts, k):
+    """``vec.fit(texts[k])`` from the distinct texts alone: the vocabulary and idf ``fit`` learns on
+    the repeated corpus, each distinct text analysed once (MCTS: a game's rules, thousands of
+    characters, on each of its matches; analysing every copy was gigabytes and minutes per
+    vectoriser). Exact while every term's total count stays below 2**24, the float32 sums'
+    exact range; otherwise, and for options this does not reproduce, ``fit`` on the copies."""
+    from collections import Counter
+    from numbers import Integral
+    from sklearn.feature_extraction.text import TfidfTransformer
+    if (vec.vocabulary is not None or vec.binary or not vec.use_idf or vec.max_features is None
+            or np.dtype(vec.dtype) != np.float32):
+        return vec.fit(texts.to_numpy()[k])
+    order = pd.unique(k)                              # distinct texts in order of first use
+    mult = np.bincount(k, minlength=len(texts))[order]
+    analyze = vec.build_analyzer()
+    dfc, tfc = {}, {}
+    for d, m in zip(texts.to_numpy()[order], mult):
+        for term, n in Counter(analyze(d)).items():
+            dfc[term] = dfc.get(term, 0) + int(m)
+            tfc[term] = tfc.get(term, 0) + int(m) * n
+    if not dfc or max(tfc.values()) >= 1 << 24:
+        return vec.fit(texts.to_numpy()[k])
+    n_doc = len(k)
+    terms = sorted(dfc)
+    dfs = np.array([dfc[t] for t in terms], dtype=np.int64)
+    high = vec.max_df if isinstance(vec.max_df, Integral) else vec.max_df * n_doc
+    low = vec.min_df if isinstance(vec.min_df, Integral) else vec.min_df * n_doc
+    if high < low:
+        raise ValueError("max_df corresponds to < documents than min_df")
+    mask = (dfs <= high) & (dfs >= low)
+    if mask.sum() > vec.max_features:                 # as CountVectorizer._limit_features
+        tfs = np.array([tfc[t] for t in terms], dtype=np.float32)
+        inds = (-tfs[mask]).argsort()[:vec.max_features]
+        keep = np.zeros(len(dfs), dtype=bool)
+        keep[np.where(mask)[0][inds]] = True
+        mask = keep
+    if not mask.any():
+        raise ValueError("After pruning, no terms remain. Try a lower min_df or a higher max_df.")
+    new = np.cumsum(mask) - 1
+    pos = {t: i for i, t in enumerate(terms)}
+    seen = dict.fromkeys(t for d in texts.to_numpy()[order] for t in analyze(d))   # first-use order
+    vec.fixed_vocabulary_ = False
+    vec.vocabulary_ = {t: new[pos[t]] for t in seen if mask[pos[t]]}
+    df = dfs[mask].astype(np.float32)                 # as TfidfTransformer.fit
+    df += float(vec.smooth_idf)
+    idf = np.full_like(df, fill_value=n_doc + int(vec.smooth_idf), dtype=np.float32)
+    idf /= df
+    np.log(idf, out=idf)
+    idf += 1.0
+    vec._tfidf = TfidfTransformer(norm=vec.norm, use_idf=vec.use_idf, smooth_idf=vec.smooth_idf,
+                                  sublinear_tf=vec.sublinear_tf)
+    vec._tfidf.idf_ = idf
+    vec._tfidf.n_features_in_ = len(vec.vocabulary_)
+    return vec
+
+
 class TextSVD(Spec):
     """Latent semantic components of a free-text field: TF-IDF of words and word
     pairs reduced by truncated SVD, fitted label-free on every row whose text is
@@ -1499,14 +1579,10 @@ class TextSVD(Spec):
     def fit(self, df, y, ctx):
         from sklearn.decomposition import TruncatedSVD
         c = self.parents[0]
-        extra = getattr(ctx, "extra_rows", None)
-        t = _text_values(df, c, TEXT_CLIP)
-        if extra is not None and c in extra:
-            t = pd.concat([t, _text_values(extra, c, TEXT_CLIP)], ignore_index=True)
-        if len(t) > self.max_fit_rows:
-            t = t.sample(self.max_fit_rows, random_state=0)
-        self.vec_ = _tfidf("word", 50_000).fit(t)
-        T = self.vec_.transform(t)
+        texts, k = _doc_parts(df, getattr(ctx, "extra_rows", None), c, TEXT_CLIP)
+        k = _sample_rows(k, self.max_fit_rows)
+        self.vec_ = _fit_counted(_tfidf("word", 50_000), texts, k)
+        T = self.vec_.transform(texts)[k]
         self.n_out = int(min(self.n_out, max(1, T.shape[1] - 1)))
         self.svd_ = TruncatedSVD(self.n_out, random_state=0, algorithm="randomized", n_iter=4).fit(T)
         return self
@@ -1539,14 +1615,11 @@ class TextLinearOOF(Spec):
         extra = getattr(ctx, "extra_rows", None)
         self.vecs_ = []
         for c in self.text_cols:
-            t = _text_values(df, c, TEXT_CLIP)
-            if extra is not None and c in extra:
-                t = pd.concat([t, _text_values(extra, c, TEXT_CLIP)], ignore_index=True)
-            if len(t) > 300_000:
-                t = t.sample(300_000, random_state=0)
-            vs = [_tfidf("word", 200_000).fit(t)]
-            if self.chars and t.str.len().mean() <= 80:
-                vs.append(_tfidf("char", 100_000).fit(t))
+            texts, k = _doc_parts(df, extra, c, TEXT_CLIP)
+            k = _sample_rows(k, 300_000)
+            vs = [_fit_counted(_tfidf("word", 200_000), texts, k)]
+            if self.chars and pd.Series(texts.str.len().to_numpy()[k]).mean() <= 80:
+                vs.append(_fit_counted(_tfidf("char", 100_000), texts, k))
             self.vecs_.append(vs)
         if self.keys:
             from sklearn.preprocessing import OneHotEncoder
@@ -3298,7 +3371,7 @@ class FeatureForge:
         self.addons_ = {}
         # Column names as unique strings (integer names broke sorting, a repeated name made pandas return a frame
         # where a column was expected); transform renames new rows' columns the same way.
-        X = self._named(X).reset_index(drop=True)
+        X = _renumbered(self._named(X))
         if X_unlabeled is not None:
             X_unlabeled = self._named(X_unlabeled)
         y = pd.Series(np.asarray(y))
@@ -3851,9 +3924,22 @@ class FeatureForge:
         self.U_search_ = self.WU_ = None
         if on and getattr(self, "_wu_src", None) is not None:
             X, idx_gate, U = self._wu_src
-            parts = [W[self.raw_cols_], X.iloc[idx_gate][self.raw_cols_]] + ([] if U is None else [self._prep(U)[self.raw_cols_]])
-            self.WU_ = _concat_cats(parts)
-            self.U_search_ = self.WU_.iloc[len(W):].reset_index(drop=True)
+            Up = None if U is None else self._prep(U)
+            cols, pos = list(self.raw_cols_), X.columns.get_indexer(self.raw_cols_)
+            # A few hundred columns at a time: the parts' copies of a wide table (all its rows) were
+            # as large as the frame itself, on top of it (Bosch, 4,264 columns: past the 15 GB limit).
+            # Joined column by column (each a view of its chunk), not consolidated: consolidating copied it all again.
+            out = {}
+            for i in range(0, len(cols), 256):
+                cc = cols[i:i + 256]
+                parts = [W[cc], X.iloc[idx_gate, pos[i:i + 256]]] + ([] if Up is None else [Up[cc]])
+                chunk = _concat_cats(parts)
+                del parts
+                out.update({c: chunk[c] for c in cc})
+            del Up
+            self.WU_ = pd.DataFrame(out, copy=False) if len(cols) > 256 else chunk
+            del out
+            self.U_search_ = _renumbered(self.WU_.iloc[len(W):])
         self.ctx_.extra_rows = self.U_search_
 
     def _parity_filter(self, G, U, specs, max_rows=50_000):
@@ -4137,7 +4223,8 @@ class FeatureForge:
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
-        X = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
+        drop = [c for c in getattr(self, "shifted_", []) if c in X.columns]
+        X = _renumbered(X.drop(columns=drop) if drop else X)
         for c in getattr(self, "date_cols_", []):
             X[c] = _to_days(X[c])
         for c in self.cat_cols_:

@@ -48,7 +48,19 @@ def log_y(y: pd.Series) -> np.ndarray:
 
 
 def read(path: str) -> pd.DataFrame:
-    return normalise(pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path, low_memory=False))
+    df = normalise(pd.read_parquet(path) if path.endswith(".parquet") else pd.read_csv(path, low_memory=False))
+    release_arrow()
+    return df
+
+
+def release_arrow():
+    """Hand back the memory pyarrow's allocator keeps after a parquet read (Bosch: 2.6 GB of a
+    2.6 GB table, held through the whole search)."""
+    try:
+        import pyarrow as pa
+        pa.default_memory_pool().release_unused()
+    except (ImportError, AttributeError):
+        pass
 
 
 def normalise(df: pd.DataFrame) -> pd.DataFrame:
@@ -435,6 +447,7 @@ def main():
             Xte = pd.concat([Xte.reset_index(drop=True), Pte], axis=1)
             print(f"panel: {P} -> {Ptr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
     del tr, te  # a second copy of both tables is gigabytes on IEEE-CIS
+    release_arrow()
     forecasting = False
     if a.forecast == "auto":
         from tabularaml.generate.forecast import ForecastFeatures
