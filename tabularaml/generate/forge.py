@@ -3559,7 +3559,12 @@ class FeatureForge:
         # rows next to the model's matrix. When labels carry little signal, fits stop early and
         # the time rule above never shrinks the search (Malware's 5.9M search rows with shuffled
         # labels: killed at 14 GB in the first round), so the rows are also capped by memory.
-        mem_cap = self._mem_rows(len(self.raw_cols_))
+        # The frame of every row (search, held-out and unlabeled; see _set_wu) is built for each round
+        # whatever the search rows: its size comes off the memory the search rows may use.
+        mu = X.memory_usage(index=False, deep=False)
+        all_rows = float(mu[[c for c in self.raw_cols_ if c in mu.index]].sum()) * (
+            1 + (0 if X_unlabeled is None else len(X_unlabeled) / max(len(X), 1)))
+        mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows)
         if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
             self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
@@ -3892,11 +3897,12 @@ class FeatureForge:
         self._log(f"done: {len(self.selected_)} features added in {self.elapsed_:.1f}s ({self._work:.0f}s of work)")
         return self
 
-    def _mem_rows(self, n_cols, share=0.3):
+    def _mem_rows(self, n_cols, share=0.3, fixed=0.0):
         """Search rows whose candidate columns, their build-time copies and the model's matrix
         (float32) fit in ``share`` of the memory still free under the limit (the container's
         cgroup limit when set), or None when it is unknown. Malware: about 6 KB per search row
-        in the first round on top of the 7 GB its tables already take."""
+        in the first round on top of the 7 GB its tables already take. ``fixed``: bytes needed
+        whatever the search rows."""
         lim = []
         for f in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
             try:
@@ -3914,7 +3920,7 @@ class FeatureForge:
         if not lim:
             return None
         keep = min(80, 3 * self.max_new_features)
-        return int(share * max(min(lim) - rss, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
+        return int(share * max(min(lim) - rss - fixed, 0) / (4 * (16 * keep + 2 * n_cols + 16)))
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,
