@@ -2637,6 +2637,11 @@ class FeatureForge:
                     self._mine_paths(b, cols, self.pair_gain_, self.triple_gain_)
             losses.append(_loss(self.task_, y, oof))
             oof_mean += oof / len(repeats)
+        # The binned dataset, the selected columns' copy and LightGBM's per-thread buffers are freed
+        # here, but glibc keeps them in its arenas: across a prefix ladder of fits on a wide table the
+        # process grew by gigabytes it no longer used (1,913 columns: 10.9 -> 13.6 GB).
+        D = b = None
+        _trim_heap()
         return oof_mean, float(np.mean(losses)), imp
 
     # ------------------------------------------------------- candidate pool
