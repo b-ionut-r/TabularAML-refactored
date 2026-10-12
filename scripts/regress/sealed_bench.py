@@ -386,56 +386,80 @@ if a.arm == 'ff':
         try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)  # hand freed pages back to the OS
         except OSError: pass
         subprocess.run(cmd + (a.extra.split() if a.extra else []), check=True, cwd=a.repo)
-        import pyarrow.parquet as pq  # self_destruct: arrow buffers freed column by column, not a second full copy
-        _rd = lambda f: pq.read_table(f).to_pandas(self_destruct=True, split_blocks=True)
-        Ftr = _rd(tmp / 'out' / 'train_features.parquet').drop(columns=['__y'])
-        Fte = _rd(tmp / 'out' / 'test_features.parquet')[Ftr.columns]
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    Xtr, Xte = Ftr, Fte; del Ftr, Fte
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True); raise
 fe_t = time.time() - t0
-if idc:
-    Xtr, Xte = Xtr.drop(columns=[idc], errors='ignore'), Xte.drop(columns=[idc], errors='ignore')
-# No defensive copy: every arm's frames are fresh here (a 4k-column FF output is 4 GB per copy).
-for c in Xtr.columns:
-    if pd.api.types.is_datetime64_any_dtype(Xtr[c]):
-        Xtr[c] = (Xtr[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float); Xte[c] = (Xte[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float)
-    elif not pd.api.types.is_numeric_dtype(Xtr[c]):
-        # object -> str per value: astype(str) on a category of long rule texts makes a fixed-width array (118 GiB on MCTS)
-        _s = lambda v: v.astype(object).map(str)
-        cats = pd.Index(pd.unique(_s(Xtr[c])))
-        Xtr[c] = pd.Categorical(_s(Xtr[c]), categories=cats); Xte[c] = pd.Categorical(_s(Xte[c]), categories=cats)
+import pyarrow.parquet as pq
+
+
+def _conv(Ftr, Fte):
+    """Dates -> days, text -> categories with the train's levels; the same for every arm, column by column."""
+    for c in Ftr.columns:
+        if pd.api.types.is_datetime64_any_dtype(Ftr[c]):
+            Ftr[c] = (Ftr[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float); Fte[c] = (Fte[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float)
+        elif not pd.api.types.is_numeric_dtype(Ftr[c]):
+            # object -> str per value: astype(str) on a category of long rule texts makes a fixed-width array (118 GiB on MCTS)
+            _s = lambda v: v.astype(object).map(str)
+            cats = pd.Index(pd.unique(_s(Ftr[c])))
+            Ftr[c] = pd.Categorical(_s(Ftr[c]), categories=cats); Fte[c] = pd.Categorical(_s(Fte[c]), categories=cats)
+    return Ftr, Fte
+
+
+# The judge is fed the matrix LightGBM's pandas path would build from these frames (category codes, -1 -> NaN,
+# its dtype rule), as numpy. The FF arm's output (4k+ columns on the wide case, 4 GB per copy) is read from its
+# parquet a block of columns at a time straight into that matrix, so it never exists as a whole frame as well.
+_lt = lambda t: np.float64 if isinstance(t, pd.CategoricalDtype) or pd.api.types.is_datetime64_any_dtype(t) or \
+    not pd.api.types.is_numeric_dtype(t) else t.type
+if a.arm == 'ff':
+    _ftr, _fte = tmp / 'out' / 'train_features.parquet', tmp / 'out' / 'test_features.parquet'
+    _sch = pq.read_schema(_ftr).empty_table().to_pandas()
+    cols = [c for c in _sch.columns if c != '__y' and c != idc]
+    dts = [_sch[c].dtype for c in cols]
+    n_tr, n_te = pq.read_metadata(_ftr).num_rows, pq.read_metadata(_fte).num_rows
+    _rd = lambda f, cs: pq.read_table(f, columns=cs).to_pandas(self_destruct=True, split_blocks=True)
+    blocks = lambda: ((_rd(_ftr, cols[i:i + 256]), _rd(_fte, cols[i:i + 256])) for i in range(0, len(cols), 256))
+else:
+    if idc:
+        Xtr, Xte = Xtr.drop(columns=[idc], errors='ignore'), Xte.drop(columns=[idc], errors='ignore')
+    cols, dts, n_tr, n_te = list(Xtr.columns), list(Xtr.dtypes), len(Xtr), len(Xte)
+    _blk = [(Xtr, Xte)]; del Xtr, Xte
+    blocks = lambda: (_blk.pop() for _ in range(1))
+_tdt = np.result_type(*[_lt(t) for t in dts], np.float32)
+names, cat_cols = [str(c) for c in cols], []
+Atr, Ate = np.empty((n_tr, len(cols)), dtype=_tdt, order='F'), np.empty((n_te, len(cols)), dtype=_tdt, order='F')
+j = 0
+for Ftr, Fte in blocks():
+    Ftr, Fte = _conv(Ftr, Fte)
+    for c in Ftr.columns:
+        for F, A in ((Ftr, Atr), (Fte, Ate)):
+            v = F[c]
+            if isinstance(v.dtype, pd.CategoricalDtype):
+                v = v.cat.codes.to_numpy().astype(np.float64); v[v == -1] = np.nan
+            else:
+                v = v.to_numpy(dtype=_tdt, na_value=np.nan)
+            A[:, j] = v
+        if isinstance(Ftr[c].dtype, pd.CategoricalDtype) and not Ftr[c].cat.ordered:
+            cat_cols.append(str(c))
+        j += 1
+    del Ftr, Fte
+assert j == len(cols)
+if a.arm == 'ff':
+    shutil.rmtree(tmp, ignore_errors=True)
+import gc; gc.collect()
+try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)
+except OSError: pass
 import lightgbm as lgb
 obj = {'binary': 'binary', 'multiclass': 'multiclass'}.get(P['task'], 'regression')
-Pm = dict(objective=obj, **({'num_class': P['n_class']} if obj == 'multiclass' else {}), learning_rate=0.05, num_leaves=63, min_child_samples=20 if len(Xtr) < 5000 else 100,
+Pm = dict(objective=obj, **({'num_class': P['n_class']} if obj == 'multiclass' else {}), learning_rate=0.05, num_leaves=63, min_child_samples=20 if n_tr < 5000 else 100,
           feature_fraction=0.5, bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, num_threads=4, verbose=-1,
           max_cat_to_onehot=8, cat_smooth=50)
-n = len(Xtr)
+n = n_tr
 if P.get('time'):
     fit, va = np.arange(int(0.85 * n)), np.arange(int(0.85 * n), n)
 else:
     perm = np.random.default_rng(a.seed + 1).permutation(n); fit, va = np.sort(perm[:int(0.85 * n)]), np.sort(perm[int(0.85 * n):])
-# The matrix LightGBM would build from the frames (its _data_from_pandas: category codes, -1 -> NaN, dtype by
-# its rule), filled column-major one column at a time, the frames freed before any fit, and handed over as numpy:
-# a wide frame is never held as frame + row-subset copy + LightGBM's own conversion at once. Same values, same model.
-cat_cols = [c for c in Xtr.columns if isinstance(Xtr[c].dtype, pd.CategoricalDtype) and not Xtr[c].cat.ordered]
-_tdt = np.result_type(*[np.float64 if isinstance(t, pd.CategoricalDtype) else t.type for t in Xtr.dtypes], np.float32)
-names = [str(c) for c in Xtr.columns]
-def _mat(F):
-    A = np.empty(F.shape, dtype=_tdt, order='F')
-    for j, c in enumerate(F.columns):
-        v = F[c]
-        if isinstance(v.dtype, pd.CategoricalDtype):
-            v = v.cat.codes.to_numpy().astype(np.float64); v[v == -1] = np.nan
-        else:
-            v = v.to_numpy(dtype=_tdt, na_value=np.nan)
-        A[:, j] = v
-    return A
 _ds = lambda A, y: lgb.Dataset(A, y, feature_name=names, categorical_feature=cat_cols, free_raw_data=True)
-n_cols = Xtr.shape[1]; Atr = _mat(Xtr); del Xtr; Ate = _mat(Xte); del Xte
-import gc; gc.collect()
-try: import ctypes; ctypes.CDLL('libc.so.6').malloc_trim(0)
-except OSError: pass
+n_cols = len(cols)
 d_fit = _ds(Atr[fit], ytr[fit]); d_va = _ds(Atr[va], ytr[va])  # built by lgb.train with Pm, as before
 b = lgb.train(dict(Pm, seed=0), d_fit, 5000, valid_sets=[d_va], callbacks=[lgb.early_stopping(200, verbose=False)])
 del d_fit, d_va
