@@ -2960,7 +2960,11 @@ class FeatureForge:
         kinds = ("prev", "nth") if self.event_gaps == "past" else ("prev", "next", "nth")
         for u in users:
             for kind in kinds:
-                add(EntityLag(list(u) if len(u) > 1 else u[0], t, kind))
+                sp = EntityLag(list(u) if len(u) > 1 else u[0], t, kind)
+                # Planned as a family of their own: as entity lags (about ten times an arithmetic
+                # candidate's work, planned first) they shared one family share and were starved.
+                sp.family_ = "EventGap"
+                add(sp)
 
     def _entity_candidates(self, W, imp, top_num, add):
         """Counts, target maps and group statistics over ID-like columns and over
@@ -3272,9 +3276,11 @@ class FeatureForge:
         # and machine: one of each family first, then family by family from the cheapest per
         # candidate; a family stops at its share, and building stops where the ranking's reserve
         # begins.
+        def fam(sp):
+            return getattr(sp, "family_", type(sp).__name__)
         fams: Dict[str, list] = {}
         for sp in specs:
-            fams.setdefault(type(sp).__name__, []).append(sp)
+            fams.setdefault(fam(sp), []).append(sp)
         order = {sp.name: i for i, sp in enumerate(specs)}
         n_all = len(specs)
         plan, fam_work, capped, total = [], {}, set(), 0.0
@@ -3289,12 +3295,14 @@ class FeatureForge:
                 total += work(sp)
                 plan.append(sp)
                 continue
-            f = type(sp).__name__
+            f = fam(sp)
             if f in capped:
                 continue
             w = work(sp)
+            # A candidate that would cut into the reserve is skipped, not the end of the plan:
+            # cheaper ones after it (another family's) may still fit.
             if self.time_budget and self._time_left() - (total + w) / _REF_THREADS < reserve:
-                break
+                continue
             if self.time_budget and fam_work.get(f, 0.0) + w > fam_cap and f in fam_work:
                 capped.add(f)
                 self._log(f"budget: {f} candidates would take {fam_work[f] + w:.0f}s of work; the rest of them skipped")
