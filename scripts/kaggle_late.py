@@ -133,8 +133,8 @@ CONTESTS["hc_s"] = dict(CONTESTS["hc"], raw="hc", repo=S_REPO, base="hc")
 
 # Work clock with per-iteration fit costs (wt_det2, on superset 3f92353).
 CONTESTS["ieee_t"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_det2")
-# Calibrated work clock 76b7e07.
-CONTESTS["hc_t"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_76b7e07", base="hc")
+# Calibrated work clock + liblinear lock 76132f0.
+CONTESTS["hc_t"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_76132f0", base="hc")
 
 
 def download(c: str) -> Path:
