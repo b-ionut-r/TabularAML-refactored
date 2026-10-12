@@ -90,6 +90,11 @@ _SETUP_COL_S = 5e-1     # column screens before the search (codes, keys, label e
 _WU_ROW_SHARE = 0.05    # a label-free candidate fitted over all known rows costs its search rows plus this
                         # share of those rows (IEEE-CIS: 1,698 group statistics over 1.1M rows, 0.09 s each)
 _REF_THREADS = 4        # candidate building runs on this many threads there
+_CLASS_CELL_S = 5e-8    # multiclass only: one residual-probe column or interaction grid, per row and class.
+                        # Each class adds two histogram passes and its share of the softmax loss (4-5.5e-8
+                        # measured at 12 and 100 classes); a 100-output target map is probed column by
+                        # column, so it costs classes squared. Binary and regression costs are in the
+                        # family constants.
 # Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
 _SPEC_WORK = {
     "Arith": 1, "Expr": 1, "Digits": 1, "DatePart": 1, "Rotate": 1, "GroupStat": 2, "StrNum": 2, "GeoPair": 2,
@@ -2987,6 +2992,8 @@ class FeatureForge:
                     continue
                 triples[t] = self._cell_gain(ab * sizes[c] + codes[c], sizes[a] * sizes[b] * sizes[c], *args) \
                     - max(pairs[(a, b)] + max(one[a], one[b], 0.0), 0.0)
+        if self.task_ == "multiclass":
+            self._charge(_CLASS_CELL_S * n * self.n_classes_ * (len(one) + len(pairs) + len(triples)))
         return ({k: v for k, v in pairs.items() if v > 0}, {k: v for k, v in triples.items() if v > 0})
 
     def _wide_pairs(self, W, y, margin, imp):
@@ -3082,6 +3089,9 @@ class FeatureForge:
                 # Brute-force neighbours: every row against every row, over the subspace's columns
                 # (thread seconds per candidate: IEEE-CIS 151k rows 45-59, Home Credit 246k rows 193).
                 w *= rows / 150_000 * (len(s.parents) + 8) / 18
+            if self.task_ == "multiclass":
+                # The residual probe scores every output column against every class.
+                w += _CLASS_CELL_S * getattr(s, "n_out", 1) * self.n_classes_ * len(W)
             return w
 
         def compute(s):
