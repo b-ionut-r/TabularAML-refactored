@@ -81,6 +81,19 @@ _SPEC_WORK_DEFAULT = 20
 # Column helpers
 # ============================================================================
 
+def _unique_names(cols) -> list:
+    """Column names as strings, a repeated name numbered (``a``, ``a.1``) as pandas numbers a CSV's."""
+    out, seen = [], set()
+    for c in cols:
+        name, k = str(c), 0
+        while name in seen:
+            k += 1
+            name = f"{c}.{k}"
+        seen.add(name)
+        out.append(name)
+    return out
+
+
 def _is_cat(s: pd.Series) -> bool:
     return (s.dtype == object or s.dtype == bool or isinstance(s.dtype, pd.CategoricalDtype)
             or pd.api.types.is_string_dtype(s))
@@ -3283,7 +3296,11 @@ class FeatureForge:
         self._deadline = None
         self.wide_ = []
         self.addons_ = {}
-        X = X.reset_index(drop=True)
+        # Column names as unique strings (integer names broke sorting, a repeated name made pandas return a frame
+        # where a column was expected); transform renames new rows' columns the same way.
+        X = self._named(X).reset_index(drop=True)
+        if X_unlabeled is not None:
+            X_unlabeled = self._named(X_unlabeled)
         y = pd.Series(np.asarray(y))
         self.model_width_ = X.shape[1] + 3 * self.max_new_features   # widest frame a model sees
         self.n_synthetic_ = 0
@@ -4492,6 +4509,7 @@ class FeatureForge:
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         """Add features to new rows using statistics from all training rows."""
+        X = self._named(X)
         F = self._prep(X)
         for s in self.selected_:
             v = s.transform(F, self.ctx_)
@@ -4502,6 +4520,11 @@ class FeatureForge:
             out[c] = F[c].astype(np.float32).to_numpy()
         return out
 
+    @staticmethod
+    def _named(X: pd.DataFrame) -> pd.DataFrame:
+        names = _unique_names(X.columns)
+        return X if list(X.columns) == names else X.set_axis(names, axis=1)
+
     def _recode_out(self, X):
         out = X.reset_index(drop=True).drop(columns=[c for c in getattr(self, "shifted_", []) if c in X.columns])
         if self.recode_:
@@ -4511,7 +4534,7 @@ class FeatureForge:
 
     def transform_train(self, X: pd.DataFrame) -> pd.DataFrame:
         """Training rows with features as fitted (target encodings out-of-fold)."""
-        out = self._recode_out(X)
+        out = self._recode_out(self._named(X))
         if len(out) != len(self._train_frame):
             raise ValueError("transform_train expects the exact frame passed to fit")
         for c in self.new_columns_:
