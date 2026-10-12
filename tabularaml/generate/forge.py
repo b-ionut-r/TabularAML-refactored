@@ -95,6 +95,7 @@ _CLASS_CELL_S = 5e-8    # multiclass only: one residual-probe column or interact
                         # measured at 12 and 100 classes); a 100-output target map is probed column by
                         # column, so it costs classes squared. Binary and regression costs are in the
                         # family constants.
+_SCAN_SHARE = 0.125     # multiclass interaction scan: at most this share of the work left (rows subsampled)
 # Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
 _SPEC_WORK = {
     "Arith": 1, "Expr": 1, "Digits": 1, "DatePart": 1, "Rotate": 1, "GroupStat": 2, "StrNum": 2, "GeoPair": 2,
@@ -3085,6 +3086,21 @@ class FeatureForge:
         rows the lookup did not see. Triples extend the best pairs the same way.
         """
         cols = [c for c in imp.sort_values(ascending=False).index if c in W.columns][:n_cols]
+        if self.task_ == "multiclass" and self.time_budget:
+            # Every grid is scored once per class: Expedia's 100 hotel clusters over 510k search rows
+            # spent 1,985 s of wall in this scan before the search began. When the scan (singles,
+            # pairs, up to 130 triples) would take more than its share of the work left, it reads a
+            # fixed random subset of the rows instead.
+            k = len(cols)
+            est = _CLASS_CELL_S * len(y) * self.n_classes_ * (k + k * (k - 1) // 2 + 130)
+            cap = _SCAN_SHARE * max(self._time_left(), 0.0)
+            m = max(2_000, int(len(y) * cap / est)) if est > cap else len(y)
+            if m < len(y):
+                keep = np.sort(np.random.default_rng(self.random_state + 8).choice(len(y), m, replace=False))
+                self._log(f"interaction scan: {est:.0f}s of work on {len(y)} rows over {self.n_classes_} classes; "
+                          f"reading {m} of them")
+                W, y = W.iloc[keep], np.asarray(y)[keep]
+                margin = margin[keep] if np.ndim(margin) else margin
         n = len(y)
         K = 5
         fold = np.random.default_rng(self.random_state + 7).permutation(n) % K
