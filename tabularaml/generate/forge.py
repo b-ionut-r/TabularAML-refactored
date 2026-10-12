@@ -2444,12 +2444,11 @@ class FeatureForge:
     def _lgb_data(self, X: pd.DataFrame, y, lr=0.1):
         """One binned LightGBM dataset for a whole frame; folds train on its row subsets.
         Binning once per frame instead of once per fold, from a float32 matrix instead of
-        float64 copies of each fold, is most of the search's memory and a fifth of its time."""
+        float64 copies of each fold, is most of the search's memory and a fifth of its time.
+        The raw matrix is not kept: kept, every row subset took its own copy of its rows."""
         import lightgbm as lgb
         M, cats = self._lgb_matrix(X)
-        D = lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr),
-                        free_raw_data=False).construct()
-        return M, D
+        return lgb.Dataset(M, np.asarray(y), categorical_feature=cats, params=self._lgb_params(lr)).construct()
 
     def _fit_eval_rows(self, D, tr, va, lr=0.1, rounds=2000, es=50):
         """``_fit_eval`` on row subsets of a dataset built by ``_lgb_data``."""
@@ -3635,7 +3634,7 @@ class FeatureForge:
                 idx_out = np.union1d(idx_out, np.setdiff1d(idx_sel, keep))
                 self._log(f"search on {m} of {len(idx_sel)} rows")
                 idx_sel = keep
-            W = X.iloc[idx_sel].reset_index(drop=True)
+            W = _renumbered(X.iloc[idx_sel])
             yW = y_np[idx_sel]
             if self.group_col_ is not None:
                 gx = as_text(X[self.group_col_]).to_numpy()
@@ -3812,8 +3811,8 @@ class FeatureForge:
             values = {nm: v for nm, v in values.items() if v.dtype != np.float32}
             new = None
             import lightgbm as lgb
-            Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params(),
-                             free_raw_data=False).construct()
+            # Not keeping the raw matrix: the row subsets would each copy their rows of it.
+            Dj = lgb.Dataset(Mj, yW, categorical_feature=sorted(cats_j), params=self._lgb_params()).construct()
             b = self._fit_eval_rows(Dj, idx_a, idx_b)
             del Dj
             gain = pd.Series(b.feature_importance("gain"), index=jcols)
@@ -3920,7 +3919,7 @@ class FeatureForge:
         values = cands = Mw = None
         _trim_heap()
         if self.parity_check and X_unlabeled is not None and len(idx_gate) and self.selected_:
-            self.selected_ = selected = self._parity_filter(X.iloc[idx_gate].reset_index(drop=True),
+            self.selected_ = selected = self._parity_filter(_renumbered(X.iloc[idx_gate]),
                                                             self._prep(X_unlabeled)[self.raw_cols_], self.selected_)
         self.gate_passed_ = None
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
@@ -4063,9 +4062,11 @@ class FeatureForge:
         the search (target features out of fold); every selected spec is still
         fitted on exactly those rows, so the gate rows only need ``transform``.
         """
-        Xg = X.iloc[idx_gate].reset_index(drop=True)
+        # The gate rows once: features are added to a shallow copy (columns inserted, never
+        # written into), not to a second full copy of a wide table.
+        Xg = _renumbered(X.iloc[idx_gate])
         ys, yg = y[idx_sel], y[idx_gate]
-        Fs, Fg = W, Xg.copy()
+        Fs, Fg = W, Xg.copy(deep=False)
         addons = [sp for sp, _ in getattr(self, "addons_", {}).values()]
         for s in list(self.selected_) + [sp for _, extra, _ in getattr(self, "wide_", []) for sp in extra] + addons:
             if all(c in Fg.columns for c in s.out_names()):
@@ -4085,7 +4086,7 @@ class FeatureForge:
         def gate_loss(cols, recode=None):
             # A bag of differently seeded / early-stopped models: one model's
             # randomness otherwise flips keep-or-drop decisions on small gates.
-            A, D = self._lgb_data(self._model_frame(_columns(Fs, cols), recode), ys, lr=0.05)
+            D = self._lgb_data(self._model_frame(_columns(Fs, cols), recode), ys, lr=0.05)
             G, _ = self._lgb_matrix(self._model_frame(_columns(Fg, cols), recode))
             margin = 0.0
             for k, (tr, va) in enumerate(es_splits):
@@ -4094,7 +4095,7 @@ class FeatureForge:
                 full = lgb.train(self._lgb_params(0.05, seed=self.random_state + k), D,
                                  max(1, b.best_iteration))
                 margin = margin + full.predict(G, raw_score=True) / len(es_splits)
-            A = D = G = b = full = None
+            D = G = b = full = None
             _trim_heap()
             return _row_loss(self.task_, yg, margin)
 
