@@ -792,11 +792,19 @@ class RowStat(Spec):
     def transform(self, df, ctx):
         # Row blocks: a wide family over a large frame (IEEE-CIS's 339 V columns over a
         # million rows) is gigabytes as one float64 matrix, plus the nan-function copies.
+        # Each block is filled column by column: df[self.parents] copied the whole family over every
+        # row for each block, and the four materialising threads did it at once (a 1,900-column
+        # family: gigabytes per thread, killed at 12.5 GB in round 1). Column-major, as pandas
+        # lays out a frame's matrix, so the row reductions sum in the same order.
         step = max(1, 2_000_000 // max(len(self.parents), 1))
-        if len(df) <= step:
-            return self._stat(df[self.parents].to_numpy(dtype=float))
-        return np.concatenate([self._stat(df[self.parents].iloc[i:i + step].to_numpy(dtype=float))
-                               for i in range(0, len(df), step)])
+        cols = [df[c] for c in self.parents]
+        out = []
+        for i in range(0, len(df), step):
+            M = np.empty((min(step, len(df) - i), len(cols)), dtype=float, order="F")
+            for j, s in enumerate(cols):
+                M[:, j] = s.iloc[i:i + step].to_numpy(dtype=float)
+            out.append(self._stat(M))
+        return out[0] if len(out) == 1 else np.concatenate(out)
 
     def _stat(self, M):
         with np.errstate(all="ignore"):
