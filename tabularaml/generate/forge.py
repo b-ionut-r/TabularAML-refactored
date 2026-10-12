@@ -3928,6 +3928,7 @@ class FeatureForge:
                     self._log(f"budget: one CV fit costs {self._cv_s:.0f}s of work on {len(W)} rows; searching fewer rows")
                     continue
             break
+        self._cv_w = max(len(Mw[2]), 1)  # the width that one CV fit's work was measured at
         if self.n_interactions:
             self.fast_pairs_, self.fast_triples_ = self._fast_interactions(W, yW, margin, imp)
         self.wide_pairs_ = self._wide_pairs(W, yW, margin, imp) if self.pair_scan else []
@@ -4098,10 +4099,13 @@ class FeatureForge:
                     if k <= 0:
                         continue
                     key = frozenset(order[:k])
-                    if key in tried or (tried and self._time_left() < self._cv_s):
+                    cols = list(base_cols) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
+                    # A step costs its width: priced at the base CV's width, a 320-column step on
+                    # Expedia 3% (100 classes) was started with a 23-column fit's work left and took
+                    # 1,362 s.
+                    if key in tried or (tried and self._time_left() < self._cv_s * len(cols) / self._cv_w):
                         continue
                     tried.add(key)
-                    cols = list(base_cols) + [c for nm in order[:k] for c in spec_by_name[nm].out_names()]
                     oof_k, loss_k, imp_k = self._cv(None, yW, folds, nested=nested, mat=sub(cols, copy=False))
                     self._log(f"  {label} top-{k:<3d} CV loss={loss_k:.6f} ({100 * (cur_loss - loss_k) / cur_loss:+.2f}%)")
                     ladder_res.append((label, k, loss_k, order))
