@@ -386,11 +386,11 @@ if a.arm == 'ff':
         Fte = pd.read_parquet(tmp / 'out' / 'test_features.parquet')[Ftr.columns]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    Xtr, Xte = Ftr, Fte
+    Xtr, Xte = Ftr, Fte; del Ftr, Fte
 fe_t = time.time() - t0
 if idc:
     Xtr, Xte = Xtr.drop(columns=[idc], errors='ignore'), Xte.drop(columns=[idc], errors='ignore')
-Xtr, Xte = Xtr.copy(), Xte.copy()
+# No defensive copy: every arm's frames are fresh here (a 4k-column FF output is 4 GB per copy).
 for c in Xtr.columns:
     if pd.api.types.is_datetime64_any_dtype(Xtr[c]):
         Xtr[c] = (Xtr[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float); Xte[c] = (Xte[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float)
