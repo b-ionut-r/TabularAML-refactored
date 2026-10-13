@@ -541,20 +541,26 @@ def main():
         kw = dict(label_cols=[c for c in label_cols if c in Xtr.columns], **json.loads(a.forge_kw))
         forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **kw).fit(Xtr, y, X_unlabeled=Xte)
         out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
+        del forge
+    # Added a column at a time, and the test file written and dropped before the training file: a concat
+    # consolidates the whole output into a copy next to it (Instacart's 8.5 million rows: killed at 14 GB).
     if spill is not None:
         rest = [c for c in rel_cols if c not in out_tr.columns]
-        out_tr = pd.concat([out_tr, pd.read_parquet(spill / "train.parquet", columns=rest)], axis=1)
-        out_te = pd.concat([out_te, pd.read_parquet(spill / "test.parquet", columns=rest)], axis=1)
+        for o, f in ((out_tr, "train.parquet"), (out_te, "test.parquet")):
+            for c in rest:
+                o[c] = pd.read_parquet(spill / f, columns=[c])[c]
+            release_arrow()
         shutil.rmtree(spill, ignore_errors=True)
-        release_arrow()
     out_tr[a.target] = labels[y.to_numpy()] if labels is not None else y.to_numpy()
     if a.id:
         out_tr.insert(0, a.id, ids_tr)
         out_te.insert(0, a.id, ids_te)
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    out_tr.to_parquet(out / "train_features.parquet")
     out_te.to_parquet(out / "test_features.parquet")
+    del out_te, Xte
+    release_arrow()
+    out_tr.to_parquet(out / "train_features.parquet")
     print(f"done in {time.time() - t0:.0f}s: {out_tr.shape[1] - n_main - 1} columns added -> {out}/")
 
 
