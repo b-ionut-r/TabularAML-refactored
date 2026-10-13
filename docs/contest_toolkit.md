@@ -264,7 +264,7 @@ protocol):
 | Wider search (2× seeds, 4 rounds, 80 features) | +2.36% vs +2.34%, 35% slower |
 | Looser novelty filter, no gate | no gain; without the gate house prices −8% |
 | Gate averaged over 3 models | +2.25% vs +2.30% |
-| Composite-key group statistics (`n_composite`) | +2.02% vs +2.05% (kept, off by default) |
+| Composite-key group statistics (`n_composite`) | +2.02% vs +2.05% (removed) |
 | Gate z ≥ 0 on large gates | +2.01% vs +1.96%, more losing runs |
 | Denoising-autoencoder code, OOF MLP prediction, permutation-based column drop | no gain on the zero tables (MLP: steel plates −2 to −5%) |
 
@@ -448,7 +448,7 @@ suite tables checked it flags none. Resubmitted with the fix (ad001f8):
 FeatureForge 0.9205 public / 0.9176 private against raw 0.8979 / 0.8954,
 +0.022 on the private board as the holdouts predicted; 28-minute feature build.
 
-Tried and left opt-in (`family_nb=True`): per-column out-of-fold target maps
+Tried and removed (was `family_nb=True`): per-column out-of-fold target maps
 over (value band, value count) plus their sum, a naive-Bayes score. With the
 family blocks already present it lowered holdout 0 from 0.9183 to 0.9138.
 

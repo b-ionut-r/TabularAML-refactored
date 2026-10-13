@@ -98,10 +98,10 @@ _CLASS_CELL_S = 5e-8    # multiclass only: one residual-probe column or interact
 _SCAN_SHARE = 0.125     # multiclass interaction scan: at most this share of the work left (rows subsampled)
 # Candidate cost in row passes (thread time per row / _ROW_PASS_S), by family.
 _SPEC_WORK = {
-    "Arith": 1, "Expr": 1, "Digits": 1, "DatePart": 1, "Rotate": 1, "GroupStat": 2, "StrNum": 2, "GeoPair": 2,
+    "Arith": 1, "Digits": 1, "DatePart": 1, "Rotate": 1, "GroupStat": 2, "StrNum": 2, "GeoPair": 2,
     "TargetEnc": 3, "KeyBinTE": 3, "MixedTE": 3, "MixedCount": 3, "BinnedPairTE": 4, "Count": 5, "RowStat": 5,
     "SlotBag": 5, "SlotTE": 5, "TextStats": 5, "EntityLag": 10, "GroupSeq": 10, "LaggedTargetMean": 10,
-    "EventRecency": 14, "LinResid": 60, "LinearOOF": 60, "Projection": 60, "FamilyCount": 400, "FamilyNB": 400,
+    "EventRecency": 14, "LinResid": 60, "LinearOOF": 60, "Projection": 60, "FamilyCount": 400,
     "TextSVD": 500, "CrossLinearOOF": 1000, "TextLinearOOF": 1000, "KNNClassDist": 1300, "ClientProfile": 1300,
     "KNNTarget": 1900,
 }
@@ -1027,82 +1027,6 @@ class FamilyCount(Spec):
             else:
                 x = df[c].to_numpy(dtype=float)
                 out[:, j] = np.where(cnt > 1, x, np.nan)
-        return out
-
-
-class FamilyNB(Spec):
-    """Per-column target maps over (value band, how often the value occurs), for a
-    family of similar columns, plus their sum: a naive-Bayes score that treats
-    the columns as independent evidence (the Santander winners' model, as
-    features). Out-of-fold on training rows; frequencies use every row whose
-    features are known (``ctx.extra_rows``)."""
-    target_dep = True
-    paired = True
-
-    def __init__(self, cols: Sequence[str], label: str, n_bins: int = 32):
-        super().__init__(cols)
-        self.n_bins = n_bins
-        self.n_out = len(cols) + 1
-        self.name = f"famnb__{label}"
-
-    def out_names(self):
-        return [f"famnb__{c}" for c in self.parents] + [self.name + "__sum"]
-
-    def _cells(self, df):
-        cells = np.empty((len(df), len(self.parents)), dtype=np.int64)
-        for j, c in enumerate(self.parents):
-            x = df[c].to_numpy(dtype=float)
-            cnt = np.nan_to_num(df[c].map(self.vc_[j]).to_numpy(dtype=float), nan=1.0)
-            b = np.searchsorted(self.edges_[j], np.nan_to_num(x, nan=np.inf), side="right")
-            cells[:, j] = b * 3 + (np.clip(cnt, 1, 3).astype(np.int64) - 1)
-        return cells
-
-    def _prep(self, df, ctx):
-        extra = getattr(ctx, "extra_rows", None)
-        ref = df[self.parents] if extra is None else pd.concat([df[self.parents], extra[self.parents]], ignore_index=True)
-        self.vc_ = [ref[c].value_counts() for c in self.parents]
-        self.edges_ = [np.unique(np.nanquantile(ref[c].to_numpy(dtype=float), np.linspace(0, 1, self.n_bins + 1)[1:-1]))
-                       for c in self.parents]
-
-    def _table(self, cells, y):
-        size = (self.n_bins + 1) * 3
-        prior = float(np.mean(y))
-        tabs = []
-        for j in range(cells.shape[1]):
-            s = np.bincount(cells[:, j], y, minlength=size)
-            n = np.bincount(cells[:, j], minlength=size).astype(float)
-            m = (s + 20 * prior) / (n + 20)
-            if self.binary_:
-                m = np.clip(m, 1e-4, 1 - 1e-4)
-                pr = np.clip(prior, 1e-4, 1 - 1e-4)
-                tabs.append(np.log(m / (1 - m)) - np.log(pr / (1 - pr)))
-            else:
-                tabs.append(m - prior)
-        return np.stack(tabs, 1)
-
-    def _apply(self, cells, tab):
-        v = np.take_along_axis(tab, cells, axis=0)
-        return np.column_stack([v, v.sum(1)]).astype(np.float32)
-
-    def fit(self, df, y, ctx):
-        y = np.asarray(y, dtype=float)
-        self.binary_ = ctx.task == "binary"
-        self._prep(df, ctx)
-        self.tab_ = self._table(self._cells(df), y)
-        return self
-
-    def transform(self, df, ctx):
-        return self._apply(self._cells(df), self.tab_)
-
-    def fit_transform_oof(self, df, y, ctx, folds):
-        y = np.asarray(y, dtype=float)
-        self.binary_ = ctx.task == "binary"
-        self._prep(df, ctx)
-        cells = self._cells(df)
-        out = np.zeros((len(df), self.n_out), dtype=np.float32)
-        for tr, va in folds:
-            out[va] = self._apply(cells[va], self._table(cells[tr], y[tr]))
-        self.tab_ = self._table(cells, y)
         return out
 
 
@@ -2155,66 +2079,8 @@ class LinResid(Spec):
         return r
 
 
-class Expr(Spec):
-    """Arithmetic expression tree over numeric columns, found by the genetic search.
-
-    ``tree`` is a column name or ``(op, left, right)`` with op in
-    add / sub / mul / div. Depth-3 trees express ratios of sums, products of
-    ratios and similar compound interactions that pairwise Arith cannot.
-    """
-
-    def __init__(self, tree):
-        self.tree = _expr_canon(tree)
-        super().__init__(sorted(set(_expr_leaves(self.tree))))
-        self.name = "gp__" + _expr_str(self.tree)
-
-    def transform(self, df, ctx):
-        r = _expr_eval(self.tree, df)
-        r = np.asarray(r, dtype=float).copy()
-        r[~np.isfinite(r)] = np.nan
-        return r
-
-
-def _expr_leaves(t):
-    return [t] if isinstance(t, str) else _expr_leaves(t[1]) + _expr_leaves(t[2])
-
-
-def _expr_str(t):
-    if isinstance(t, str):
-        return t
-    sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}[t[0]]
-    return f"({_expr_str(t[1])}{sym}{_expr_str(t[2])})"
-
-
-def _expr_canon(t):
-    if isinstance(t, str):
-        return t
-    a, b = _expr_canon(t[1]), _expr_canon(t[2])
-    if t[0] in ("add", "mul") and _expr_str(b) < _expr_str(a):
-        a, b = b, a
-    return (t[0], a, b)
-
-
-def _expr_depth(t):
-    return 0 if isinstance(t, str) else 1 + max(_expr_depth(t[1]), _expr_depth(t[2]))
-
-
-def _expr_eval(t, df):
-    if isinstance(t, str):
-        return df[t].to_numpy(dtype=float)
-    a, b = _expr_eval(t[1], df), _expr_eval(t[2], df)
-    with np.errstate(all="ignore"):
-        if t[0] == "add":
-            return a + b
-        if t[0] == "sub":
-            return a - b
-        if t[0] == "mul":
-            return a * b
-        return a / np.where(b == 0, np.nan, b)
-
-
 # Features computed from a row's own values only (no other rows enter them).
-_SAME_ROW = (Arith, RowStat, Digits, Rotate, Expr, DatePart, TextStats, GeoPair)
+_SAME_ROW = (Arith, RowStat, Digits, Rotate, DatePart, TextStats, GeoPair)
 
 
 class FeatureForge:
@@ -2314,11 +2180,6 @@ class FeatureForge:
         with a given level of a low-cardinality column (days since the last
         promotion, until the next holiday). Date columns (datetime or ISO date
         strings) are always expanded into calendar fields as candidates.
-    family_nb : bool
-        Within a family of 8+ similar numeric columns (Santander's var_0..199),
-        add per-column out-of-fold target maps over (value bin, value count)
-        and their sum, a naive-Bayes score. Off: it lowered Santander's AUC
-        from 0.918 to 0.914 next to the label-free family counts.
     text : bool
         Free-text columns (strings of mostly distinct values, several words each:
         titles, descriptions) get label-free writing statistics and TF-IDF SVD
@@ -2340,15 +2201,9 @@ class FeatureForge:
         stop appearing) are judged as they will be on a later test set. "auto"
         picks a numeric column whose unlabeled values (``X_unlabeled``) lie
         beyond the training range, as a competition's test period does.
-    n_composite : int
-        Key pairs (most interacting first) whose groups get numeric aggregations.
     gate_bags : int
         Models averaged per feature set on the gate (different seeds and
         early-stopping splits), to keep model noise out of the decision.
-    evolve_time : float
-        Seconds of genetic interaction search per round (0 disables): populations
-        of key/binned-numeric cells (target-encoded) and arithmetic expression
-        trees evolve under the novel residual gain, seeded from the mined pairs.
     n_interactions : int
         Number of feature pairs (and half as many triples) mined from the base
         model's tree paths and expanded into explicit interaction features.
@@ -2369,10 +2224,10 @@ class FeatureForge:
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
-                 evolve_time: float = 0.0, gate_bags: int = 1, n_composite: int = 0, fold_avg_te: bool = False,
+                 gate_bags: int = 1, fold_avg_te: bool = False,
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
-                 family_nb: bool = False, events: bool = True, time_cv: bool = True,
+                 events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
@@ -2393,9 +2248,7 @@ class FeatureForge:
         self.hc_threshold = hc_threshold
         self.n_interactions = n_interactions
         self.novelty_slack = novelty_slack
-        self.evolve_time = evolve_time
         self.gate_bags = gate_bags
-        self.n_composite = n_composite
         self.fold_avg_te = fold_avg_te
         self.gate_subsets = gate_subsets
         self.nested_cv = nested_cv
@@ -2404,7 +2257,6 @@ class FeatureForge:
         self.entity_nums = entity_nums
         self.entity_lags = entity_lags
         self.event_gaps = event_gaps
-        self.family_nb = family_nb
         self.events = events
         self.time_cv = time_cv
         self.lagged_te = lagged_te
@@ -2799,8 +2651,6 @@ class FeatureForge:
                 if len(cols) >= 8:
                     add(FamilyCount(cols, "count", stem))
                     add(FamilyCount(cols, "mask", stem))
-                    if self.family_nb and self.n_classes_ <= 2:
-                        add(FamilyNB(cols, stem))
             # Multi-valued fields stored in numbered slots (components, specs, items).
             for stem, cols, pair in slot_families(W[self.base_cols_], self.cat_cols_):
                 add(SlotBag(cols, pair, stem))
@@ -2905,14 +2755,6 @@ class FeatureForge:
             for k1, k2 in combinations(top_keys, 2):
                 add(Count([k1, k2]))
                 add(TargetEnc([k1, k2], self.n_classes_))
-            # Composite-key aggregations: statistics of the strongest numerics within
-            # the groups of the most interacting key pairs.
-            kp = [p for p in sorted(getattr(self, "pair_gain_", {}), key=self.pair_gain_.get, reverse=True)
-                  if all(c in self.key_cols_ for c in p)][:self.n_composite]
-            for kk in kp:
-                for c in [c for c in top_num if c not in kk and c not in self.cat_cols_][:6]:
-                    for st in ("mean", "dev", "z", "nunique"):
-                        add(GroupStat(kk, c, st))
             for c in top_num:
                 if c not in self.key_cols_:
                     add(Count([c]))
@@ -3443,176 +3285,6 @@ class FeatureForge:
             parent_gain = dict(zip(W.columns, pool.map(own_gain, list(W.columns))))
         return probe, parent_gain
 
-    def _evolve(self, W, y, margin, imp, folds, budget, existing):
-        """Genetic interaction search under the novel residual gain.
-
-        Two genomes evolve side by side: column sets of 2-4 keys / binned
-        numerics (expressed as an out-of-fold target-encoded cell) and
-        arithmetic expression trees of depth <= 3 over numerics. Fitness is
-        the cross-fitted residual gain beyond the best single parent, the same
-        criterion screening uses, so the population climbs toward high-order
-        interactions the current model has not found. The initial populations
-        are seeded from the pairs and triples mined from the model's trees.
-        Returns ``{name: (spec, values)}`` for the fittest distinct individuals.
-        """
-        t_end = time.time() + budget
-        rng = np.random.default_rng(self.random_state + 17)
-        probe, pg = self._probe_setup(W, y, margin)
-        order = [c for c in imp.sort_values(ascending=False).index if c in W.columns]
-        nums = [c for c in order if c not in self.cat_cols_ and W[c].nunique() > 10][:16]
-        setcols = [c for c in order if c in self.key_cols_ or c not in self.cat_cols_][:20]
-        nunq = {c: W[c].nunique() for c in setcols}
-        out, fit = {}, {}
-
-        def evaluate(spec, parents):
-            if spec.name in fit or spec.name in existing:
-                return fit.get(spec.name, -np.inf)
-            try:
-                v = spec.fit_transform_oof(W, y, self.ctx_, folds) if spec.target_dep \
-                    else spec.fit(W, y, self.ctx_).transform(W, self.ctx_)
-                v = np.asarray(v, dtype=np.float32)
-                col = v if v.ndim == 1 else v[:, 0]
-                if np.isfinite(col).mean() < 0.05 or len(np.unique(np.round(col[np.isfinite(col)][:2000], 6))) < 3:
-                    raise ValueError
-                f = probe(v) - max(pg.get(p, 0.0) for p in parents)
-            except Exception:
-                f, v = -np.inf, None
-            fit[spec.name] = f
-            if v is not None and f > 0:
-                out[spec.name] = (spec, v)
-            return f
-
-        def set_spec(cols):
-            cols = sorted(set(cols))
-            binned = [c for c in cols if c not in self.cat_cols_ and (c not in self.key_cols_ or nunq[c] > 16)]
-            return MixedTE(cols, binned, self.n_classes_, 8 if len(cols) <= 2 else (6 if len(cols) == 3 else 4))
-
-        def mutate_set(cols):
-            cols = list(cols)
-            r = rng.random()
-            if (r < 0.4 and len(cols) < 4) or len(cols) < 2:
-                cols.append(setcols[int(rng.integers(len(setcols)))])
-            elif r < 0.6 and len(cols) > 2:
-                cols.pop(int(rng.integers(len(cols))))
-            else:
-                cols[int(rng.integers(len(cols)))] = setcols[int(rng.integers(len(setcols)))]
-            return tuple(sorted(set(cols)))
-
-        ops = ("add", "sub", "mul", "div")
-
-        def rand_leaf():
-            return nums[int(rng.integers(len(nums)))]
-
-        def subtrees(t, path=()):
-            yield path, t
-            if not isinstance(t, str):
-                yield from subtrees(t[1], path + (1,))
-                yield from subtrees(t[2], path + (2,))
-
-        def replace(t, path, new):
-            if not path:
-                return new
-            t = list(t)
-            t[path[0]] = replace(t[path[0]], path[1:], new)
-            return tuple(t)
-
-        def mutate_expr(t):
-            subs = list(subtrees(t))
-            path, node = subs[int(rng.integers(len(subs)))]
-            r = rng.random()
-            if r < 0.4:
-                new = (ops[int(rng.integers(4))], node, rand_leaf())
-                if rng.random() < 0.5:
-                    new = (new[0], new[2], new[1])
-            elif r < 0.7 or isinstance(node, str):
-                new = rand_leaf() if isinstance(node, str) else (ops[int(rng.integers(4))], node[1], node[2])
-            else:
-                new = node[1] if rng.random() < 0.5 else node[2]
-            return replace(t, path, new)
-
-        def cross_expr(a, b):
-            pa, _ = list(subtrees(a))[int(rng.integers(sum(1 for _ in subtrees(a))))]
-            _, nb = list(subtrees(b))[int(rng.integers(sum(1 for _ in subtrees(b))))]
-            return replace(a, pa, nb)
-
-        # Seeds: mined pairs / triples, then random fill.
-        mined = sorted(getattr(self, "pair_gain_", {}).items(), key=lambda kv: -kv[1])[:20]
-        mined += sorted(getattr(self, "triple_gain_", {}).items(), key=lambda kv: -kv[1])[:10]
-        mined += sorted(getattr(self, "fast_pairs_", {}).items(), key=lambda kv: -kv[1])[:10]
-        P = 24
-        sets, exprs = [], []
-        for cols, _ in mined:
-            cols = tuple(sorted(set(c for c in cols if c in nunq)))
-            if len(cols) >= 2 and cols not in sets:
-                sets.append(cols)
-            nc = [c for c in cols if c in nums]
-            if len(nc) >= 2:
-                exprs.append((ops[int(rng.integers(4))], nc[0], nc[1]))
-        while len(sets) < P and len(setcols) >= 2:
-            sets.append(tuple(sorted(set(rng.choice(setcols, size=int(rng.integers(2, 4)), replace=False)))))
-        while len(exprs) < P and len(nums) >= 2:
-            a, b = rng.choice(nums, size=2, replace=False)
-            exprs.append((ops[int(rng.integers(4))], str(a), str(b)))
-        sets, exprs = sets[:P], exprs[:P]
-        sfit = {c: evaluate(set_spec(c), c) for c in sets if time.time() < t_end}
-        efit = {_expr_canon(e): evaluate(Expr(e), _expr_leaves(e)) for e in exprs if time.time() < t_end}
-
-        def pick(pop):
-            keys = list(pop)
-            cand = [keys[int(rng.integers(len(keys)))] for _ in range(3)]
-            return max(cand, key=pop.get)
-
-        gens = 0
-        while time.time() < t_end and (sfit or efit):
-            gens += 1
-            for _ in range(P):
-                if time.time() >= t_end:
-                    break
-                if len(sfit) >= 2:
-                    a = pick(sfit)
-                    child = tuple(sorted(set(a) | set(pick(sfit)))) if rng.random() < 0.3 else a
-                    if len(child) > 4:
-                        child = tuple(sorted(rng.choice(child, size=4, replace=False)))
-                    for _try in range(8):  # re-mutate until the child is new
-                        if child != a and len(child) >= 2 and set_spec(child).name not in fit:
-                            break
-                        child = mutate_set(child)
-                    if len(child) >= 2 and set_spec(child).name not in fit:
-                        sfit[child] = evaluate(set_spec(child), child)
-                if len(efit) >= 2:
-                    a = pick(efit)
-                    child = cross_expr(a, pick(efit)) if rng.random() < 0.4 else a
-                    for _try in range(8):
-                        child = _expr_canon(child)
-                        if (child != a and not isinstance(child, str) and _expr_depth(child) <= 3
-                                and Expr(child).name not in fit):
-                            break
-                        child = mutate_expr(child if not isinstance(child, str) else a)
-                    child = _expr_canon(child)
-                    if not isinstance(child, str) and _expr_depth(child) <= 3 and Expr(child).name not in fit:
-                        efit[child] = evaluate(Expr(child), _expr_leaves(child))
-            # Survivors: the fittest P of each population (elitist).
-            sfit = dict(sorted(sfit.items(), key=lambda kv: -kv[1])[:P])
-            efit = dict(sorted(efit.items(), key=lambda kv: -kv[1])[:P])
-        # Populations converge on near-copies of one winner: keep distinct ones.
-        best, kept = [], []
-        samp = rng.permutation(len(y))[:5000]
-        for nm in sorted(out, key=lambda nm: -fit[nm]):
-            v = out[nm][1]
-            x = (v if v.ndim == 1 else v[:, 0])[samp].astype(float)
-            x = pd.Series(x).rank().to_numpy()
-            x = np.where(np.isnan(x), np.nanmean(x), x)
-            if x.std() == 0 or any(abs(np.corrcoef(x, k)[0, 1]) > 0.95 for k in kept):
-                continue
-            best.append(nm)
-            kept.append(x)
-            if len(best) >= 30:
-                break
-        self._log(f"  genetic search: {len(fit)} individuals over {gens} generations, "
-                  f"{len(out)} with novel gain, top {len(best)} kept: "
-                  + ", ".join(f"{nm}={fit[nm]:.2g}" for nm in best[:4]))
-        return {nm: out[nm] for nm in best}
-
     def _spec_novelty(self, spec, v, probe, parent_gain):
         """(gain, novel gain) of a candidate under the residual probe."""
         if getattr(spec, "paired", False):
@@ -4031,12 +3703,6 @@ class FeatureForge:
                     _release(spec_by_name[worst])
                 return True
             values = self._materialize(cands, W, yW, te_folds, keep_fn=keep_fn, score_fn=score_fn)
-            if self.evolve_time > 0 and r == 0:
-                evolved = self._evolve(W, yW, margin, imp, te_folds, self.evolve_time,
-                                       {s.name for s in cands} | {s.name for s in selected})
-                for nm, (sp, v) in evolved.items():
-                    cands.append(sp)
-                    values[nm] = v
             self._set_wu(W, on=False)
             _trim_heap()
             self._log(f"round {r + 1}: {len(cands)} candidates generated, {len(scores)} valid")
