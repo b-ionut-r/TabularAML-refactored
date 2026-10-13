@@ -2228,7 +2228,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto", past_te: bool = False,
+                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto",
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
@@ -2271,7 +2271,6 @@ class FeatureForge:
         self.label_cols = label_cols
         self.gate_wide = gate_wide
         self.gate_families = gate_families
-        self.past_te = past_te
         self.pair_scan = pair_scan
         self.profiles = profiles
         self.random_state = random_state
@@ -2311,18 +2310,9 @@ class FeatureForge:
             return list(KFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows)))
         return list(StratifiedKFold(k, shuffle=True, random_state=seed).split(np.zeros(n_rows), y))
 
-    def _te_folds(self, X: pd.DataFrame, y, seed, k: int = 8):
-        """Folds for out-of-fold target statistics. On time-ordered data each block of rows
-        is encoded from earlier blocks only (the first from the next one), as test rows are
-        encoded from the past: random folds hand a row its own period's labels through
-        neighbouring days, so models learn to trust encodings that the test period cannot
-        match (Rossmann's store target maps: search CV better, later weeks 57% worse)."""
-        t = getattr(self, "time_col_", None)
-        if t is None or not self.time_cv or self.past_te is False or t not in X.columns:
-            return self._folds(len(X), y, 5, seed)
-        order = np.argsort(X[t].to_numpy(dtype=float), kind="stable")
-        blocks = [np.sort(b) for b in np.array_split(order, k)]
-        return [(blocks[1], blocks[0])] + [(np.sort(np.concatenate(blocks[:i])), blocks[i]) for i in range(1, k)]
+    def _te_folds(self, X: pd.DataFrame, y, seed):
+        """Folds for out-of-fold target statistics: five folds, split as ``_folds`` splits them."""
+        return self._folds(len(X), y, 5, seed)
 
     def _model_frame(self, X: pd.DataFrame, recode: Optional[bool] = None) -> pd.DataFrame:
         """Model view of a frame: categoricals as ``category`` dtype, or, when the
@@ -3781,11 +3771,6 @@ class FeatureForge:
             # (a single pairwise interaction) down the split-gain order.
             novel_rank = sorted(survivors, key=lambda nm: -self._last_novelty.get(nm, 0.0))
             orders = [("gain", rank, (3, 6, 12, 25, 50, 80)), ("novelty", novel_rank, (3, 6, 12))]
-            # Label-free prefixes too: when target statistics do not carry over (their honest,
-            # past-only encodings lose), they top the gain order and would sink every prefix.
-            free_rank = [nm for nm in rank if not spec_by_name[nm].target_dep]
-            if self.past_te and self.time_col_ is not None and 0 < len(free_rank) < len(rank):
-                orders.append(("label-free", free_rank, (6, 25)))
             best_k, best_loss, best_fit, best_rank = 0, cur_loss, None, rank
             tried = set()
             ladder_res = []
