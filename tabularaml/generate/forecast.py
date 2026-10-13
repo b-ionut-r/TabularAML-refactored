@@ -557,13 +557,36 @@ class ForecastFeatures:
         k = np.maximum(k, 0)
         return self.T_ - self.L_ * k
 
+    def _inputs(self, df: pd.DataFrame) -> dict:
+        """All that the features read from the frame, one value per row: periods, entity and group keys,
+        numeric covariates. They are decided on the whole frame (a key column's text, a date format),
+        so any rows of them are the rows the whole frame gives; the rest of transform is row by row."""
+        I = {"p": self._periods(df), "k": self._keys(df, self.entity_, self.ent_vocab_)}
+        for g, vocab, _ in self.grp_:
+            if g:
+                I[("g", tuple(g))] = self._keys(df, g, vocab)
+        for c, *_ in getattr(self, "num_", []):
+            I[("x", c)] = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+        return I
+
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         if not getattr(self, "active_", False):
             return pd.DataFrame(index=df.index)
-        p_abs = self._periods(df)
+        return self._transform(self._inputs(df), df.index)
+
+    def transform_chunks(self, df: pd.DataFrame, rows: int):
+        """``transform(df)`` in blocks of ``rows`` rows, yielded as (first row, frame): the same values,
+        with only one block's columns in memory at a time."""
+        I = self._inputs(df)
+        for a in range(0, len(df), rows):
+            yield a, self._transform({n: v[a:a + rows] for n, v in I.items()}, df.index[a:a + rows])
+
+    def _transform(self, I: dict, index: pd.Index) -> pd.DataFrame:
+        n_rows = len(index)
+        p_abs = I["p"]
         ok = np.isfinite(p_abs)
         p_abs = np.nan_to_num(p_abs, nan=self.T_ + 1)
-        k = self._keys(df, self.entity_, self.ent_vocab_)
+        k = I["k"]
         kk = np.maximum(k, 0)
         o_abs = self.origin(p_abs, salt=kk)
         t = (p_abs - self.p_lo_).astype(np.int64)
@@ -662,7 +685,7 @@ class ForecastFeatures:
         # Groups of entities.
         for g, vocab, G in self.grp_:
             tag = "+".join(g) if g else "all"
-            kg = np.maximum(self._keys(df, g, vocab), 0) if g else np.zeros(len(df), dtype=np.int64)
+            kg = np.maximum(I[("g", tuple(g))], 0) if g else np.zeros(n_rows, dtype=np.int64)
             for w in (W[2], W[4], W[6] if len(W) > 6 else W[-1]):
                 F[f"fc_g_{tag}_mean{w}"] = G.mean(kg, o - w, o, nz=self.intermittent_ and not g)[0]
             if self.season_:
@@ -714,7 +737,7 @@ class ForecastFeatures:
                     F[f"fc_ev_past{kw}__{c}"] = past
                     F[f"fc_ev_next{kw}__{c}"] = np.where(fend >= q, fut, 0)
         for c, V, em, ex in getattr(self, "num_", []):
-            x = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
+            x = I[("x", c)]
             with np.errstate(invalid="ignore", divide="ignore"):
                 F[f"fc_num_rel__{c}"] = x / em[kk]
                 F[f"fc_num_norm__{c}"] = x / ex[kk]
@@ -725,10 +748,10 @@ class ForecastFeatures:
         # Columns move into one float32 block one at a time, so the float64 values and their copy are
         # never all held at once.
         names = list(F)
-        M = np.empty((len(df), len(names)), dtype=np.float32, order="F")
+        M = np.empty((n_rows, len(names)), dtype=np.float32, order="F")
         for j, n in enumerate(names):
             M[:, j] = F.pop(n)
-        out = pd.DataFrame(M, columns=names, index=df.index, copy=False)
+        out = pd.DataFrame(M, columns=names, index=index, copy=False)
         bad = (k < 0) | ~ok
         if bad.any():
             out.loc[bad, [c for c in out.columns if c != "fc_h"]] = np.nan

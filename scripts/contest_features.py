@@ -230,6 +230,9 @@ def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
     return keep
 
 
+_CHECK_CHUNK_ROWS = 250_000   # earlier rows transformed at a time in the forecasting check
+
+
 def _check_matrix(frames: list[pd.DataFrame], picks: list[tuple[int, np.ndarray | None]],
                   out: list[np.ndarray] | None = None, at: int = 0) -> list[np.ndarray]:
     """Rows of the frames as float32 matrices for a quick model: dates as days, text and categories as codes
@@ -304,15 +307,25 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
     losses = {}
     for arm in ("raw", "block"):
         if arm == "block":
-            Ff, Fh = probe.transform(Xf), probe.transform(Xh)
-            del Xf, Xh, probe
+            # The block's columns are all float32; the earlier rows are transformed a block of rows at a
+            # time straight into the rows each model reads (Store Sales: the whole block for 2.9M rows
+            # was the check's peak).
+            Fh = probe.transform(Xh)
+            del Xh
             nr = raw[0].shape[1]
-            wide = [np.empty((len(R), nr + Ff.shape[1]), dtype=np.float32) for R in raw]
+            wide = [np.empty((len(R), nr + Fh.shape[1]), dtype=np.float32) for R in raw]
             for W, R in zip(wide, raw):
                 W[:, :nr] = R
             raw = None
-            _check_matrix([Ff, Fh], picks, out=wide, at=nr)
-            del Ff, Fh
+            wide[2][:, nr:] = Fh.to_numpy(dtype=np.float32)
+            del Fh
+            for a0, Fc in probe.transform_chunks(Xf, _CHECK_CHUNK_ROWS):
+                V = Fc.to_numpy(dtype=np.float32)
+                for W, rows in ((wide[0], es_tr), (wide[1], es_va)):
+                    lo, hi = np.searchsorted(rows, [a0, a0 + len(Fc)])
+                    W[lo:hi, nr:] = V[rows[lo:hi] - a0]
+                del V, Fc
+            del Xf, probe
             mats = wide
         else:
             mats = raw
