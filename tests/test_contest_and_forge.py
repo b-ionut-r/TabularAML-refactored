@@ -555,16 +555,16 @@ def test_event_gaps_find_time_to_next_click_of_a_user():
 
 
 def test_history_families_need_the_test_rows_at_fit():
-    # Times to an entity's last / next flagged row (and single-key entity lags) are read from the history fit
-    # holds; test rows an API sends later in batches would miss their own batch, so these stay off without them.
+    # Times to an entity's last / next flagged row are read from the history fit holds; test rows an API sends
+    # later in batches would miss their own batch, so these stay off without them.
     rng = np.random.default_rng(0)
     n = 3000
     X = pd.DataFrame({"store": rng.integers(0, 300, n), "promo": rng.integers(0, 2, n), "x": rng.normal(size=n),
                       "t": np.sort(rng.uniform(0, 100, n))})
     y = pd.Series(X["x"] + X["promo"] + rng.normal(size=n))
-    ff = FeatureForge(task="regression", time_budget=0.1, time_col="t", verbose=False, random_state=0,
-                      entity_lags=True).fit(X.iloc[:2400].reset_index(drop=True), y.iloc[:2400].reset_index(drop=True),
-                                            X_unlabeled=X.iloc[2400:].reset_index(drop=True))
+    ff = FeatureForge(task="regression", time_budget=0.1, time_col="t", verbose=False, random_state=0).fit(
+        X.iloc[:2400].reset_index(drop=True), y.iloc[:2400].reset_index(drop=True),
+        X_unlabeled=X.iloc[2400:].reset_index(drop=True))
     W = ff._prep(X.iloc[:2400])
     def made(has_test):
         names = []
@@ -572,5 +572,5 @@ def test_history_families_need_the_test_rows_at_fit():
         ff._event_candidates(W, {}, lambda s: names.append(s.name))
         ff._entity_candidates(W, {}, [], lambda s: names.append(s.name))
         return names
-    assert any(s.startswith("ev_") for s in made(True)) and any(s.startswith("lag_") for s in made(True))
+    assert any(s.startswith("ev_") for s in made(True))
     assert not any(s.startswith(("ev_", "lag_")) for s in made(False))

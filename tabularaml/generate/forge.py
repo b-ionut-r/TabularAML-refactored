@@ -2140,10 +2140,8 @@ class FeatureForge:
         X" column is constant per entity (account opening date, first visit);
         such anchors are added as columns and combined with ID-like columns
         into composite keys for counts, target maps and group statistics.
-    entity_nums, entity_lags : int, bool
-        Numerics aggregated per entity; whether to add each row's place in its
-        entity's history (time since previous / until next row, rows before it)
-        when a time column is known. Lags were neutral on IEEE-CIS, so off.
+    entity_nums : int
+        Numerics aggregated per entity.
     event_gaps : "auto" | "past" | "off"
         With a time column and a repeating many-level key: time since each user's previous
         row, until their next and rows before it, users being the key with the row's other
@@ -2214,7 +2212,7 @@ class FeatureForge:
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
                  gate_bags: int = 1,
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
-                 time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
+                 time_col: Optional[str] = "auto", entity_nums: int = 6,
                  events: bool = True, time_cv: bool = True,
                  lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto",
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
@@ -2242,7 +2240,6 @@ class FeatureForge:
         self.entities = entities
         self.time_col = time_col
         self.entity_nums = entity_nums
-        self.entity_lags = entity_lags
         self.event_gaps = event_gaps
         self.events = events
         self.time_cv = time_cv
@@ -2847,13 +2844,6 @@ class FeatureForge:
                 if t not in e:
                     add(Count(list(e) + [t]))
         for e in ents:
-            # Read from the history fit holds: only with the test rows at fit (see _event_gap_candidates).
-            if self.entity_lags and t is not None and t not in e and getattr(self, "has_test_", False):
-                tw = W[t].to_numpy(dtype=float)
-                R = float(np.nanmax(tw) - np.nanmin(tw))
-                wins = [f"{p}{R * f:.6g}" for f in (0.001, 0.01, 0.05) for p in ("win", "fwd")] if R > 0 else []
-                for kind in ("prev", "next", "nth", *wins):
-                    add(EntityLag(e if len(e) > 1 else e[0], t, kind))
             if len(e) > 1:
                 add(Count(list(e)))
             add(TargetEnc(list(e), self.n_classes_))

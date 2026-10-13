@@ -311,7 +311,7 @@ with `python scripts/ieee_fraud.py`.
   entity (AUC 0.9529 vs 0.9522, 25% slower; `entity_nums`); each row's place in
   its entity's history, i.e. time since previous / until next transaction and
   rows before it (0.9555 vs 0.9550 on top of the entity features, log loss
-  worse; `entity_lags=True`). The search now screens candidates as it builds
+  worse; was `entity_lags=True`, since removed). The search now screens candidates as it builds
   them, so only promising columns stay in memory (peak 6.1 -> 5.0 GB on 94k x
   430; the rest is the frame copies).
 * Gap left on the table: raw + anchors + entity target maps alone score 0.9550;
@@ -495,7 +495,8 @@ What v17 adds, all generic:
   a date column are not generated (v15 shipped `te__Date`); label-free counts
   and group statistics per date still are.
 - `EntityLag` gains past / future window counts (rows of the entity within
-  0.1%, 1% and 5% of the time span), opt-in with `entity_lags=True`.
+  0.1%, 1% and 5% of the time span), opt-in with `entity_lags=True` (option since
+  removed; the event-gap family still builds previous / next / count lags).
 
 v17 cost IEEE-CIS: its latest window read 0.9479 with time-blocked search
 against 0.9522 before. The cause was target encodings fitted on random folds
