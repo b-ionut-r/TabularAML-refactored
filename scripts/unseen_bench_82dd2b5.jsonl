@@ -1,0 +1,12 @@
+{"contest": "allstate", "arm": "raw", "seed": 0, "metric": "mae", "score": 1139.8509918854434, "n_tr": 150655, "n_te": 37663, "n_cols": 130, "best_it": 405, "fe_s": 0, "total_s": 62, "ff_peak_gb": null}
+{"contest": "allstate", "arm": "ff", "seed": 0, "metric": "mae", "score": 1136.691368424477, "n_tr": 150655, "n_te": 37663, "n_cols": 130, "best_it": 393, "fe_s": 313, "total_s": 369, "ff_peak_gb": 1.19}
+{"contest": "allstate", "arm": "raw_shuffled", "seed": 0, "metric": "mae", "score": 1825.9085214584602, "n_tr": 150655, "n_te": 37663, "n_cols": 130, "best_it": 6, "fe_s": 0, "total_s": 17, "ff_peak_gb": null}
+{"contest": "allstate", "arm": "ff_shuffled", "seed": 0, "metric": "mae", "score": 1825.9085214584602, "n_tr": 150655, "n_te": 37663, "n_cols": 130, "best_it": 6, "fe_s": 188, "total_s": 205, "ff_peak_gb": 1.31}
+{"contest": "bnp", "arm": "raw", "seed": 0, "metric": "logloss", "score": 0.4605201894221541, "n_tr": 91456, "n_te": 22865, "n_cols": 131, "best_it": 249, "fe_s": 0, "total_s": 35, "ff_peak_gb": null}
+{"contest": "bnp", "arm": "ff", "seed": 0, "metric": "logloss", "score": 0.45192433361886075, "n_tr": 91456, "n_te": 22865, "n_cols": 302, "best_it": 293, "fe_s": 394, "total_s": 451, "ff_peak_gb": 1.33}
+{"contest": "bnp", "arm": "raw_shuffled", "seed": 0, "metric": "logloss", "score": 0.5494264709888589, "n_tr": 91456, "n_te": 22865, "n_cols": 131, "best_it": 8, "fe_s": 0, "total_s": 11, "ff_peak_gb": null}
+{"contest": "bnp", "arm": "ff_shuffled", "seed": 0, "metric": "logloss", "score": 0.54941668085418, "n_tr": 91456, "n_te": 22865, "n_cols": 131, "best_it": 6, "fe_s": 204, "total_s": 212, "ff_peak_gb": 1.33}
+{"contest": "homesite", "arm": "raw", "seed": 0, "metric": "auc", "score": 0.9658390580995093, "n_tr": 208602, "n_te": 52151, "n_cols": 297, "best_it": 471, "fe_s": 0, "total_s": 137, "ff_peak_gb": null}
+{"contest": "homesite", "arm": "ff", "seed": 0, "metric": "auc", "score": 0.9666558344299029, "n_tr": 208602, "n_te": 52151, "n_cols": 347, "best_it": 443, "fe_s": 909, "total_s": 1111, "ff_peak_gb": 3.03}
+{"contest": "homesite", "arm": "raw_shuffled", "seed": 0, "metric": "auc", "score": 0.5090921162660337, "n_tr": 208602, "n_te": 52151, "n_cols": 297, "best_it": 3, "fe_s": 0, "total_s": 32, "ff_peak_gb": null}
+{"contest": "homesite", "arm": "ff_shuffled", "seed": 0, "metric": "auc", "score": 0.5090921162660337, "n_tr": 208602, "n_te": 52151, "n_cols": 297, "best_it": 3, "fe_s": 210, "total_s": 243, "ff_peak_gb": 2.98}
