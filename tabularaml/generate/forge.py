@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 import warnings
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from tabularaml.generate.stream import available_bytes
 from tabularaml.generate.strs import as_text, as_text_frame
 
 TE_SMOOTHING = 20.0
@@ -239,10 +240,13 @@ def _cache_put(cache: dict, key, df, *entry):
     except TypeError:
         return
     size = sum(getattr(e, "nbytes", 0) for e in entry)
+    # Smaller when memory runs short: three full caches were 3 GB of Instacart's search over 8.5 million
+    # rows, where the 14 GB limit was reached (a dropped entry is only computed again).
+    cap = min(_CACHE_BYTES, available_bytes() // 8)
     with _CACHE_LOCK:
         cache[key] = (ref, *entry, len(df), size)
         total = sum(v[-1] for v in cache.values())
-        while total > _CACHE_BYTES and len(cache) > 1:
+        while total > cap and len(cache) > 1:
             old = cache.pop(next(iter(cache)))
             total -= old[-1]
 
@@ -3876,18 +3880,20 @@ class FeatureForge:
             X, idx_gate, U = self._wu_src
             Up = None if U is None else self._prep(U)
             cols, pos = list(self.raw_cols_), X.columns.get_indexer(self.raw_cols_)
-            # A few hundred columns at a time: the parts' copies of a wide table (all its rows) were
-            # as large as the frame itself, on top of it (Bosch, 4,264 columns: past the 15 GB limit).
-            # Joined column by column (each a view of its chunk), not consolidated: consolidating copied it all again.
+            # Sixteen columns at a time: the parts' copies of all the rows were as large as the frame itself, on
+            # top of it (Bosch, 4,264 columns: past the 15 GB limit; Instacart, where the rows beyond the search
+            # rows are 8 million of 78 columns: 4 GB at the search's peak). Joined column by column (each a
+            # view of its chunk), not consolidated: consolidating copied it all again.
+            step = 16
             out = {}
-            for i in range(0, len(cols), 256):
-                cc = cols[i:i + 256]
-                parts = [W[cc], X.iloc[idx_gate, pos[i:i + 256]]] + ([] if Up is None else [Up[cc]])
+            for i in range(0, len(cols), step):
+                cc = cols[i:i + step]
+                parts = [W[cc], X.iloc[idx_gate, pos[i:i + step]]] + ([] if Up is None else [Up[cc]])
                 chunk = _concat_cats(parts)
                 del parts
                 out.update({c: chunk[c] for c in cc})
             del Up
-            self.WU_ = pd.DataFrame(out, copy=False) if len(cols) > 256 else chunk
+            self.WU_ = pd.DataFrame(out, copy=False) if len(cols) > step else chunk
             del out
             self.U_search_ = _renumbered(self.WU_.iloc[len(W):])
         self.ctx_.extra_rows = self.U_search_
@@ -4147,7 +4153,12 @@ class FeatureForge:
             for j, col in enumerate(s.out_names()):
                 F[col] = v if np.ndim(v) == 1 else v[:, j]
         self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
-        self._train_frame = F[self.new_columns_].astype(np.float32)
+        # Filled column by column: selecting the columns and casting them were two more copies of them all
+        # (Instacart's 6.8 million training rows: killed at 13 GB here).
+        M = np.empty((len(F), len(self.new_columns_)), dtype=np.float32, order="F")
+        for j, c in enumerate(self.new_columns_):
+            M[:, j] = F[c].to_numpy(dtype=np.float32)
+        self._train_frame = pd.DataFrame(M, index=F.index, columns=self.new_columns_, copy=False)
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
