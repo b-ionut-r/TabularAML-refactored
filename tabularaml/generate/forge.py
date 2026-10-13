@@ -4607,8 +4607,10 @@ class FeatureForge:
         out = self._recode_out(self._named(X))
         if len(out) != len(self._train_frame):
             raise ValueError("transform_train expects the exact frame passed to fit")
+        # The training frame's own columns, shared copy-on-write (a write to the output copies the column
+        # first), not a second copy of every feature while the fitted forge is still held.
         for c in self.new_columns_:
-            out[c] = self._train_frame[c].to_numpy()
+            out[c] = self._train_frame[c].set_axis(out.index)
         return out
 
     def fit_transform(self, X, y, X_unlabeled=None):
