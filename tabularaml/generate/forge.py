@@ -448,6 +448,11 @@ class _OneHot:
         return len(self.y)
 
 
+def _class_labels(Y) -> np.ndarray:
+    """The class of each row of a one-hot target matrix, or of a ``_OneHot``."""
+    return Y.y if isinstance(Y, _OneHot) else np.argmax(Y, axis=1)
+
+
 class TargetEnc(Spec):
     """Smoothed target mean of a key (or key pair); out-of-fold on training rows."""
     target_dep = True
@@ -581,7 +586,9 @@ class KNNTarget(Spec):
 
     def _targets(self, y):
         y = np.asarray(y, dtype=float)
-        return np.eye(self.n_classes)[y.astype(int)] if self.per > 1 else y[:, None]
+        # Classes kept as labels: the neighbour families only read which class a row is
+        # (np.eye(100)[y] over 637k rows was 510 MB, and each fold took a copy of its rows).
+        return _OneHot(y.astype(int), self.n_classes) if self.per > 1 else y[:, None]
 
     def _query(self, M_ref, Y_ref, M_q):
         from sklearn.neighbors import NearestNeighbors
@@ -593,7 +600,7 @@ class KNNTarget(Spec):
             # Class counts among the first k neighbours, without the (rows x k x classes) one-hot
             # gather: 80k query rows x 50 neighbours x 100 classes is 3.2 GB twice over. Counts
             # are exact integers, so the frequencies equal the one-hot cumulative sums.
-            lab = np.argmax(Y_ref, axis=1)[idx]  # (n, kmax)
+            lab = _class_labels(Y_ref)[idx]  # (n, kmax)
             base = np.arange(len(M_q))[:, None] * self.per
             for i, k in enumerate(self.ks):
                 k = min(k, kmax)
@@ -656,7 +663,7 @@ class KNNClassDist(KNNTarget):
 
     def _query(self, M_ref, Y_ref, M_q):
         from sklearn.neighbors import NearestNeighbors
-        yc = Y_ref.argmax(1) if Y_ref.shape[1] > 1 else Y_ref[:, 0].astype(int)
+        yc = _class_labels(Y_ref) if isinstance(Y_ref, _OneHot) or Y_ref.shape[1] > 1 else Y_ref[:, 0].astype(int)
         out = np.zeros((len(M_q), self.n_out))
         kmax = max(self.ks)
         for c in range(self.n_classes):
@@ -671,10 +678,6 @@ class KNNClassDist(KNNTarget):
                 k = min(k, kk)
                 out[:, c * len(self.ks) + i] = cs[:, k - 1] / k
         return out
-
-    def _targets(self, y):
-        y = np.asarray(y, dtype=float)
-        return np.eye(self.n_classes)[y.astype(int)] if self.n_classes > 2 else y[:, None]
 
 
 class LinearOOF(KNNTarget):
@@ -700,7 +703,7 @@ class LinearOOF(KNNTarget):
         m = self._model()
         if self.n_classes == 0:
             return m.fit(M_ref, Y_ref[:, 0]).predict(M_q)[:, None]
-        yc = Y_ref.argmax(1) if self.per > 1 else Y_ref[:, 0].astype(int)
+        yc = _class_labels(Y_ref) if self.per > 1 else Y_ref[:, 0].astype(int)
         m.fit(M_ref, yc)
         if self.per == 1:
             return m.decision_function(M_q)[:, None]
@@ -723,6 +726,11 @@ class Projection(KNNTarget):
         self.n_out = min(n_comp, len(cols))
         self.target_dep = kind == "pls"
         self.name = f"{kind}__{label}"
+
+    def _targets(self, y):
+        y = np.asarray(y, dtype=float)
+        # PLS regresses on the one-hot matrix itself.
+        return np.eye(self.n_classes)[y.astype(int)] if self.per > 1 else y[:, None]
 
     def _proj(self, M_ref, Y_ref):
         if self.kind == "pca":
