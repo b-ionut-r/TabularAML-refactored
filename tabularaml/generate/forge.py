@@ -2041,19 +2041,35 @@ def _loss(task, y, margin) -> float:
     return float(np.mean(_row_loss(task, y, margin)))
 
 
-def _stepped_class_loss(y, margin, idx, n_cells, K, gT, hT, lam) -> float:
+def _fold_steps(idx, n_folds, n_cells, g, h, lam) -> np.ndarray:
+    """Regularised Newton step of every cell from the other folds' gradients: (folds, cells[, classes]).
+
+    ``idx`` is fold * n_cells + cell per row. With many classes, one (cells x rows) indicator times the
+    (rows x classes) gradients adds each cell's rows in row order, as one bincount per class does, so the
+    steps are bit-identical without a strided copy of every class column.
+    """
+    if g.ndim == 1:
+        G = np.bincount(idx, g, minlength=n_folds * n_cells).reshape(n_folds, n_cells)
+        H = np.bincount(idx, h, minlength=n_folds * n_cells).reshape(n_folds, n_cells)
+        return -(G.sum(0) - G) / (H.sum(0) - H + lam)
+    if g.shape[1] < 8:
+        return np.stack([_fold_steps(idx, n_folds, n_cells, g[:, k], h[:, k], lam) for k in range(g.shape[1])], 2)
+    from scipy import sparse
+    A = sparse.csr_matrix((np.ones(len(idx)), (idx, np.arange(len(idx)))), shape=(n_folds * n_cells, len(idx)))
+    G = (A @ g).reshape(n_folds, n_cells, -1)
+    H = (A @ h).reshape(n_folds, n_cells, -1)
+    return -(G.sum(0) - G) / (H.sum(0) - H + lam)
+
+
+def _stepped_class_loss(y, margin, idx, n_cells, K, g, h, lam) -> float:
     """Multiclass loss of ``margin`` plus, per class, the cross-fitted Newton step of each row's
     cell: rows of fold f in cell c (``idx = f * n_cells + c``) get the step fitted on the other
-    folds' rows of c. ``gT`` / ``hT`` are classes x rows. The steps are gathered from a small
-    (fold, cell) x classes table, a few thousand rows at a time, into a buffer that stays in
-    cache while it is shifted and exponentiated in place: a whole rows x classes copy is 400 MB
-    on the Expedia stand-in (510k rows x 100 classes), with four probes at a time. Same values
-    as adding the per-class corrections column by column: every step is per row."""
-    steps = np.empty((K * n_cells, len(gT)))
-    for k in range(len(gT)):
-        G = np.bincount(idx, gT[k], minlength=K * n_cells).reshape(K, n_cells)
-        H = np.bincount(idx, hT[k], minlength=K * n_cells).reshape(K, n_cells)
-        steps[:, k] = (-(G.sum(0) - G) / (H.sum(0) - H + lam)).ravel()
+    folds' rows of c. The steps are gathered from the small (fold, cell) x classes table, a few
+    thousand rows at a time, into a buffer that stays in cache while it is shifted and
+    exponentiated in place: a whole rows x classes copy is 400 MB on the Expedia stand-in (510k
+    rows x 100 classes), with four probes at a time. Same values as adding the per-class
+    corrections column by column: every step is per row."""
+    steps = _fold_steps(idx, K, n_cells, g, h, lam).reshape(K * n_cells, -1)
     y, out = np.asarray(y), np.empty(len(y))
     for i in range(0, len(y), 4096):
         x = steps[idx[i:i + 4096]]
@@ -2899,13 +2915,8 @@ class FeatureForge:
     def _cell_gain(self, cell, ncell, g, h, lam, fold, K, y, margin, base):
         """Cross-fitted Newton gain of a lookup table over integer cells."""
         idx = fold * ncell + cell
-        def step_for(gk, hk):
-            G = np.bincount(idx, gk, minlength=K * ncell).reshape(K, ncell)
-            H = np.bincount(idx, hk, minlength=K * ncell).reshape(K, ncell)
-            return (-(G.sum(0) - G) / (H.sum(0) - H + lam))[fold, cell]
         if g.ndim == 1:
-            return base - _loss(self.task_, y, margin + step_for(g, h))
-        # Multiclass: g and h come classes x rows (see _fast_interactions).
+            return base - _loss(self.task_, y, margin + _fold_steps(idx, K, ncell, g, h, lam)[fold, cell])
         return base - _stepped_class_loss(y, margin, idx, ncell, K, g, h, lam)
 
     def _fast_interactions(self, W, y, margin, imp, n_cols=30, n_bins=8, n_levels=16):
@@ -2938,9 +2949,6 @@ class FeatureForge:
         fold = np.random.default_rng(self.random_state + 7).permutation(n) % K
         g, h = self._grad_hess(y, margin)
         lam = 10.0 * float(h.mean())
-        if g.ndim == 2:
-            # Classes x rows: each class's gradients are read contiguously, once per cell layout.
-            g, h = np.ascontiguousarray(g.T), np.ascontiguousarray(h.T)
         base = _loss(self.task_, y, margin)
         codes, sizes = {}, {}
         for c in cols:
@@ -3208,13 +3216,9 @@ class FeatureForge:
         K = self._n_probe_folds
         cell = self._probe_fold * nb + bins
         if g.ndim == 2:
-            # Multiclass: g and h come classes x rows (see _probe_setup).
             return self._probe_base_loss - _stepped_class_loss(self._probe_y, self._probe_margin, cell, nb, K,
                                                                g, h, lam)
-        G = np.bincount(cell, g, minlength=K * nb).reshape(K, nb)
-        H = np.bincount(cell, h, minlength=K * nb).reshape(K, nb)
-        step = -(G.sum(0) - G) / (H.sum(0) - H + lam)
-        corr = step[self._probe_fold, bins]
+        corr = _fold_steps(cell, K, nb, g, h, lam)[self._probe_fold, bins]
         return self._probe_base_loss - _loss(self.task_, self._probe_y, self._probe_margin + corr)
 
     def _probe_setup(self, W, y, margin):
@@ -3226,8 +3230,6 @@ class FeatureForge:
         self._probe_base_loss = _loss(self.task_, y, margin)
         g, h = self._grad_hess(y, margin)
         lam = 10.0 * float(h.mean())
-        if g.ndim == 2:
-            g, h = np.ascontiguousarray(g.T), np.ascontiguousarray(h.T)
         n_bins = int(np.clip(n // 50, 8, 64))
 
         def probe(v):
