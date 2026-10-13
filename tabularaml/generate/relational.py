@@ -595,8 +595,22 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
             a = cuts[-1]
             b = int(np.searchsorted(cum, (cum[a - 1] if a else 0) + cap, side="right"))
             cuts.append(min(len(main), max(b, a + 1)))
+        # Each slice joins only its own keys' child rows (kept in their order, so every sum adds the same
+        # values in the same order): joined against the whole child, every slice rebuilt its hash table.
+        if len(cuts) > 2:
+            kidx = pd.Index(pd.unique(j[key]))
+            jc, mc = kidx.get_indexer(j[key]), kidx.get_indexer(rows[key])
+            jo = np.argsort(jc, kind="stable")
+            jst = np.searchsorted(jc[jo], np.arange(len(kidx) + 1))
         for a, b in zip(cuts[:-1], cuts[1:]):
-            m = rows.iloc[a:b][["__r", key, c]].merge(j, on=[key, c], how="inner")
+            if len(cuts) > 2:
+                u = np.unique(mc[a:b]); u = u[u >= 0]
+                lens = jst[u + 1] - jst[u]
+                sel = np.repeat(jst[u] - np.cumsum(lens) + lens, lens) + np.arange(lens.sum())
+                js = j.iloc[np.sort(jo[sel])]
+            else:
+                js = j
+            m = rows.iloc[a:b][["__r", key, c]].merge(js, on=[key, c], how="inner")
             if t_child is not None:
                 m["__age"] = t_main[m["__r"].to_numpy()] - m["__t"].to_numpy()
                 m = m[m["__age"] > 0]
