@@ -328,14 +328,16 @@ def test_forge_picks_do_not_depend_on_the_clock(monkeypatch):
     assert a.history_ == b.history_
 
 
-def test_forge_search_subsample_keeps_output_on_every_row():
+def test_forge_search_subsample_keeps_output_on_every_row(monkeypatch):
+    # The search runs on the latest 2,000 rows (as when memory caps them); the output covers every row.
+    monkeypatch.setattr(FeatureForge, "_mem_rows", lambda self, *a, **k: 2000)
     rng = np.random.default_rng(0)
     X = pd.DataFrame(rng.normal(size=(6000, 4)), columns=list("abcd"))
     X["t"] = np.arange(len(X), dtype=float)
     y = X.a * X.b + rng.normal(size=len(X)) * 0.1
     U = X.iloc[:500].assign(t=X.t.iloc[:500] + 6000)
     f = FeatureForge(task="regression", time_budget=60, n_rounds=1, n_jobs=1, verbose=False,
-                     time_col="t", max_search_rows=2000).fit(X, y, X_unlabeled=U)
+                     time_col="t").fit(X, y, X_unlabeled=U)
     assert len(f.transform_train(X)) == len(X) and len(f.transform(U)) == len(U)
     assert any("a" in c and "b" in c for c in f.new_columns_)
 

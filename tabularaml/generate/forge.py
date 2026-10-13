@@ -2083,11 +2083,6 @@ class FeatureForge:
     task : "regression" | "binary" | "multiclass" | None
     log_target : bool
         Search on ``log1p(y)`` (use for RMSLE-scored regression).
-    max_search_rows : int | None
-        Search on at most this many training rows (the latest on time-ordered data, whole
-        groups when test rows are new entities, else a random sample); the rest still
-        count in label-free statistics, and the output is computed on every row. Off by
-        default: a 300k cap lost M5's and Favorita's gains.
     gate_families : bool | "auto"
         When the full set fails the gate, drop feature families one at a time and keep the
         best remaining set that clears the gate by one more standard error. "auto" (default):
@@ -2195,7 +2190,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6,
                  events: bool = True, time_cv: bool = True,
                  group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, gate_families="auto",
-                 max_search_rows: Optional[int] = None, family_time_share: float = 1 / 3, label_echo: bool = True, label_cols: Sequence[str] = (),
+                 family_time_share: float = 1 / 3, label_echo: bool = True, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -2224,7 +2219,6 @@ class FeatureForge:
         self.group_col = group_col
         self.text = text
         self.drop_synthetic = drop_synthetic
-        self.max_search_rows = max_search_rows
         self.family_time_share = family_time_share
         self.label_echo = label_echo
         self.label_cols = label_cols
@@ -3464,10 +3458,10 @@ class FeatureForge:
             1 + (0 if X_unlabeled is None else len(X_unlabeled) / max(len(X), 1)))
         mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows,
                                  held=self._in_bytes + float(X.memory_usage(index=True, deep=False).sum()))
-        if mem_cap is not None and mem_cap < len(idx_sel) and not self.max_search_rows:
+        if mem_cap is not None and mem_cap < len(idx_sel):
             self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
-            m = min(m_cap or self.max_search_rows or len(idx_sel), mem_cap or len(idx_sel))
+            m = min(m_cap or len(idx_sel), mem_cap or len(idx_sel))
             if len(idx_sel) > m:
                 rng = np.random.default_rng(self.random_state)
                 if self.time_col_ is not None:
