@@ -98,6 +98,9 @@ def _combo(df: pd.DataFrame, cols: Sequence[str]) -> np.ndarray:
     return pd.factorize(k)[0]
 
 
+_KEY_SCAN_CELLS = 2e8  # rows x candidate columns the key search may read per step beyond its first eight
+
+
 def _integral(s: pd.Series) -> bool:
     if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
         return True
@@ -250,7 +253,14 @@ class ForecastFeatures:
             if nu < 2 or nu > n / 3 or not _integral(s):
                 continue
             cand.append((nu, c))
-        cand = [c for _, c in sorted(cand, reverse=True)][:8]
+        ranked = [c for _, c in sorted(cand, reverse=True)]
+        cand = ranked[:8]
+        pk = per.astype(np.int64)
+        span = int(per.max()) + 2
+
+        def unique_share(k):
+            return len(pd.unique(k.astype(np.int64) * span + pk)) / n
+
         ent = None
         if self.entity != "auto":
             ent = [self.entity] if isinstance(self.entity, str) else list(self.entity)
@@ -261,12 +271,37 @@ class ForecastFeatures:
                     ne = k.max() + 1
                     if ne > n / 5:
                         continue
-                    u = len(pd.unique(k.astype(np.int64) * (int(per.max()) + 2) + per.astype(np.int64)))
-                    if u / n >= 0.98:
+                    if unique_share(k) >= 0.98:
                         ent = list(combo)
                         break
                 if ent:
                     break
+            if not ent and len(ranked) > 8:
+                # The eight most varied integral columns can all be attributes of one entity (a building's
+                # floor area, year built, its site's weather), which push a coarse key part (the meter of a
+                # building) out. Grow the key instead: start from the column whose (column, date) pairs are
+                # most nearly unique and add whichever column makes them most unique, up to three. Every
+                # candidate is read once per step, so the candidates are bounded by cells read, not by count.
+                pool = ranked[:max(8, int(_KEY_SCAN_CELLS // max(n, 1)))]
+                codes = {c: _combo(A, [c]) for c in pool}
+                key, best = None, 0.0
+                for _ in range(3):
+                    add = None
+                    for c in pool:
+                        if key is not None and c in key:
+                            continue
+                        k = codes[c] if key is None else _combo(A, key + [c])
+                        if k.max() + 1 > n / 5:
+                            continue
+                        u = unique_share(k)
+                        if u > best + 1e-9:
+                            best, add = u, c
+                    if add is None:
+                        break
+                    key = [add] if key is None else key + [add]
+                    if best >= 0.98:
+                        ent = key
+                        break
         if not ent:
             return "no entity key (rows per key and date are not unique)"
         self.entity_ = ent
