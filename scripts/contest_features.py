@@ -659,7 +659,10 @@ def main():
         # horizon: its picks lost held-out (Favorita 0.669 -> 0.689, Recruit 0.519 -> 0.525,
         # Rossmann kept none), so a forecasting contest gets the forecasting columns alone.
         print("forecasting family active: FeatureForge search skipped", flush=True)
-        out_tr, out_te = Xtr.reset_index(drop=True).copy(), Xte.reset_index(drop=True).copy()
+        # The outputs are these frames themselves: a copy (which also consolidated every column into one
+        # block) held the whole output twice (Store Sales: 5.4 GB peak, the run's highest).
+        out_tr, out_te = (F if F.index.equals(pd.RangeIndex(len(F))) else F.reset_index(drop=True) for F in (Xtr, Xte))
+        Xtr = Xte = None
     else:
         # Columns computed from the labels (child-row model scores, outcome histories) stay out of
         # FeatureForge's cross-row features: Home Credit's kept cell count over gender x binned
