@@ -152,6 +152,7 @@ CONTESTS["ieee_b8"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_b8d6ee5
 CONTESTS["ieee_hv"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_7b60227")
 CONTESTS["ieee_08"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_08f397c")
 CONTESTS["hc_08"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_08f397c", base="hc")
+CONTESTS["hc_932"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_932ebd6", base="hc")
 # Round-2 head 08f397c: the other six Kaggle contests, as their final-variant configs.
 for _c in ("ross", "fav", "m5", "wnv", "sct", "porto"):
     CONTESTS[f"{_c}_r2"] = dict(CONTESTS[f"{_c}_final"], repo="/tmp/claude-0/wt_b_08f397c")
