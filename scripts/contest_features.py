@@ -686,7 +686,7 @@ def main():
     del out_te, Xte
     release_arrow()
     if not forecasting:
-        out_tr = forge.transform_train(Xtr)
+        out_tr = forge.transform_train(Xtr, release=True)
         del forge
     related(out_tr, "train.parquet")
     if spill is not None:

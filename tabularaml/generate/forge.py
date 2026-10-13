@@ -4214,17 +4214,12 @@ class FeatureForge:
         # (Santander Transaction: 335 of the final fit's 620 s, then again for the test file).
         used = {c for s in self.selected_ for c in s.parents}
         self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
-        # Each feature is written once, into the float32 matrix the training frame wraps; the frame
-        # later features are built from holds views of its columns. Copied into the frame and then
-        # into the matrix, every feature was held twice at the end (Expedia 3%: 300 columns over
-        # 637k rows, 765 MB).
-        M = np.empty((len(F), len(self.new_columns_)), dtype=np.float32, order="F")
-        at: Dict[str, List[int]] = {}
-        for j, c in enumerate(self.new_columns_):
-            at.setdefault(c, []).append(j)
-        for a in self.anchors_:
-            for j in at[a[3]]:
-                M[:, j] = F[a[3]].to_numpy(dtype=np.float32)
+        # Kept features are kept as float32 columns, each its own array (selecting them from F and casting
+        # them were two more copies of them all: Instacart's 6.8 million training rows, killed at 13 GB; as
+        # one matrix they could not leave memory a column at a time, see transform_train); only those later
+        # features are built from stay in F as well (F's copy of them all was the final fit's peak under a
+        # 10 GB limit).
+        kept = {a[3]: np.array(F[a[3]].to_numpy(dtype=np.float32), copy=True) for a in self.anchors_}
         for s in self.selected_:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
@@ -4239,16 +4234,17 @@ class FeatureForge:
             if U is not None and used.intersection(s.out_names()):
                 vu = s.transform(U, self.ctx_)
                 vu = np.asarray(vu, dtype=np.float32)
-                for j, col in enumerate(s.out_names()):
-                    U[col] = vu if np.ndim(vu) == 1 else vu[:, j]
+                for i, col in enumerate(s.out_names()):
+                    U[col] = vu if np.ndim(vu) == 1 else vu[:, i]
             # float32, as the search saw them (and half the memory of the growing frame).
             v = np.asarray(v, dtype=np.float32)
-            for j, col in enumerate(s.out_names()):
-                for k in at[col]:
-                    M[:, k] = v if np.ndim(v) == 1 else v[:, j]
-                F[col] = pd.Series(M[:, at[col][0]], index=F.index, copy=False)
-            v = None
-        self._train_frame = pd.DataFrame(M, index=F.index, columns=self.new_columns_, copy=False)
+            for i, col in enumerate(s.out_names()):
+                vc = np.ascontiguousarray(v if np.ndim(v) == 1 else v[:, i])
+                kept[col] = vc
+                if col in used:
+                    F[col] = vc
+        self._train_cols = kept
+        self._n_train = len(F)
 
     # ------------------------------------------------------------- transform
     def _prep(self, X):
@@ -4660,15 +4656,18 @@ class FeatureForge:
                 out[c] = self._rank(out[c], c)
         return out
 
-    def transform_train(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Training rows with features as fitted (target encodings out-of-fold)."""
+    def transform_train(self, X: pd.DataFrame, release: bool = False) -> pd.DataFrame:
+        """Training rows with features as fitted (target encodings out-of-fold). ``release``: each fitted
+        column leaves this object once copied into the output (the output and a full copy of the fitted
+        columns next to it were 1.6 GB more on Instacart's 6.8 million rows, killed under a 10 GB limit);
+        transform_train cannot be called again after it."""
         out = self._recode_out(self._named(X))
-        if len(out) != len(self._train_frame):
+        if len(out) != self._n_train:
             raise ValueError("transform_train expects the exact frame passed to fit")
-        # The training frame's own columns, shared copy-on-write (a write to the output copies the column
-        # first), not a second copy of every feature while the fitted forge is still held.
-        for c in self.new_columns_:
-            out[c] = self._train_frame[c].set_axis(out.index)
+        for c in dict.fromkeys(self.new_columns_):
+            out[c] = self._train_cols[c]
+            if release:
+                del self._train_cols[c]
         return out
 
     def fit_transform(self, X, y, X_unlabeled=None):
