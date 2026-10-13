@@ -33,6 +33,7 @@ Typical use::
 from __future__ import annotations
 
 import os
+import threading
 import time
 from itertools import combinations
 from typing import Dict, List, Optional, Sequence
@@ -143,6 +144,9 @@ def _as_str_frame_col(s: pd.Series) -> pd.Series:
 # Resident memory beyond the data frames (the interpreter, numpy, pandas, scikit-learn, LightGBM,
 # Arrow's pool after reading the files): 0.63-0.73 GB on an Avazu-shaped table (_mem_rows).
 _BASE_RSS = 0.8e9
+# A candidate's working arrays while it is built, per row it reads: keys' codes, values and the group
+# statistics' temporaries, about eight float64 arrays (_materialize starts fewer at once when memory is short).
+_SPEC_BYTES_PER_ROW = 64
 
 
 def _permute_columns(M: np.ndarray, perm) -> None:
@@ -3186,11 +3190,32 @@ class FeatureForge:
         if len(plan) < n_all:
             self._log(f"budget: built {len(plan)} of {n_all} candidates")
         self._charge(total / _REF_THREADS)
+        # A candidate starts only while the memory left could hold its working arrays twice over, or when
+        # no other is running: four threads each building a statistic over every row took Instacart's
+        # 8.5 million rows from 10.5 to 13 GB of a 14.3 GB limit. Which candidates are built, and each
+        # one's values, do not depend on how many run at once; fewer run when memory is short.
+        gate = threading.Condition()
+        running = [0]
+
+        def gated(s):
+            rows = len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else len(W)
+            need = 2 * _SPEC_BYTES_PER_ROW * rows
+            with gate:
+                while running[0] and available_bytes() < need:
+                    gate.wait(0.2)
+                running[0] += 1
+            try:
+                return compute(s)
+            finally:
+                with gate:
+                    running[0] -= 1
+                    gate.notify_all()
+
         batch = 4 * n_threads
         with ThreadPoolExecutor(n_threads) as pool:
             for i in range(0, len(plan), batch):
                 chunk = plan[i:i + batch]
-                for s, r in zip(chunk, pool.map(compute, chunk)):
+                for s, r in zip(chunk, pool.map(gated, chunk)):
                     if r is None:
                         _release(s)
                         continue
