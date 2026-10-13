@@ -109,7 +109,7 @@ class RelatedTables:
         df = ch.df
         for g in ch.children:
             parent_key = g.key
-            agg = self._aggregate(g, parent_key)
+            agg = self._aggregate_fitting(g, parent_key)
             df = df.merge(agg, left_on=parent_key, right_index=True, how="left")
         return df
 
@@ -222,9 +222,65 @@ class RelatedTables:
         keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
         return res[keep].astype(np.float32)
 
+    def _kinds(self, df: pd.DataFrame, ids) -> tuple:
+        """(categorical columns, numeric columns, long-format bag?) of a child table, as _aggregate reads them."""
+        feats = [c for c in df.columns if c not in ids]
+        cats = [c for c in feats if df[c].dtype == object or isinstance(df[c].dtype, pd.CategoricalDtype)
+                or pd.api.types.is_string_dtype(df[c]) or df[c].dtype == bool]
+        num = [c for c in feats if c not in cats and pd.api.types.is_numeric_dtype(df[c])]
+        return cats, num, len(cats) == 1 and len(feats) <= 3
+
+    def _aggregate_fitting(self, ch: Child, key: str) -> pd.DataFrame:
+        """``_aggregate``, or when its frame of per-row values would not fit in the memory free now (the
+        machine's, or this process's memory cgroup's when less) the same aggregation a range of keys at a time,
+        with each categorical column's levels and the channel split chosen on the whole table first (a memory
+        guard: the statistics are per key, but ties in a key's latest rows may resolve differently). A
+        12-million-row event log with a few categorical columns crossed the 14.3 GB limit while its frame was
+        built."""
+        ids = {key, *ch.drop} | {g.key for g in ch.children if g.key != key}
+        cats, num, bag = self._kinds(ch.df, ids)
+        levels = sum(min(ch.df[c].nunique(), 300 if bag else self.top_levels) for c in cats)
+        width = 1 + len(num) + (2 * self.max_pairs if self.row_pairs else 0) + levels + (levels * len(num) if bag else 0)
+        need = len(ch.df) * width * 4 * 3  # float32 parts, the frame they make, the grouping's temporaries
+        free = available_bytes()
+        if need <= free or len(ch.df) < 100_000:
+            return self._aggregate(ch, key)
+        df = self._flatten(ch)
+        flat = Child(ch.name, df, key=ch.key, time=ch.time, drop=sorted(ids - {key}))
+        cats, num, bag = self._kinds(df, ids)
+        for c in cats:
+            if (ch.name, c) not in self.levels_:
+                vc = as_text(df[c]).value_counts()
+                self.levels_[(ch.name, c)] = list(vc.index[vc >= 20][:300] if bag else vc.index[:self.top_levels])
+        if (ch.name, "__channels__") not in self.levels_:
+            # (the channel split as _aggregate chooses it on its first call, here on the whole table)
+            chans = []
+            for c in num:
+                if c != ch.time and pd.api.types.is_integer_dtype(df[c]):
+                    vc = df[c].value_counts(normalize=True)
+                    if 3 <= len(vc) <= 8 and vc.min() >= 0.05:
+                        chans.append((c, sorted(vc.index.tolist())))
+            vals_ = [c for c in num if c != ch.time and c not in {cc for cc, _ in chans}][:6]
+            self.levels_[(ch.name, "__channels__")] = (chans[:1], vals_)
+        codes = pd.factorize(df[key])[0]
+        n = int(np.ceil(need / max(0.5 * free, 1)))
+        part = codes * n // max(codes.max() + 1, 1)
+        print(f"memory guard: table {ch.name} aggregated in {n} key ranges (whole: {need / 1e9:.1f} GB, "
+              f"{free / 1e9:.1f} GB free)", flush=True)
+        drop_const, self.drop_const = self.drop_const, False
+        try:
+            res = pd.concat([self._aggregate(Child(ch.name, df[part == i], key=ch.key, time=ch.time, drop=flat.drop), key)
+                             for i in range(n) if (part == i).any()])
+        finally:
+            self.drop_const = drop_const
+        if not self.drop_const:
+            return res
+        keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
+        return res[keep].astype(np.float32)
+
     def features(self) -> pd.DataFrame:
         """Aggregations of every child, indexed by the main table's key."""
-        frames = [self._aggregate(ch, ch.key) for ch in self.children]
+        frames = [self._aggregate_fitting(ch, ch.key) for ch in self.children]
         return pd.concat(frames, axis=1)
 
     def join(self, main: pd.DataFrame, key: str) -> pd.DataFrame:
