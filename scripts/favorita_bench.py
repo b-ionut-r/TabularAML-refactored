@@ -64,7 +64,7 @@ elif a.arm == 'fc':
     info = dict(n_fc=Ftr.shape[1])
 elif a.arm == 'forge':
     from tabularaml.generate.forge import FeatureForge
-    kw = dict(time_col='date'); kw.update(json.loads(a.kw))
+    kw = json.loads(a.kw)
     f = FeatureForge(task='regression', time_budget=a.budget, random_state=0, n_jobs=4, verbose=True, **kw).fit(Xtr, ytr, X_unlabeled=U)
     info = dict(n_added=len(f.new_columns_), gate=f.gate_passed_, feats=f.new_columns_[:80])
     Xtr, Xho = raw(f.transform_train(Xtr)), raw(f.transform(Xho))
