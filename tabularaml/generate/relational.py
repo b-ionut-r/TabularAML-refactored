@@ -145,6 +145,9 @@ class RelatedTables:
                     parts.append(pd.DataFrame({f"{c}@{cats[0]}={lv}": np.where(m, df[c].to_numpy(dtype=float), 0.0)
                                                .astype(np.float32)}, index=df.index))
         W = pd.concat(parts, axis=1)
+        # The parts are copied into W: held to the end, the per-level 0/1 columns stood twice in memory (a
+        # 13.7M-row game event log: 12.3 GB at this step).
+        del parts
         vals = [c for c in W.columns if c != key]
         dense = [c for c in vals if "=" not in c]
         onehot = [c for c in vals if "=" in c and "@" not in c]
