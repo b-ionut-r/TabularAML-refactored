@@ -4556,20 +4556,14 @@ class FeatureForge:
         # budget rule below. Otherwise the greedy pass runs to the end, as when it fits the budget.
         fams = {fam(sp) for sp in cur}
         est = sum(range(2, len(fams) + 1)) * getattr(self, "_gate_fit_s", 0.0)
-        # FEATUREFORGE_PROBE_LABEL_FREE=1 (diagnostics only) scores the label-free families wherever the
-        # pass runs and logs them next to the greedy pass's own end point, which it does not change.
-        probe_only = os.environ.get("FEATUREFORGE_PROBE_LABEL_FREE") == "1"
-        if probe_only or (not budgeted and self.time_budget and est > self.time_budget):
+        if not budgeted and self.time_budget and est > self.time_budget:
             free = closed([sp for sp in cur if not sp.target_dep])
             if free and len(free) < len(cur):
-                fit_s, spent0 = getattr(self, "_gate_fit_s", 0.0), spent
                 l, z = score(free)
-                if probe_only:   # leave the pass's own budget exactly as without the probe
-                    self._gate_fit_s, spent = fit_s, spent0
                 self._log(f"  gate families: the pass takes about {est:.0f}s of work; label-free families first: "
                           f"loss={l:.6f} vs raw {raw_rows.mean():.6f} (z={z:+.2f}, need {z_needed + 1:.2f}): "
                           + ", ".join(sorted({fam(sp) for sp in free})))
-                if not probe_only and l < best_l and z >= z_needed + 1:
+                if l < best_l and z >= z_needed + 1:
                     best_set, best_l, cur, budgeted = list(free), l, free, True
         # The pass refits the gate models once per family per step (about F^2/2 fits): on a wide
         # table each fit is minutes of work (a held-back 1,930-column contest: 1,400 s for the first
@@ -4595,9 +4589,6 @@ class FeatureForge:
             cur = rest
             if l < best_l and z >= z_needed + 1:
                 best_set, best_l = list(cur), l
-        if probe_only:
-            self._log(f"  gate families: pass ends at loss={best_l:.6f}: "
-                      + ", ".join(sorted({fam(sp) for sp in best_set or []})))
         return best_set, best_l
 
     def _fit_full(self, X, y, U=None):
