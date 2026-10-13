@@ -367,6 +367,99 @@ def prep_storesales():
     return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmsle', higher=False, time=True)
 
 
+def prep_pfs():
+    # Predict Future Sales (1C, Coursera contest): monthly sales of each item in each shop; the test is next
+    # month's count for every shop x item pair of the test grid, clipped to [0, 20], scored RMSE. Built like
+    # that: each month's rows are every (shop with sales that month) x (item with sales that month), months
+    # 20..33 (the usual kernels' grid, kept to 14 months for memory); held out: month 33 (Oct 2015).
+    s = pd.read_csv(D / 'raw' / 'sales_train.csv')
+    s = s[s.date_block_num >= 20]
+    cnt = s.groupby(['date_block_num', 'shop_id', 'item_id'], as_index=False)['item_cnt_day'].sum()
+    parts = []
+    for m, g in s.groupby('date_block_num'):
+        sh, it = np.unique(g.shop_id), np.unique(g.item_id)
+        parts.append(pd.DataFrame({'date_block_num': m, 'shop_id': np.repeat(sh, len(it)), 'item_id': np.tile(it, len(sh))}))
+    d = pd.concat(parts, ignore_index=True).merge(cnt, how='left', on=['date_block_num', 'shop_id', 'item_id'])
+    items = pd.read_csv(D / 'raw' / 'items.csv')[['item_id', 'item_category_id']]
+    d = d.merge(items, how='left', on='item_id')
+    d['date'] = pd.to_datetime({'year': 2013 + d.date_block_num // 12, 'month': d.date_block_num % 12 + 1, 'day': 1})
+    d = d.sort_values(['date_block_num', 'shop_id', 'item_id'], kind='stable').reset_index(drop=True)
+    y = d.pop('item_cnt_day').fillna(0).clip(0, 20).to_numpy()
+    ho = (d['date_block_num'] == 33).to_numpy()
+    return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmse_clip20', higher=False, time=True)
+
+
+def prep_rohlik():
+    # Rohlik Sales Forecasting Challenge v2 (2024-25): daily sales of each product in each of 7 warehouses, with
+    # the inventory (product, name, 4 category levels) and calendar (holidays, closures per warehouse) tables.
+    # The test is the next 14 days, scored weighted MAE (test_weights per unique_id). Held out: the last 14 days
+    # of train (2024-05-20 .. 2024-06-02); availability is left out (absent from the real test file).
+    d = pd.read_parquet(D / 'raw' / 'sales_train.parquet').drop(columns=['availability'])
+    d = d.merge(pd.read_parquet(D / 'raw' / 'inventory.parquet'), how='left', on=['unique_id', 'warehouse'])
+    d = d.merge(pd.read_parquet(D / 'raw' / 'calendar.parquet'), how='left', on=['date', 'warehouse'])
+    d['date'] = pd.to_datetime(d['date'])
+    d = d[d['sales'].notna()].sort_values(['date', 'unique_id'], kind='stable').reset_index(drop=True)
+    w = d['unique_id'].map(pd.read_parquet(D / 'raw' / 'test_weights.parquet').set_index('unique_id')['weight']).fillna(1.0)
+    y = np.log1p(d.pop('sales').to_numpy())
+    ho = (d['date'] >= pd.Timestamp('2024-05-20')).to_numpy(); wh = w.to_numpy()[ho]
+    wmae = lambda yy, p: float(np.sum(wh * np.abs(np.expm1(yy) - np.expm1(p))) / np.sum(wh))
+    return dict(X=d, y=y, task='regression', ho=ho, score=wmae, metric='wmae', higher=False, time=True)
+
+
+def prep_gefw():
+    # GEFCom2014 wind track (IEEE, prizes): hourly power of 10 wind farms (normalized 0..1) with the farms'
+    # wind forecasts (u/v at 10 m and 100 m). Each task gave history to the end of a month and scored the next
+    # month with its forecasts known. Final task (15) history, held out: its last month (Nov 2013). The contest
+    # scored quantiles (pinball); here the point forecast, RMSE.
+    d = pd.concat([pd.read_csv(D / 'raw' / f'Task15_W_Zone{z}.csv') for z in range(1, 11)], ignore_index=True)
+    d['TIMESTAMP'] = pd.to_datetime(d['TIMESTAMP'], format='%Y%m%d %H:%M')
+    d = d[d['TARGETVAR'].notna()].sort_values(['TIMESTAMP', 'ZONEID'], kind='stable').reset_index(drop=True)
+    y = d.pop('TARGETVAR').to_numpy()
+    ho = (d['TIMESTAMP'] > pd.Timestamp('2013-11-01')).to_numpy()
+    return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmse', higher=False, time=True)
+
+
+def _stormy_rows():
+    d = pd.read_csv(D.parent / 'stormy' / 'raw' / 'train.csv', parse_dates=['date'])
+    d = d.merge(pd.read_csv(D.parent / 'stormy' / 'raw' / 'key.csv'), how='left', on='store_nbr')
+    w = pd.read_csv(D.parent / 'stormy' / 'raw' / 'weather.csv', parse_dates=['date'], dtype=str).assign(
+        station_nbr=lambda t: t.station_nbr.astype(int), date=lambda t: pd.to_datetime(t.date))
+    d = d.merge(w, how='left', on=['station_nbr', 'date'])
+    return d.sort_values(['date', 'store_nbr', 'item_nbr'], kind='stable').reset_index(drop=True), w
+
+
+def _stormy_finish(d, ho):
+    # Store x item pairs that never sell in the training rows are dropped (their test answer is 0; the usual prep).
+    keep = d.groupby(['store_nbr', 'item_nbr'])['units'].transform(lambda u: u[~ho[u.index]].max() > 0).to_numpy()
+    d, ho = d[keep].reset_index(drop=True), ho[keep]
+    y = np.log1p(d.pop('units').to_numpy())
+    return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmsle', higher=False, time=True)
+
+
+def prep_stormy():
+    # Walmart Recruiting II: Sales in Stormy Weather (2015): daily units of 111 weather-sensitive items in 45
+    # stores, with the stores' weather station table (raw strings, as shipped). The real test is the days within
+    # 3 of a weather event (snowfall >= 2 in or rain >= 1 in at the store's station), interleaved with training
+    # days; RMSLE. Held out that way: a random half (seed) of the training period's events, every row of the
+    # station's stores within 3 days of the event.
+    d, w = _stormy_rows()
+    num = lambda c: pd.to_numeric(w[c].str.strip().replace({'T': '0.001', 'M': None}), errors='coerce')
+    ev = w.loc[(num('snowfall') >= 2) | (num('preciptotal') >= 1), ['station_nbr', 'date']].reset_index(drop=True)
+    rng = np.random.default_rng(a.seed); ev = ev[rng.random(len(ev)) < 0.5]
+    win = pd.concat([ev.assign(date=ev.date + pd.Timedelta(days=k)) for k in range(-3, 4)]).drop_duplicates()
+    ho = d[['station_nbr', 'date']].merge(win.assign(_h=1), how='left', on=['station_nbr', 'date'])['_h'].notna().to_numpy()
+    return _stormy_finish(d, ho)
+
+
+def prep_stormy_last():
+    # Same rows, held out as a forecast instead (NOT how this contest tested): the last 28 days of train
+    # (2014-10-04 .. 2014-10-31). Only to exercise the forecasting family's key search on a key whose low
+    # cardinality part (store_nbr, 45 levels) is outranked by the joined weather columns.
+    d, w = _stormy_rows()
+    ho = (d['date'] >= pd.Timestamp('2014-10-04')).to_numpy()
+    return _stormy_finish(d, ho)
+
+
 def hand_svp(X):
     # Public kernels' row statistics over the non-zero cells (count of non-zeros, log-scale mean/max/min/std/median, sum).
     v = X.to_numpy(float); nz = v != 0; lv = np.where(nz, np.log1p(np.abs(v)), np.nan)
@@ -451,6 +544,8 @@ if a.arm == 'ff':
         shutil.rmtree(tmp, ignore_errors=True)
     Xtr, Xte = Ftr, Fte
 fe_t = time.time() - t0
+if os.environ.get('BUILD_ONLY'):  # outputs kept via KEEP_OUT; no judge
+    print('BUILT', a.contest, round(fe_t), globals().get('ff_peak_gb')); sys.exit()
 if idc:
     Xtr, Xte = Xtr.drop(columns=[idc], errors='ignore'), Xte.drop(columns=[idc], errors='ignore')
 Xtr, Xte = Xtr.copy(), Xte.copy()
@@ -463,6 +558,10 @@ for c in Xtr.columns:
         _s = lambda v: v.astype(object).map(str)
         cats = pd.Index(pd.unique(_s(Xtr[c])))
         Xtr[c] = pd.Categorical(_s(Xtr[c]), categories=cats); Xte[c] = pd.Categorical(_s(Xte[c]), categories=cats)
+if os.environ.get('CAST32'):  # check: the judge on float32 numerics (as contest_features writes them)
+    for c in Xtr.columns:
+        if Xtr[c].dtype == np.float64:
+            Xtr[c], Xte[c] = Xtr[c].astype(np.float32), Xte[c].astype(np.float32)
 import lightgbm as lgb
 obj = {'binary': 'binary', 'multiclass': 'multiclass'}.get(P['task'], 'regression')
 Pm = dict(objective=obj, **({'num_class': P['n_class']} if obj == 'multiclass' else {}), learning_rate=0.05, num_leaves=63, min_child_samples=20 if len(Xtr) < 5000 else 100,
@@ -480,5 +579,5 @@ for s in range(3):
     p += lgb.train(dict(Pm, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
 res = dict(contest=a.contest, arm=a.arm + (f'_shuffled{a.perm or ""}' if a.shuffle else ''), seed=a.seed, metric=P['metric'],
            score=P['score'](yte, p), n_tr=len(Xtr), n_te=len(Xte), n_cols=Xtr.shape[1], best_it=b.best_iteration,
-           fe_s=round(fe_t), total_s=round(time.time() - t0), ff_peak_gb=globals().get('ff_peak_gb'))
+           extra=a.extra, fe_s=round(fe_t), total_s=round(time.time() - t0), ff_peak_gb=globals().get('ff_peak_gb'))
 print('RESULT', json.dumps(res)); open(a.log, 'a').write(json.dumps(res) + '\n')
