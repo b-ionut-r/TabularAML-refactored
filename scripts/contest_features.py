@@ -230,7 +230,7 @@ def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
     return keep
 
 
-_CHECK_CHUNK_ROWS = 250_000   # earlier rows transformed at a time in the forecasting check
+_CHECK_CHUNK_ROWS = 250_000   # rows the forecasting block is transformed at a time (check and output)
 
 
 def _check_matrix(frames: list[pd.DataFrame], picks: list[tuple[int, np.ndarray | None]],
@@ -593,7 +593,17 @@ def main():
                   f"({time.time() - tc:.0f}s)", flush=True)
         if keep:
             forecasting = True
-            Ftr, Fte = ff.transform(Xtr), ff.transform(Xte)
+            # The training rows' block a block of rows at a time into one float32 matrix: the whole
+            # transform's working columns were the run's peak (Store Sales: 4.2 GB).
+            Ftr, M = None, None
+            for a0, Fc in ff.transform_chunks(Xtr, _CHECK_CHUNK_ROWS):
+                if M is None:
+                    M = np.empty((len(Xtr), Fc.shape[1]), dtype=np.float32, order="F")
+                    names = list(Fc.columns)
+                M[a0:a0 + len(Fc)] = Fc.to_numpy(dtype=np.float32)
+            Ftr = pd.DataFrame(M, columns=names, index=Xtr.index, copy=False) if M is not None else ff.transform(Xtr)
+            del M
+            Fte = ff.transform(Xte)
             Xtr = pd.concat([Xtr.reset_index(drop=True), Ftr.reset_index(drop=True)], axis=1)
             Xte = pd.concat([Xte.reset_index(drop=True), Fte.reset_index(drop=True)], axis=1)
             print(f"forecast: {Ftr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
