@@ -3,7 +3,9 @@
 # ladder on scikit-learn-backed families: IEEE-CIS 0.96236 vs 0.96011). These are the
 # generalization bench's versions (Python 3.13). Install with: pip install -r requirements.txt
 numpy==2.4.6
-pandas==2.3.3
+# pandas 3, as every bench ran: it reads parquet text as ``str``, which contest_features passes
+# through as strings, where pandas 2 gave categories (the same features, other dtypes).
+pandas==3.0.5
 scipy==1.17.1
 scikit-learn==1.9.1
 lightgbm==4.7.0
