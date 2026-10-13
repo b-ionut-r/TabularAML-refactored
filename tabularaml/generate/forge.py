@@ -2113,10 +2113,6 @@ class FeatureForge:
         hand each row its own label through the entity's later rows.
     family_time_share : float
         Largest share of the candidate-building work one family may take (1 disables).
-    gate_by_period : bool
-        On time-ordered data, test the gate's paired improvement with each period (gate
-        time value, or one of 30 time blocks) as one observation instead of each row; rows
-        of one period share its shocks. The period-level z is logged either way.
     time_budget : float
         Search budget in seconds of work on the reference container (the work clock: costs
         come from row, column and candidate counts, never from timing, so a run picks the same
@@ -2204,7 +2200,7 @@ class FeatureForge:
                  time_col: Optional[str] = "auto", entity_nums: int = 6,
                  events: bool = True, time_cv: bool = True,
                  group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto",
-                 max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
+                 max_search_rows: Optional[int] = None, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
         self.log_target = log_target
@@ -2235,7 +2231,6 @@ class FeatureForge:
         self.drop_synthetic = drop_synthetic
         self.parity_check = parity_check
         self.max_search_rows = max_search_rows
-        self.gate_by_period = gate_by_period
         self.family_time_share = family_time_share
         self.label_echo = label_echo
         self.label_cols = label_cols
@@ -3991,8 +3986,8 @@ class FeatureForge:
             return _row_loss(self.task_, yg, margin)
 
         # Rows of one period share its shocks, so their paired differences are not
-        # independent: the period-level test treats each period (gate time value, or one of
-        # 30 equal time blocks when values are finer) as one observation.
+        # independent: the period-level z, logged next to the row-level one, treats each period
+        # (gate time value, or one of 30 equal time blocks when values are finer) as one observation.
         blocks = None
         if self.time_col_ is not None and self.time_col_ in Xg.columns:
             tg = Xg[self.time_col_].to_numpy(dtype=float)
@@ -4059,8 +4054,6 @@ class FeatureForge:
             self._log(f"  gate {label}{' (recoded)' if self.recode_ and rc is None else ''}: loss={rows.mean():.6f} vs raw {raw_l:.6f} "
                       f"(z={z:+.2f}" + (f", by period {zb:+.2f}" if zb is not None else "")
                       + (f", later half {late:+.2e}" if late is not None else "") + f", need {z_needed:.2f})")
-            if self.gate_by_period and zb is not None:
-                z = zb
             if specs and {id(s) for s in specs} == full_ids and z >= z_needed and (late is None or late > 0):
                 full_ok = True
             # Time-ordered gates: the gain must still hold over the later half of the gate rows
