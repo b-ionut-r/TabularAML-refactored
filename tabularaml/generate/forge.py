@@ -2133,8 +2133,6 @@ class FeatureForge:
         so search CV is not optimistic about sparse-key encodings. "auto": on with
         time-blocked search, where encodings fitted on random folds carry the
         validation block's labels (IEEE-CIS latest window 0.948 -> 0.953).
-    gate_subsets : bool
-        Also offer each round's label-free features alone to the gate.
     entities : bool
         Look for hidden entity ids: a timestamp-like column minus a "days since
         X" column is constant per entity (account opening date, first visit);
@@ -2202,7 +2200,7 @@ class FeatureForge:
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
-                 gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
+                 nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6,
                  events: bool = True, time_cv: bool = True,
                  group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto",
@@ -2225,7 +2223,6 @@ class FeatureForge:
         self.hc_threshold = hc_threshold
         self.n_interactions = n_interactions
         self.novelty_slack = novelty_slack
-        self.gate_subsets = gate_subsets
         self.nested_cv = nested_cv
         self.entities = entities
         self.time_col = time_col
@@ -4017,18 +4014,10 @@ class FeatureForge:
         # Candidate feature sets are the cumulative rounds; the best one on the gate is
         # kept only if its paired per-row improvement clears ``gate_z`` standard errors.
         best_set, best_l, best_z = None, raw_l, 0.0
-        # Candidate sets: the cumulative rounds; round -1 is the high-cardinality recode
-        # alone. Each round also offers its label-free subset: target statistics are the
-        # features whose search CV can be optimistic (training rows' encodings carry the
-        # validation rows' labels), so a gate can reject them without losing the rest.
+        # Candidate sets: the cumulative rounds; round -1 is the high-cardinality recode alone.
         cands = [("anchors", [])] if self.anchors_ else []
         for r in ([-1] if self.recode_ else []) + sorted({s.round_ for s in self.selected_}):
-            full = [s for s in self.selected_ if s.round_ <= r]
-            cands.append((f"rounds<={r + 1}", full))
-            if self.gate_subsets:
-                free = [s for s in full if not s.target_dep]
-                if free and len(free) < len(full):
-                    cands.append((f"rounds<={r + 1} label-free", free))
+            cands.append((f"rounds<={r + 1}", [s for s in self.selected_ if s.round_ <= r]))
         # Picks that skipped the residual screen (kNN class distances, numbered codes) reach
         # the gate untested on their own: each set is also offered without each such family,
         # so one that does not carry over cannot ride on the others (Telstra: kNN distances
