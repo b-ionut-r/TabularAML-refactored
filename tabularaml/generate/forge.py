@@ -2012,12 +2012,32 @@ def _row_loss(task, y, margin) -> np.ndarray:
         p = np.clip(p, 1e-15, 1 - 1e-15)
         return -(y * np.log(p) + (1 - y) * np.log(1 - p))
     m = margin - margin.max(axis=1, keepdims=True)
-    logp = m - np.log(np.exp(m).sum(axis=1, keepdims=True))
-    return -logp[np.arange(len(y)), y.astype(int)]
+    # Only the label's log-probability: the same two terms subtracted as in the full log-softmax.
+    return -(m[np.arange(len(y)), y.astype(int)] - np.log(np.exp(m).sum(axis=1)))
 
 
 def _loss(task, y, margin) -> float:
     return float(np.mean(_row_loss(task, y, margin)))
+
+
+def _fold_steps(idx, n_folds, n_cells, g, h, lam) -> np.ndarray:
+    """Regularised Newton step of every cell from the other folds' gradients: (folds, cells[, classes]).
+
+    ``idx`` is fold * n_cells + cell per row. With many classes, one (cells x rows) indicator times the
+    (rows x classes) gradients adds each cell's rows in row order, as one bincount per class does, so the
+    steps are bit-identical without a strided copy of every class column.
+    """
+    if g.ndim == 1:
+        G = np.bincount(idx, g, minlength=n_folds * n_cells).reshape(n_folds, n_cells)
+        H = np.bincount(idx, h, minlength=n_folds * n_cells).reshape(n_folds, n_cells)
+        return -(G.sum(0) - G) / (H.sum(0) - H + lam)
+    if g.shape[1] < 8:
+        return np.stack([_fold_steps(idx, n_folds, n_cells, g[:, k], h[:, k], lam) for k in range(g.shape[1])], 2)
+    from scipy import sparse
+    A = sparse.csr_matrix((np.ones(len(idx)), (idx, np.arange(len(idx)))), shape=(n_folds * n_cells, len(idx)))
+    G = (A @ g).reshape(n_folds, n_cells, -1)
+    H = (A @ h).reshape(n_folds, n_cells, -1)
+    return -(G.sum(0) - G) / (H.sum(0) - H + lam)
 
 
 # ============================================================================
@@ -2854,15 +2874,7 @@ class FeatureForge:
 
     def _cell_gain(self, cell, ncell, g, h, lam, fold, K, y, margin, base):
         """Cross-fitted Newton gain of a lookup table over integer cells."""
-        idx = fold * ncell + cell
-        def step_for(gk, hk):
-            G = np.bincount(idx, gk, minlength=K * ncell).reshape(K, ncell)
-            H = np.bincount(idx, hk, minlength=K * ncell).reshape(K, ncell)
-            return (-(G.sum(0) - G) / (H.sum(0) - H + lam))[fold, cell]
-        if g.ndim == 1:
-            corr = step_for(g, h)
-        else:
-            corr = np.stack([step_for(g[:, k], h[:, k]) for k in range(g.shape[1])], 1)
+        corr = _fold_steps(fold * ncell + cell, K, ncell, g, h, lam)[fold, cell]
         return base - _loss(self.task_, y, margin + corr)
 
     def _fast_interactions(self, W, y, margin, imp, n_cols=30, n_bins=8, n_levels=16):
@@ -3161,18 +3173,7 @@ class FeatureForge:
         bins = np.where(finite, np.searchsorted(edges, np.where(finite, x, 0.0), side="right"), nb - 1)
         K = self._n_probe_folds
         cell = self._probe_fold * nb + bins
-        if g.ndim == 1:
-            G = np.bincount(cell, g, minlength=K * nb).reshape(K, nb)
-            H = np.bincount(cell, h, minlength=K * nb).reshape(K, nb)
-            step = -(G.sum(0) - G) / (H.sum(0) - H + lam)
-            corr = step[self._probe_fold, bins]
-        else:
-            corr = np.empty_like(g)
-            for k in range(g.shape[1]):
-                G = np.bincount(cell, g[:, k], minlength=K * nb).reshape(K, nb)
-                H = np.bincount(cell, h[:, k], minlength=K * nb).reshape(K, nb)
-                step = -(G.sum(0) - G) / (H.sum(0) - H + lam)
-                corr[:, k] = step[self._probe_fold, bins]
+        corr = _fold_steps(cell, K, nb, g, h, lam)[self._probe_fold, bins]
         return self._probe_base_loss - _loss(self.task_, self._probe_y, self._probe_margin + corr)
 
     def _probe_setup(self, W, y, margin):
