@@ -656,26 +656,34 @@ def main():
         # bureau model score read other rows' scores, which were fitted on this row's label.
         kw = dict(label_cols=[c for c in label_cols if c in Xtr.columns], **json.loads(a.forge_kw))
         forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **kw).fit(Xtr, y, X_unlabeled=Xte)
-        out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
+        out_te = forge.transform(Xte)
+    # The test rows are transformed, finished and written before the training rows are transformed: held,
+    # their output and the fit's frames were 13.2 GB on Instacart's 8.5 million rows (the 14.3 GB limit).
+    # Related columns are added a column at a time: a concat consolidates the whole output into a copy next
+    # to it (Instacart: killed at 14 GB).
+    rest = [c for c in rel_cols if c not in out_te.columns] if spill is not None else []
+
+    def related(o, f):
+        for c in rest:
+            o[c] = pd.read_parquet(spill / f, columns=[c])[c]
+        release_arrow()
+    out = Path(a.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    related(out_te, "test.parquet")
+    if a.id:
+        out_te.insert(0, a.id, ids_te)
+    out_te.to_parquet(out / "test_features.parquet")
+    del out_te, Xte
+    release_arrow()
+    if not forecasting:
+        out_tr = forge.transform_train(Xtr)
         del forge
-    # Added a column at a time, and the test file written and dropped before the training file: a concat
-    # consolidates the whole output into a copy next to it (Instacart's 8.5 million rows: killed at 14 GB).
+    related(out_tr, "train.parquet")
     if spill is not None:
-        rest = [c for c in rel_cols if c not in out_tr.columns]
-        for o, f in ((out_tr, "train.parquet"), (out_te, "test.parquet")):
-            for c in rest:
-                o[c] = pd.read_parquet(spill / f, columns=[c])[c]
-            release_arrow()
         shutil.rmtree(spill, ignore_errors=True)
     out_tr[a.target] = labels[y.to_numpy()] if labels is not None else y.to_numpy()
     if a.id:
         out_tr.insert(0, a.id, ids_tr)
-        out_te.insert(0, a.id, ids_te)
-    out = Path(a.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    out_te.to_parquet(out / "test_features.parquet")
-    del out_te, Xte
-    release_arrow()
     out_tr.to_parquet(out / "train_features.parquet")
     print(f"done in {time.time() - t0:.0f}s: {out_tr.shape[1] - n_main - 1} columns added -> {out}/")
 
