@@ -2182,9 +2182,6 @@ class FeatureForge:
         stop appearing) are judged as they will be on a later test set. "auto"
         picks a numeric column whose unlabeled values (``X_unlabeled``) lie
         beyond the training range, as a competition's test period does.
-    gate_bags : int
-        Models averaged per feature set on the gate (different seeds and
-        early-stopping splits), to keep model noise out of the decision.
     n_interactions : int
         Number of feature pairs (and half as many triples) mined from the base
         model's tree paths and expanded into explicit interaction features.
@@ -2205,7 +2202,6 @@ class FeatureForge:
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
-                 gate_bags: int = 1,
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6,
                  events: bool = True, time_cv: bool = True,
@@ -2229,7 +2225,6 @@ class FeatureForge:
         self.hc_threshold = hc_threshold
         self.n_interactions = n_interactions
         self.novelty_slack = novelty_slack
-        self.gate_bags = gate_bags
         self.gate_subsets = gate_subsets
         self.nested_cv = nested_cv
         self.entities = entities
@@ -3975,27 +3970,22 @@ class FeatureForge:
             for j, col in enumerate(s.out_names()):
                 Fg[col] = vg if np.ndim(vg) == 1 else vg[:, j]
         import lightgbm as lgb
-        es_splits = [self._folds(len(Fs), ys, 5, self.random_state + 11 + k)[0] for k in range(self.gate_bags)]
+        es_tr, es_va = self._folds(len(Fs), ys, 5, self.random_state + 11)[0]
         if self.time_col_ is not None:
             # Early-stop on the latest search rows too, so the gate's models are tuned
             # for later periods as the competition's are.
             order = np.argsort(Fs[self.time_col_].to_numpy(dtype=float), kind="stable")
             n_va = max(1, len(order) // 5)
-            es_splits = [(np.sort(order[:-n_va]), np.sort(order[-n_va:]))] * self.gate_bags
+            es_tr, es_va = np.sort(order[:-n_va]), np.sort(order[-n_va:])
 
         def gate_loss(cols, recode=None):
-            # A bag of differently seeded / early-stopped models: one model's
-            # randomness otherwise flips keep-or-drop decisions on small gates.
             D = self._lgb_data(self._model_frame(_columns(Fs, cols), recode), ys, lr=0.05)
             G, _ = self._lgb_matrix(self._model_frame(_columns(Fg, cols), recode))
-            margin, iters = 0.0, 0
-            for k, (tr, va) in enumerate(es_splits):
-                b = self._fit_eval_rows(D, tr, va, lr=0.05, es=100)
-                # Refit on all search rows at the early-stopped size, then score the gate rows.
-                full = lgb.train(self._train_params(D, 0.05, seed=self.random_state + k), D,
-                                 max(1, b.best_iteration))
-                margin = margin + full.predict(G, raw_score=True) / len(es_splits)
-                iters += b.current_iteration() + full.current_iteration()
+            b = self._fit_eval_rows(D, es_tr, es_va, lr=0.05, es=100)
+            # Refit on all search rows at the early-stopped size, then score the gate rows.
+            full = lgb.train(self._train_params(D, 0.05, seed=self.random_state), D, max(1, b.best_iteration))
+            margin = full.predict(G, raw_score=True)
+            iters = b.current_iteration() + full.current_iteration()
             # The fit's work, as a CV fold is charged (from the iterations it trained).
             self._gate_fit_s = _TREE_CELL_S * iters * len(ys) * len(cols) * (
                 self.n_classes_ if self.task_ == "multiclass" else 1)
