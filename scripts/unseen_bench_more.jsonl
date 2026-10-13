@@ -8,3 +8,9 @@
 {"contest": "ashrae", "arm": "ff", "seed": 0, "metric": "rmsle", "score": 1.3509145627773382, "n_tr": 1327057, "n_te": 687183, "n_cols": 15, "best_it": 135, "fe_s": 503, "total_s": 552, "ff_peak_gb": 4.4}
 {"contest": "ashrae", "arm": "raw_shuffled", "seed": 0, "metric": "rmsle", "score": 2.102097585597077, "n_tr": 1327057, "n_te": 687183, "n_cols": 15, "best_it": 13, "fe_s": 0, "total_s": 16, "ff_peak_gb": null}
 {"contest": "ashrae", "arm": "ff_shuffled", "seed": 0, "metric": "rmsle", "score": 2.1021053292161964, "n_tr": 1327057, "n_te": 687183, "n_cols": 15, "best_it": 13, "fe_s": 166, "total_s": 180, "ff_peak_gb": 3.21}
+{"contest": "storesales", "arm": "raw", "seed": 0, "metric": "rmsle", "score": 0.48050555451420884, "n_tr": 2972376, "n_te": 28512, "n_cols": 11, "best_it": 728, "fe_s": 0, "total_s": 304, "ff_peak_gb": null}
+{"contest": "storesales", "arm": "ff", "seed": 0, "metric": "rmsle", "score": 0.41326329651653687, "n_tr": 2972376, "n_te": 28512, "n_cols": 83, "best_it": 134, "fe_s": 135, "total_s": 394, "ff_peak_gb": 6.55}
+{"contest": "storesales", "arm": "raw_shuffled", "seed": 0, "metric": "rmsle", "score": 2.621936282690319, "n_tr": 2972376, "n_te": 28512, "n_cols": 11, "best_it": 2, "fe_s": 0, "total_s": 37, "ff_peak_gb": null}
+{"contest": "storesales", "arm": "ff_shuffled", "seed": 0, "metric": "rmsle", "score": 2.6220687205951747, "n_tr": 2972376, "n_te": 28512, "n_cols": 83, "best_it": 1, "fe_s": 136, "total_s": 233, "ff_peak_gb": 6.54}
+{"contest": "storesales", "arm": "ff", "seed": 0, "metric": "rmsle", "score": 0.41326329651653687, "n_tr": 2972376, "n_te": 28512, "n_cols": 83, "best_it": 134, "fe_s": 134, "total_s": 395, "ff_peak_gb": 6.54}
+{"contest": "storesales", "arm": "ff_shuffled", "seed": 0, "metric": "rmsle", "score": 2.6220687205951747, "n_tr": 2972376, "n_te": 28512, "n_cols": 83, "best_it": 1, "fe_s": 130, "total_s": 223, "ff_peak_gb": 6.56}

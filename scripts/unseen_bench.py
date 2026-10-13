@@ -1,6 +1,6 @@
 """Unseen recent contests ("sealed" set): raw vs FeatureForge blind, held out like each contest's test.
 
-    python unseen_bench.py --contest allstate|bnp|homesite|ashrae --arm raw|ff --seed 0 [--shuffle] [--repo <worktree>]
+    python sealed_bench.py --contest icr --arm raw|ff --seed 0 [--shuffle] [--repo <worktree>]
 
 Data: DATA/sealed/<contest>/ (see /mnt/project-files/generalization/sealed/MANIFEST.md for sources). Each
 contest's ``prep`` returns the main rows, the target, the task, the held-out mask built like the contest's
@@ -353,6 +353,17 @@ def prep_ashrae():
     d = pd.read_parquet(D / 'subset10.parquet')
     y = np.log1p(d.pop('meter_reading').to_numpy())
     ho = (d['timestamp'] >= pd.Timestamp('2016-09-01')).to_numpy()
+    return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmsle', higher=False, time=True)
+
+
+def prep_storesales():
+    # Store Sales - Time Series Forecasting (Favorita successor, 2021-): daily sales of 33 product families in
+    # 54 stores, 2013-2017, with stores, oil price and national holiday tables (joined by joined.parquet; the
+    # transactions table is left out, as it does not cover the test days). The real test is the next 16 days,
+    # scored RMSLE; held out here: the last 16 days of train (2017-07-31 .. 2017-08-15).
+    d = pd.read_parquet(D / 'joined.parquet')
+    y = np.log1p(d.pop('sales').to_numpy())
+    ho = (d['date'] >= pd.Timestamp('2017-07-31')).to_numpy()
     return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmsle', higher=False, time=True)
 
 
