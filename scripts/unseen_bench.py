@@ -522,7 +522,11 @@ if a.arm == 'hand':
     else:
         _H = _hf(pd.concat([Xtr, Xte], ignore_index=True))
         Xtr, Xte = _H.iloc[:len(Xtr)].reset_index(drop=True), _H.iloc[len(Xtr):].reset_index(drop=True); del _H
-if a.arm == 'ff':
+if a.arm == 'ff' and os.environ.get('JUDGE_FROM'):  # judge a kept build (KEEP_OUT dir) without rebuilding
+    Ftr = pd.read_parquet(Path(os.environ['JUDGE_FROM']) / 'train_features.parquet').drop(columns=['__y'])
+    Xtr, Xte = Ftr, pd.read_parquet(Path(os.environ['JUDGE_FROM']) / 'test_features.parquet')[Ftr.columns]; del Ftr
+    if a.shuffle: sys.exit('JUDGE_FROM judges the kept build as is: no --shuffle')
+elif a.arm == 'ff':
     tmp = Path(tempfile.mkdtemp(dir='/home/user/tmp'))
     try:
         Xtr.assign(__y=ytr).to_parquet(tmp / 'train.parquet'); Xte.to_parquet(tmp / 'test.parquet')
@@ -566,17 +570,19 @@ import lightgbm as lgb
 obj = {'binary': 'binary', 'multiclass': 'multiclass'}.get(P['task'], 'regression')
 Pm = dict(objective=obj, **({'num_class': P['n_class']} if obj == 'multiclass' else {}), learning_rate=0.05, num_leaves=63, min_child_samples=20 if len(Xtr) < 5000 else 100,
           feature_fraction=0.5, bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, num_threads=4, verbose=-1,
+          deterministic=True, force_row_wise=True,
           max_cat_to_onehot=8, cat_smooth=50)
 n = len(Xtr)
 if P.get('time'):
     fit, va = np.arange(int(0.85 * n)), np.arange(int(0.85 * n), n)
 else:
     perm = np.random.default_rng(a.seed + 1).permutation(n); fit, va = np.sort(perm[:int(0.85 * n)]), np.sort(perm[int(0.85 * n):])
-b = lgb.train(dict(Pm, seed=0), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 5000, valid_sets=[lgb.Dataset(Xtr.iloc[va], ytr[va])],
+_js = int(os.environ.get('JSEED', 0))  # judge seed base (0 = the usual seeds 0..2)
+b = lgb.train(dict(Pm, seed=_js), lgb.Dataset(Xtr.iloc[fit], ytr[fit]), 5000, valid_sets=[lgb.Dataset(Xtr.iloc[va], ytr[va])],
               callbacks=[lgb.early_stopping(200, verbose=False)])
 p = np.zeros((len(Xte), P['n_class']) if obj == 'multiclass' else len(Xte))
 for s in range(3):
-    p += lgb.train(dict(Pm, seed=s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
+    p += lgb.train(dict(Pm, seed=_js + s), lgb.Dataset(Xtr, ytr), int(b.best_iteration * 1.1) + 1).predict(Xte) / 3
 res = dict(contest=a.contest, arm=a.arm + (f'_shuffled{a.perm or ""}' if a.shuffle else ''), seed=a.seed, metric=P['metric'],
            score=P['score'](yte, p), n_tr=len(Xtr), n_te=len(Xte), n_cols=Xtr.shape[1], best_it=b.best_iteration,
            extra=a.extra, fe_s=round(fe_t), total_s=round(time.time() - t0), ff_peak_gb=globals().get('ff_peak_gb'))
