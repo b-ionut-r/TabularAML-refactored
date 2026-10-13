@@ -514,6 +514,18 @@ def test_field_missing_from_unlabeled_rows_is_left_out():
     assert "z" not in f.transform(U).columns and "z" not in f.transform_train(X).columns
 
 
+
+def test_single_later_period_is_not_left_out():
+    # A test that is one later day (or month id) is constant there on a value training never holds;
+    # it orders the test after training, so it stays for time detection.
+    from tabularaml.generate.forge import _absent_in_test
+    rng = np.random.default_rng(0)
+    day = np.repeat(np.arange(30), 100)
+    X = pd.DataFrame({"date": (pd.Timestamp("2022-03-01") + pd.to_timedelta(day, unit="D")).strftime("%Y-%m-%d"),
+                      "month_id": day, "z": rng.uniform(0, 2, 3000)})
+    U = pd.DataFrame({"date": ["2022-03-31"] * 100, "month_id": [30] * 100, "z": [-9.0] * 100})
+    assert _absent_in_test(X, U) == ["z"]
+
 def test_json_object_columns_are_flattened_into_fields():
     from tabularaml.generate.lists import json_fields
     rng = np.random.default_rng(0)

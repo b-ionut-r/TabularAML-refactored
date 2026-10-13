@@ -1931,9 +1931,24 @@ def _absent_in_test(X: pd.DataFrame, U: pd.DataFrame) -> List[str]:
             continue
         v = vb.index[0]
         s_tr = float(X[c].isna().mean()) if pd.isna(v) else float((X[c] == v).mean())
-        if s_tr <= 0.05:
+        if s_tr <= 0.05 and not _later_than_train(X[c], U[c]):
             out.append(c)
     return out
+
+
+def _later_than_train(x: pd.Series, u: pd.Series) -> bool:
+    """``u`` (nearly) all beyond every value of ``x``: a test that is one later period (a single day or
+    month) is constant on its date or period id. Such a column orders the test after training, and
+    time detection needs it; it is not a field the test lacks."""
+    if _is_date_like(x) and _is_date_like(u):
+        a, b = _to_days(x), _to_days(u)
+    elif pd.api.types.is_numeric_dtype(x) and pd.api.types.is_numeric_dtype(u) and not pd.api.types.is_bool_dtype(x):
+        a, b = x.to_numpy(dtype=float, na_value=np.nan), u.to_numpy(dtype=float, na_value=np.nan)
+    else:
+        return False
+    if not np.isfinite(a).any():
+        return False
+    return bool(np.mean(b > np.nanmax(a)) >= 0.98)
 
 
 def _numbered_codes(s: pd.Series) -> bool:
