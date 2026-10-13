@@ -3582,7 +3582,8 @@ class FeatureForge:
                 self._groups = {len(W): gx[idx_sel], n: gx}
             self.U_search_ = self.WU_ = None
             extra = np.concatenate([idx_out, idx_gate]).astype(int)
-            self._wu_src = None if X_unlabeled is None and not len(idx_out) else (X, extra, X_unlabeled)
+            self._wu_src = None if X_unlabeled is None and not len(idx_out) else \
+                self._wu_guard(X, W, extra, X_unlabeled)
             self.ctx_.extra_rows = None
             # Small tables get repeated CV so that selection is not driven by fold noise.
             n_rep = int(np.clip(round(12_000 / max(len(W), 1)), 1, 3))
@@ -3921,6 +3922,34 @@ class FeatureForge:
                       f"(this run's rows, and the picks after them, depend on the memory in use)")
             n = live
         return n
+
+    def _wu_guard(self, X, W, extra, U):
+        """The rows the label-free statistics read beyond the search rows (``extra`` rows of X, and U),
+        sampled when the frame of all of them, with one candidate's working arrays over it (_materialize
+        builds one at a time when memory is short), would not fit in the memory free now: the machine's,
+        or this process's memory cgroup's when that is less. The statistics then come from fewer rows,
+        and the log says so; when it all fits, nothing changes."""
+        n_u = 0 if U is None else len(U)
+        n_x = len(extra) + n_u
+        if not n_x:
+            return X, extra, U
+        cols = [c for c in self.raw_cols_ if c in X.columns]
+        mu = X[cols].memory_usage(index=False, deep=False) if cols else pd.Series(dtype=float)
+        per_row = float(mu.sum()) / max(len(X), 1) + _SPEC_BYTES_PER_ROW
+        room = available_bytes()
+        if (len(W) + n_x) * per_row <= room:
+            return X, extra, U
+        k = int(max(room / per_row - len(W), 0))
+        self._log(f"memory guard: label-free statistics read {k} of the {n_x} rows beyond the search rows "
+                  f"(all would take {(len(W) + n_x) * per_row / 1e9:.1f} GB, {room / 1e9:.1f} GB free)")
+        if k == 0:
+            return None
+        rng = np.random.default_rng(self.random_state + 7)
+        pick = np.sort(rng.choice(n_x, min(k, n_x), replace=False))
+        extra_k = extra[pick[pick < len(extra)]]
+        u_k = pick[pick >= len(extra)] - len(extra)
+        U_k = None if U is None else _renumbered(U.iloc[u_k])
+        return X, extra_k, U_k
 
     def _set_wu(self, W, on=True):
         """Search rows, then gate and unlabeled rows: every row whose raw features are known,

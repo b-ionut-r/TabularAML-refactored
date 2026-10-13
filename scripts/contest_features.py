@@ -33,7 +33,7 @@ from tabularaml.generate.forge import FeatureForge  # noqa: E402
 from tabularaml.generate.lists import as_lists, json_fields, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.returns import return_features  # noqa: E402
 from tabularaml.generate.panel import panel_features  # noqa: E402
-from tabularaml.generate.stream import aggregation_bytes, chunks, memory_bytes  # noqa: E402
+from tabularaml.generate.stream import aggregation_bytes, available_bytes, chunks, memory_bytes  # noqa: E402
 from tabularaml.generate.history import event_log_features, history_features, repeats  # noqa: E402
 from tabularaml.generate.relational import (Child, RelatedTables, asof_features, time_values, child_model_features,  # noqa: E402
                                              lookup_features, match_features)
@@ -609,20 +609,30 @@ def main():
             v = s_.to_numpy(dtype=np.float64, na_value=np.nan)
             return bool(np.all((v.astype(np.float32).astype(np.float64) == v) | np.isnan(v)))
         dt = np.float32 if all(exact32(s_) for s_ in srcs) else np.float64
-        M = np.empty((len(Xtr), len(names)), dtype=dt)
+        # Memory guard: the matrix and LightGBM's binned copy of it (about a byte per cell) must fit in what is
+        # free now (the machine's, or this process's memory cgroup's when less); when they would not, the quick
+        # model reads a row sample.
+        rows = None
+        fit_rows = int(0.9 * available_bytes() / ((np.dtype(dt).itemsize + 1) * len(names)))
+        if fit_rows < len(Xtr):
+            rows = np.sort(np.random.default_rng(0).choice(len(Xtr), max(fit_rows, 1000), replace=False))
+            print(f"memory guard: related columns ranked on {len(rows)} of {len(Xtr)} rows", flush=True)
+        M = np.empty((len(Xtr) if rows is None else len(rows), len(names)), dtype=dt)
         for j, s_ in enumerate(srcs):
             if isinstance(s_.dtype, pd.CategoricalDtype):
                 k = s_.cat.codes.to_numpy()
-                M[:, j] = np.where(k < 0, np.nan, k)
+                v = np.where(k < 0, np.nan, k)
             else:
-                M[:, j] = s_.to_numpy(dtype=dt, na_value=np.nan)
+                v = s_.to_numpy(dtype=dt, na_value=np.nan)
+            M[:, j] = v if rows is None else v[rows]
         del srcs
         obj = dict(objective="multiclass", num_class=len(labels)) if labels is not None else \
             dict(objective="binary" if y.nunique() == 2 else "regression")
         params = dict(obj, learning_rate=0.1, num_leaves=31, feature_fraction=0.5, verbose=-1,
                       deterministic=True, force_col_wise=True)  # histogram mode not chosen by timing (load)
         # Bin first and drop the matrix before boosting: LightGBM keeps only its binned copy.
-        ds = lgb.Dataset(M, log_y(y) if a.log_target else y, feature_name=names, categorical_feature=cats,
+        yy = log_y(y) if a.log_target else y
+        ds = lgb.Dataset(M, yy if rows is None else np.asarray(yy)[rows], feature_name=names, categorical_feature=cats,
                          params=params).construct()
         del M
         b = lgb.train(params, ds, 300)
