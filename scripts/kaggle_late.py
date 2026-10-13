@@ -155,6 +155,11 @@ CONTESTS["hc_08"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_08f3
 # Round-2 head 08f397c: the other six Kaggle contests, as their final-variant configs.
 for _c in ("ross", "fav", "m5", "wnv", "sct", "porto"):
     CONTESTS[f"{_c}_r2"] = dict(CONTESTS[f"{_c}_final"], repo="/tmp/claude-0/wt_b_08f397c")
+# Scratch: prefix ladder narrowest-first across orderings (c9bc29a on 82dd2b5).
+for _c in ("sct", "wnv", "porto"):
+    CONTESTS[f"{_c}_lad"] = dict(CONTESTS[f"{_c}_final"], repo="/tmp/claude-0/wt_lad")
+CONTESTS["ieee_lad"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_lad")
+CONTESTS["hc_lad"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_lad", base="hc")
 
 
 def download(c: str) -> Path:
