@@ -29,6 +29,18 @@ def memory_bytes() -> int:
         return 16 << 30
 
 
+def available_bytes() -> int:
+    """Memory free for new allocations now (the kernel's MemAvailable), else half the machine."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return memory_bytes() // 2
+
+
 def aggregation_bytes(path: str, key: str) -> Optional[int]:
     """What aggregating the parquet table whole would take: rows x (numeric columns + 2 x same-unit pairs) x 4 bytes
     x 3 copies. None for files that are not parquet."""

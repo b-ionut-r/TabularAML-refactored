@@ -40,6 +40,7 @@ import re
 import numpy as np
 import pandas as pd
 from tabularaml.generate.strs import as_text
+from tabularaml.generate.stream import available_bytes
 
 
 def _safe(name: str) -> str:
@@ -539,25 +540,52 @@ def match_features(main: pd.DataFrame, key: str, ch: Child, cols: Sequence[str],
         t_child = pd.to_datetime(as_text(df[ch.time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
         t_main = pd.to_datetime(as_text(main[main_time]), errors="coerce").to_numpy("datetime64[D]").astype(np.int64)
     rows = pd.DataFrame({"__r": np.arange(len(main)), key: main[key].to_numpy()})
+    spans = [("all", None)] + ([(f"{w}d", w) for w in windows] if t_child is not None else [])
     for c in cols:
         rows[c] = main[c].to_numpy()
         j = df[[key, c] + nums].copy()
         if t_child is not None:
             j["__t"] = t_child
-        m = rows[["__r", key, c]].merge(j, on=[key, c], how="inner")
-        if t_child is not None:
-            m["__age"] = t_main[m["__r"].to_numpy()] - m["__t"].to_numpy()
-            m = m[m["__age"] > 0]
-        spans = [("all", None)] + ([(f"{w}d", w) for w in windows] if t_child is not None else [])
+        res = {}
         for lab, w in spans:
-            mm = m if w is None else m[m["__age"] <= w]
-            g = mm.groupby("__r")
             base = f"{ch.name}__same_{_safe(c)}__{lab}"
-            out[base + "__n"] = g.size().reindex(np.arange(len(main))).fillna(0).to_numpy(dtype=np.float32)
+            res[base + "__n"] = np.zeros(len(main), dtype=np.float32)
             for v in nums:
-                out[f"{base}__{_safe(v)}_sum"] = g[v].sum().reindex(np.arange(len(main))).fillna(0).to_numpy(dtype=np.float32)
+                res[f"{base}__{_safe(v)}_sum"] = np.zeros(len(main), dtype=np.float32)
+        since = f"{ch.name}__same_{_safe(c)}__{'since' if ordinal else 'days_since'}"
         if t_child is not None:
-            last = m.groupby("__r")["__age"].min().reindex(np.arange(len(main)))
-            out[f"{ch.name}__same_{_safe(c)}__{'since' if ordinal else 'days_since'}"] = last.to_numpy(dtype=np.float32)
-        del m, j
+            res[since] = np.full(len(main), np.nan, dtype=np.float32)
+        # The join has one row per (main row, matching child row): a user's every earlier order line in the row's
+        # department is millions of rows per million main rows (Instacart, 15,000 users: 13 GB). Main rows are
+        # joined a slice at a time, each slice's join sized to a quarter of the memory free now; every
+        # statistic is per main row, so the result is the same as one join.
+        per = rows[[key, c]].merge(j.groupby([key, c], sort=False, dropna=False).size().rename("__k").reset_index(),
+                                   on=[key, c], how="left")["__k"].fillna(0).to_numpy()
+        row_bytes = 8 * (len(j.columns) + 3) * 4  # joined columns plus __r and __age, about four copies at its peak
+        cap = max(1, available_bytes() // 4 // row_bytes)
+        cum = np.cumsum(per)
+        cuts = [0]
+        while cuts[-1] < len(main):
+            a = cuts[-1]
+            b = int(np.searchsorted(cum, (cum[a - 1] if a else 0) + cap, side="right"))
+            cuts.append(min(len(main), max(b, a + 1)))
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            m = rows.iloc[a:b][["__r", key, c]].merge(j, on=[key, c], how="inner")
+            if t_child is not None:
+                m["__age"] = t_main[m["__r"].to_numpy()] - m["__t"].to_numpy()
+                m = m[m["__age"] > 0]
+            idx = np.arange(a, b)
+            for lab, w in spans:
+                mm = m if w is None else m[m["__age"] <= w]
+                g = mm.groupby("__r")
+                base = f"{ch.name}__same_{_safe(c)}__{lab}"
+                res[base + "__n"][a:b] = g.size().reindex(idx).fillna(0).to_numpy(dtype=np.float32)
+                for v in nums:
+                    res[f"{base}__{_safe(v)}_sum"][a:b] = g[v].sum().reindex(idx).fillna(0).to_numpy(dtype=np.float32)
+            if t_child is not None:
+                res[since][a:b] = m.groupby("__r")["__age"].min().reindex(idx).to_numpy(dtype=np.float32)
+            del m
+        for k, v in res.items():
+            out[k] = v
+        del j
     return out
