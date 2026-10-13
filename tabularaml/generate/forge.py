@@ -222,6 +222,16 @@ _CACHE_LOCK = __import__("threading").Lock()
 _LIBLINEAR_LOCK = __import__("threading").Lock()
 
 
+def _warm(ix: pd.Index) -> pd.Index:
+    """``ix`` with its hash table built. pandas builds an index's table on its first lookup, and
+    threads looking up in the same new index at once can find it half built: ``get_indexer`` then
+    takes the unique index for a non-unique one and raises. The level vocabularies cached below are
+    shared by every candidate on their key (ICR: one to three candidates lost per round, a different
+    count from run to run under load, and with them the picks)."""
+    ix.is_unique
+    return ix
+
+
 def _cache_put(cache: dict, key, df, *entry):
     import weakref
     try:
@@ -242,7 +252,7 @@ def _col_codes(df: pd.DataFrame, c: str):
     if hit is not None and hit[0]() is df and hit[3] == len(df):
         return hit[1], hit[2]
     codes, levels = pd.factorize(_key_values(df[c]))
-    levels = pd.Index(levels)
+    levels = _warm(pd.Index(levels))
     codes = codes.astype(np.int32) if len(levels) < 2 ** 31 else codes
     _cache_put(_COL_CACHE, (id(df), c), df, codes, levels)
     return codes, levels
@@ -292,6 +302,7 @@ def _grouper(df, cols, k):
         return hit[1], hit[2]
     codes, levels = pd.factorize(k, sort=True)
     g = pd.Categorical.from_codes(codes.astype(np.int32), categories=pd.Index(levels), validate=False)
+    _warm(g.categories)
     _cache_put(_GROUP_CACHE, (id(df), tuple(cols)), df, g, levels)
     return g, levels
 
@@ -2336,6 +2347,7 @@ class FeatureForge:
             rare = n_ <= 2
             if rare.any():
                 r[rare] = r[rare].groupby(n_[rare]).transform("min").to_numpy()
+            _warm(r.index)
             self.rank_maps_[c] = r
 
     def _rank(self, s: pd.Series, c: str) -> np.ndarray:
@@ -3338,7 +3350,7 @@ class FeatureForge:
         self.cat_cols_ = [c for c in X.columns if _is_cat(X[c])]
         for c in self.cat_cols_:
             X[c] = _as_str_frame_col(X[c])
-        self.cat_levels_ = {c: pd.Index(sorted(pd.unique(X[c]))) for c in self.cat_cols_}
+        self.cat_levels_ = {c: _warm(pd.Index(sorted(pd.unique(X[c])))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
         # Structured strings (molecules, sequences, segmented codes): read character by character.
         from .seqstr import is_seq_string, is_smiles
