@@ -1,0 +1,10 @@
+{"contest": "allstate", "arm": "ff", "seed": 0, "metric": "mae", "score": 1136.691368424477, "n_tr": 150655, "n_te": 37663, "n_cols": 130, "best_it": 393, "fe_s": 372, "total_s": 434, "ff_peak_gb": 1.27}
+{"contest": "allstate", "arm": "ff_shuffled", "seed": 0, "metric": "mae", "score": 1825.9085214584602, "n_tr": 150655, "n_te": 37663, "n_cols": 130, "best_it": 6, "fe_s": 214, "total_s": 233, "ff_peak_gb": 1.24}
+{"contest": "bnp", "arm": "ff", "seed": 0, "metric": "logloss", "score": 0.45192433361886075, "n_tr": 91456, "n_te": 22865, "n_cols": 302, "best_it": 293, "fe_s": 449, "total_s": 516, "ff_peak_gb": 1.32}
+{"contest": "bnp", "arm": "ff_shuffled", "seed": 0, "metric": "logloss", "score": 0.54941668085418, "n_tr": 91456, "n_te": 22865, "n_cols": 131, "best_it": 6, "fe_s": 224, "total_s": 234, "ff_peak_gb": 1.32}
+{"contest": "homesite", "arm": "ff", "seed": 0, "metric": "auc", "score": 0.9666558344299029, "n_tr": 208602, "n_te": 52151, "n_cols": 347, "best_it": 443, "fe_s": 904, "total_s": 1104, "ff_peak_gb": 3.1}
+{"contest": "homesite", "arm": "ff_shuffled", "seed": 0, "metric": "auc", "score": 0.5090921162660337, "n_tr": 208602, "n_te": 52151, "n_cols": 297, "best_it": 3, "fe_s": 213, "total_s": 249, "ff_peak_gb": 3.17}
+{"contest": "ashrae", "arm": "raw", "seed": 0, "metric": "rmsle", "score": 1.3509145627773382, "n_tr": 1327057, "n_te": 687183, "n_cols": 15, "best_it": 135, "fe_s": 0, "total_s": 49, "ff_peak_gb": null}
+{"contest": "ashrae", "arm": "ff", "seed": 0, "metric": "rmsle", "score": 1.3509145627773382, "n_tr": 1327057, "n_te": 687183, "n_cols": 15, "best_it": 135, "fe_s": 503, "total_s": 552, "ff_peak_gb": 4.4}
+{"contest": "ashrae", "arm": "raw_shuffled", "seed": 0, "metric": "rmsle", "score": 2.102097585597077, "n_tr": 1327057, "n_te": 687183, "n_cols": 15, "best_it": 13, "fe_s": 0, "total_s": 16, "ff_peak_gb": null}
+{"contest": "ashrae", "arm": "ff_shuffled", "seed": 0, "metric": "rmsle", "score": 2.1021053292161964, "n_tr": 1327057, "n_te": 687183, "n_cols": 15, "best_it": 13, "fe_s": 166, "total_s": 180, "ff_peak_gb": 3.21}

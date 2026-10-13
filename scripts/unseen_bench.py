@@ -1,6 +1,6 @@
 """Unseen recent contests ("sealed" set): raw vs FeatureForge blind, held out like each contest's test.
 
-    python unseen_bench.py --contest allstate|bnp|homesite --arm raw|ff --seed 0 [--shuffle] [--repo <worktree>] (needs KEEP_OUT unset or a dir)
+    python unseen_bench.py --contest allstate|bnp|homesite|ashrae --arm raw|ff --seed 0 [--shuffle] [--repo <worktree>]
 
 Data: DATA/sealed/<contest>/ (see /mnt/project-files/generalization/sealed/MANIFEST.md for sources). Each
 contest's ``prep`` returns the main rows, the target, the task, the held-out mask built like the contest's
@@ -346,6 +346,16 @@ def prep_homesite():
     return dict(X=d, y=y, task='binary', ho=strat_holdout(y, 0.2, a.seed), score=auc, metric='auc', higher=True)
 
 
+def prep_ashrae():
+    # ASHRAE Great Energy Predictor III (2019): hourly meter readings of 1,449 buildings over 2016, with building
+    # metadata and site weather tables; the real test is the next two years of the same buildings, scored RMSLE.
+    # A fixed 10% of buildings (145, seed 0, joined to both tables by subset10.parquet); held out: Sep-Dec 2016.
+    d = pd.read_parquet(D / 'subset10.parquet')
+    y = np.log1p(d.pop('meter_reading').to_numpy())
+    ho = (d['timestamp'] >= pd.Timestamp('2016-09-01')).to_numpy()
+    return dict(X=d, y=y, task='regression', ho=ho, score=rmse, metric='rmsle', higher=False, time=True)
+
+
 def hand_svp(X):
     # Public kernels' row statistics over the non-zero cells (count of non-zeros, log-scale mean/max/min/std/median, sum).
     v = X.to_numpy(float); nz = v != 0; lv = np.where(nz, np.log1p(np.abs(v)), np.nan)
@@ -435,7 +445,8 @@ if idc:
 Xtr, Xte = Xtr.copy(), Xte.copy()
 for c in Xtr.columns:
     if pd.api.types.is_datetime64_any_dtype(Xtr[c]):
-        Xtr[c] = (Xtr[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float); Xte[c] = (Xte[c] - pd.Timestamp('2000-01-01')).dt.days.astype(float)
+        # fractional days: time of day kept (whole days for date-only columns, as before)
+        Xtr[c] = (Xtr[c] - pd.Timestamp('2000-01-01')).dt.total_seconds() / 86400; Xte[c] = (Xte[c] - pd.Timestamp('2000-01-01')).dt.total_seconds() / 86400
     elif not pd.api.types.is_numeric_dtype(Xtr[c]):
         # object -> str per value: astype(str) on a category of long rule texts makes a fixed-width array (118 GiB on MCTS)
         _s = lambda v: v.astype(object).map(str)
