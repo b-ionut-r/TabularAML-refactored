@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -423,6 +424,7 @@ def main():
             tr.to_parquet(cache / "main_train.parquet")  # with any one-row-per-key tables joined
             te.to_parquet(cache / "main_test.parquet")
         del A, both_main, children, keyed
+        ch = chm = lookups = cm_tables = None  # the last table's rows otherwise stay referenced (Instacart's log: 1.8 GB)
 
     Xtr = tr.drop(columns=[a.id]) if a.id else tr
     Xte = te.drop(columns=[a.id]) if a.id else te
@@ -515,6 +517,17 @@ def main():
         del conv
         Xte = pd.concat([Xte.reset_index(drop=True), rel_te[top]], axis=1)
         del b
+    spill = None
+    if rel_tr is not None:
+        # Written aside while the search runs and read back for the output: held, the related columns were
+        # memory the search could not use (Instacart's 8.5 million rows: 2.4 GB).
+        spill = Path(a.out_dir) / ".related_columns"
+        spill.mkdir(parents=True, exist_ok=True)
+        rel_tr.to_parquet(spill / "train.parquet")
+        rel_te.to_parquet(spill / "test.parquet")
+        rel_cols = list(rel_tr.columns)
+        del rel_tr, rel_te
+        release_arrow()
     if forecasting:
         # On top of the forecasting columns the search's gate rows stop resembling the test
         # horizon: its picks lost held-out (Favorita 0.669 -> 0.689, Recruit 0.519 -> 0.525,
@@ -528,10 +541,12 @@ def main():
         kw = dict(label_cols=[c for c in label_cols if c in Xtr.columns], **json.loads(a.forge_kw))
         forge = FeatureForge(task=a.task, time_budget=a.budget, log_target=a.log_target, **kw).fit(Xtr, y, X_unlabeled=Xte)
         out_tr, out_te = forge.transform_train(Xtr), forge.transform(Xte)
-    if rel_tr is not None:
-        rest = [c for c in rel_tr.columns if c not in out_tr.columns]
-        out_tr = pd.concat([out_tr, rel_tr[rest]], axis=1)
-        out_te = pd.concat([out_te, rel_te[rest]], axis=1)
+    if spill is not None:
+        rest = [c for c in rel_cols if c not in out_tr.columns]
+        out_tr = pd.concat([out_tr, pd.read_parquet(spill / "train.parquet", columns=rest)], axis=1)
+        out_te = pd.concat([out_te, pd.read_parquet(spill / "test.parquet", columns=rest)], axis=1)
+        shutil.rmtree(spill, ignore_errors=True)
+        release_arrow()
     out_tr[a.target] = labels[y.to_numpy()] if labels is not None else y.to_numpy()
     if a.id:
         out_tr.insert(0, a.id, ids_tr)
