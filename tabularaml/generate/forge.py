@@ -2194,7 +2194,7 @@ class FeatureForge:
                  nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6,
                  events: bool = True, time_cv: bool = True,
-                 group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto",
+                 group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, gate_families="auto",
                  max_search_rows: Optional[int] = None, family_time_share: float = 1 / 3, label_echo: bool = True, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
@@ -2224,7 +2224,6 @@ class FeatureForge:
         self.group_col = group_col
         self.text = text
         self.drop_synthetic = drop_synthetic
-        self.parity_check = parity_check
         self.max_search_rows = max_search_rows
         self.family_time_share = family_time_share
         self.label_echo = label_echo
@@ -3758,9 +3757,6 @@ class FeatureForge:
         # Candidate values of the last round can be gigabytes on large tables.
         values = cands = Mw = None
         _trim_heap()
-        if self.parity_check and X_unlabeled is not None and len(idx_gate) and self.selected_:
-            self.selected_ = selected = self._parity_filter(_renumbered(X.iloc[idx_gate]),
-                                                            self._prep(X_unlabeled)[self.raw_cols_], self.selected_)
         self.gate_passed_ = None
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
             best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
@@ -3855,60 +3851,6 @@ class FeatureForge:
             del out
             self.U_search_ = _renumbered(self.WU_.iloc[len(W):])
         self.ctx_.extra_rows = self.U_search_
-
-    def _parity_filter(self, G, U, specs, max_rows=50_000):
-        """Drop features distributed differently on the unlabeled rows (the test file) than on
-        the latest labelled rows: a missing rate that differs by over 0.2, or a two-sample KS
-        statistic above max(0.5, twice the largest of the raw columns' own). "Days until the
-        next holiday" is known for training rows but missing near the end of a test period;
-        counts over a test file built differently from the training file drift the same way.
-        Later specs that use a dropped spec's output are dropped with it."""
-        rng = np.random.default_rng(self.random_state)
-        if len(G) > max_rows:
-            G = G.iloc[np.sort(rng.choice(len(G), max_rows, replace=False))].reset_index(drop=True)
-        if len(U) > max_rows:
-            U = U.iloc[np.sort(rng.choice(len(U), max_rows, replace=False))].reset_index(drop=True)
-        G, U = G.copy(), U.copy()
-
-        def ks(a, b):
-            a, b = a[np.isfinite(a)], b[np.isfinite(b)]
-            if len(a) < 20 or len(b) < 20:
-                return 0.0
-            grid = np.unique(np.concatenate([a, b]))
-            fa = np.searchsorted(np.sort(a), grid, side="right") / len(a)
-            fb = np.searchsorted(np.sort(b), grid, side="right") / len(b)
-            return float(np.max(np.abs(fa - fb)))
-
-        raw_ks = [ks(G[c].to_numpy(dtype=float), U[c].to_numpy(dtype=float)) for c in self.raw_cols_
-                  if c not in self.cat_cols_ and c != self.time_col_ and c not in getattr(self, "date_cols_", [])
-                  and pd.api.types.is_numeric_dtype(G[c])]
-        limit = max(0.5, 2 * float(np.max(raw_ks))) if raw_ks else 0.5
-        kept, dropped = [], []
-        for s in specs:
-            try:
-                vg, vu = s.transform(G, self.ctx_), s.transform(U, self.ctx_)
-            except KeyError:  # built on a dropped spec's output
-                dropped.append((s.name, "parent dropped"))
-                continue
-            vg = np.asarray(vg, dtype=float).reshape(len(G), -1)
-            vu = np.asarray(vu, dtype=float).reshape(len(U), -1)
-            bad = None
-            for j in range(vg.shape[1]):
-                d_na = abs(np.isnan(vg[:, j]).mean() - np.isnan(vu[:, j]).mean())
-                k = ks(vg[:, j], vu[:, j])
-                if d_na > 0.2 or k > limit:
-                    bad = f"missing {np.isnan(vg[:, j]).mean():.2f} vs {np.isnan(vu[:, j]).mean():.2f}, KS {k:.2f}"
-                    break
-            if bad:
-                dropped.append((s.name, bad))
-                continue
-            kept.append(s)
-            for j, col in enumerate(s.out_names()):
-                G[col], U[col] = vg[:, j], vu[:, j]
-        for name, why in dropped:
-            self._log(f"parity: dropped {name} ({why} on latest labelled vs unlabeled rows)")
-        self.parity_dropped_ = [d[0] for d in dropped]
-        return kept
 
     def _gate(self, X, y, idx_sel, idx_gate, W):
         """Score raw vs. engineered feature sets on the held-out gate rows.
