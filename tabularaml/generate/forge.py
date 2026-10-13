@@ -3870,6 +3870,10 @@ class FeatureForge:
         # Refit every spec's statistics on all training rows.
         self.U_search_ = self.WU_ = self._wu_src = None
         self._fit_full(X, y_np, None if X_unlabeled is None else self._prep(X_unlabeled))
+        # Read by fits only: the unlabeled rows' raw columns (a copy) and every row's group labels
+        # (Instacart's 8.5 million rows: about 1.2 GB held through the transforms after the fit).
+        self.ctx_.extra_rows = None
+        self._groups = {}
         _CODE_CACHE.clear()
         _COL_CACHE.clear()
         _GROUP_CACHE.clear()
