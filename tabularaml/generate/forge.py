@@ -2094,6 +2094,35 @@ def _loss(task, y, margin) -> float:
     return float(np.mean(_row_loss(task, y, margin)))
 
 
+def _stepped_loss(task, y, margin, steps, cell) -> float:
+    """``_loss(task, y, margin + steps[cell])`` for a binary or regression target, a few thousand rows at a time
+    in a buffer that stays in cache, every operation in place: the same elementwise operations in the same
+    order, then the mean over all rows, so the same value. Spelled out, each step allocated a full row vector
+    (half a million rows: about ten passes through memory per probe)."""
+    y, out = np.asarray(y), np.empty(len(y))
+    for i in range(0, len(y), 8192):
+        m = steps[cell[i:i + 8192]]
+        m += margin[i:i + 8192]
+        yc = y[i:i + 8192]
+        if task == "regression":
+            np.subtract(yc, m, out=m)
+            np.square(m, out=out[i:i + 8192])
+            continue
+        np.negative(m, out=m)
+        np.exp(m, out=m)
+        m += 1
+        np.divide(1, m, out=m)
+        np.clip(m, 1e-15, 1 - 1e-15, out=m)
+        a = np.log(m)
+        a *= yc
+        np.subtract(1, m, out=m)
+        np.log(m, out=m)
+        m *= 1 - yc
+        a += m
+        np.negative(a, out=out[i:i + 8192])
+    return float(np.mean(out))
+
+
 def _fold_steps(idx, n_folds, n_cells, g, h, lam) -> np.ndarray:
     """Regularised Newton step of every cell from the other folds' gradients: (folds, cells[, classes]).
 
@@ -3305,8 +3334,9 @@ class FeatureForge:
         if g.ndim == 2:
             return self._probe_base_loss - _stepped_class_loss(self._probe_y, self._probe_margin, cell, nb, K,
                                                                g, h, lam)
-        corr = _fold_steps(cell, K, nb, g, h, lam)[self._probe_fold, bins]
-        return self._probe_base_loss - _loss(self.task_, self._probe_y, self._probe_margin + corr)
+        # The step of row r is steps[fold[r], bins[r]], i.e. the flat table at its cell.
+        steps = _fold_steps(cell, K, nb, g, h, lam).ravel()
+        return self._probe_base_loss - _stepped_loss(self.task_, self._probe_y, self._probe_margin, steps, cell)
 
     def _probe_setup(self, W, y, margin):
         """Cross-fitted residual probe for the current margin, plus each column's own gain."""
