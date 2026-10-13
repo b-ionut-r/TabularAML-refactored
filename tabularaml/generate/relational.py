@@ -334,6 +334,35 @@ def time_values(s: pd.Series) -> np.ndarray:
     return v
 
 
+class _Float32Columns(dict):
+    """Output columns of ``asof_features``, each judged (more than 1% present, more than one value) on its
+    float64 values and stored as float32 as soon as it is computed: kept as float64 until the end, all of
+    them plus their frame's copy were 16 bytes per row and column (Instacart's 8.5 million rows: about 8 GB).
+    The result is the same as building the float64 frame, dropping names that repeat once made safe,
+    then the sparse or constant columns, and casting."""
+
+    def __setitem__(self, name, v):
+        s = pd.Series(np.asarray(v, dtype=np.float64))
+        super().__setitem__(name, (s.notna().mean() > 0.01 and s.nunique() > 1, s.to_numpy(dtype=np.float32)))
+
+    def frame(self, index) -> pd.DataFrame:
+        names, seen = [], set()
+        for name, (keep, _) in self.items():
+            safe = _safe(name)
+            if safe not in seen:
+                seen.add(safe)
+                if keep:
+                    names.append((name, safe))
+        # Copied one column at a time into the frame's own block, each freed as it goes: a frame built
+        # from the columns would hold them twice.
+        for name in set(self) - {name for name, _ in names}:
+            del self[name]
+        M = np.empty((len(index), len(names)), dtype=np.float32, order="F")
+        for j, (name, _) in enumerate(names):
+            M[:, j] = self.pop(name)[1]
+        return pd.DataFrame(M, index=index, columns=[safe for _, safe in names], copy=False)
+
+
 def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Sequence[int] = (5, 20),
                   top_levels: int = 12, stats: Sequence[str] = ("mean", "sum", "max", "min", "std")) -> pd.DataFrame:
     """Aggregations of a child event table as of each main row's time: only child rows of
@@ -353,7 +382,8 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
     keys = pd.Index(pd.unique(main[key]))
     ck = keys.get_indexer(df[key])
     keep = ck >= 0
-    df, ck = df.loc[keep], ck[keep]
+    if not keep.all():  # (a copy of the whole log otherwise)
+        df, ck = df.loc[keep], ck[keep]
     ct = time_values(df[ch.time])
     mk = keys.get_indexer(main[key])
     mt = time_values(main[time])
@@ -369,7 +399,7 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
     lo = np.searchsorted(cs, mk.astype(np.int64) * big, side="left")
     n = (p - lo).astype(np.float64)
     has = n > 0
-    out = {}
+    out = _Float32Columns()
     pre = _safe(ch.name)
     out[f"{pre}__n"] = n
     ts = ct[order]
@@ -431,11 +461,7 @@ def asof_features(main: pd.DataFrame, key: str, time: str, ch: Child, recent: Se
             out[f"{pre}__{c}={lv}_last{recent[0]}"] = window(S, a, p)
         first = ~pd.DataFrame({"k": blk, "v": s}).duplicated().to_numpy()
         out[f"{pre}__{c}_nunique"] = window(prefix(first.astype(float)), lo, p)
-    res = pd.DataFrame(out, index=main.index)
-    res.columns = [_safe(c) for c in res.columns]
-    res = res.loc[:, ~res.columns.duplicated()]
-    keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
-    return res[keep].astype(np.float32)
+    return out.frame(main.index)
 
 
 def lookup_features(main: pd.DataFrame, table: pd.DataFrame, key: str, name: str,
