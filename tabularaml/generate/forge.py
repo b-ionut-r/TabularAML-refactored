@@ -831,12 +831,16 @@ class RowStat(Spec):
         # family: gigabytes per thread, killed at 12.5 GB in round 1). Column-major, as pandas
         # lays out a frame's matrix, so the row reductions sum in the same order.
         step = max(1, 2_000_000 // max(len(self.parents), 1))
+        # Plain numeric columns are sliced as their own arrays (no copy) and cast on assignment, as
+        # to_numpy(dtype=float) casts them: slicing each pandas column per block held the GIL for
+        # most of a wide family's time (1,913 columns, 92,800 rows: 88 blocks x 1,900 slices a spec).
         cols = [df[c] for c in self.parents]
+        cols = [s.to_numpy() if isinstance(s.dtype, np.dtype) and s.dtype.kind in "biuf" else s for s in cols]
         out = []
         for i in range(0, len(df), step):
             M = np.empty((min(step, len(df) - i), len(cols)), dtype=float, order="F")
             for j, s in enumerate(cols):
-                M[:, j] = s.iloc[i:i + step].to_numpy(dtype=float)
+                M[:, j] = s[i:i + step] if isinstance(s, np.ndarray) else s.iloc[i:i + step].to_numpy(dtype=float)
             out.append(self._stat(M))
         return out[0] if len(out) == 1 else np.concatenate(out)
 
