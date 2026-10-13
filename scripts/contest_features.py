@@ -230,10 +230,11 @@ def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
     return keep
 
 
-def _check_matrix(frames: list[pd.DataFrame]) -> list[np.ndarray]:
-    """The frames as float32 matrices for a quick model: dates as days, text and categories as shared codes."""
+def _check_matrix(frames: list[pd.DataFrame], picks: list[tuple[int, np.ndarray | None]]) -> list[np.ndarray]:
+    """Rows of the frames as float32 matrices for a quick model: dates as days, text and categories as codes
+    shared by all the frames. ``picks`` lists (frame, rows) per matrix; rows None takes the whole frame."""
     cols = list(frames[0].columns)
-    out = [np.empty((len(F), len(cols)), dtype=np.float32) for F in frames]
+    out = [np.empty((len(frames[f]) if r is None else len(r), len(cols)), dtype=np.float32) for f, r in picks]
     for j, c in enumerate(cols):
         ss = [F[c] for F in frames]
         if pd.api.types.is_datetime64_any_dtype(ss[0]):
@@ -248,8 +249,8 @@ def _check_matrix(frames: list[pd.DataFrame]) -> list[np.ndarray]:
             vs, i = [], 0
             for t_ in t:
                 vs.append(codes[i:i + len(t_)]); i += len(t_)
-        for M, v in zip(out, vs):
-            M[:, j] = v
+        for M, (f, r) in zip(out, picks):
+            M[:, j] = vs[f] if r is None else vs[f][r]
     return out
 
 
@@ -293,10 +294,26 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
                   min_child_samples=100, verbose=-1, num_threads=4, seed=0, deterministic=True, force_col_wise=True)
     if task == "multiclass":
         params["num_class"] = int(np.nanmax(y)) + 1
+    # The block arm's matrices are the raw arm's with the block's columns appended: the raw columns are
+    # converted once, and only the rows each model reads are materialized.
+    picks = [(0, es_tr), (0, es_va), (1, None)]
+    raw = _check_matrix([Xf, Xh], picks)
+    del Xf, Xh
+    blk = _check_matrix([Ff, Fh], picks)
+    del Ff, Fh, probe
     losses = {}
-    for arm, (A, B) in {"raw": (Xf, Xh), "block": (pd.concat([Xf, Ff], axis=1), pd.concat([Xh, Fh], axis=1))}.items():
-        Mf, Mh = _check_matrix([A, B])
-        b = lgb.train(params, lgb.Dataset(Mf[es_tr], tf[es_tr]), 2000, valid_sets=[lgb.Dataset(Mf[es_va], tf[es_va])],
+    for arm in ("raw", "block"):
+        if arm == "block":
+            wide = []
+            for i in range(len(raw)):
+                W = np.empty((len(raw[i]), raw[i].shape[1] + blk[i].shape[1]), dtype=np.float32)
+                W[:, :raw[i].shape[1]] = raw[i]
+                W[:, raw[i].shape[1]:] = blk[i]
+                raw[i] = blk[i] = None
+                wide.append(W)
+            raw = wide
+        Mtr, Mva, Mh = raw
+        b = lgb.train(params, lgb.Dataset(Mtr, tf[es_tr]), 2000, valid_sets=[lgb.Dataset(Mva, tf[es_va])],
                       callbacks=[lgb.early_stopping(50, verbose=False)])
         q = b.predict(Mh, num_iteration=b.best_iteration)
         if task == "regression":
@@ -306,7 +323,8 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
             losses[arm] = -(th * np.log(q) + (1 - th) * np.log(1 - q))
         else:
             losses[arm] = -np.log(np.clip(q[np.arange(len(q)), th.astype(int)], 1e-7, 1))
-        del Mf, Mh, b
+        del Mtr, Mva, Mh, b
+    del raw
     d = losses["raw"] - losses["block"]
     z = float(d.mean() / (d.std(ddof=1) / np.sqrt(len(d)) + 1e-300))
     keep = bool(d.mean() > 0 and z >= z_needed)
