@@ -148,6 +148,7 @@ CONTESTS["hc_v5"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_b6c1
 CONTESTS["hc_v6"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_cw", base="hc")
 CONTESTS["ieee_b6"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_b6c1275")
 CONTESTS["ieee_7b"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_7b60227")
+CONTESTS["ieee_b8"] = dict(CONTESTS["ieee_v6"], repo="/tmp/claude-0/wt_b_b8d6ee5")
 
 
 def download(c: str) -> Path:
