@@ -2034,19 +2034,22 @@ def _stepped_class_loss(y, margin, idx, n_cells, K, gT, hT, lam) -> float:
     """Multiclass loss of ``margin`` plus, per class, the cross-fitted Newton step of each row's
     cell: rows of fold f in cell c (``idx = f * n_cells + c``) get the step fitted on the other
     folds' rows of c. ``gT`` / ``hT`` are classes x rows. The steps are gathered from a small
-    (fold, cell) x classes table into one rows x classes buffer, shifted and exponentiated in
-    place: a probe holds one copy of the margins instead of five (Expedia stand-in, 510k rows x
-    100 classes: 400 MB a copy, four probes at a time). Same values as adding the per-class
-    corrections column by column."""
+    (fold, cell) x classes table, a few thousand rows at a time, into a buffer that stays in
+    cache while it is shifted and exponentiated in place: a whole rows x classes copy is 400 MB
+    on the Expedia stand-in (510k rows x 100 classes), with four probes at a time. Same values
+    as adding the per-class corrections column by column: every step is per row."""
     steps = np.empty((K * n_cells, len(gT)))
     for k in range(len(gT)):
         G = np.bincount(idx, gT[k], minlength=K * n_cells).reshape(K, n_cells)
         H = np.bincount(idx, hT[k], minlength=K * n_cells).reshape(K, n_cells)
         steps[:, k] = (-(G.sum(0) - G) / (H.sum(0) - H + lam)).ravel()
-    x = steps[idx]
-    x += margin
-    x -= x.max(axis=1, keepdims=True)
-    return float(np.mean(_class_row_loss(y, x)))
+    y, out = np.asarray(y), np.empty(len(y))
+    for i in range(0, len(y), 4096):
+        x = steps[idx[i:i + 4096]]
+        x += margin[i:i + 4096]
+        x -= x.max(axis=1, keepdims=True)
+        out[i:i + 4096] = _class_row_loss(y[i:i + 4096], x)
+    return float(np.mean(out))
 
 
 # ============================================================================
