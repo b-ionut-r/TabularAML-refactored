@@ -12,3 +12,7 @@ lightgbm==4.7.0
 pyarrow==24.0.0
 joblib==1.6.0
 threadpoolctl==3.7.0
+# Imported when the package loads (tabularaml.generate pulls in the older generator and its scorers).
+tqdm==4.70.1
+xgboost==3.4.1
+category_encoders==2.11.1
