@@ -4255,8 +4255,12 @@ class FeatureForge:
         cols = [c for c in num if c in U.columns][:50]
         if len(cols) < 3 or len(U) < 100:
             return True
-        A = pd.concat([X[cols], U[cols]], ignore_index=True).apply(pd.to_numeric, errors="coerce")
-        A = A.rank(pct=True).fillna(0.5).to_numpy(dtype=np.float32)
+        # Ranked one column at a time into single precision: the whole frame's float64 ranks, and its
+        # interleaved copy, were 16 bytes per cell (Instacart's 8.5 million rows: 7 GB).
+        A = np.empty((len(X) + len(U), len(cols)), dtype=np.float32)
+        for j, c in enumerate(cols):
+            s = pd.to_numeric(pd.concat([X[c], U[c]], ignore_index=True), errors="coerce").to_frame()
+            A[:, j] = s.rank(pct=True).fillna(0.5).to_numpy(dtype=np.float32)[:, 0]  # (a frame's rank: as before on nullable ints)
         tr, te = A[:len(X)], A[len(X):]
         rng = np.random.default_rng(seed)
         k = min(m, len(te), len(tr) // 4)
@@ -4321,7 +4325,6 @@ class FeatureForge:
         num = [c for c in X.columns if c not in self.cat_cols_ and c not in self.id_cols_]
         if not num:
             return set()
-        vals = {c: X[c].to_numpy(dtype=float) for c in num}
         ids = list(self.id_cols_[:3])
         codes = {k: pd.factorize(X[k])[0] for k in ids}
         groups = [codes[k] for k in ids]
@@ -4363,7 +4366,7 @@ class FeatureForge:
             for c in num:
                 if c in echo:
                     continue
-                v = vals[c]
+                v = X[c].to_numpy(dtype=float)  # one column at a time: all at once were 8 bytes per cell
                 # running statistic of past labels (sign too: a running mean over many
                 # earlier answers moves by little, but always toward the latest answer)
                 d = v[r1] - v[rows]
