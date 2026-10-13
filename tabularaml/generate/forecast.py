@@ -101,6 +101,32 @@ def _combo(df: pd.DataFrame, cols: Sequence[str]) -> np.ndarray:
 _KEY_SCAN_CELLS = 2e8  # rows x candidate columns the key search may read per step beyond its first eight
 
 
+class _Cols(dict):
+    """Feature columns, held as the float32 they are returned as, except those later columns are built
+    from (means, the last-year delta), which stay float64 until the end so the arithmetic is unchanged."""
+
+    @staticmethod
+    def _read_later(n: str) -> bool:
+        return (n in ("fc_same26", "fc_ly_delta") or n.startswith(("fc_mean", "fc_nzmean"))
+                or (n.startswith("fc_g_") and "_mean" in n))
+
+    def __setitem__(self, n, v):
+        super().__setitem__(n, v if self._read_later(n) else np.asarray(v, dtype=np.float32))
+
+
+def _nanmedian0(V: np.ndarray) -> np.ndarray:
+    """``np.nanmedian(V, 0)`` from one sort: the middle value, or (low + high) / 2 of the two middle
+    values, as numpy computes it."""
+    S = np.sort(V, axis=0)          # NaN sorts last
+    c = (~np.isnan(S)).sum(0)
+    cols = np.arange(S.shape[1])
+    lo = S[np.maximum(c - 1, 0) // 2, cols]
+    hi = S[np.minimum(c // 2, S.shape[0] - 1), cols]
+    with np.errstate(invalid="ignore", over="ignore"):
+        m = (lo + hi) / 2.0 + 0.0      # numpy's sum of the two starts from +0: -0 comes out as 0
+    return np.where(c > 0, m, np.nan)
+
+
 def _integral(s: pd.Series) -> bool:
     if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
         return True
@@ -368,10 +394,14 @@ class ForecastFeatures:
         return np.round((_to_days(df[self.time_col_]) - self.t0_) / self.step_)
 
     def _keys(self, df, cols, vocab):
-        if not cols:
-            return np.zeros(len(df), dtype=np.int64)
-        key = _keytext(df, cols)
-        return vocab.get_indexer(key)
+        if not cols or not len(df):
+            return np.zeros(len(df), dtype=np.int64) if not cols else vocab.get_indexer(_keytext(df, cols))
+        # The key text of each distinct combination, read once: the same text as row by row, since
+        # every distinct value is among the rows read.
+        combo = _combo(df, cols)
+        _, first = np.unique(combo, return_index=True)
+        key = _keytext(df.iloc[first], cols)
+        return vocab.get_indexer(key)[combo]
 
     def _vocab(self, df, cols):
         if not cols:
@@ -539,7 +569,7 @@ class ForecastFeatures:
         t = (p_abs - self.p_lo_).astype(np.int64)
         o = (o_abs - self.p_lo_).astype(np.int64)
         h = (p_abs - o_abs)
-        F: Dict[str, np.ndarray] = {"fc_h": h}
+        F: Dict[str, np.ndarray] = _Cols({"fc_h": h})
         if self.step_ <= 7:
             # Calendar fields of the target date (lag features are read against them).
             dt = pd.to_datetime(self.t0_ + p_abs * self.step_, unit="D")
@@ -582,8 +612,9 @@ class ForecastFeatures:
             s = self.season_
             j0 = np.ceil(h / s).astype(np.int64)
             n_same = 26 if self.long_season else 8
-            vals = [E.at(kk, t - s * (j0 + i)) for i in range(n_same)]
-            V = np.vstack(vals)
+            V = np.empty((n_same, len(kk)))
+            for i in range(n_same):
+                V[i] = E.at(kk, t - s * (j0 + i))
             with np.errstate(invalid="ignore"), warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 F["fc_same1"] = V[0]
@@ -593,7 +624,7 @@ class ForecastFeatures:
                     # Half a year of the same weekday: a stable weekday profile for short,
                     # noisy series, and its spread.
                     F["fc_same26"] = np.nanmean(V, 0)
-                    F["fc_same26_med"] = np.nanmedian(V, 0)
+                    F["fc_same26_med"] = _nanmedian0(V)
                     F["fc_same26_std"] = np.nanstd(V, 0)
                     F["fc_same_rel"] = F["fc_same26"] - E.mean(kk, o - s * n_same, o)[0]
                 V = V[:8]
@@ -691,7 +722,13 @@ class ForecastFeatures:
                     tp = t - lag
                     xp = np.where(tp >= 0, V[kk, np.clip(tp, 0, Pn - 1)], np.nan)
                     F[f"fc_num_mom{lag}__{c}"] = x / xp
-        out = pd.DataFrame({n: np.asarray(v, dtype=np.float32) for n, v in F.items()}, index=df.index)
+        # Columns move into one float32 block one at a time, so the float64 values and their copy are
+        # never all held at once.
+        names = list(F)
+        M = np.empty((len(df), len(names)), dtype=np.float32, order="F")
+        for j, n in enumerate(names):
+            M[:, j] = F.pop(n)
+        out = pd.DataFrame(M, columns=names, index=df.index, copy=False)
         bad = (k < 0) | ~ok
         if bad.any():
             out.loc[bad, [c for c in out.columns if c != "fc_h"]] = np.nan
