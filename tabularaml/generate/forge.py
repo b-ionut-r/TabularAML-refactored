@@ -488,24 +488,16 @@ class TargetEnc(Spec):
 
     def transform(self, df, ctx):
         k = self._codes(df)
-        if getattr(self, "fold_stats_", None):
-            # New rows get the average of the fold encoders, so their values carry
-            # the same shrinkage as the out-of-fold values the model was trained on.
-            return sum(self._apply(k, *st) for st in self.fold_stats_) / len(self.fold_stats_)
         return self._apply(k, self.sums_, self.counts_, self.prior_)
 
     def fit_transform_oof(self, df, y, ctx, folds):
         k = self._fit_codes(df)
         Y = self._targets(y)
         out = np.zeros((len(df), self.n_out))
-        stats = []
         for tr, va in folds:
-            st = self._stats(k[tr], Y[tr])
-            stats.append(st)
-            r = self._apply(k[va], *st)
+            r = self._apply(k[va], *self._stats(k[tr], Y[tr]))
             out[va] = r if r.ndim == 2 else r[:, None]
         self.fit(df, y, ctx)
-        self.fold_stats_ = stats if getattr(ctx, "fold_avg_te", False) else None
         return out[:, 0] if self.n_out == 1 else out
 
 
@@ -2143,10 +2135,6 @@ class FeatureForge:
         validation block's labels (IEEE-CIS latest window 0.948 -> 0.953).
     gate_subsets : bool
         Also offer each round's label-free features alone to the gate.
-    fold_avg_te : bool
-        New rows get target encodings averaged over the out-of-fold encoders
-        instead of one encoder fitted on all rows, matching the shrinkage of
-        the training values (matters for sparse, many-level keys).
     entities : bool
         Look for hidden entity ids: a timestamp-like column minus a "days since
         X" column is constant per entity (account opening date, first visit);
@@ -2224,7 +2212,7 @@ class FeatureForge:
                  arith_ops: Sequence[str] = ARITH_OPS, group_stats: Sequence[str] = GROUP_STATS,
                  gate_frac: float = 0.2, gate_z: float = 1.0, min_rel_gain: float = 0.001, cv: int = 3,
                  hc_threshold: int = 32, n_interactions: int = 40, novelty_slack: float = 1.0,
-                 gate_bags: int = 1, fold_avg_te: bool = False,
+                 gate_bags: int = 1,
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6, entity_lags: bool = False,
                  events: bool = True, time_cv: bool = True,
@@ -2249,7 +2237,6 @@ class FeatureForge:
         self.n_interactions = n_interactions
         self.novelty_slack = novelty_slack
         self.gate_bags = gate_bags
-        self.fold_avg_te = fold_avg_te
         self.gate_subsets = gate_subsets
         self.nested_cv = nested_cv
         self.entities = entities
@@ -3423,7 +3410,6 @@ class FeatureForge:
             self._log(f"structured strings: {', '.join(self.seq_cols_)}"
                       + (f" (molecules: {', '.join(self.smiles_cols_)})" if self.smiles_cols_ else ""))
         self.ctx_ = Context(self.task_, self.n_classes_, self.random_state)
-        self.ctx_.fold_avg_te = self.fold_avg_te
 
         # Gate split: these rows never influence the search.
         n = len(X)
