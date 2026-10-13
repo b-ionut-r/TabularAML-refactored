@@ -4140,6 +4140,18 @@ class FeatureForge:
         # features queried every unlabeled row against every training row for nothing
         # (Santander Transaction: 335 of the final fit's 620 s, then again for the test file).
         used = {c for s in self.selected_ for c in s.parents}
+        self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
+        # Each feature is written once, into the float32 matrix the training frame wraps; the frame
+        # later features are built from holds views of its columns. Copied into the frame and then
+        # into the matrix, every feature was held twice at the end (Expedia 3%: 300 columns over
+        # 637k rows, 765 MB).
+        M = np.empty((len(F), len(self.new_columns_)), dtype=np.float32, order="F")
+        at: Dict[str, List[int]] = {}
+        for j, c in enumerate(self.new_columns_):
+            at.setdefault(c, []).append(j)
+        for a in self.anchors_:
+            for j in at[a[3]]:
+                M[:, j] = F[a[3]].to_numpy(dtype=np.float32)
         for s in self.selected_:
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
@@ -4159,13 +4171,10 @@ class FeatureForge:
             # float32, as the search saw them (and half the memory of the growing frame).
             v = np.asarray(v, dtype=np.float32)
             for j, col in enumerate(s.out_names()):
-                F[col] = v if np.ndim(v) == 1 else v[:, j]
-        self.new_columns_ = [a[3] for a in self.anchors_] + [c for s in self.selected_ for c in s.out_names()]
-        # Filled column by column: selecting the columns and casting them were two more copies of them all
-        # (Instacart's 6.8 million training rows: killed at 13 GB here).
-        M = np.empty((len(F), len(self.new_columns_)), dtype=np.float32, order="F")
-        for j, c in enumerate(self.new_columns_):
-            M[:, j] = F[c].to_numpy(dtype=np.float32)
+                for k in at[col]:
+                    M[:, k] = v if np.ndim(v) == 1 else v[:, j]
+                F[col] = pd.Series(M[:, at[col][0]], index=F.index, copy=False)
+            v = None
         self._train_frame = pd.DataFrame(M, index=F.index, columns=self.new_columns_, copy=False)
 
     # ------------------------------------------------------------- transform
