@@ -269,8 +269,19 @@ class RelatedTables:
               f"{free / 1e9:.1f} GB free)", flush=True)
         drop_const, self.drop_const = self.drop_const, False
         try:
-            res = pd.concat([self._aggregate(Child(ch.name, df[part == i], key=ch.key, time=ch.time, drop=flat.drop), key)
-                             for i in range(n) if (part == i).any()])
+            # A categorical key groups to every category in each range: a range keeps the keys its rows have,
+            # and the first range also the categories no row has, as the one pass gives them.
+            kv, res = df[key], []
+            for i in range(n):
+                m = part == i
+                if not m.any():
+                    continue
+                r = self._aggregate(Child(ch.name, df[m], key=ch.key, time=ch.time, drop=flat.drop), key)
+                own = r.index.isin(kv[m].unique())
+                if not res:
+                    own |= ~r.index.isin(kv.unique())
+                res.append(r[own])
+            res = pd.concat(res)
         finally:
             self.drop_const = drop_const
         if not self.drop_const:
