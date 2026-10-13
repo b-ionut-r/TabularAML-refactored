@@ -505,7 +505,7 @@ block's labels. v18 recomputes them inside each fold whenever time-blocked
 search is on (`nested_cv="auto"`): IEEE-CIS latest window **0.9531**, Rossmann
 0.1201 / 0.1205 (mean 0.1203 vs 0.1234 for v17).
 
-Tried and left opt-in (`lagged_te=True`): per-store and store x flag mean
+Tried and removed (was `lagged_te=True`): per-store and store x flag mean
 target over a trailing window ending one test horizon before each row. On top
 of the hand-made features it made Rossmann worse (0.114 -> 0.124, 0.122 ->
 0.146): a full-horizon lag is too stale. Without time-blocked search, Rossmann window 1 ships a numeric target
@@ -606,7 +606,7 @@ days. Defaults, no settings; `date` is detected as time.
 week. Columns whose test values are all new (week numbers beyond training)
 are now excluded from target maps like the time column; on M5 the week column
 overlaps the holdout's first week, so nothing changed. Trailing-window target
-means (`lagged_te=True`) were not selected.
+means (`lagged_te=True`, since removed) were not selected.
 
 ## Free text: Mercari Price Suggestion (Kaggle 2018, $100k)
 

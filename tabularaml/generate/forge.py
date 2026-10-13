@@ -2152,11 +2152,6 @@ class FeatureForge:
         rows' values seen in training. The gate, search folds, screening split
         and out-of-fold encodings then split whole groups, and target maps over
         that column are not generated.
-    lagged_te : bool
-        With a time column and unlabeled rows later in time: an entity's (and
-        entity x flag's) mean target over a trailing window ending one test
-        horizon before each row. Off: on Rossmann the full-horizon lag made them
-        stale (hand-made features + these: RMSPE 0.122 -> 0.146).
     time_cv : bool
         With a time column, search CV uses contiguous time blocks as folds and
         screening is measured on the latest rows, so features that only
@@ -2214,7 +2209,7 @@ class FeatureForge:
                  gate_subsets: bool = False, nested_cv="auto", entities: bool = True,
                  time_col: Optional[str] = "auto", entity_nums: int = 6,
                  events: bool = True, time_cv: bool = True,
-                 lagged_te: bool = False, group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto",
+                 group_col: Optional[str] = "auto", text: bool = True, drop_synthetic: bool = True, parity_check: bool = False, gate_families="auto",
                  max_search_rows: Optional[int] = None, gate_by_period: bool = False, family_time_share: float = 1 / 3, label_echo: bool = True, gate_wide: bool = False, label_cols: Sequence[str] = (),
                  pair_scan: bool = True, profiles: bool = True, event_gaps: str = "auto", random_state: int = 0, n_jobs: int = -1, verbose: bool = True):
         self.task = task
@@ -2243,7 +2238,6 @@ class FeatureForge:
         self.event_gaps = event_gaps
         self.events = events
         self.time_cv = time_cv
-        self.lagged_te = lagged_te
         self.group_col = group_col
         self.text = text
         self.drop_synthetic = drop_synthetic
@@ -2853,20 +2847,6 @@ class FeatureForge:
                 for st in ("mean", "dev", "std", "nunique"):
                     add(GroupStat(e if len(e) > 1 else e[0], c, st))
 
-    def _lagged_target_candidates(self, W, ids, flags, add):
-        """Trailing-window target means per entity (and entity x flag), lagged by the
-        test horizon."""
-        t = self.time_col_
-        if self.horizon_ <= 0 or self.n_classes_ > 2 or not ids:
-            return
-        tw = W[t].to_numpy(dtype=float)
-        R = float(np.nanmax(tw) - np.nanmin(tw))
-        for f in (0.03, 0.1, 0.25):
-            w = R * f
-            for k in ids:
-                add(LaggedTargetMean([k], t, w, self.horizon_))
-                for fl in flags:
-                    add(LaggedTargetMean([k, fl], t, w, self.horizon_))
 
     def _event_candidates(self, W, imp, add, max_levels=4):
         """With a time column: time since / until each entity's last / next row with
@@ -2877,11 +2857,6 @@ class FeatureForge:
         ids = sorted(self.id_cols_, key=lambda c: -imp.get(c, 0.0))[:2]
         keysets = [[k] for k in ids] or [[]]
         WU = W if self.WU_ is None else self.WU_
-        if self.lagged_te and ids:
-            flags = [f for f in self.base_cols_ if f != t and f not in ids and f not in self.date_cols_
-                     and 2 <= W[f].nunique() <= 7
-                     and W.groupby(ids[0], sort=False)[f].nunique().mean() >= 1.5][:3]
-            self._lagged_target_candidates(W, ids[:2], flags, add)
         if not getattr(self, "has_test_", False):
             # Times to an entity's last / next flagged row are read from the history fit holds: test rows
             # sent later in batches would miss their own batch's rows (see _event_gap_candidates).
