@@ -3326,9 +3326,19 @@ class FeatureForge:
         finite = np.isfinite(x)
         if finite.sum() < 20:
             return -np.inf
-        edges = np.unique(np.nanquantile(x[finite], np.linspace(0, 1, n_bins + 1)[1:-1]))
+        # From one argsort of the finite values: their quantiles (taken from the sorted values: the same order
+        # statistics, so the same edges, without numpy's partition, 3x slower here) and their bins, read off
+        # where each edge falls in the sorted values (a row's bin is the number of edges at or below it, as
+        # searchsorted(side="right") counts). Non-finite values get the last bin.
+        pos = np.flatnonzero(finite) if not finite.all() else None
+        xf = x if pos is None else x[pos]
+        order = np.argsort(xf)
+        xs = xf[order]
+        edges = np.unique(np.quantile(xs, np.linspace(0, 1, n_bins + 1)[1:-1]))
         nb = len(edges) + 2
-        bins = np.where(finite, np.searchsorted(edges, np.where(finite, x, 0.0), side="right"), nb - 1)
+        cuts = np.searchsorted(xs, edges, side="left")
+        bins = np.full(len(x), nb - 1, dtype=np.intp)
+        bins[order if pos is None else pos[order]] = np.repeat(np.arange(len(edges) + 1), np.diff(np.r_[0, cuts, len(xs)]))
         K = self._n_probe_folds
         cell = self._probe_fold * nb + bins
         if g.ndim == 2:
