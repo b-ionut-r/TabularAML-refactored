@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 import warnings
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
-from tabularaml.generate.stream import available_bytes
+from tabularaml.generate.stream import available_bytes, memory_limit
 from tabularaml.generate.strs import as_text, as_text_frame
 
 TE_SMOOTHING = 20.0
@@ -235,6 +235,28 @@ def _warm(ix: pd.Index) -> pd.Index:
     count from run to run under load, and with them the picks)."""
     ix.is_unique
     return ix
+
+
+def _spec_bytes(s, rows: int) -> int:
+    """A candidate's working memory while it is built over ``rows`` rows: keys' codes, values and group
+    statistics' temporaries (_SPEC_BYTES_PER_ROW); a matrix of its columns in about four float64 copies
+    (linear residuals, projections, neighbours: 513 and 776 bytes per row measured over 16 and 24 columns);
+    for neighbour queries also scikit-learn's distance blocks and a fold's query rows' neighbours."""
+    b = _SPEC_BYTES_PER_ROW * rows
+    if isinstance(s, (LinResid, KNNTarget)):  # (projections are neighbour encoders' kin)
+        b += 32 * len(s.parents) * rows
+    if isinstance(s, (KNNTarget, KNNClassDist)) and not isinstance(s, Projection):
+        b += _sk_working_bytes() + 24 * rows * max(s.ks) // 4  # (a fold's query rows at a time)
+    return b
+
+
+def _sk_working_bytes() -> int:
+    """scikit-learn's working memory (bytes): the distance blocks a neighbour query holds at a time."""
+    try:
+        import sklearn
+        return int(sklearn.get_config().get("working_memory", 1024)) << 20
+    except Exception:
+        return 1 << 30
 
 
 def _cache_put(cache: dict, key, df, *entry):
@@ -3124,7 +3146,7 @@ class FeatureForge:
                 w += _CLASS_CELL_S * getattr(s, "n_out", 1) * self.n_classes_ * len(W)
             return w
 
-        def compute(s):
+        def compute(s, WU=WU):
             t_s = time.time()
             try:
                 if s.target_dep:
@@ -3198,14 +3220,27 @@ class FeatureForge:
         running = [0]
 
         def gated(s):
-            rows = len(WU) if (WU is not None and not s.target_dep and set(s.parents) <= raw) else len(W)
-            need = 2 * _SPEC_BYTES_PER_ROW * rows
+            on_wu = WU is not None and not s.target_dep and set(s.parents) <= raw
+            rows = len(WU) if on_wu else len(W)
+            need = 2 * _spec_bytes(s, rows)
             with gate:
                 while running[0] and available_bytes() < need:
                     gate.wait(0.2)
                 running[0] += 1
+                free = available_bytes()
             try:
-                return compute(s)
+                if need <= 2 * free:
+                    return compute(s)
+                # Memory guard: even alone it would not fit. A label-free statistic is fitted on a seeded sample
+                # of the rows it reads; any other candidate is not built.
+                if on_wu:
+                    k = int(0.5 * free / max(_spec_bytes(s, 1), 1))
+                    if k >= 1000:
+                        pick = np.sort(np.random.default_rng(self.random_state).choice(len(WU), k, replace=False))
+                        self._log(f"memory guard: {s.name} fitted on {k} of {len(WU)} rows")
+                        return compute(s, _renumbered(WU.iloc[pick]))
+                self._log(f"memory guard: {s.name} not built ({need / 2 / 1e9:.1f} GB, {free / 1e9:.1f} GB free)")
+                return None
             finally:
                 with gate:
                     running[0] -= 1
@@ -3556,6 +3591,13 @@ class FeatureForge:
             1 + (0 if X_unlabeled is None else len(X_unlabeled) / max(len(X), 1)))
         mem_cap = self._mem_rows(len(self.raw_cols_), fixed=all_rows,
                                  held=self._in_bytes + float(X.memory_usage(index=True, deep=False).sum()))
+        n_wu = len(X) + (0 if X_unlabeled is None else len(X_unlabeled))
+        u_bytes = all_rows * (0 if X_unlabeled is None else len(X_unlabeled)) / max(n_wu, 1)
+        guard = self._memory_guard(min(mem_cap or len(idx_sel), len(idx_sel)), n_wu, all_rows, u_bytes,
+                                   self._in_bytes + float(X.memory_usage(index=True, deep=False).sum()))
+        self._wu_keep = None
+        if guard is not None:
+            mem_cap, self._wu_keep = guard
         if mem_cap is not None and mem_cap < len(idx_sel):
             self._log(f"memory: searching at most {mem_cap} rows")
         for attempt in range(3):
@@ -3923,29 +3965,51 @@ class FeatureForge:
             n = live
         return n
 
+    def _memory_guard(self, n_search, n_wu, wu_bytes, u_bytes, held):
+        """None when a search round fits in the memory this process may use (the machine's, or its memory
+        cgroup's limit when less): the interpreter, the caller's frames and the fit's (``held``), the frame of
+        every row the label-free statistics read (``wu_bytes`` over ``n_wu`` rows) with one candidate's
+        working arrays over it, the unlabeled rows' prepared copy (``u_bytes``) and the search rows' share
+        (see _mem_rows). Whether it fires comes from the limit and the frames' sizes, not from the memory free
+        at the time, so one machine decides the same on every run: Instacart's 131,209 users are modelled at
+        12.9 GB of the 14.3 GB limit (its search peaked at 12.3 to 13.2 GB) and it does not fire.
+        When it fires, the rows that fit: (search rows, rows beyond them the label-free statistics read),
+        from what this process uses now, which the model above understates (Instacart under a 10 GB limit:
+        9.5 GB in use before the first candidate); neighbour queries also take smaller distance blocks."""
+        lim = memory_limit()
+        keep = min(80, 3 * self.max_new_features)
+        row = 4 * (16 * keep + 2 * len(self.raw_cols_) + 16)
+        per_row = wu_bytes / max(n_wu, 1) + 2 * _SPEC_BYTES_PER_ROW
+        need = _BASE_RSS + held + n_wu * per_row + u_bytes + n_search * row
+        if need <= lim:
+            return None
+        try:
+            rss = int(open("/proc/self/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError, IndexError):
+            rss = _BASE_RSS + held
+        import sklearn
+        sklearn.set_config(working_memory=128)
+        # A gigabyte for one candidate's working arrays and the models; of the rest, a quarter for the search
+        # rows' columns and half for the frame of the rows the label-free statistics read.
+        avail = max(lim - max(rss, _BASE_RSS + held) - (1 << 30), 0)
+        m = max(min(n_search, int(0.25 * avail / row)), 1000)
+        k = int(max(0.5 * avail / per_row - m, 0))
+        self._log(f"memory guard: a search round would take {need / 1e9:.1f} GB of the {lim / 1e9:.1f} GB this "
+                  f"process may use ({rss / 1e9:.1f} GB in use); searching at most {m} rows, label-free statistics "
+                  f"read {k} rows beyond them")
+        return m, k
+
     def _wu_guard(self, X, W, extra, U):
         """The rows the label-free statistics read beyond the search rows (``extra`` rows of X, and U),
-        sampled when the frame of all of them, with one candidate's working arrays over it (_materialize
-        builds one at a time when memory is short), would not fit in the memory free now: the machine's,
-        or this process's memory cgroup's when that is less. The statistics then come from fewer rows,
-        and the log says so; when it all fits, nothing changes."""
-        n_u = 0 if U is None else len(U)
-        n_x = len(extra) + n_u
-        if not n_x:
+        sampled (seeded) to the count the memory guard set; all of them when it did not fire."""
+        k = getattr(self, "_wu_keep", None)
+        n_x = len(extra) + (0 if U is None else len(U))
+        if k is None or k >= n_x:
             return X, extra, U
-        cols = [c for c in self.raw_cols_ if c in X.columns]
-        mu = X[cols].memory_usage(index=False, deep=False) if cols else pd.Series(dtype=float)
-        per_row = float(mu.sum()) / max(len(X), 1) + _SPEC_BYTES_PER_ROW
-        room = available_bytes()
-        if (len(W) + n_x) * per_row <= room:
-            return X, extra, U
-        k = int(max(room / per_row - len(W), 0))
-        self._log(f"memory guard: label-free statistics read {k} of the {n_x} rows beyond the search rows "
-                  f"(all would take {(len(W) + n_x) * per_row / 1e9:.1f} GB, {room / 1e9:.1f} GB free)")
         if k == 0:
             return None
         rng = np.random.default_rng(self.random_state + 7)
-        pick = np.sort(rng.choice(n_x, min(k, n_x), replace=False))
+        pick = np.sort(rng.choice(n_x, k, replace=False))
         extra_k = extra[pick[pick < len(extra)]]
         u_k = pick[pick >= len(extra)] - len(extra)
         U_k = None if U is None else _renumbered(U.iloc[u_k])

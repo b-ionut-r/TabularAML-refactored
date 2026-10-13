@@ -62,6 +62,16 @@ def _read_int(path: str) -> Optional[int]:
     return int(v) if v.isdigit() and int(v) < 1 << 60 else None
 
 
+def memory_limit() -> int:
+    """The memory this process may use: the machine's, or the least limit of its memory cgroups."""
+    lim = memory_bytes()
+    for d, lim_f, _ in _cgroup_dirs():
+        v = _read_int(os.path.join(d, lim_f))
+        if v is not None:
+            lim = min(lim, v)
+    return lim
+
+
 def cgroup_headroom() -> Optional[int]:
     """What this process's memory cgroups (it and every parent with a limit) can still give: the least of
     limit minus usage, usage not counting the file cache, which the kernel reclaims before it kills
