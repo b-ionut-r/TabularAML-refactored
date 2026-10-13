@@ -2673,8 +2673,11 @@ class FeatureForge:
         losses = []
         pos = {c: j for j, c in enumerate(cols)}
         specs = [sp for sp in (nested or {}).get("specs", []) if sp.out_names()[0] in pos]
+        cat_cols = {cols[i] for i in cats}
+        derived = [sp for sp in (nested or {}).get("derived", []) if sp.out_names()[0] in pos
+                   and all(p in pos and p not in cat_cols for p in sp.parents)]
         D = None
-        if not specs:
+        if not specs and not derived:
             # One binned dataset; folds train on its row subsets. The raw matrix is not kept:
             # validation rows are read from ``M`` again. A run of a column-major matrix's columns is
             # passed as it is (LightGBM reads it in place; same bins, same model), not copied.
@@ -2697,6 +2700,12 @@ class FeatureForge:
                         for j, col in enumerate(sp.out_names()):
                             Mtr[:, pos[col]] = vt if vt.ndim == 1 else vt[:, j]
                             Mva[:, pos[col]] = vv if vv.ndim == 1 else vv[:, j]
+                    for sp in derived:  # in build order: a feature's parents are already this fold's
+                        for Mx in (Mtr, Mva):
+                            v = np.asarray(sp.transform(pd.DataFrame({p: Mx[:, pos[p]] for p in sp.parents}),
+                                                        self.ctx_), dtype=np.float32)
+                            for j, col in enumerate(sp.out_names()):
+                                Mx[:, pos[col]] = v if v.ndim == 1 else v[:, j]
                     dtr = lgb.Dataset(Mtr, y[tr], categorical_feature=cats, free_raw_data=False)
                     dva = lgb.Dataset(Mva, y[va], reference=dtr)
                     b = lgb.train(self._lgb_params(lr), dtr, 2000, valid_sets=[dva],
@@ -4089,7 +4098,17 @@ class FeatureForge:
             if self.nested_cv is True or (self.nested_cv == "auto" and self.time_col_ is not None and self.time_cv):
                 te_specs = [sp for sp in list(selected) + [spec_by_name[nm] for nm in survivors]
                             if isinstance(sp, TargetEnc)]
-                nested = {"specs": te_specs, "W": W}
+                # Features built on those encodings (a sum or product of two) are recomputed per fold
+                # from the fold's encodings too: kept at their values over the whole search frame, whose
+                # folds are not the CV's, they carry the validation rows' labels (Avazu round 2: search CV
+                # +6.3%, gate +0.13%).
+                tdep = {c for sp in te_specs for c in sp.out_names()}
+                derived = []
+                for sp in list(selected) + [spec_by_name[nm] for nm in survivors]:
+                    if not isinstance(sp, TargetEnc) and tdep & set(sp.parents):
+                        derived.append(sp)
+                        tdep |= set(sp.out_names())
+                nested = {"specs": te_specs, "derived": derived, "W": W}
             room = self.max_new_features - len(selected)
             # Two orderings: joint-model split gain, and novel residual gain from
             # screening. Wide candidate pools can push strong but narrow features
