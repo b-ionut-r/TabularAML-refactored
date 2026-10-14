@@ -580,15 +580,21 @@ def main():
         # 3 GB, sat next to the aggregates: under 5.6 GiB, killed aggregating the fourth; dropped and read again
         # each time, a 2x Student Game Play stand-in's events table took two more minutes to read).
         sizes = {ch.name: (len(ch.df), frame_bytes(ch.df)) for ch in keyed if ch.source is None}
+        one_at_a_time = False
         for ch in keyed:
             if ch.source is None:
                 others = [o for o in keyed if o is not ch and o.source is None and o.df is not None]
                 held = sum(sizes[o.name][1] for o in others)
-                if others and available_bytes() < 2 * held + 4 * sizes[ch.name][1]:
+                if not one_at_a_time and others and available_bytes() < 2 * held + 4 * sizes[ch.name][1]:
+                    # From here on each table is read for its own step and dropped after it, the table at hand
+                    # included (kept from the parse, it left the stages after it less memory: under 5.6 GiB, Home
+                    # Credit's first two latest-state histories were skipped).
                     print(f"memory guard: related tables held one at a time from table {ch.name} "
                           f"({held / 1e9:.1f} GB of others dropped, read again when needed)", flush=True)
-                    for o in others:
-                        o.df = None
+                    one_at_a_time = True
+                    for o in keyed:
+                        if o.source is None:
+                            o.df = None
                     _trim_heap()
                 if ch.df is None:
                     ch.df = read(src[ch.name])
@@ -635,6 +641,9 @@ def main():
                 A.insert(1, Hk)
                 del Hk
             Rk = None
+            if one_at_a_time:
+                ch.df = None
+                _trim_heap()
         rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
         # Child rows that also share the main row's code values (a customer's purchases of the
         # offer's brand), counted before the main row's date when both tables carry dates.
