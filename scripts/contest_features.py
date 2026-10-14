@@ -66,6 +66,11 @@ def release_arrow():
 
 def normalise(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
+        if isinstance(df[c].dtype, pd.StringDtype):
+            # pandas 3 reads text as its str dtype, pandas 2 as object: text takes the object path either way, so
+            # the output does not depend on the pandas version (Rossmann's Date stayed text under pandas 3 and the
+            # panel family, which reads categories as levels, did not see it).
+            df[c] = df[c].astype(object)
         if df[c].dtype == object and isinstance(df[c].dropna().iloc[:1].tolist()[0] if df[c].notna().any() else None,
                                                 (list, tuple, np.ndarray)):
             # List cells (amenities, photo URLs): items joined, so they stay readable as a list column.
