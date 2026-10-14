@@ -4032,11 +4032,19 @@ class FeatureForge:
         _trim_heap()
         self.gate_passed_ = None
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
-            # Memory guard: the gate's widest model (raw columns and every pick) over the search and gate rows,
-            # priced against the memory free now. When it would not fit, nothing can be shown to beat the raw
-            # columns: they are kept, as when the gate rejects.
+            # Memory guard: the gate's widest model (raw columns and every pick), priced against the memory free
+            # now, at the larger of its two phases: building the search rows' dataset (their float32 matrix and
+            # LightGBM's bin sample, the matrix freed once binned), then fitting it and scoring the gate rows (the
+            # binned rows, the gate rows' frame and matrix, the histogram pool and per-row gradients). Priced as
+            # their sum, Springleaf's 1,935-column gate came to 7.6 GB against 6.5 GB free at the normal limit and
+            # was skipped, though the whole run had peaked at 12.4 GB of 14.3 with it. When it would not fit,
+            # nothing can be shown to beat the raw columns: they are kept, as when the gate rejects.
             width = len(self.base_cols_) + sum(len(sp.out_names()) for sp in selected)
-            need = 4 * (len(idx_sel) + len(idx_gate)) * width + self._lgb_fit_bytes(len(idx_sel), width)
+            n_s, n_g = len(idx_sel), len(idx_gate)
+            p = self._sample_cap(self._lgb_params(), n_s, width)
+            build = 4 * n_s * width + 13 * min(p.get("bin_construct_sample_cnt", 200_000), n_s) * width
+            fit = (n_s + 8 * n_g) * width + 24 * 255 * 31 * width + 24 * n_s * max(self.n_classes_, 1)
+            need = max(build, fit)
             free = available_bytes()
             if need > free:
                 self.gate_passed_ = False
