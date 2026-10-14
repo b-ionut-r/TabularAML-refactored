@@ -263,6 +263,11 @@ def _spec_bytes(s, rows: int, wm: int | None = None, text_nnz: dict | None = Non
                 b += int(56 * (words + (chars if s.chars else 0.0)) * rows)
             else:
                 b += int(40 * words * min(rows, s.max_fit_rows))
+    if isinstance(s, CrossLinearOOF):
+        # Its codes (int64) and one-hot designs for each key and key pair, a fold's at a time: 40 to 49 bytes a row
+        # and block measured over 200k and 400k rows of 4 and 6 keys (1 KB a row with 6 keys, priced at 64 bytes).
+        k = len(s.parents)
+        b += 56 * (k + (k * (k - 1) // 2 if s.pairs else 0)) * rows
     if isinstance(s, (LinResid, KNNTarget)):  # (projections are neighbour encoders' kin)
         b += 32 * len(s.parents) * rows
     if isinstance(s, (KNNTarget, KNNClassDist)) and not isinstance(s, Projection):
@@ -4458,7 +4463,24 @@ class FeatureForge:
         # features are built from stay in F as well (F's copy of them all was the final fit's peak under a
         # 10 GB limit).
         kept = {a[3]: np.array(F[a[3]].to_numpy(dtype=np.float32), copy=True) for a in self.anchors_}
+        # Memory guard: each feature's fit over every row, priced against the memory free when it starts (the
+        # search priced it over its search rows only), over the training and unlabeled rows both (a target model's
+        # transform of new rows is fitted on every training row). One that would not fit is left out, with the
+        # features built from it (Avito's 886k rows under 70% of its peak passed the gate, then were killed after).
+        n_all = len(F) + (0 if U is None else len(U))
+        wm, tn = getattr(self, "_sk_wm", None), getattr(self, "_text_nnz", None)
+        left_out = set()
         for s in self.selected_:
+            if left_out.intersection(s.parents):
+                left_out.update(s.out_names())
+                continue
+            need = _spec_bytes(s, n_all, wm, tn) + 4 * len(F) * len(s.out_names())
+            free = available_bytes()
+            if need > free:
+                self._log(f"memory guard: {s.name} left out of the final fit (needs about {need / 1e9:.2f} GB, "
+                          f"{free / 1e9:.2f} GB free)")
+                left_out.update(s.out_names())
+                continue
             if s.target_dep:
                 v = s.fit_transform_oof(F, y, self.ctx_, folds)
             elif U is not None:
@@ -4481,6 +4503,9 @@ class FeatureForge:
                 kept[col] = vc
                 if col in used:
                     F[col] = vc
+        if left_out:
+            self.selected_ = [s for s in self.selected_ if not left_out.intersection(s.out_names())]
+            self.new_columns_ = [c for c in self.new_columns_ if c not in left_out]
         self._train_cols = kept
         self._n_train = len(F)
 
