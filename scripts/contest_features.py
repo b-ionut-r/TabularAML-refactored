@@ -574,18 +574,24 @@ def main():
 
         def table(ch):
             return Child(ch.name, read(src[ch.name]), key=ch.key, time=ch.time, children=ch.children, drop=ch.drop)
-        # Keyed tables are held one at a time: each is read again for its own aggregates and dropped after them, and
-        # read again for its matches and child-row models (all five of Home Credit's, about 3 GB, sat next to the
-        # aggregates: under 5.6 GiB, killed aggregating the fourth).
-        sizes = {}
+        # Keyed tables stay held while memory allows. When the free memory is short of twice the other tables held
+        # and four times the table at hand, the others are dropped and each is read again at its own step, for its
+        # matches and for its child-row models: the same file gives the same frame (all five of Home Credit's, about
+        # 3 GB, sat next to the aggregates: under 5.6 GiB, killed aggregating the fourth; dropped and read again
+        # each time, a 2x Student Game Play stand-in's events table took two more minutes to read).
+        sizes = {ch.name: (len(ch.df), frame_bytes(ch.df)) for ch in keyed if ch.source is None}
         for ch in keyed:
             if ch.source is None:
-                sizes[ch.name] = (len(ch.df), frame_bytes(ch.df))
-                ch.df = None
-        _trim_heap()
-        for ch in keyed:
-            if ch.source is None:
-                ch.df = read(src[ch.name])
+                others = [o for o in keyed if o is not ch and o.source is None and o.df is not None]
+                held = sum(sizes[o.name][1] for o in others)
+                if others and available_bytes() < 2 * held + 4 * sizes[ch.name][1]:
+                    print(f"memory guard: related tables held one at a time from table {ch.name} "
+                          f"({held / 1e9:.1f} GB of others dropped, read again when needed)", flush=True)
+                    for o in others:
+                        o.df = None
+                    _trim_heap()
+                if ch.df is None:
+                    ch.df = read(src[ch.name])
             if ch.source is not None:
                 for j, Fs in enumerate(streamed_features(ch, a.history == "auto")):
                     Fs = Fs.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
@@ -628,9 +634,7 @@ def main():
                 print(f"table {ch.name}: latest-state history, {Hk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
                 A.insert(1, Hk)
                 del Hk
-            ch.df = None
             Rk = None
-            _trim_heap()
         rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
         # Child rows that also share the main row's code values (a customer's purchases of the
         # offer's brand), counted before the main row's date when both tables carry dates.
