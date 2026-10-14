@@ -171,6 +171,8 @@ CONTESTS["ieee_fh"] = dict(CONTESTS["ieee_v6"], repo=FH_REPO)
 CONTESTS["hc_fh"] = dict(CONTESTS["hc"], raw="hc", repo=FH_REPO, base="hc")
 CONTESTS["hc_fhg"] = dict(CONTESTS["hc_fh"])  # under a 6.0 GB memory cgroup
 CONTESTS["hc_fhg75"] = dict(CONTESTS["hc_fh"])  # under a 7.5 GB memory cgroup
+CONTESTS["hc_812g"] = dict(CONTESTS["hc_fh"], repo="/tmp/claude-0/wt_b_812cb51")  # 812cb51 under a 6.0 GB cgroup
+CONTESTS["hc_812g75"] = dict(CONTESTS["hc_812g"])  # 812cb51 under a 7.5 GB cgroup
 for _c in ("ross", "fav", "m5", "wnv", "sct", "porto"):
     CONTESTS[f"{_c}_fh"] = dict(CONTESTS[f"{_c}_final"], repo=FH_REPO)
 # Scratch: prefix ladder narrowest-first across orderings (c9bc29a on 82dd2b5).
