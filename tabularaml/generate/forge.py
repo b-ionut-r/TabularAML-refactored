@@ -42,7 +42,7 @@ import numpy as np
 import pandas as pd
 import warnings
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
-from tabularaml.generate.stream import available_bytes, memory_limit
+from tabularaml.generate.stream import available_bytes
 from tabularaml.generate.strs import as_text, as_text_frame
 
 TE_SMOOTHING = 20.0
@@ -237,16 +237,17 @@ def _warm(ix: pd.Index) -> pd.Index:
     return ix
 
 
-def _spec_bytes(s, rows: int) -> int:
+def _spec_bytes(s, rows: int, wm: int | None = None) -> int:
     """A candidate's working memory while it is built over ``rows`` rows: keys' codes, values and group
     statistics' temporaries (_SPEC_BYTES_PER_ROW); a matrix of its columns in about four float64 copies
     (linear residuals, projections, neighbours: 513 and 776 bytes per row measured over 16 and 24 columns);
-    for neighbour queries also scikit-learn's distance blocks and a fold's query rows' neighbours."""
+    for neighbour queries also scikit-learn's distance blocks (``wm`` bytes, its working memory, at most every
+    row against every row) and a fold's query rows' neighbours."""
     b = _SPEC_BYTES_PER_ROW * rows
     if isinstance(s, (LinResid, KNNTarget)):  # (projections are neighbour encoders' kin)
         b += 32 * len(s.parents) * rows
     if isinstance(s, (KNNTarget, KNNClassDist)) and not isinstance(s, Projection):
-        b += _sk_working_bytes() + 24 * rows * max(s.ks) // 4  # (a fold's query rows at a time)
+        b += min(_sk_working_bytes() if wm is None else wm, 8 * rows * rows) + 24 * rows * max(s.ks) // 4  # (a fold's query rows at a time)
     return b
 
 
@@ -3175,8 +3176,18 @@ class FeatureForge:
                 w += _CLASS_CELL_S * getattr(s, "n_out", 1) * self.n_classes_ * len(W)
             return w
 
+        # scikit-learn's configuration is per thread: the guard's smaller distance blocks are set on each.
+        wm = getattr(self, "_sk_wm", None)
+
         def compute(s, WU=WU):
             t_s = time.time()
+            if wm is not None:
+                import sklearn
+                with sklearn.config_context(working_memory=wm >> 20):
+                    return _compute(s, WU, t_s)
+            return _compute(s, WU, t_s)
+
+        def _compute(s, WU, t_s):
             try:
                 if s.target_dep:
                     v = s.fit_transform_oof(W, y, self.ctx_, folds)
@@ -3251,7 +3262,7 @@ class FeatureForge:
         def gated(s):
             on_wu = WU is not None and not s.target_dep and set(s.parents) <= raw
             rows = len(WU) if on_wu else len(W)
-            need = 2 * _spec_bytes(s, rows)
+            need = 2 * _spec_bytes(s, rows, wm)
             with gate:
                 while running[0] and available_bytes() < need:
                     gate.wait(0.2)
@@ -3263,7 +3274,7 @@ class FeatureForge:
                 # Memory guard: even alone it would not fit. A label-free statistic is fitted on a seeded sample
                 # of the rows it reads; any other candidate is not built.
                 if on_wu:
-                    k = int(0.5 * free / max(_spec_bytes(s, 1), 1))
+                    k = int(0.5 * free / max(_spec_bytes(s, 1, wm), 1))
                     if k >= 1000:
                         pick = np.sort(np.random.default_rng(self.random_state).choice(len(WU), k, replace=False))
                         self._log(f"memory guard: {s.name} fitted on {k} of {len(WU)} rows")
@@ -4006,37 +4017,49 @@ class FeatureForge:
         return n
 
     def _memory_guard(self, n_search, n_wu, wu_bytes, u_bytes, held):
-        """None when a search round fits in the memory this process may use (the machine's, or its memory
-        cgroup's limit when less): the interpreter, the caller's frames and the fit's (``held``), the frame of
-        every row the label-free statistics read (``wu_bytes`` over ``n_wu`` rows) with one candidate's
-        working arrays over it, the unlabeled rows' prepared copy (``u_bytes``) and the search rows' share
-        (see _mem_rows). Whether it fires comes from the limit and the frames' sizes, not from the memory free
-        at the time, so one machine decides the same on every run: Instacart's 131,209 users are modelled at
-        12.9 GB of the 14.3 GB limit (its search peaked at 12.3 to 13.2 GB) and it does not fire.
-        When it fires, the rows that fit: (search rows, rows beyond them the label-free statistics read),
-        from what this process uses now, which the model above understates (Instacart under a 10 GB limit:
-        9.5 GB in use before the first candidate); neighbour queries also take smaller distance blocks."""
-        lim = memory_limit()
+        """None when a search round fits in the memory free now (the machine's, or this process's memory cgroups'
+        when less, which also counts the other processes in them): what the round adds to what this process
+        already holds, from the frames' actual sizes, with no fixed part (the interpreter and the frames read so
+        far are in use already):
+          - the frame of every row the label-free statistics read, ``wu_bytes`` over ``n_wu`` rows, and the
+            unlabeled rows' prepared copy, ``u_bytes``;
+          - one candidate's working arrays over each of those rows, 2 x _SPEC_BYTES_PER_ROW a row;
+          - per search row, float32 values of the candidates alive at once: the screen's pool of 4 x ``keep``
+            columns and the joint matrix's survivors, about 16 x ``keep`` values, next to the model's matrix of
+            the raw columns (two copies) and 16 more for folds and predictions.
+        (0.8 GB fixed and the limit in place of the memory free fired on 493-row ICR under a 189 MB limit, whose
+        whole run peaks at 0.27 GB.) When it fires: all of both kinds of rows if they fit after all, else the
+        most search rows that fit next to every label-free row, else both cut in proportion, with at least 200
+        search rows for each CV fold (a fold's loss on fewer moved by more than the gains it is to measure).
+        Neighbour queries also take smaller distance blocks."""
         keep = min(80, 3 * self.max_new_features)
         row = 4 * (16 * keep + 2 * len(self.raw_cols_) + 16)
-        per_row = wu_bytes / max(n_wu, 1) + 2 * _SPEC_BYTES_PER_ROW
-        need = _BASE_RSS + held + n_wu * per_row + u_bytes + n_search * row
-        if need <= lim:
+        f_wu = wu_bytes + u_bytes
+        work = 2 * _SPEC_BYTES_PER_ROW * n_wu
+        need = f_wu + work + n_search * row
+        free = available_bytes()
+        if need <= free:
             return None
         try:
             rss = int(open("/proc/self/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
         except (OSError, ValueError, IndexError):
-            rss = _BASE_RSS + held
+            rss = 0
         import sklearn
         sklearn.set_config(working_memory=128)
-        # A gigabyte for one candidate's working arrays and the models; of the rest, a quarter for the search
-        # rows' columns and half for the frame of the rows the label-free statistics read.
-        avail = max(lim - max(rss, _BASE_RSS + held) - (1 << 30), 0)
-        m = max(min(n_search, int(0.25 * avail / row)), 1000)
-        k = int(max(0.5 * avail / per_row - m, 0))
-        self._log(f"memory guard: a search round would take {need / 1e9:.1f} GB of the {lim / 1e9:.1f} GB this "
-                  f"process may use ({rss / 1e9:.1f} GB in use); searching at most {m} rows, label-free statistics "
-                  f"read {k} rows beyond them")
+        self._sk_wm = 128 << 20
+        avail = max(free - work, 0)
+        m_min = min(n_search, 200 * self.cv)
+        m, k = n_search, None
+        if f_wu + n_search * row > avail:
+            m = int((avail - f_wu) / row)
+            if m < m_min:
+                s = avail / (f_wu + n_search * row)
+                m = max(int(s * n_search), m_min)
+                k = int(max(s * n_wu - m, 0))
+        m = min(m, n_search)
+        self._log(f"memory guard: a search round would add {need / 1e9:.2f} GB to the {rss / 1e9:.2f} GB in use, "
+                  f"{free / 1e9:.2f} GB free; searching at most {m} rows, label-free statistics read "
+                  f"{'every row' if k is None else f'{k} rows'} beyond them")
         return m, k
 
     def _wu_guard(self, X, W, extra, U):
