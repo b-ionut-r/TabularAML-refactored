@@ -406,8 +406,13 @@ class ForecastFeatures:
     def _vocab(self, df, cols):
         if not cols:
             return None
-        key = _keytext(df, cols)
-        return pd.Index(pd.unique(key))
+        # The key texts in order of first appearance, read on each distinct combination's first row: the
+        # texts and order the rows give, without a Python string per row (M5's check was killed at 4.0 GB
+        # in this step).
+        if not len(df):
+            return pd.Index(pd.unique(_keytext(df, cols)))
+        _, first = np.unique(_combo(df, cols), return_index=True)
+        return pd.Index(pd.unique(_keytext(df.iloc[np.sort(first)], cols)))
 
     def fit(self, X: pd.DataFrame, y, X_unlabeled: Optional[pd.DataFrame] = None):
         self.active_ = False
