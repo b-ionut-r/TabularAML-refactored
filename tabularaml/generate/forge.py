@@ -4428,7 +4428,8 @@ class FeatureForge:
         Up = self._prep(U)
         n, best, best_ov = len(X), None, 0.2
         for c in X.columns:
-            if c not in Up.columns or c in self.text_cols_:
+            # A column built from labels (an outcome history's counts) is no group, however new its test values.
+            if c not in Up.columns or c in self.text_cols_ or c in getattr(self, "echo_cols_", ()):
                 continue
             nu = X[c].nunique()
             if not (50 <= nu <= n / 2):
@@ -4438,7 +4439,11 @@ class FeatureForge:
                 fin = x[np.isfinite(x)]
                 if len(fin) < 0.9 * n or np.any(fin != np.round(fin)):
                     continue
-            ov = float(Up[c].isin(set(X[c].unique())).mean())
+            # A missing test value counts as seen when training has missing values too, as isin did under
+            # pandas 3; pandas 2's isin never matched the set's NaN, so the choice depended on the version
+            # (Riiid: a label history half missing in the test rows, 0.58 seen under pandas 3, 0.07 under 2).
+            seen = X[c].dropna().unique()
+            ov = float((Up[c].isin(seen) | (Up[c].isna() & X[c].isna().any())).mean())
             if ov < best_ov:
                 best, best_ov = c, ov
         return best
@@ -4446,7 +4451,7 @@ class FeatureForge:
     def _detect_order(self, X, key):
         """A numeric column that orders each group's rows: distinct within nearly every group
         and rising in row order (time steps of a breath, event times of a session)."""
-        g = pd.factorize(X[key].to_numpy())[0]
+        g = pd.factorize(X[key].to_numpy(), use_na_sentinel=False)[0]   # (missing keys: one group, not code -1)
         sizes = np.bincount(g)
         if np.median(sizes) < 5:
             return None
