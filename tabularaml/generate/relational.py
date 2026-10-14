@@ -242,10 +242,12 @@ class RelatedTables:
         levels = sum(min(ch.df[c].nunique(), 300 if bag else self.top_levels) for c in cats)
         dense = 1 + len(num) + (2 * self.max_pairs if self.row_pairs else 0)
         width = dense + levels + (levels * len(num) if bag else 0)
-        # float32 parts and the frame they are copied into, then the latest rows: the dense columns with the time
-        # (assign), their sorted copy and the rows kept (three whole copies of the frame overstated a 13.7M-row
-        # stand-in's step by half: 13.7 GB modelled, 9 GB measured)
-        need = len(ch.df) * 4 * (2 * width + (3 * dense if ch.time is not None and self.recent else 0))
+        # float32 parts and the frame they are copied into (the parts are dropped once it is built); then, next to the
+        # frame, the latest rows: the dense columns with the time (assign), their sorted copy and the rows kept. The
+        # larger of the two (adding them priced SGP's 13.7M-row stand-in at 15.2 GB, where the whole run peaks at
+        # 9 GB, and split it with no limit)
+        latest = 3 * dense if ch.time is not None and self.recent else 0
+        need = len(ch.df) * 4 * max(2 * width, width + latest)
         free = available_bytes()
         if need <= free or len(ch.df) < 100_000:
             return self._aggregate(ch, key)
