@@ -327,8 +327,9 @@ def cmd_feats(c: str, budget: float, extra: list[str]):
 
 # ---------------------------------------------------------------- judge
 
-def encode(Xtr: pd.DataFrame, Xte: pd.DataFrame, dates: list[str]):
-    Xtr, Xte = Xtr.copy(), Xte.copy()
+def encode(Xtr: pd.DataFrame, Xte: pd.DataFrame, dates: list[str], copy: bool = True):
+    if copy:
+        Xtr, Xte = Xtr.copy(), Xte.copy()
     for c in Xtr.columns:
         if c in dates:
             for X in (Xtr, Xte):
@@ -338,6 +339,15 @@ def encode(Xtr: pd.DataFrame, Xte: pd.DataFrame, dates: list[str]):
             Xtr[c] = pd.Categorical(Xtr[c].astype(str), categories=u)
             Xte[c] = pd.Categorical(Xte[c].astype(str), categories=u)
     return Xtr, Xte
+
+
+def _trim():
+    import ctypes, gc
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
 
 
 def judge(Xtr, y, Xte, cfg, groups=None, seeds=(0, 1, 2)):
@@ -369,6 +379,10 @@ def judge(Xtr, y, Xte, cfg, groups=None, seeds=(0, 1, 2)):
                       valid_sets=[lgb.Dataset(Xtr.iloc[v], yt[v])], callbacks=[lgb.early_stopping(200, verbose=False)])
         oof[v] = b.predict(Xtr.iloc[v], num_iteration=b.best_iteration)
         pte += b.predict(Xte, num_iteration=b.best_iteration) / len(splits)
+        # The booster holds both fold Datasets: free them (and the heap they leave) before the next fold
+        # builds its own, so wide frames don't carry two folds at once.
+        del b
+        _trim()
     return pte, oof, np.ones(len(Xtr), bool)
 
 
@@ -389,6 +403,10 @@ def score(metric, y, p):
 
 
 def cmd_fit(c: str, arm: str, drop: list[str]):
+    import pyarrow as pa
+    # Arrow's own pool keeps the parquet read's buffers resident after they are freed; the system pool
+    # hands them back.
+    pa.set_memory_pool(pa.system_memory_pool())
     cfg = CONTESTS[c]
     if arm == "raw":
         tr, te = pd.read_parquet(ROOT / c / "prep" / "train.parquet"), pd.read_parquet(ROOT / c / "prep" / "test.parquet")
@@ -400,20 +418,29 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
         te = pd.read_parquet(sub / "test_features.parquet")
     y = tr.pop(cfg["target"]).to_numpy()
     ids = te[cfg["id"]].to_numpy()
-    Xtr = tr.drop(columns=[cfg["id"]], errors="ignore")
-    Xte = te.drop(columns=[cfg["id"]], errors="ignore")
+    # Only the closed flag is read from the raw frames later.
+    closed = te[cfg["closed_zero"]].to_numpy() if cfg.get("closed_zero") else None
+    # Wide feature frames (Home Credit, IEEE-CIS: 1,000+ columns) are edited in place: drop() and a
+    # reordering column selection would each copy the whole frame.
+    Xtr, Xte = tr, te
+    del tr, te
+    for X in (Xtr, Xte):
+        if cfg["id"] in X.columns:
+            del X[cfg["id"]]
     gone = [x for x in Xtr.columns if any(s in x for s in drop)] if drop else []
-    Xtr, Xte = Xtr.drop(columns=gone), Xte.drop(columns=gone)
     if gone:
+        Xtr, Xte = Xtr.drop(columns=gone), Xte.drop(columns=gone)
         print(f"dropped {len(gone)} columns: {gone}")
-    Xte = Xte[Xtr.columns]
+    if list(Xte.columns) != list(Xtr.columns):
+        Xte = Xte[Xtr.columns]
     if cfg.get("fit_pos"):  # score-relevant training rows only (RMSPE skips zero sales)
         keep = y > 0
         Xtr, y = Xtr[keep].reset_index(drop=True), y[keep]
     groups = None
     if cfg["folds"] == "group:year":
         groups = pd.to_datetime(Xtr["Date"].astype(str)).dt.year.to_numpy()
-    Xtr, Xte = encode(Xtr, Xte, cfg.get("dates", []))
+    Xtr, Xte = encode(Xtr, Xte, cfg.get("dates", []), copy=False)
+    _trim()
     t0 = time.time()
     pte, oof, m = judge(Xtr, y, Xte, cfg, groups)
     cv = score(cfg["metric"], np.log1p(y[m]) if cfg.get("log_target") else y[m], oof[m])
@@ -422,7 +449,7 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
     if cfg["task"] == "regression" and y.min() >= 0:  # non-negative target: no negative forecasts
         pte = pte.clip(0)
     if cfg.get("closed_zero"):
-        pte[te[cfg["closed_zero"]].to_numpy() == 0] = 0
+        pte[closed == 0] = 0
     tag = arm + ("_" + "-".join(drop) if drop else "")
     out = Path(os.environ["KG_FEATS"]) / "subs" if os.environ.get("KG_FEATS") else ROOT / c / "subs"
     out.mkdir(parents=True, exist_ok=True)

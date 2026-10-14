@@ -28,9 +28,11 @@ if a.arm != 'raw':
         print(out[-4000:]); sys.exit(r.returncode)
     g = re.findall(r'gate: raw=\S+ fe=\S+ \(([+-]?\d+\.\d+)%\) -> (PASS|REJECT)', out)
     info.update(gate_gain_pct=float(g[-1][0]) if g else None, gate=g[-1][1] if g else None)
-    import pandas as pd
-    raw_cols = pd.read_parquet(f'/tmp/claude-0/kg/{a.contest}/prep/train.parquet').columns
-    info['n_new'] = sum(c not in raw_cols for c in pd.read_parquet(work / 'train_features.parquet').columns)
+    # Column names from the parquet schemas: reading the frames here kept ~3.6 GB resident in this parent
+    # for the whole judge on Home Credit, enough to push the judge over the container's memory limit.
+    import pyarrow.parquet as pq
+    raw_cols = set(pq.read_schema(f'/tmp/claude-0/kg/{a.contest}/prep/train.parquet').names)
+    info['n_new'] = sum(c not in raw_cols for c in pq.read_schema(work / 'train_features.parquet').names)
 fe_t = time.time() - t0
 r = subprocess.run([sys.executable, KL, 'fit', '--contest', a.contest, '--arm', 'raw' if a.arm == 'raw' else 'forge'],
                    env=env, capture_output=True, text=True)
