@@ -617,18 +617,24 @@ def main():
             print(f"forecast: {note} -> {'kept' if keep else 'rejected; FeatureForge search runs'} "
                   f"({time.time() - tc:.0f}s)", flush=True)
         if keep:
+            # Each block a block of rows at a time into one float32 matrix, with fewer rows a block when memory
+            # is short (the whole transform's working columns were Store Sales' peak, and killed Rohlik in
+            # 6.5 GB); when even the matrix would not fit, the block is skipped and the search runs, as when
+            # the check rejects it.
+            def block(X):
+                if not len(X):
+                    return ff.transform(X)
+                names, M = ff.transform_float32(X, _CHECK_CHUNK_ROWS, guard=True)
+                return pd.DataFrame(M, columns=names, index=X.index, copy=False)
+            try:
+                Ftr = block(Xtr)
+                Fte = block(Xte)
+            except MemoryError as e:
+                Ftr = Fte = None
+                keep = False
+                print(f"memory guard: {e}; forecasting block skipped, FeatureForge search runs", flush=True)
+        if keep:
             forecasting = True
-            # The training rows' block a block of rows at a time into one float32 matrix: the whole
-            # transform's working columns were the run's peak (Store Sales: 4.2 GB).
-            Ftr, M = None, None
-            for a0, Fc in ff.transform_chunks(Xtr, _CHECK_CHUNK_ROWS):
-                if M is None:
-                    M = np.empty((len(Xtr), Fc.shape[1]), dtype=np.float32, order="F")
-                    names = list(Fc.columns)
-                M[a0:a0 + len(Fc)] = Fc.to_numpy(dtype=np.float32)
-            Ftr = pd.DataFrame(M, columns=names, index=Xtr.index, copy=False) if M is not None else ff.transform(Xtr)
-            del M
-            Fte = ff.transform(Xte)
             Xtr = pd.concat([_rows(Xtr), _rows(Ftr)], axis=1)
             Xte = pd.concat([_rows(Xte), _rows(Fte)], axis=1)
             print(f"forecast: {Ftr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)

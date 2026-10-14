@@ -582,6 +582,47 @@ class ForecastFeatures:
         return ((a, self._transform({n: v[a:a + rows] for n, v in I.items()}, index[a:a + rows]))
                 for a in range(0, len(index), rows))
 
+    # A block's working bytes per row and output column (an estimate: float64 copies while they are built, the
+    # float32 block they move into and the matrix row they are written to), plus the per-row arrays every
+    # feature reads. Under a 5.5 GB cap M5 all stores (3.66M rows, 75 columns) finished byte-identical.
+    _BLOCK_BYTES_PER_CELL, _BLOCK_BYTES_PER_ROW = 24, 512
+
+    def transform_float32(self, df: pd.DataFrame, rows: int = 250_000, guard: bool = False, log=print):
+        """``transform(df)`` as (column names, one float32 matrix in Fortran order), built a block of rows at a
+        time from inputs read once on the whole frame, so the values are those of ``transform`` for any block
+        size. With ``guard`` (against the memory free now) the blocks get fewer rows when the matrix and one
+        block's working columns would not fit (a memory guard: Rohlik's whole-frame transform was killed in a
+        6.5 GB container); a MemoryError says what it needed when even the matrix and a small block would not."""
+        n = len(df)
+        I, index = self._inputs(df), df.index
+        first = min(n, 10_000)
+        F0 = self._transform({k: v[:first] for k, v in I.items()}, index[:first])
+        names = list(F0.columns)
+        need_m = n * len(names) * 4
+        per_row = len(names) * self._BLOCK_BYTES_PER_CELL + self._BLOCK_BYTES_PER_ROW
+        if guard:
+            from tabularaml.generate.stream import available_bytes
+            free = available_bytes()
+            room = free - need_m
+            if room < first * per_row:
+                raise MemoryError(
+                    f"forecasting block: {n} rows x {len(names)} columns need {need_m / 1e9:.2f} GB for the "
+                    f"matrix and {first * per_row / 1e9:.2f} GB for a block of {first} rows; "
+                    f"{free / 1e9:.2f} GB free")
+            fit = int(room // 2 // per_row)
+            if fit < rows and n > first + fit:
+                rows = max(first, fit)
+                if log:
+                    log(f"memory guard: forecasting block built {rows} rows at a time (matrix "
+                        f"{need_m / 1e9:.2f} GB, {free / 1e9:.2f} GB free)", flush=True)
+        M = np.empty((n, len(names)), dtype=np.float32, order="F")
+        M[:first] = F0.to_numpy(dtype=np.float32)
+        del F0
+        for a in range(first, n, rows):
+            M[a:a + rows] = self._transform({k: v[a:a + rows] for k, v in I.items()},
+                                            index[a:a + rows]).to_numpy(dtype=np.float32)
+        return names, M
+
     def _transform(self, I: dict, index: pd.Index) -> pd.DataFrame:
         n_rows = len(index)
         p_abs = I["p"]
