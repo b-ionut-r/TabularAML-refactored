@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -407,6 +408,10 @@ def _trim():
         pass
 
 
+# JSEED (env, default 0): shifts the judge's fold split and model seeds, to measure seed noise; 0 is the pinned judge.
+JSEED = int(os.environ.get("JSEED", 0))
+
+
 def judge(Xtr, y, Xte, cfg, groups=None, seeds=(0, 1, 2)):
     import lightgbm as lgb
     from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold
@@ -427,12 +432,12 @@ def judge(Xtr, y, Xte, cfg, groups=None, seeds=(0, 1, 2)):
     if groups is not None:
         splits = GroupKFold(n_splits=min(5, len(np.unique(groups)))).split(Xtr, y, groups)
     elif obj == "binary":
-        splits = StratifiedKFold(5, shuffle=True, random_state=0).split(Xtr, y)
+        splits = StratifiedKFold(5, shuffle=True, random_state=JSEED).split(Xtr, y)
     else:
-        splits = KFold(5, shuffle=True, random_state=0).split(Xtr)
+        splits = KFold(5, shuffle=True, random_state=JSEED).split(Xtr)
     splits = list(splits)
     for k, (a, v) in enumerate(splits):
-        b = lgb.train(dict(P, seed=k), lgb.Dataset(Xtr.iloc[a], yt[a]), 10000,
+        b = lgb.train(dict(P, seed=k + JSEED), lgb.Dataset(Xtr.iloc[a], yt[a]), 10000,
                       valid_sets=[lgb.Dataset(Xtr.iloc[v], yt[v])], callbacks=[lgb.early_stopping(200, verbose=False)])
         oof[v] = b.predict(Xtr.iloc[v], num_iteration=b.best_iteration)
         pte += b.predict(Xte, num_iteration=b.best_iteration) / len(splits)
@@ -505,7 +510,7 @@ def cmd_fit(c: str, arm: str, drop: list[str]):
         pte = pte.clip(0)
     if cfg.get("closed_zero"):
         pte[closed == 0] = 0
-    tag = arm + ("_" + "-".join(drop) if drop else "")
+    tag = arm + ("_" + "-".join(drop) if drop else "") + (f"_js{JSEED}" if JSEED else "")
     out = ROOT / c / "subs"
     out.mkdir(parents=True, exist_ok=True)
     sub = pd.DataFrame({cfg["id"]: ids, cfg["target"]: pte})
