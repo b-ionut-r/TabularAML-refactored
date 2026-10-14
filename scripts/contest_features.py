@@ -218,6 +218,32 @@ def main_time(main: pd.DataFrame, ch: Child, given: str | None) -> str | None:
 CM_CHECK_PARENTS, CM_CHECK_ROWS = 60_000, 300_000
 
 
+def join_columns(A: list) -> pd.DataFrame:
+    """pd.concat(A, axis=1) of frames on one index, emptying A. When the copy does not fit next to the parts and
+    every column is float32, the parts are copied one at a time into one float32 block, each dropped once copied:
+    the same frame, at the parts plus the largest one instead of twice the parts (Home Credit under 5.6 GiB: killed
+    joining its related columns)."""
+    need = sum(frame_bytes(F) for F in A)
+    free = available_bytes()
+    same = all(F.index.equals(A[0].index) and (F.dtypes == np.float32).all() for F in A)
+    if need <= free or not same:
+        out = pd.concat(A, axis=1)
+        A.clear()
+        return out
+    print(f"memory guard: related columns joined a table at a time (whole: {need / 1e9:.1f} GB, "
+          f"{free / 1e9:.1f} GB free)", flush=True)
+    index, columns = A[0].index, A[0].columns.append([F.columns for F in A[1:]])
+    arr = np.empty((len(index), len(columns)), np.float32, order="F")
+    j = 0
+    while A:
+        F = A.pop(0)
+        arr[:, j:j + F.shape[1]] = F.to_numpy()
+        j += F.shape[1]
+        del F
+        _trim_heap()
+    return pd.DataFrame(arr, index=index, columns=columns, copy=False)
+
+
 def stage_fits(name: str, need: float) -> bool:
     """Memory guard for a stage whose output the pipeline can do without: whether its working set (``need``
     bytes, estimated from the frames it reads) fits in the memory free now. When it does not, the log says
@@ -668,8 +694,7 @@ def main():
         # of its rows: a concat per side of row slices copied every block twice more, consolidated and joined
         # (Home Credit's 1,200 related columns: the pipeline's peak before the search).
         if A:
-            rel = pd.concat(A, axis=1)
-            A.clear()
+            rel = join_columns(A)
             rel_tr, rel_te = _rows(rel, 0, len(tr)), _rows(rel, len(tr), len(rel))
             del rel
         print(f"related tables: {rel_tr.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)

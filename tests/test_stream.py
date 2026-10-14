@@ -64,3 +64,14 @@ def test_text_columns_become_the_object_path_categorical():
     pd.testing.assert_frame_equal(got, want)
     for c in got:
         assert got[c].cat.categories.dtype == want[c].cat.categories.dtype
+
+
+def test_joining_a_table_at_a_time_equals_concat(monkeypatch):
+    rng = np.random.default_rng(0)
+    A = [pd.DataFrame(rng.normal(size=(500, k)).astype(np.float32), columns=[f"{p}{i}" for i in range(k)])
+         for k, p in ((3, "a"), (5, "b"), (1, "c"))]
+    whole = pd.concat(A, axis=1)
+    monkeypatch.setattr(cf, "available_bytes", lambda: 10)   # the copy does not fit: one part at a time
+    parts = list(A)
+    pd.testing.assert_frame_equal(cf.join_columns(parts), whole)
+    assert parts == []
