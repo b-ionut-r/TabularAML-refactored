@@ -577,10 +577,14 @@ class ForecastFeatures:
     def transform_chunks(self, df: pd.DataFrame, rows: int):
         """``transform(df)`` in blocks of ``rows`` rows, yielded as (first row, frame): the same values,
         with only one block's columns in memory at a time. The frame is read here, before the first block,
-        so the caller may let it go."""
+        so the caller may let it go. ``rows`` may be a function, asked for the block size at the first block."""
         I, index = self._inputs(df), df.index
-        return ((a, self._transform({n: v[a:a + rows] for n, v in I.items()}, index[a:a + rows]))
-                for a in range(0, len(index), rows))
+
+        def blocks():
+            r = rows() if callable(rows) else rows
+            for a in range(0, len(index), r):
+                yield a, self._transform({n: v[a:a + r] for n, v in I.items()}, index[a:a + r])
+        return blocks()
 
     # A block's working bytes per row and output column (an estimate: float64 copies while they are built, the
     # float32 block they move into and the matrix row they are written to), plus the per-row arrays every

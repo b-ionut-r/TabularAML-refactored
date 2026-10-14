@@ -347,7 +347,8 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
     picks = [(0, es_tr), (0, es_va), (1, None)]
     raw = _check_matrix([Xf, Xh], picks)
     # The block's inputs from the earlier rows are read now, so their frame is not held through both arms.
-    chunks = probe.transform_chunks(Xf, _CHECK_CHUNK_ROWS)
+    block_rows = [_CHECK_CHUNK_ROWS]
+    chunks = probe.transform_chunks(Xf, lambda: block_rows[0])
     del Xf
     losses = {}
     for arm in ("raw", "block"):
@@ -357,12 +358,35 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
             # was the check's peak).
             # (the held-out rows' block too, a block of rows at a time: whole, its working columns were the
             # step at M5's 4.6 GB kill on pandas 3)
-            _, Fh = probe.transform_float32(Xh, _CHECK_CHUNK_ROWS)
+            try:
+                _, Fh = probe.transform_float32(Xh, _CHECK_CHUNK_ROWS, guard=True, log=None)
+            except MemoryError as e:
+                return False, f"memory guard: {e} (the check's held-out rows); the block is not used"
             del Xh
-            nr = raw[0].shape[1]
-            wide = [np.empty((len(R), nr + Fh.shape[1]), dtype=np.float32) for R in raw]
-            for W, R in zip(wide, raw):
-                W[:, :nr] = R
+            nr, nf = raw[0].shape[1], Fh.shape[1]
+            # A memory guard: the models' matrices (each the raw columns and the block's, made while its raw
+            # matrix is let go) and one block of the earlier rows' working columns against the memory free now,
+            # with fewer rows a block when short, and the block not used when the matrices would not fit (the
+            # check was Rohlik's peak: 6.24 GB of its 6.5 GB container).
+            from tabularaml.generate.stream import available_bytes
+            per_row = nf * probe._BLOCK_BYTES_PER_CELL + probe._BLOCK_BYTES_PER_ROW
+            need = sum(len(R) for R in raw) * nf * 4 + max(R.nbytes for R in raw)
+            free = available_bytes()
+            if free - need < 10_000 * per_row:
+                return False, (f"memory guard: the check's matrices need {need / 1e9:.2f} GB more, "
+                               f"{free / 1e9:.2f} GB free; the block is not used")
+            fit_rows = int((free - need) // 2 // per_row)
+            if fit_rows < block_rows[0] and len(es_tr) + len(es_va) > fit_rows:
+                block_rows[0] = max(10_000, fit_rows)
+                print(f"memory guard: forecasting check builds {block_rows[0]} earlier rows at a time "
+                      f"(matrices {need / 1e9:.2f} GB, {free / 1e9:.2f} GB free)", flush=True)
+            wide = []
+            for i in range(len(raw)):
+                W = np.empty((len(raw[i]), nr + nf), dtype=np.float32)
+                W[:, :nr] = raw[i]
+                raw[i] = None
+                wide.append(W)
+            del W
             raw = None
             wide[2][:, nr:] = Fh
             del Fh
