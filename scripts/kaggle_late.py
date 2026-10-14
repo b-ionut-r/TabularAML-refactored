@@ -165,6 +165,14 @@ CONTESTS["hc_43p2"] = dict(CONTESTS["hc_43"])  # the same build under pandas 2.3
 # Round-2 head 08f397c: the other six Kaggle contests, as their final-variant configs.
 for _c in ("ross", "fav", "m5", "wnv", "sct", "porto"):
     CONTESTS[f"{_c}_r2"] = dict(CONTESTS[f"{_c}_final"], repo="/tmp/claude-0/wt_b_08f397c")
+# Final head (faster's abdd97d, worktree wt_fh): the final rebuild of the 8 contests, as their submitted configs.
+FH_REPO = "/tmp/claude-0/wt_fh"
+CONTESTS["ieee_fh"] = dict(CONTESTS["ieee_v6"], repo=FH_REPO)
+CONTESTS["hc_fh"] = dict(CONTESTS["hc"], raw="hc", repo=FH_REPO, base="hc")
+CONTESTS["hc_fhg"] = dict(CONTESTS["hc_fh"])  # under a 6.0 GB memory cgroup
+CONTESTS["hc_fhg75"] = dict(CONTESTS["hc_fh"])  # under a 7.5 GB memory cgroup
+for _c in ("ross", "fav", "m5", "wnv", "sct", "porto"):
+    CONTESTS[f"{_c}_fh"] = dict(CONTESTS[f"{_c}_final"], repo=FH_REPO)
 # Scratch: prefix ladder narrowest-first across orderings (c9bc29a on 82dd2b5).
 for _c in ("sct", "wnv", "porto"):
     CONTESTS[f"{_c}_lad"] = dict(CONTESTS[f"{_c}_final"], repo="/tmp/claude-0/wt_lad")
