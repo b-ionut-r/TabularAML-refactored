@@ -290,6 +290,17 @@ def _check_matrix(frames: list[pd.DataFrame], picks: list[tuple[int, np.ndarray 
             vs = [((s_ - pd.Timestamp("2000-01-01")).dt.total_seconds() / 86400).to_numpy(dtype=np.float32) for s_ in naive]
         elif pd.api.types.is_numeric_dtype(ss[0]) and not isinstance(ss[0].dtype, pd.CategoricalDtype):
             vs = [s_.to_numpy(dtype=np.float32, na_value=np.nan) for s_ in ss]
+        elif all(isinstance(s_.dtype, (pd.StringDtype, pd.CategoricalDtype)) for s_ in ss):
+            # Each frame's distinct values are coded once and their text sorted across frames: the codes the
+            # rows' text gives below, without a Python string per row (the check's raw matrices were Rohlik's
+            # peak, 6.1 GB of its 6.5 GB container, in this conversion).
+            parts = [pd.factorize(s_, use_na_sentinel=True) for s_ in ss]
+            # (a missing value's text is "nan", as as_text writes it; code -1 reads the last entry)
+            texts = [np.asarray(as_text(pd.Series(u)), dtype=object).tolist() + (["nan"] if (k < 0).any() else [])
+                     for k, u in parts]
+            order = pd.Index(sorted(set().union(*texts)))
+            vs = [order.get_indexer(np.array(t_ + ["nan"], dtype=object)).astype(np.float32)[k]
+                  for (k, _), t_ in zip(parts, texts)]
         else:
             t = [as_text(s_) for s_ in ss]
             codes, _ = pd.factorize(pd.concat(t, ignore_index=True), sort=True)
