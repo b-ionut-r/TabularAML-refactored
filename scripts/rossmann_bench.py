@@ -113,8 +113,10 @@ for X in (Xtr, Xte):
     X['Date'] = (pd.to_datetime(X['Date'].astype(str)) - pd.Timestamp('2013-01-01')).dt.days.astype(float)
 for c in Xtr.columns:
     if not pd.api.types.is_numeric_dtype(Xtr[c]):
-        cats = pd.Index(pd.unique(Xtr[c].astype(str)))
-        Xtr[c] = pd.Categorical(Xtr[c].astype(str), categories=cats); Xte[c] = pd.Categorical(Xte[c].astype(str), categories=cats)
+        # Missing as the text 'nan' under either pandas (pandas 3's astype(str) keeps it missing).
+        txt = lambda s: s.astype(object).map(str)
+        cats = pd.Index(pd.unique(txt(Xtr[c])))
+        Xtr[c] = pd.Categorical(txt(Xtr[c]), categories=cats); Xte[c] = pd.Categorical(txt(Xte[c]), categories=cats)
 fit = (Xtr['Open'].to_numpy() == 1) & (ytr_all > 0)
 Xf, yf = Xtr[fit], np.log1p(ytr_all[fit])
 P = dict(objective='regression', learning_rate=0.05, num_leaves=63, min_child_samples=100, feature_fraction=0.7,
