@@ -49,3 +49,18 @@ def test_streamed_equals_whole(tmp_path, monkeypatch):
     assert set(S[0].columns) == set(F.columns)
     pd.testing.assert_frame_equal(S[0].loc[F.index, F.columns], F, check_exact=False, rtol=1e-5)
     pd.testing.assert_frame_equal(S[1].loc[R.index, R.columns], R, check_exact=False, rtol=1e-5)
+
+
+def test_text_columns_become_the_object_path_categorical():
+    from tabularaml.generate.strs import as_text
+    rng = np.random.default_rng(0)
+    v = np.array(["b", "a", "Zed", "é", "10", "9", "", "a b"], dtype=object)[rng.integers(0, 8, 2000)]
+    v[rng.random(2000) < 0.1] = None
+    df = pd.DataFrame({"t": pd.Series(v, dtype="string"), "n": pd.Series([None] * 2000, dtype="string")})
+    want = df.astype(object)
+    for c in want:
+        want[c] = want[c].where(want[c].isna(), as_text(want[c])).astype("category")
+    got = cf.normalise(df)
+    pd.testing.assert_frame_equal(got, want)
+    for c in got:
+        assert got[c].cat.categories.dtype == want[c].cat.categories.dtype

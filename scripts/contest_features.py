@@ -67,10 +67,19 @@ def release_arrow():
 def normalise(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         if isinstance(df[c].dtype, pd.StringDtype):
-            # pandas 3 reads text as its str dtype, pandas 2 as object: text takes the object path either way, so
-            # the output does not depend on the pandas version (Rossmann's Date stayed text under pandas 3 and the
-            # panel family, which reads categories as levels, did not see it).
-            df[c] = df[c].astype(object)
+            # pandas 3 reads text as its str dtype, pandas 2 as object: text becomes the categorical the object path
+            # below gives, so the output does not depend on the pandas version (Rossmann's Date stayed text under
+            # pandas 3 and the panel family, which reads categories as levels, did not see it). Coded from the
+            # column's distinct values: a Python string a row, next to the column's own buffers, was killed on a
+            # 13.7M-row event log's text columns under its memory limit. (Text holds no list cells.)
+            s = df[c]
+            codes, uniq = pd.factorize(s, sort=True)
+            cats = pd.Series(np.asarray(uniq, dtype=object), dtype=object).astype("category").cat.categories
+            remap = np.append(cats.get_indexer(np.asarray(uniq, dtype=object)), -1)   # (-1, missing, stays -1)
+            codes = remap[codes]
+            df[c] = pd.Series(pd.Categorical.from_codes(codes, dtype=pd.CategoricalDtype(cats)), index=s.index, name=c)
+            del s, codes
+            continue
         if df[c].dtype == object and isinstance(df[c].dropna().iloc[:1].tolist()[0] if df[c].notna().any() else None,
                                                 (list, tuple, np.ndarray)):
             # List cells (amenities, photo URLs): items joined, so they stay readable as a list column.
