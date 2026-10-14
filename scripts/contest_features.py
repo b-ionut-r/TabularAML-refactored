@@ -568,7 +568,21 @@ def main():
             # when the key repeats
             # (not for a table read by key range: its rows never sit in memory together)
             cm_tables = [ch for ch in keyed if tr[ch.key].is_unique and ch.source is None]
+
+        def table(ch):
+            return Child(ch.name, read(src[ch.name]), key=ch.key, time=ch.time, children=ch.children, drop=ch.drop)
+        # Keyed tables are held one at a time: each is read again for its own aggregates and dropped after them, and
+        # read again for its matches and child-row models (all five of Home Credit's, about 3 GB, sat next to the
+        # aggregates: under 5.6 GiB, killed aggregating the fourth).
+        sizes = {}
         for ch in keyed:
+            if ch.source is None:
+                sizes[ch.name] = (len(ch.df), frame_bytes(ch.df))
+                ch.df = None
+        _trim_heap()
+        for ch in keyed:
+            if ch.source is None:
+                ch.df = read(src[ch.name])
             if ch.source is not None:
                 for j, Fs in enumerate(streamed_features(ch, a.history == "auto")):
                     Fs = Fs.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
@@ -610,11 +624,17 @@ def main():
                 Hk = history_features(ch).reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
                 print(f"table {ch.name}: latest-state history, {Hk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
                 A.insert(1, Hk)
+                del Hk
+            ch.df = None
+            Rk = None
+            _trim_heap()
         rel_tr, rel_te = pd.DataFrame(index=range(len(tr))), pd.DataFrame(index=range(len(te)))
         # Child rows that also share the main row's code values (a customer's purchases of the
         # offer's brand), counted before the main row's date when both tables carry dates.
         mt = date_col(both_main)
         for ch in [ch for ch in keyed if ch.source is None] + [ch for ch in children if ch.name in asof]:
+            if ch.df is None:
+                ch = table(ch)
             cols = match_cols(both_main, ch)
             if not cols:
                 continue
@@ -635,17 +655,13 @@ def main():
             L = lookup_features(both_main, lk.df, lk.key, lk.name)
             print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
             A.append(L)
-        # The child tables are read again, one at a time, for their child-row models: held all at once through
-        # the models they were 3 GB of Home Credit's 9.2 GB peak. What the aggregation left behind (its key
-        # ranges' parts, freed arrays glibc keeps) goes back too: the models' fits are the pipeline's next peak.
-        sizes = {ch.name: (len(ch.df), frame_bytes(ch.df)) for ch in cm_tables}
+        # The child-row models read their tables again, one at a time (the as-of tables are dropped here too). What
+        # the aggregation left behind (its key ranges' parts, freed arrays glibc keeps) goes back: the models' fits
+        # are the pipeline's next peak.
         for ch in children:
             if ch.source is None:
                 ch.df = None
         _trim_heap()
-
-        def table(ch):
-            return Child(ch.name, read(src[ch.name]), key=ch.key, time=ch.time, children=ch.children, drop=ch.drop)
         if cm_tables and a.task != "multiclass":
             # The check's quick models read every related column on the sampled parents (float32 mostly): the
             # frames of both arms and one fit's training and validation rows of each, next to its child-row models
