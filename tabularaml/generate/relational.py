@@ -271,11 +271,22 @@ class RelatedTables:
         print(f"memory guard: table {ch.name} aggregated in {n} key ranges (whole: {need / 1e9:.1f} GB, "
               f"{free / 1e9:.1f} GB free)", flush=True)
         drop_const, self.drop_const = self.drop_const, False
+        seen = pd.unique(df[key].dropna())
+        ranges = [i for i in range(n) if (part == i).any()]
+        res = []
         try:
-            res = pd.concat([self._aggregate(Child(ch.name, df[part == i], key=ch.key, time=ch.time, drop=flat.drop), key)
-                             for i in range(n) if (part == i).any()])
+            for i in ranges:
+                sub = df[part == i]
+                r = self._aggregate(Child(ch.name, sub, key=ch.key, time=ch.time, drop=flat.drop), key)
+                # A categorical key's grouping lists every category: each range keeps its own keys, and the last
+                # one also the categories no row has (where one pass lists them, after the keys seen).
+                keep = r.index.isin(pd.unique(sub[key].dropna()))
+                if i == ranges[-1]:
+                    keep |= ~r.index.isin(seen)
+                res.append(r[keep])
         finally:
             self.drop_const = drop_const
+        res = pd.concat(res)
         if not self.drop_const:
             return res
         keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
