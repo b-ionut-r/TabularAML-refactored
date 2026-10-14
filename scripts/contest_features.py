@@ -783,6 +783,14 @@ def main():
             try:
                 Ftr = block(Xtr)
                 Fte = block(Xte)
+                # The training rows joined to their block are a copy of both next to the originals, and writing
+                # them out converts that copy again (Rossmann at 1.5 GB: killed there, after its block was built).
+                need = int(1.1 * (Xtr.memory_usage(deep=True).sum() + Ftr.memory_usage(deep=True).sum()))
+                free = available_bytes()
+                if need > free:
+                    Ftr = Fte = None
+                    raise MemoryError(f"joining the forecasting block to the training rows needs {need / 2**30:.2f} GB, "
+                                      f"{free / 2**30:.2f} GB free")
             except MemoryError as e:
                 Ftr = Fte = None
                 keep = False
