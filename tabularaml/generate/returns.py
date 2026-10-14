@@ -84,29 +84,39 @@ def book_levels(cols: Sequence[str], prices: Sequence[str]) -> dict:
 
 
 def return_features(df: pd.DataFrame, key: str, name: str, time: Optional[str] = None,
-                    plan: Optional[dict] = None) -> pd.DataFrame:
+                    plan: Optional[dict] = None, ignore: Sequence[str] = ()) -> pd.DataFrame:
     """Per parent key: realized volatility of each price column (and of their row mean, a mid price) over the
     whole window and its later half, the net log move, and the share of rows where it moved. Empty when the table
     has no price path. A book with bid / ask prices and sizes also gets each level's size-weighted price.
-    ``plan``: a dict shared by the chunks of one table; the first chunk records which columns are prices."""
+    ``plan``: a dict shared by the chunks of one table; the first chunk records which columns are prices.
+    ``ignore``: columns read as if dropped from ``df`` (ids), without a copy of the table."""
+    cols = [c for c in df.columns if c not in set(ignore)]
     # The time column is the order, never a price (PLAsTiCC's mjd rises slowly and stays positive).
-    num = [c for c in df.columns if c not in (key, time) and pd.api.types.is_numeric_dtype(df[c])
+    num = [c for c in cols if c not in (key, time) and pd.api.types.is_numeric_dtype(df[c])
            and not pd.api.types.is_bool_dtype(df[c])]
     if len(df) < 1000 or not df[key].duplicated().any():
         return pd.DataFrame()
-    if time is not None and time in df.columns:
-        df = df.sort_values([key, time], kind="stable")
-    elif not (df[key].to_numpy()[1:] >= df[key].to_numpy()[:-1]).all():
-        df = df.sort_values(key, kind="stable")   # a parent's rows together, file order kept within it
+    # The order rows are read in, from the sort's own columns only: the table is sorted whole only when it has a
+    # price path (on Home Credit, which has none, sorting the 13.6M installments was the related step's peak).
+    by = [key, time] if time is not None and time in df.columns else \
+        None if (df[key].to_numpy()[1:] >= df[key].to_numpy()[:-1]).all() else [key]  # (a parent's rows together)
+    pos = None if by is None else \
+        df[by].reset_index(drop=True).sort_values(by if len(by) > 1 else by[0], kind="stable").index.to_numpy()
     if plan is not None and "prices" in plan:
         prices, order = plan["prices"], plan["order"]   # decided on an earlier chunk of the same table
     else:
-        prices = price_cols(df, key, num)
-        order = _order_col(df, key, time, [c for c in num if c not in prices]) if prices else None
+        # (price_cols reads the first rows in that order)
+        prices = price_cols(df if pos is None else df.iloc[pos[:500_000]], key, num)
+        order = None
+        if prices:
+            df = df if pos is None else df.iloc[pos]
+            pos = None
+            order = _order_col(df, key, time, [c for c in num if c not in prices])
         if plan is not None:
             plan.update(prices=prices, order=order)
     if not prices or order is None:
         return pd.DataFrame()
+    df = df if pos is None else df.iloc[pos]
     d = df[[key, order] + prices]
     k = d[key].to_numpy()
     first = np.r_[True, k[1:] != k[:-1]]
@@ -114,7 +124,7 @@ def return_features(df: pd.DataFrame, key: str, name: str, time: Optional[str] =
     series = {c: d[c].to_numpy(dtype=float) for c in prices}
     if len(prices) >= 2:
         series["mid"] = d[prices].to_numpy(dtype=float).mean(axis=1)
-    for name_, (pa, sa, pb, sb) in book_levels(df.columns, prices).items():
+    for name_, (pa, sa, pb, sb) in book_levels(cols, prices).items():
         # The size-weighted price of a book level (Optiver's WAP): each side's price weighted by the
         # other side's size, so it leans toward the side about to be taken.
         A, B = df.loc[d.index, sa].to_numpy(dtype=float), df.loc[d.index, sb].to_numpy(dtype=float)

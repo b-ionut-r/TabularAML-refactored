@@ -135,8 +135,7 @@ def streamed_features(ch: Child, history: bool) -> list[pd.DataFrame]:
     for i, df in enumerate(chunks(ch.source, ch.key, max(1, int(STREAM_BUDGET_SHARE * memory_bytes())), normalise)):
         c = Child(ch.name, df, key=ch.key, time=ch.time, drop=ch.drop)
         F.append(rt._aggregate(c, ch.key))
-        R.append(return_features(df.drop(columns=[d for d in ch.drop if d in df.columns]), ch.key, ch.name,
-                                 ch.time, plan=plan))
+        R.append(return_features(df, ch.key, ch.name, ch.time, plan=plan, ignore=ch.drop))
         hist = (history and repeats(c)) if hist is None else hist
         if hist:
             H.append(history_features(c))
@@ -470,7 +469,7 @@ def main():
                 ch = Child(ch.name, ch.df[time_values(ch.df[ch.time]) < tmin], key=ch.key, time=ch.time, drop=ch.drop)
             # Price paths (an order book, a trade log): realized volatility per parent.
             t = time.time()
-            Rk = return_features(ch.df.drop(columns=[c for c in ch.drop if c in ch.df.columns]), ch.key, ch.name, ch.time)
+            Rk = return_features(ch.df, ch.key, ch.name, ch.time, ignore=ch.drop)
             if Rk.shape[1]:
                 A.insert(1, Rk.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
                 print(f"table {ch.name}: price paths, {Rk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
