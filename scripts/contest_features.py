@@ -818,11 +818,16 @@ def main():
             v = s_.to_numpy(dtype=np.float64, na_value=np.nan)
             return bool(np.all((v.astype(np.float32).astype(np.float64) == v) | np.isnan(v)))
         dt = np.float32 if all(exact32(s_) for s_ in srcs) else np.float64
-        # Memory guard: the matrix and LightGBM's binned copy of it (about a byte per cell) must fit in what is
-        # free now (the machine's, or this process's memory cgroup's when less); when they would not, the quick
-        # model reads a row sample.
+        # Memory guard: the matrix, LightGBM's binned copy of it (about a byte per cell) and the sample it bins from
+        # (up to 200,000 rows' values as doubles with their row numbers, 12 bytes a value: 3 GB on Home Credit's
+        # 1,243 columns, killed under 5.6 GiB with the matrix priced alone) must fit in what is free now (the
+        # machine's, or this process's memory cgroup's when less); when they would not, the quick model reads a
+        # row sample.
         rows = None
-        fit_rows = int(0.9 * available_bytes() / ((np.dtype(dt).itemsize + 1) * len(names)))
+        room, per, samp = 0.9 * available_bytes(), (np.dtype(dt).itemsize + 1) * len(names), 12 * len(names)
+        fit_rows = int(room / (per + samp))
+        if fit_rows > 200_000:
+            fit_rows = int((room - 200_000 * samp) / per)
         if fit_rows < len(Xtr):
             rows = np.sort(np.random.default_rng(0).choice(len(Xtr), max(fit_rows, 1000), replace=False))
             print(f"memory guard: related columns ranked on {len(rows)} of {len(Xtr)} rows", flush=True)
