@@ -4428,18 +4428,33 @@ class FeatureForge:
                 self._log(f"  gate families: next step takes {step:.0f}s of work, {max(self.time_budget - spent, 0):.0f}s "
                           f"left of {self.time_budget:.0f}s; pass stops")
                 break
-            trials = []
-            for f in sorted({fam(sp) for sp in cur}):
+            trials, over = [], False
+            fams_now = sorted({fam(sp) for sp in cur})
+            for f in fams_now:
                 rest = closed([sp for sp in cur if fam(sp) != f])
                 if rest:
                     trials.append((score(rest), f, rest))
+                    # The step's estimate is the last gate fit's cost a family; dropping a family can make the fits
+                    # dearer (a held-back 1,935-column contest: a step estimated within the budget took 1,560 s of
+                    # wall, then the pass stopped with 0 s left). A refinement stops at the fit that runs it past
+                    # its budget, so it overruns by one fit at most; a step that ran within it is never stopped.
+                    if budgeted and self.time_budget and spent > self.time_budget:
+                        over = True
+                        break
             if not trials:
                 break
             (l, z), f, rest = min(trials, key=lambda t: t[0][0])
-            self._log(f"  gate without {f}: loss={l:.6f} vs raw {raw_rows.mean():.6f} (z={z:+.2f}, need {z_needed + 1:.2f})")
+            self._log(f"  gate without {f}: loss={l:.6f} vs raw {raw_rows.mean():.6f} (z={z:+.2f}, need {z_needed + 1:.2f})"
+                      + (f" (of {len(trials)} of {len(fams_now)} families tried)" if over else ""))
             cur = rest
+            # Stopped partway, the best set tried still counts under the same stricter rule: kept only when it clears
+            # the gate by one more standard error and beats the best so far; else the best so far stands (a set that
+            # passed the gate, never worse than the raw columns).
             if l < best_l and z >= z_needed + 1:
                 best_set, best_l = list(cur), l
+            if over:
+                self._log(f"  gate families: {spent:.0f}s of work spent of {self.time_budget:.0f}s; pass stops")
+                break
         return best_set, best_l
 
     def _fit_full(self, X, y, U=None):
