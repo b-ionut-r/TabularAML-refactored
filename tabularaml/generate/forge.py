@@ -2565,6 +2565,15 @@ class FeatureForge:
         return lgb.Dataset(M, np.asarray(y), categorical_feature=cats,
                            params=self._sample_cap(self._lgb_params(lr), *M.shape)).construct()
 
+    def _lgb_fit_bytes(self, n_rows, width):
+        """A LightGBM fit's memory beyond its matrix: the sample it bins from (about 13 bytes a sampled cell, see
+        _lgb_params), the binned rows and the row subsets' copies of them (a byte a value each), the histogram
+        pool (255 bins of gradient, hessian and count for each column and each of 31 leaves) and, a class each,
+        float32 gradients and hessians, float64 scores and the validation rows' predictions."""
+        p = self._sample_cap(self._lgb_params(), n_rows, width)
+        sample = min(p.get("bin_construct_sample_cnt", 200_000), n_rows)
+        return 13 * sample * width + 2 * n_rows * width + 24 * 255 * 31 * width + 24 * n_rows * max(self.n_classes_, 1)
+
     def _fit_eval_rows(self, D, tr, va, lr=0.1, rounds=2000, es=50):
         """``_fit_eval`` on row subsets of a dataset built by ``_lgb_data``."""
         import lightgbm as lgb
@@ -3816,6 +3825,18 @@ class FeatureForge:
         for r in range(self.n_rounds):
             if len(selected) >= self.max_new_features:
                 break
+            # Memory guard: the least a round needs (the fewest search rows the guard ever leaves, 200 a CV fold,
+            # their candidates' values and a LightGBM fit over them) against the memory free now. When even that
+            # does not fit, the search stops and keeps what earlier rounds accepted (a 100-class table under 70% of
+            # its peak: the base model's fits left no memory free, and the round's candidates were killed).
+            m_min = min(len(W), 200 * self.cv)
+            width = min(80, 3 * self.max_new_features) + len(self.raw_cols_)
+            need = m_min * self._round_row_bytes() + self._lgb_fit_bytes(m_min, width)
+            free = available_bytes()
+            if need > free:
+                self._log(f"memory guard: search stopped before round {r + 1} (needs about {need / 1e9:.2f} GB, "
+                          f"{free / 1e9:.2f} GB free); earlier rounds' features stand")
+                break
             # The first round always gets room for sixteen CV fits (building, then eight for
             # screening and the prefix ladder); later rounds start only while ten fit in the budget.
             self._deadline = None
@@ -3878,6 +3899,18 @@ class FeatureForge:
             new = list(dict(new).items())  # one column per name, last wins (as column assignment)
             base_cols = Mw[2]
             jcols = base_cols + [c for c, _ in new if c not in set(base_cols)]
+            # Memory guard: the joint matrix and its LightGBM fit (below), priced against the memory free now. When
+            # they would not fit, the search stops here and keeps what earlier rounds accepted (Expedia's 12 classes
+            # under a 335 MB limit, about 0.1 GB free after screening: killed building this Dataset).
+            need = 4 * len(W) * len(jcols) + self._lgb_fit_bytes(len(W), len(jcols))
+            free = available_bytes()
+            if need > free:
+                self._log(f"memory guard: search stopped before the joint model of {len(survivors)} survivors "
+                          f"(needs about {need / 1e9:.2f} GB, {free / 1e9:.2f} GB free); earlier rounds' features stand")
+                for nm in survivors:
+                    _release(spec_by_name[nm])
+                values = new = None
+                break
             # Column-major: a run of its columns is a matrix LightGBM reads without a copy (see the
             # prefix ladder below).
             Mj = np.empty((len(W), len(jcols)), dtype=np.float32, order="F")
@@ -3994,16 +4027,30 @@ class FeatureForge:
         _trim_heap()
         self.gate_passed_ = None
         if (selected or self.recode_ or self.anchors_) and len(idx_gate):
-            best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
-            self.gate_passed_ = best_set is not None
-            self.addons_ = {}
-            if self.gate_passed_:
-                self.selected_ = list(best_set)
-            else:
+            # Memory guard: the gate's widest model (raw columns and every pick) over the search and gate rows,
+            # priced against the memory free now. When it would not fit, nothing can be shown to beat the raw
+            # columns: they are kept, as when the gate rejects.
+            width = len(self.base_cols_) + sum(len(sp.out_names()) for sp in selected)
+            need = 4 * (len(idx_sel) + len(idx_gate)) * width + self._lgb_fit_bytes(len(idx_sel), width)
+            free = available_bytes()
+            if need > free:
+                self.gate_passed_ = False
+                self.gate_raw_loss_ = self.gate_fe_loss_ = float("nan")
+                self.addons_ = {}
                 self.recode_ = False
-            self._log(f"gate: raw={self.gate_raw_loss_:.6f} fe={self.gate_fe_loss_:.6f} "
-                      f"({100 * (self.gate_raw_loss_ - self.gate_fe_loss_) / self.gate_raw_loss_:+.2f}%) "
-                      f"-> {'PASS' if self.gate_passed_ else 'REJECT'}")
+                self._log(f"memory guard: gate skipped (needs about {need / 1e9:.2f} GB, {free / 1e9:.2f} GB free) "
+                          f"-> raw columns kept")
+            else:
+                best_set, self.gate_raw_loss_, self.gate_fe_loss_ = self._gate(X, y_np, idx_sel, idx_gate, W)
+                self.gate_passed_ = best_set is not None
+                self.addons_ = {}
+                if self.gate_passed_:
+                    self.selected_ = list(best_set)
+                else:
+                    self.recode_ = False
+                self._log(f"gate: raw={self.gate_raw_loss_:.6f} fe={self.gate_fe_loss_:.6f} "
+                          f"({100 * (self.gate_raw_loss_ - self.gate_fe_loss_) / self.gate_raw_loss_:+.2f}%) "
+                          f"-> {'PASS' if self.gate_passed_ else 'REJECT'}")
             if not self.gate_passed_:
                 self.selected_ = []
                 dropped = {a[3] for a in self.anchors_}
@@ -4065,6 +4112,18 @@ class FeatureForge:
             n = live
         return n
 
+    def _round_row_bytes(self):
+        """What a search round holds per search row (see _memory_guard)."""
+        keep = min(80, 3 * self.max_new_features)
+        row = 4 * (16 * keep + 2 * len(self.raw_cols_) + 16)
+        # LightGBM's binned dataset of the joint matrix (a byte a value), and for several classes its gradients and
+        # hessians (float32), scores and the folds' predictions (float64) for every class (Expedia's 12 and 100
+        # classes under 70% of their peak: killed in the gain ladder's fits, with no term for either).
+        row += keep + len(self.raw_cols_)
+        if self.task_ == "multiclass":
+            row += 24 * self.n_classes_
+        return row
+
     def _memory_guard(self, n_search, n_wu, wu_bytes, u_bytes, held):
         """None when a search round fits in the memory free now (the machine's, or this process's memory cgroups'
         when less, which also counts the other processes in them): what the round adds to what this process
@@ -4083,13 +4142,7 @@ class FeatureForge:
         search rows for each CV fold (a fold's loss on fewer moved by more than the gains it is to measure).
         Neighbour queries also take smaller distance blocks."""
         keep = min(80, 3 * self.max_new_features)
-        row = 4 * (16 * keep + 2 * len(self.raw_cols_) + 16)
-        # LightGBM's binned dataset of the joint matrix (a byte a value), and for several classes its gradients and
-        # hessians (float32), scores and the folds' predictions (float64) for every class (Expedia's 12 and 100
-        # classes under 70% of their peak: killed in the gain ladder's fits, with no term for either).
-        row += keep + len(self.raw_cols_)
-        if self.task_ == "multiclass":
-            row += 24 * self.n_classes_
+        row = self._round_row_bytes()
         f_wu = wu_bytes + u_bytes
         # One candidate's working arrays over every row, or one fit's histogram pool (a histogram of 255 bins of
         # gradient, hessian and count, float64, for each column of the joint matrix and each of 31 leaves).
