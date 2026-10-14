@@ -576,10 +576,11 @@ class ForecastFeatures:
 
     def transform_chunks(self, df: pd.DataFrame, rows: int):
         """``transform(df)`` in blocks of ``rows`` rows, yielded as (first row, frame): the same values,
-        with only one block's columns in memory at a time."""
-        I = self._inputs(df)
-        for a in range(0, len(df), rows):
-            yield a, self._transform({n: v[a:a + rows] for n, v in I.items()}, df.index[a:a + rows])
+        with only one block's columns in memory at a time. The frame is read here, before the first block,
+        so the caller may let it go."""
+        I, index = self._inputs(df), df.index
+        return ((a, self._transform({n: v[a:a + rows] for n, v in I.items()}, index[a:a + rows]))
+                for a in range(0, len(index), rows))
 
     def _transform(self, I: dict, index: pd.Index) -> pd.DataFrame:
         n_rows = len(index)

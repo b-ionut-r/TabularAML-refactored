@@ -317,6 +317,9 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
     # training rows live only as LightGBM's bins while it trains.
     picks = [(0, es_tr), (0, es_va), (1, None)]
     raw = _check_matrix([Xf, Xh], picks)
+    # The block's inputs from the earlier rows are read now, so their frame is not held through both arms.
+    chunks = probe.transform_chunks(Xf, _CHECK_CHUNK_ROWS)
+    del Xf
     losses = {}
     for arm in ("raw", "block"):
         if arm == "block":
@@ -332,13 +335,13 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
             raw = None
             wide[2][:, nr:] = Fh.to_numpy(dtype=np.float32)
             del Fh
-            for a0, Fc in probe.transform_chunks(Xf, _CHECK_CHUNK_ROWS):
+            for a0, Fc in chunks:
                 V = Fc.to_numpy(dtype=np.float32)
                 for W, rows in ((wide[0], es_tr), (wide[1], es_va)):
                     lo, hi = np.searchsorted(rows, [a0, a0 + len(Fc)])
                     W[lo:hi, nr:] = V[rows[lo:hi] - a0]
                 del V, Fc
-            del Xf, probe
+            del chunks, probe
             mats = wide
         else:
             mats = raw
