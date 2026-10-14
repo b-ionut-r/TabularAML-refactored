@@ -225,12 +225,12 @@ def frame_bytes(df: pd.DataFrame) -> float:
     return float(df.memory_usage(index=True, deep=False).sum())
 
 
-def child_model_bytes(ch, rows=None) -> float:
-    """child_model_features' working set: its float64 copy of the child's columns and 12 row pairs, the rows of
-    one fit (at most 3 million) copied for LightGBM, and its binned dataset."""
-    n = len(ch.df) if rows is None else rows
-    cols = len(ch.df.columns) + 12
-    return 8.0 * cols * (n + 2 * min(n, 3_000_000))
+def child_model_bytes(size, rows=None) -> float:
+    """child_model_features' working set on a child table of ``size`` (rows, bytes): its copy of the columns
+    with 12 float32 row pairs, then the rows of one fit (at most 3 million) copied for LightGBM and binned."""
+    n = size[0] if rows is None else rows
+    per_row = size[1] / max(size[0], 1) + 4 * 12
+    return per_row * (n + 2 * min(n, 3_000_000))
 
 
 def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
@@ -492,6 +492,7 @@ def main():
         print(f"related tables: {rel_tr.shape[1]} columns from {cache}", flush=True)
     elif a.table:
         children = [parse_table(s, tr, a.id) for s in a.table]
+        src = {ch.name: s.split("=", 1)[1].split(":")[0] for s, ch in zip(a.table, children)}
         lookups = [ch for ch in children if "__lookup__" in ch.drop]
         children = [ch for ch in children if ch not in lookups]
         # One row per key: attributes of the main row (a tube's dimensions, its bill of
@@ -599,15 +600,25 @@ def main():
             L = lookup_features(both_main, lk.df, lk.key, lk.name)
             print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
             A.append(L)
-        # What the aggregation left behind (its key ranges' parts, freed arrays glibc keeps) goes back before the
-        # child-row models, whose fits are the pipeline's next peak.
+        # The child tables are read again, one at a time, for their child-row models: held all at once through
+        # the models they were 3 GB of Home Credit's 9.2 GB peak. What the aggregation left behind (its key
+        # ranges' parts, freed arrays glibc keeps) goes back too: the models' fits are the pipeline's next peak.
+        sizes = {ch.name: (len(ch.df), frame_bytes(ch.df)) for ch in cm_tables}
+        for ch in children:
+            if ch.source is None:
+                ch.df = None
         _trim_heap()
+
+        def table(ch):
+            return Child(ch.name, read(src[ch.name]), key=ch.key, time=ch.time, children=ch.children, drop=ch.drop)
         if cm_tables and a.task != "multiclass":
-            # The check's quick models read every related column on the sampled parents (as float64, for both
-            # arms and their row subsets), next to its child-row models on those parents' rows.
+            # The check's quick models read every related column on the sampled parents (float32 mostly): the
+            # frames of both arms and one fit's training and validation rows of each, next to its child-row models
+            # on those parents' rows.
             n_cols = len(tr.columns) + sum(Fa.shape[1] for Fa in A) + 5 * len(cm_tables)
             n_par = min(len(tr), CM_CHECK_PARENTS)
-            need = 4 * 8.0 * n_par * n_cols + max(child_model_bytes(ch, min(len(ch.df), CM_CHECK_ROWS)) for ch in cm_tables)
+            need = 4 * 4.0 * n_par * n_cols + max(
+                child_model_bytes(sizes[ch.name], min(sizes[ch.name][0], CM_CHECK_ROWS)) for ch in cm_tables)
             if not stage_fits("child-row models", need):
                 cm_tables = []
         if cm_tables and a.task != "multiclass":   # (child-row models are binary or regression)
@@ -623,8 +634,10 @@ def main():
             cm_s = []
             for ch in cm_tables:
                 ks = tr[ch.key].to_numpy()[pos]
-                sub = Child(ch.name, ch.df[ch.df[ch.key].isin(set(ks))], key=ch.key, time=ch.time,
+                df = table(ch).df
+                sub = Child(ch.name, df[df[ch.key].isin(set(ks))], key=ch.key, time=ch.time,
                             children=ch.children, drop=ch.drop)
+                del df
                 Ms = child_model_features(sub, pd.Series(y.to_numpy()[pos], index=ks), [], task=obj,
                                           max_rows=CM_CHECK_ROWS)
                 cm_s.append(Ms.reindex(ks).reset_index(drop=True))
@@ -634,11 +647,11 @@ def main():
                                      y.iloc[pos].reset_index(drop=True), a.task)
             for ch in cm_tables if keep else []:
                 _trim_heap()
-                if not stage_fits(f"child model {ch.name}", child_model_bytes(ch)):
+                if not stage_fits(f"child model {ch.name}", child_model_bytes(sizes[ch.name])):
                     continue
                 t = time.time()
                 yk = pd.Series(y.to_numpy(), index=tr[ch.key].to_numpy())
-                M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)
+                M = child_model_features(table(ch), yk, te[ch.key].to_numpy(), task=obj)
                 A.append(M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
                 label_cols += list(M.columns)
                 print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
