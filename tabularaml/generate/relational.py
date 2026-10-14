@@ -65,8 +65,9 @@ def _stem(c: str) -> str:
     return c.split("_")[0].upper()
 
 
-def _row_pairs(df: pd.DataFrame, num: Sequence[str], max_pairs: int) -> pd.DataFrame:
-    """Differences and ratios of same-unit numeric columns within each row."""
+def _row_pairs(df: pd.DataFrame, num: Sequence[str], max_pairs: int, dtype=float) -> pd.DataFrame:
+    """Differences and ratios of same-unit numeric columns within each row, computed in float64 and kept as
+    ``dtype`` (float32: each column cast as it is made, the values a cast of the whole frame gives)."""
     out = {}
     by_stem = {}
     for c in num:
@@ -80,11 +81,11 @@ def _row_pairs(df: pd.DataFrame, num: Sequence[str], max_pairs: int) -> pd.DataF
         pairs += list(combinations(cols, 2))
     for a, b in pairs[:max_pairs]:
         x, y = df[a].to_numpy(dtype=float), df[b].to_numpy(dtype=float)
-        out[f"{a}-{b}"] = x - y
+        out[f"{a}-{b}"] = (x - y).astype(dtype, copy=False)
         with np.errstate(all="ignore"):
             r = x / np.where(y == 0, np.nan, y)
         r[~np.isfinite(r)] = np.nan
-        out[f"{a}/{b}"] = r
+        out[f"{a}/{b}"] = r.astype(dtype, copy=False)
     return pd.DataFrame(out, index=df.index)
 
 
@@ -353,7 +354,8 @@ def child_model_features(ch: Child, y_by_key: pd.Series, test_keys: Sequence, n_
     X = df[feats].copy()
     num = [c for c in feats if pd.api.types.is_numeric_dtype(X[c])]
     if len(num) >= 2:
-        X = pd.concat([X, _row_pairs(df, num, 12).astype(np.float32)], axis=1)
+        # (float32 as they are made: 24 float64 columns and their stacked copy were 5 GB on Home Credit's 10M POS rows)
+        X = pd.concat([X, _row_pairs(df, num, 12, np.float32)], axis=1)
     for c in X.columns:
         if pd.api.types.is_datetime64_any_dtype(X[c]):
             # days since the epoch: LightGBM cannot serialise Timestamp categories

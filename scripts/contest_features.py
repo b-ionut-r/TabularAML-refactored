@@ -261,11 +261,14 @@ def frame_bytes(df: pd.DataFrame) -> float:
 
 
 def child_model_bytes(size, rows=None) -> float:
-    """child_model_features' working set on a child table of ``size`` (rows, bytes): its copy of the columns
-    with 12 float32 row pairs, then the rows of one fit (at most 3 million) copied for LightGBM and binned."""
+    """child_model_features' working set on a child table of ``size`` (rows, bytes): the table, its copy of the
+    columns, up to 24 float32 row-pair columns and their concatenation onto the copy; then the table and that
+    matrix, next to the rows of one fit (at most 3 million) copied for LightGBM and binned. (Home Credit's 10M POS
+    rows under 5.6 GiB, priced at 1.8 GB with 12 row pairs counted once: killed building its matrix.)"""
     n = size[0] if rows is None else rows
-    per_row = size[1] / max(size[0], 1) + 4 * 12
-    return per_row * (n + 2 * min(n, 3_000_000))
+    b = size[1] / max(size[0], 1)
+    w = b + 4 * 24
+    return max(n * (3 * b + 4 * 48), n * (b + w) + 2 * min(n, 3_000_000) * w)
 
 
 def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
