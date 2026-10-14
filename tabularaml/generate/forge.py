@@ -237,13 +237,32 @@ def _warm(ix: pd.Index) -> pd.Index:
     return ix
 
 
-def _spec_bytes(s, rows: int, wm: int | None = None) -> int:
+def _spec_bytes(s, rows: int, wm: int | None = None, text_nnz: dict | None = None) -> int:
     """A candidate's working memory while it is built over ``rows`` rows: keys' codes, values and group
     statistics' temporaries (_SPEC_BYTES_PER_ROW); a matrix of its columns in about four float64 copies
     (linear residuals, projections, neighbours: 513 and 776 bytes per row measured over 16 and 24 columns);
     for neighbour queries also scikit-learn's distance blocks (``wm`` bytes, its working memory, at most every
-    row against every row) and a fold's query rows' neighbours."""
+    row against every row) and a fold's query rows' neighbours; for a target-dependent candidate of several
+    outputs (a class each), its out-of-fold outputs, a fold's statistics gathered per row and its transform, a
+    float64 rows x classes array each; for text models, their sparse matrices, from ``text_nnz`` (each text
+    column's distinct words and word pairs, and character n-grams, a row)."""
     b = _SPEC_BYTES_PER_ROW * rows
+    n_out = getattr(s, "n_out", 1) or 1
+    if s.target_dep and n_out > 1:
+        # (Expedia's 100 classes under a 524 MB limit: a target encoder priced at 64 bytes a row, admitted
+        # alone, killed it)
+        b += 24 * n_out * rows
+    if text_nnz and isinstance(s, (TextSVD, TextLinearOOF)):
+        # Measured on Mercari's and a wine-review table's descriptions (41 to 73 nonzeros a row): 34 to 54 bytes a
+        # nonzero for the linear model (vocabularies, the rows' matrix, its blocks stacked, the folds' row
+        # takes), 30 to 37 for the SVD's fit on up to max_fit_rows rows. (MCTS under 3.5 GB: three of them at
+        # once, priced at 64 bytes a row, killed it.)
+        for c in (s.text_cols if isinstance(s, TextLinearOOF) else s.parents):
+            words, chars = text_nnz.get(c, (0.0, 0.0))
+            if isinstance(s, TextLinearOOF):
+                b += int(56 * (words + (chars if s.chars else 0.0)) * rows)
+            else:
+                b += int(40 * words * min(rows, s.max_fit_rows))
     if isinstance(s, (LinResid, KNNTarget)):  # (projections are neighbour encoders' kin)
         b += 32 * len(s.parents) * rows
     if isinstance(s, (KNNTarget, KNNClassDist)) and not isinstance(s, Projection):
@@ -1590,6 +1609,22 @@ def _text_parts(df, c, clip: Optional[int] = None):
 
 
 TEXT_CLIP = 1500
+
+
+def _text_nnz(df, c, seed=0, n=300):
+    """A text column's nonzeros a row in the text models' matrices: distinct words and word pairs, and when its
+    texts average 80 characters or fewer (as TextLinearOOF decides) distinct character 2-4-grams, over a seeded
+    sample of rows. For pricing only: what the models learn does not depend on it."""
+    t, k = _text_parts(df, c, TEXT_CLIP)
+    if not len(k):
+        return 0.0, 0.0
+    pick = t.to_numpy()[k[np.random.default_rng(seed).choice(len(k), min(n, len(k)), replace=False)]]
+    pick = ["" if not isinstance(d, str) else d for d in pick]
+    words = float(np.mean([len(set(_tfidf("word", 1).build_analyzer()(d))) for d in pick]))
+    chars = 0.0
+    if np.mean([len(d) for d in pick]) <= 80:
+        chars = float(np.mean([len(set(_tfidf("char", 1).build_analyzer()(d))) for d in pick]))
+    return words, chars
 
 
 class TextStats(Spec):
@@ -3184,6 +3219,7 @@ class FeatureForge:
 
         # scikit-learn's configuration is per thread: the guard's smaller distance blocks are set on each.
         wm = getattr(self, "_sk_wm", None)
+        tn = getattr(self, "_text_nnz", None)
 
         def compute(s, WU=WU):
             t_s = time.time()
@@ -3272,7 +3308,7 @@ class FeatureForge:
         def gated(s):
             on_wu = WU is not None and not s.target_dep and set(s.parents) <= raw
             rows = len(WU) if on_wu else len(W)
-            need = 2 * _spec_bytes(s, rows, wm)
+            need = 2 * _spec_bytes(s, rows, wm, tn)
             with gate:
                 while running[0] and available_bytes() - held[0] < need:
                     gate.wait(0.2)
@@ -3285,7 +3321,7 @@ class FeatureForge:
                 # Memory guard: even alone it would not fit. A label-free statistic is fitted on a seeded sample
                 # of the rows it reads; any other candidate is not built.
                 if on_wu:
-                    k = int(0.5 * free / max(_spec_bytes(s, 1, wm), 1))
+                    k = int(0.5 * free / max(_spec_bytes(s, 1, wm, tn), 1))
                     if k >= 1000:
                         pick = np.sort(np.random.default_rng(self.random_state).choice(len(WU), k, replace=False))
                         self._log(f"memory guard: {s.name} fitted on {k} of {len(WU)} rows")
@@ -3504,6 +3540,7 @@ class FeatureForge:
             X[c] = _as_str_frame_col(X[c])
         self.cat_levels_ = {c: _warm(pd.Index(sorted(pd.unique(X[c])))) for c in self.cat_cols_}
         self.text_cols_ = [c for c in self.cat_cols_ if _is_text(X[c])] if self.text else []
+        self._text_nnz = {c: _text_nnz(X, c, self.random_state) for c in self.text_cols_}
         # Structured strings (molecules, sequences, segmented codes): read character by character.
         from .seqstr import is_seq_string, is_smiles
         self.seq_cols_ = [c for c in self.cat_cols_ if c not in self.text_cols_ and is_seq_string(X[c])] if self.text else []
