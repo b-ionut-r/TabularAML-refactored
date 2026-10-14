@@ -126,6 +126,20 @@ def stream_rows(path: str) -> int:
     return _dataset(path).count_rows()
 
 
+# pandas 2 copies unless told not to; pandas 3 never does (copy-on-write) and deprecates the keyword.
+_NOCOPY = {"copy": False} if int(pd.__version__.split(".")[0]) < 3 else {}
+
+
+def _rows(F: pd.DataFrame, a: int = 0, b: int | None = None) -> pd.DataFrame:
+    """Rows a..b of F (all by default) numbered from 0, sharing F's blocks: reset_index copied, and consolidated,
+    the whole frame (Store Sales' and M5's output: their pipeline's peak)."""
+    b = len(F) if b is None else b
+    v = F if (a, b) == (0, len(F)) else F.iloc[a:b]
+    if not v.index.equals(pd.RangeIndex(b - a)):
+        v = v.set_axis(pd.RangeIndex(b - a), axis=0, **_NOCOPY)
+    return v
+
+
 def streamed_features(ch: Child, history: bool) -> list[pd.DataFrame]:
     """RelatedTables, price-path and latest-state history features of a streamed child, a key range at a time
     (each key's rows sit in one range, so this equals aggregating the table whole)."""
@@ -532,10 +546,14 @@ def main():
                 A.append(M.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
                 label_cols += list(M.columns)
                 print(f"child model {ch.name}: {time.time() - t:.0f}s", flush=True)
-        # One concat per side, not one per block: each pairwise concat copied every column so far.
+        # One concat, not one per block (each pairwise concat copied every column so far), then each side as views
+        # of its rows: a concat per side of row slices copied every block twice more, consolidated and joined
+        # (Home Credit's 1,200 related columns: the pipeline's peak before the search).
         if A:
-            rel_tr = pd.concat([rel_tr] + [Fa.iloc[:len(tr)].reset_index(drop=True) for Fa in A], axis=1)
-            rel_te = pd.concat([rel_te] + [Fa.iloc[len(tr):].reset_index(drop=True) for Fa in A], axis=1)
+            rel = pd.concat(A, axis=1)
+            A.clear()
+            rel_tr, rel_te = _rows(rel, 0, len(tr)), _rows(rel, len(tr), len(rel))
+            del rel
         print(f"related tables: {rel_tr.shape[1]} columns in {time.time() - t0:.0f}s", flush=True)
         if cache is not None:
             cache.mkdir(parents=True, exist_ok=True)
@@ -603,16 +621,17 @@ def main():
             Ftr = pd.DataFrame(M, columns=names, index=Xtr.index, copy=False) if M is not None else ff.transform(Xtr)
             del M
             Fte = ff.transform(Xte)
-            Xtr = pd.concat([Xtr.reset_index(drop=True), Ftr.reset_index(drop=True)], axis=1)
-            Xte = pd.concat([Xte.reset_index(drop=True), Fte.reset_index(drop=True)], axis=1)
+            Xtr = pd.concat([_rows(Xtr), _rows(Ftr)], axis=1)
+            Xte = pd.concat([_rows(Xte), _rows(Fte)], axis=1)
             print(f"forecast: {Ftr.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
+            del Ftr, Fte
     if rel_tr is not None:
         # The search sees the related columns a quick model uses most; all are written out.
         import lightgbm as lgb
         # The matrix LightGBM would make of main + related columns, filled column by column: the
         # concatenated frame, its category-code copy and LightGBM's own conversion were three
         # copies of 1,330 columns at once (Home Credit: 13.4 GB, killed on the 15 GB bench).
-        Xtr = Xtr.reset_index(drop=True)
+        Xtr = _rows(Xtr)
         for c in Xtr.columns:
             if not (pd.api.types.is_numeric_dtype(Xtr[c]) or isinstance(Xtr[c].dtype, pd.CategoricalDtype)):
                 Xtr[c] = as_text(Xtr[c]).astype("category")
