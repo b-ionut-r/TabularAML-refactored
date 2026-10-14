@@ -248,6 +248,12 @@ def _spec_bytes(s, rows: int, wm: int | None = None) -> int:
         b += 32 * len(s.parents) * rows
     if isinstance(s, (KNNTarget, KNNClassDist)) and not isinstance(s, Projection):
         b += min(_sk_working_bytes() if wm is None else wm, 8 * rows * rows) + 24 * rows * max(s.ks) // 4  # (a fold's query rows at a time)
+    if type(s).__name__ == "ClientProfile":
+        # Its key strings (each key's text, about 80 bytes a row as Python strings, and their joins) and one value
+        # column's grouping at a time (the value, codes, sort order and statistics). Measured over 5.04M rows of 2
+        # keys and 25 value columns: 1.5 GB with 50 rows a client, 3.0 GB with one (6.1 to 6.2 GB when every
+        # column was grouped at once, priced at 0.65 GB without this term).
+        b += (80 * (2 * len(s.keys) + 1) + 200) * rows
     return b
 
 

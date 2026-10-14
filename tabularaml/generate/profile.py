@@ -40,9 +40,9 @@ def _key_strings(df: pd.DataFrame, keys: Sequence[str]) -> np.ndarray:
         v = df[k]
         v = v.astype(np.float64).astype(str) if pd.api.types.is_numeric_dtype(v) else as_text(v)
         parts.append(v.fillna("nan"))  # pandas' string dtype keeps missing values missing
-    s = parts[0]
-    for p in parts[1:]:
-        s = s + "|" + p
+    s = parts.pop(0)
+    while parts:   # (each part dropped once joined)
+        s = s + "|" + parts.pop(0)
     return s.to_numpy()
 
 
@@ -77,20 +77,25 @@ class ClientProfile:
     def __repr__(self):
         return self.name
 
-    def _values(self, df: pd.DataFrame) -> pd.DataFrame:
-        V = {c: df[c].to_numpy(dtype=np.float32) for c in self.nums}
+    def _columns(self, df: pd.DataFrame):
+        """(name, float32 values) of each value column, built one at a time."""
+        for c in self.nums:
+            yield c, df[c].to_numpy(dtype=np.float32)
         for t, s, d in self.rebase:
-            V[f"{d}@{t}"] = (np.floor(df[t].to_numpy(dtype=float) / s) - df[d].to_numpy(dtype=float)).astype(np.float32)
-        return pd.DataFrame(V, index=df.index)
+            yield f"{d}@{t}", (np.floor(df[t].to_numpy(dtype=float) / s) - df[d].to_numpy(dtype=float)).astype(np.float32)
+
+    def _values(self, df: pd.DataFrame) -> pd.DataFrame:
+        return pd.DataFrame(dict(self._columns(df)), index=df.index)
 
     def fit(self, df: pd.DataFrame, y=None, ctx=None):
         code, uniq = pd.factorize(_key_strings(df, self.keys))
-        V = self._values(df)
-        g = V.groupby(code, sort=True)
-        mean, std = g.mean(), g.std()
+        # One value column at a time: all of them at once, with the grouping's float64 temporaries, took 6.1 GB
+        # over Riiid's 5.04M rows (25 columns); each column's statistics are the same either way.
         cols = []
-        for c in V.columns:
-            cols += [mean[c].to_numpy(dtype=np.float32), std[c].to_numpy(dtype=np.float32)]
+        for c, v in self._columns(df):
+            g = pd.Series(v, index=df.index).groupby(code, sort=True)
+            cols += [g.mean().to_numpy(dtype=np.float32), g.std().to_numpy(dtype=np.float32)]
+            del g, v
         for c in self.cats:
             cols.append(pd.Series(df[c].to_numpy()).groupby(code, sort=True).nunique().to_numpy(dtype=np.float32))
         cols.append(np.bincount(code).astype(np.float32))
