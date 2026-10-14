@@ -29,7 +29,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tabularaml.generate.forge import FeatureForge  # noqa: E402
+from tabularaml.generate.forge import FeatureForge, _trim_heap  # noqa: E402
 from tabularaml.generate.lists import as_lists, json_fields, list_features, unit_ratio_features  # noqa: E402
 from tabularaml.generate.returns import return_features  # noqa: E402
 from tabularaml.generate.panel import panel_features  # noqa: E402
@@ -207,6 +207,30 @@ def main_time(main: pd.DataFrame, ch: Child, given: str | None) -> str | None:
 
 
 CM_CHECK_PARENTS, CM_CHECK_ROWS = 60_000, 300_000
+
+
+def stage_fits(name: str, need: float) -> bool:
+    """Memory guard for a stage whose output the pipeline can do without: whether its working set (``need``
+    bytes, estimated from the frames it reads) fits in the memory free now. When it does not, the log says
+    the stage is skipped and the pipeline carries on: fewer columns, never a kill (the gate keeps the result
+    no worse than raw columns). A run that fits never reads this: the same stages run as before."""
+    free = available_bytes()
+    if need <= free:
+        return True
+    print(f"memory guard: {name} skipped (needs about {need / 1e9:.1f} GB, {free / 1e9:.1f} GB free)", flush=True)
+    return False
+
+
+def frame_bytes(df: pd.DataFrame) -> float:
+    return float(df.memory_usage(index=True, deep=False).sum())
+
+
+def child_model_bytes(ch, rows=None) -> float:
+    """child_model_features' working set: its float64 copy of the child's columns and 12 row pairs, the rows of
+    one fit (at most 3 million) copied for LightGBM, and its binned dataset."""
+    n = len(ch.df) if rows is None else rows
+    cols = len(ch.df.columns) + 12
+    return 8.0 * cols * (n + 2 * min(n, 3_000_000))
 
 
 def child_models_help(main, rel, cm, y, task, max_rows=60_000, seed=0):
@@ -479,11 +503,18 @@ def main():
                         Fs[c] = Fs[c].fillna(0)
                     A.insert(j, Fs)
                 continue
-            Fk = RelatedTables([ch]).features()
-            Fk = Fk.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
-            for c in [c for c in Fk.columns if c.endswith("__count")]:
-                Fk[c] = Fk[c].fillna(0)
-            A.insert(0, Fk)
+            try:
+                Fk = RelatedTables([ch]).features().reindex(both_main[ch.key].to_numpy())
+            except MemoryError as e:   # (its key ranges' guard: not even a small range fits)
+                print(f"memory guard: table {ch.name} aggregates skipped ({e})", flush=True)
+                Fk = None
+                _trim_heap()
+            if Fk is not None:
+                Fk.index = both_main.index    # (set_index copied every column)
+                for c in [c for c in Fk.columns if c.endswith("__count")]:
+                    Fk[c] = Fk[c].fillna(0)
+                A.insert(0, Fk)
+                del Fk
             # Whole-history summaries (price paths, latest state) of an as-of table see only the rows before every
             # main row: a later snapshot would hold the very outcome of an earlier labelled row.
             if ch.name in asof:
@@ -491,11 +522,17 @@ def main():
                 ch = Child(ch.name, ch.df[time_values(ch.df[ch.time]) < tmin], key=ch.key, time=ch.time, drop=ch.drop)
             # Price paths (an order book, a trade log): realized volatility per parent.
             t = time.time()
-            Rk = return_features(ch.df, ch.key, ch.name, ch.time, ignore=ch.drop)
+            # (a sorted copy of the table's rows at most)
+            Rk = return_features(ch.df, ch.key, ch.name, ch.time, ignore=ch.drop) \
+                if stage_fits(f"table {ch.name}: price paths", frame_bytes(ch.df)) else pd.DataFrame()
             if Rk.shape[1]:
                 A.insert(1, Rk.reindex(both_main[ch.key].to_numpy()).set_index(both_main.index))
                 print(f"table {ch.name}: price paths, {Rk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
-            if a.history == "auto" and repeats(ch):
+            # (the key as text for the sort, about 64 bytes a row, and the sorted rows of the numeric columns, their
+            # float32 copies and their shifted copy)
+            if a.history == "auto" and repeats(ch) and stage_fits(
+                    f"table {ch.name}: latest-state history",
+                    len(ch.df) * (64 + 24.0 * (1 + sum(pd.api.types.is_numeric_dtype(t) for t in ch.df.dtypes)))):
                 t = time.time()
                 Hk = history_features(ch).reindex(both_main[ch.key].to_numpy()).set_index(both_main.index)
                 print(f"table {ch.name}: latest-state history, {Hk.shape[1]} columns in {time.time() - t:.0f}s", flush=True)
@@ -525,6 +562,17 @@ def main():
             L = lookup_features(both_main, lk.df, lk.key, lk.name)
             print(f"table {lk.name}: {L.shape[1]} lookup columns", flush=True)
             A.append(L)
+        # What the aggregation left behind (its key ranges' parts, freed arrays glibc keeps) goes back before the
+        # child-row models, whose fits are the pipeline's next peak.
+        _trim_heap()
+        if cm_tables and a.task != "multiclass":
+            # The check's quick models read every related column on the sampled parents (as float64, for both
+            # arms and their row subsets), next to its child-row models on those parents' rows.
+            n_cols = len(tr.columns) + sum(Fa.shape[1] for Fa in A) + 5 * len(cm_tables)
+            n_par = min(len(tr), CM_CHECK_PARENTS)
+            need = 4 * 8.0 * n_par * n_cols + max(child_model_bytes(ch, min(len(ch.df), CM_CHECK_ROWS)) for ch in cm_tables)
+            if not stage_fits("child-row models", need):
+                cm_tables = []
         if cm_tables and a.task != "multiclass":   # (child-row models are binary or regression)
             task = a.task or ("binary" if y.nunique() == 2 else "regression")
             obj = "binary" if task == "binary" else "regression"
@@ -548,6 +596,9 @@ def main():
                                      [Fa.iloc[pos].reset_index(drop=True) for Fa in A], cm_s,
                                      y.iloc[pos].reset_index(drop=True), a.task)
             for ch in cm_tables if keep else []:
+                _trim_heap()
+                if not stage_fits(f"child model {ch.name}", child_model_bytes(ch)):
+                    continue
                 t = time.time()
                 yk = pd.Series(y.to_numpy(), index=tr[ch.key].to_numpy())
                 M = child_model_features(ch, yk, te[ch.key].to_numpy(), task=obj)

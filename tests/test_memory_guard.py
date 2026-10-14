@@ -40,3 +40,10 @@ def test_price_paths_ignore_equals_drop():
         b = return_features(df, "id", "book", time, ignore=["parent_id"])
         pd.testing.assert_frame_equal(a, b)
         assert a.shape[1] > 0 or time is None
+
+
+def test_key_ranges_that_cannot_fit_raise_a_clear_error(monkeypatch):
+    ch = R.Child("log", _log(), key="sid", time="t")
+    monkeypatch.setattr(R, "available_bytes", lambda: 200_000)   # not even a small range fits
+    with pytest.raises(MemoryError, match="related table log"):
+        R.RelatedTables([ch]).features()

@@ -242,9 +242,10 @@ class RelatedTables:
         levels = sum(min(ch.df[c].nunique(), 300 if bag else self.top_levels) for c in cats)
         dense = 1 + len(num) + (2 * self.max_pairs if self.row_pairs else 0)
         width = dense + levels + (levels * len(num) if bag else 0)
-        # float32 parts and the frame they are copied into, then the latest rows' sorted copy of the dense columns
-        # (three whole copies overstated a 13.7M-row stand-in's step by half: 13.7 GB modelled, 9 GB measured)
-        need = len(ch.df) * 4 * (2 * width + (dense if ch.time is not None and self.recent else 0))
+        # float32 parts and the frame they are copied into, then the latest rows: the dense columns with the time
+        # (assign), their sorted copy and the rows kept (three whole copies of the frame overstated a 13.7M-row
+        # stand-in's step by half: 13.7 GB modelled, 9 GB measured)
+        need = len(ch.df) * 4 * (2 * width + (3 * dense if ch.time is not None and self.recent else 0))
         free = available_bytes()
         if need <= free or len(ch.df) < 100_000:
             return self._aggregate(ch, key)
@@ -266,36 +267,57 @@ class RelatedTables:
             vals_ = [c for c in num if c != ch.time and c not in {cc for cc, _ in chans}][:6]
             self.levels_[(ch.name, "__channels__")] = (chans[:1], vals_)
         codes = pd.factorize(df[key])[0]
+        n_keys = max(int(codes.max()) + 1, 1)
         n = int(np.ceil(need / max(0.5 * free, 1)))
-        part = codes * n // max(codes.max() + 1, 1)
         print(f"memory guard: table {ch.name} aggregated in {n} key ranges (whole: {need / 1e9:.1f} GB, "
               f"{free / 1e9:.1f} GB free)", flush=True)
         drop_const, self.drop_const = self.drop_const, False
         seen = pd.unique(df[key].dropna())
-        ranges = [i for i in range(n) if (part == i).any()]
-        res = []
+        # Ranges of the keys' first-appearance codes, sized again before each one from the memory free then, less
+        # what the ranges' results so far say all of them and their concatenation will take (one pass's output
+        # does not depend on where the ranges fall). When not even a small range fits, a clear error, not the
+        # kernel's kill.
+        # The first range a quarter of the plan's, the rest sized from the memory then free.
+        res, lo, done, step = [], 0, 0.0, max(-(-n_keys // n) // 4, 1)
         try:
-            for i in ranges:
-                sub = df[part == i]
+            while lo < n_keys:
+                if res:
+                    # (the remaining ranges' results, then the concatenation of all of them)
+                    rest = done / lo * (n_keys - lo) + done / lo * n_keys
+                    room = available_bytes() - rest
+                    step = int(0.5 * room / need * n_keys) if room > 0 else 0
+                    if step < max(n_keys // 1000, 1):
+                        raise MemoryError(
+                            f"related table {ch.name} ({len(df)} rows): its last {n_keys - lo} of {n_keys} keys need "
+                            f"about {(rest + need / 1000) / 1e9:.1f} GB, and {max(room + rest, 0) / 1e9:.1f} GB is free; "
+                            f"raise the memory limit")
+                hi = min(lo + step, n_keys)
+                sub = df[(codes >= lo) & (codes < hi)]
                 r = self._aggregate(Child(ch.name, sub, key=ch.key, time=ch.time, drop=flat.drop), key)
                 # A categorical key's grouping lists every category: each range keeps its own keys, and the last
                 # one also the categories no row has (where one pass lists them, after the keys seen).
                 keep = r.index.isin(pd.unique(sub[key].dropna()))
-                if i == ranges[-1]:
+                if hi == n_keys:
                     keep |= ~r.index.isin(seen)
+                del sub
                 res.append(r[keep])
+                del r
+                done += float(res[-1].memory_usage(index=True, deep=False).sum())
+                lo = hi
         finally:
             self.drop_const = drop_const
         res = pd.concat(res)
         if not self.drop_const:
             return res
         keep = [c for c in res.columns if res[c].notna().mean() > 0.01 and res[c].nunique() > 1]
-        return res[keep].astype(np.float32)
+        # (its parts are float32 already: no second copy)
+        res = res[keep]
+        return res.astype(np.float32, copy=False)
 
     def features(self) -> pd.DataFrame:
         """Aggregations of every child, indexed by the main table's key."""
         frames = [self._aggregate_fitting(ch, ch.key) for ch in self.children]
-        return pd.concat(frames, axis=1)
+        return frames[0] if len(frames) == 1 else pd.concat(frames, axis=1)
 
     def join(self, main: pd.DataFrame, key: str) -> pd.DataFrame:
         F = self.features()
