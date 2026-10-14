@@ -355,14 +355,16 @@ def forecast_check(ff, X: pd.DataFrame, y: np.ndarray, kw: dict, task: str | Non
             # The block's columns are all float32; the earlier rows are transformed a block of rows at a
             # time straight into the rows each model reads (Store Sales: the whole block for 2.9M rows
             # was the check's peak).
-            Fh = probe.transform(Xh)
+            # (the held-out rows' block too, a block of rows at a time: whole, its working columns were the
+            # step at M5's 4.6 GB kill on pandas 3)
+            _, Fh = probe.transform_float32(Xh, _CHECK_CHUNK_ROWS)
             del Xh
             nr = raw[0].shape[1]
             wide = [np.empty((len(R), nr + Fh.shape[1]), dtype=np.float32) for R in raw]
             for W, R in zip(wide, raw):
                 W[:, :nr] = R
             raw = None
-            wide[2][:, nr:] = Fh.to_numpy(dtype=np.float32)
+            wide[2][:, nr:] = Fh
             del Fh
             for a0, Fc in chunks:
                 V = Fc.to_numpy(dtype=np.float32)

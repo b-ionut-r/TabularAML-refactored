@@ -793,11 +793,14 @@ class ForecastFeatures:
         M = np.empty((n_rows, len(names)), dtype=np.float32, order="F")
         for j, n in enumerate(names):
             M[:, j] = F.pop(n)
-        out = pd.DataFrame(M, columns=names, index=index, copy=False)
+        # Rows of unknown entities or periods are missing, written into the block before the frame wraps it (a
+        # .loc write copied the block on pandas 3: the forecasting check's step at the 4.6 GB kill on M5).
         bad = (k < 0) | ~ok
         if bad.any():
-            out.loc[bad, [c for c in out.columns if c != "fc_h"]] = np.nan
-        return out
+            for j, n in enumerate(names):
+                if n != "fc_h":
+                    M[bad, j] = np.nan
+        return pd.DataFrame(M, columns=names, index=index, copy=False)
 
 
 def forecast_features(X: pd.DataFrame, y, X_unlabeled: pd.DataFrame, **kw):
