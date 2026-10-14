@@ -159,6 +159,8 @@ CONTESTS["hc_9dg75"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_9
 CONTESTS["hc_8e"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_8e4698e", base="hc")
 CONTESTS["hc_8eg"] = dict(CONTESTS["hc_8e"])  # under a 6.0 GB memory cgroup
 CONTESTS["hc_8eg75"] = dict(CONTESTS["hc_8e"])  # under a 7.5 GB memory cgroup
+CONTESTS["hc_43"] = dict(CONTESTS["hc"], raw="hc", repo="/tmp/claude-0/wt_b_43aaaee", base="hc")  # faster 43aaaee: pandas-3 text takes the object path
+CONTESTS["hc_43p2"] = dict(CONTESTS["hc_43"])  # the same build under pandas 2.3.3 (venv)
 # Round-2 head 08f397c: the other six Kaggle contests, as their final-variant configs.
 for _c in ("ross", "fav", "m5", "wnv", "sct", "porto"):
     CONTESTS[f"{_c}_r2"] = dict(CONTESTS[f"{_c}_final"], repo="/tmp/claude-0/wt_b_08f397c")
