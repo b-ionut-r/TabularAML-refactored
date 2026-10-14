@@ -3264,15 +3264,20 @@ class FeatureForge:
         # one's values, do not depend on how many run at once; fewer run when memory is short.
         gate = threading.Condition()
         running = [0]
+        # The working sets of the candidates already running, which they may not have allocated yet: a candidate
+        # starts only while the memory free less those could hold its own twice over (MCTS under a 3.5 GB limit:
+        # each admitted on what was free when it started, together past the limit).
+        held = [0]
 
         def gated(s):
             on_wu = WU is not None and not s.target_dep and set(s.parents) <= raw
             rows = len(WU) if on_wu else len(W)
             need = 2 * _spec_bytes(s, rows, wm)
             with gate:
-                while running[0] and available_bytes() < need:
+                while running[0] and available_bytes() - held[0] < need:
                     gate.wait(0.2)
                 running[0] += 1
+                held[0] += need // 2
                 free = available_bytes()
             try:
                 if need <= 2 * free:
@@ -3290,6 +3295,7 @@ class FeatureForge:
             finally:
                 with gate:
                     running[0] -= 1
+                    held[0] -= need // 2
                     gate.notify_all()
 
         batch = 4 * n_threads
@@ -4032,7 +4038,8 @@ class FeatureForge:
           - one candidate's working arrays over each of those rows, 2 x _SPEC_BYTES_PER_ROW a row;
           - per search row, float32 values of the candidates alive at once: the screen's pool of 4 x ``keep``
             columns and the joint matrix's survivors, about 16 x ``keep`` values, next to the model's matrix of
-            the raw columns (two copies) and 16 more for folds and predictions.
+            the raw columns (two copies) and 16 more for folds and predictions; the binned dataset, a byte a
+            column; and for a multiclass task 24 bytes a class.
         (0.8 GB fixed and the limit in place of the memory free fired on 493-row ICR under a 189 MB limit, whose
         whole run peaks at 0.27 GB.) When it fires: all of both kinds of rows if they fit after all, else the
         most search rows that fit next to every label-free row, else both cut in proportion, with at least 200
@@ -4040,8 +4047,16 @@ class FeatureForge:
         Neighbour queries also take smaller distance blocks."""
         keep = min(80, 3 * self.max_new_features)
         row = 4 * (16 * keep + 2 * len(self.raw_cols_) + 16)
+        # LightGBM's binned dataset of the joint matrix (a byte a value), and for several classes its gradients and
+        # hessians (float32), scores and the folds' predictions (float64) for every class (Expedia's 12 and 100
+        # classes under 70% of their peak: killed in the gain ladder's fits, with no term for either).
+        row += keep + len(self.raw_cols_)
+        if self.task_ == "multiclass":
+            row += 24 * self.n_classes_
         f_wu = wu_bytes + u_bytes
-        work = 2 * _SPEC_BYTES_PER_ROW * n_wu
+        # One candidate's working arrays over every row, or one fit's histogram pool (a histogram of 255 bins of
+        # gradient, hessian and count, float64, for each column of the joint matrix and each of 31 leaves).
+        work = max(2 * _SPEC_BYTES_PER_ROW * n_wu, 24 * 255 * 31 * (keep + len(self.raw_cols_)))
         need = f_wu + work + n_search * row
         free = available_bytes()
         if need <= free:
