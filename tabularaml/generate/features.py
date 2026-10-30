@@ -756,7 +756,8 @@ class FeatureGenerator:
         self.exploration_factor = exploration_factor
         
         if log_file:
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            # A bare file name ("run.log") has no directory part and logs to the working directory.
+            os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
         self.log_file = log_file
 
         # Ensure these exist before search() / _set_defaults() is called so that
@@ -2548,7 +2549,13 @@ class FeatureGenerator:
 
         # Label encode target (same as search) — category_encoders internally
         # converts non-numeric y to numpy via LabelEncoder without wrapping back in Series
-        if y is not None and getattr(self, 'task', None) != "regression":
+        # search() resets an inferred task to None, so infer it again here: a None task used to mean
+        # "classification", and a continuous target was factorized into one class per distinct value
+        # (target encodings became one column per training row's label).
+        task = getattr(self, 'task', None)
+        if task is None and y is not None:
+            task = "regression" if type_of_target(y) == "continuous" else "classification"
+        if y is not None and task != "regression":
             unique_vals = np.unique(y)
             if not np.array_equal(unique_vals, np.arange(len(unique_vals))):
                 y_encoded, _ = y.factorize(sort=True)

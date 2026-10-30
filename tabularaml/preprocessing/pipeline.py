@@ -139,25 +139,28 @@ class PipelineWrapper:
         # Process each column to determine data type and perform conversions
         for col in X.columns:
             # Handle object or categorical types
-            if X[col].dtype == np.dtype('O') or isinstance(X[col].dtype, pd.CategoricalDtype):
+            # Whole columns are replaced, never written into: under pandas 3, writing a re-categorised column into a
+            # categorical one with other categories raises, and text columns use the "str" dtype, not object.
+            if (X[col].dtype == np.dtype('O') or isinstance(X[col].dtype, pd.CategoricalDtype)
+                    or pd.api.types.is_string_dtype(X[col].dtype)):
                 # Determine if column is likely categorical based on unique value ratio
                 is_likely_categorical = X[col].nunique() / len(X[col]) < 0.1
                 
                 if is_likely_categorical:
-                    X.loc[:, col] = self._convert_to_category(X[col])
+                    X[col] = self._convert_to_category(X[col])
                     dtypes_dict[col] = "cat"
                 else:
                     # Try numeric conversion
                     numeric_result = self._try_numeric_conversion(X[col])
                     if numeric_result is not None:
-                        X.loc[:, col] = numeric_result
+                        X[col] = numeric_result
                         dtypes_dict[col] = "float" if X[col].dtype == np.float64 else "int"
                     else:
                         # Handle non-categorical text
                         if hasattr(self, 'drop_non_categorical_text') and self.drop_non_categorical_text:
                             dropped_columns.append(col)
                         else:
-                            X.loc[:, col] = self._convert_to_category(X[col])
+                            X[col] = self._convert_to_category(X[col])
                             dtypes_dict[col] = "cat"
             
             # Handle numeric types directly
